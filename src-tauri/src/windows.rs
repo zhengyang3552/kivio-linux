@@ -738,6 +738,12 @@ pub fn destroy_overlay_window(window: &WebviewWindow) {
     }
 }
 
+/// 其他平台（Linux）：浮窗没有重分类问题，直接销毁即可。
+#[cfg(not(target_os = "macos"))]
+pub fn destroy_overlay_window(window: &WebviewWindow) {
+    let _ = window.destroy();
+}
+
 /// 运行时注册一个 NSPanel 子类：borderless 窗口默认 `canBecomeKeyWindow=NO`，强制 YES 才能
 /// 接收键盘；`canBecomeMainWindow=NO` 保持其辅助身份。进程内只注册一次。
 #[cfg(target_os = "macos")]

@@ -2747,6 +2747,7 @@ fn capture_region_image(
     _width: u32,
     _height: u32,
     _scale_factor: f64,
+    _exclude_self_pid: Option<i32>,
 ) -> Result<PathBuf, String> {
     Err("Region capture is not supported on this platform".to_string())
 }

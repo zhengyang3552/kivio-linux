@@ -43,6 +43,8 @@ const DOWNLOAD_USER_AGENT: &str =
 pub const ONNX_RUNTIME_FILE_NAME: &str = "libonnxruntime.dylib";
 #[cfg(target_os = "windows")]
 pub const ONNX_RUNTIME_FILE_NAME: &str = "onnxruntime.dll";
+#[cfg(target_os = "linux")]
+pub const ONNX_RUNTIME_FILE_NAME: &str = "libonnxruntime.so";
 #[cfg(target_os = "windows")]
 const PROVIDERS_SHARED_NAME: &str = "onnxruntime_providers_shared.dll";
 
@@ -238,6 +240,26 @@ const RUNTIME: ModelFile = ModelFile {
     relative_path: ONNX_RUNTIME_FILE_NAME,
     installed_size: 39_742_608,
     installed_sha256: "8c9c78de65ea3786f987c0d980e9c1b13a3a5fbc6b3e2965ba05b450e6e4c054",
+    source: RUNTIME_SOURCE,
+};
+
+#[cfg(target_os = "linux")]
+const RUNTIME_SOURCE: ModelSource = ModelSource::Archive {
+    cache_key: "onnxruntime-linux-x64-1.24.4.tgz",
+    url: "https://github.com/microsoft/onnxruntime/releases/download/v1.24.4/onnxruntime-linux-x64-1.24.4.tgz",
+    size: 8_155_822,
+    sha256: "3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747",
+    // 归档里 lib/libonnxruntime.so 是符号链接(.so -> .so.1 -> .so.1.24.4),
+    // 按 entry_suffix 抽条目只会拿到空链接体,所以直接抽真实文件,
+    // 安装时由 relative_path 落为 libonnxruntime.so。
+    entry_suffix: "lib/libonnxruntime.so.1.24.4",
+};
+#[cfg(target_os = "linux")]
+const RUNTIME: ModelFile = ModelFile {
+    component_id: "onnx-runtime",
+    relative_path: ONNX_RUNTIME_FILE_NAME,
+    installed_size: 22_159_232,
+    installed_sha256: "d132535d051344ff5c64c9c200004150559049a81ed330eb4422c1962fb6b7e4",
     source: RUNTIME_SOURCE,
 };
 
@@ -1189,7 +1211,7 @@ fn retry_delay(attempt: u8) -> Duration {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn extract_archive_entry(
     archive_path: &Path,
     entry_suffix: &str,
