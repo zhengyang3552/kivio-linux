@@ -3311,7 +3311,12 @@ mod tests {
         let mut s = Settings::default();
         s.screenshot_translation.ocr_mode = Some(OcrMode::Legacy);
         let s = sanitize_settings(s);
+        // macOS/Windows：迁移到 RapidOcr。Linux：sanitize_settings 的平台分支
+        // 会把 System/RapidOcr 强制落回 CloudVision（本地 OCR 目前仅 macOS/Windows）。
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(s.screenshot_translation.ocr_mode, Some(OcrMode::RapidOcr));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert_eq!(s.screenshot_translation.ocr_mode, Some(OcrMode::CloudVision));
     }
 
     #[test]

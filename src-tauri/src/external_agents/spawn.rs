@@ -746,6 +746,10 @@ mod probe_tests {
     ///
     /// （注：用 Python 的 subprocess 试会看到 ENOEXEC，那是 CPython 自己先拦了；
     /// 内核/Rust 的实际行为以本测试为准。）
+    ///
+    /// 仅 macOS：该回退走的是 macOS 的 spawn 路径；Linux 上 execve 直接 ENOEXEC，
+    /// 空文件判为不存在是正确行为，不参与本断言。
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn probe_accepts_empty_executable_because_the_kernel_runs_it() {
         let f = Fixtures::new("emptyexec");
