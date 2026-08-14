@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use flate2::read::GzDecoder;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_RANGE, RANGE, USER_AGENT};
 use serde::Serialize;
