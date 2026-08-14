@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ZMGID/kivio/releases/latest"><strong>下载</strong></a>
+  <a href="https://github.com/zhengyang3552/kivio-linux/releases/latest"><strong>下载</strong></a>
   &nbsp;·&nbsp;
   <a href="#功能">功能</a>
   &nbsp;·&nbsp;
