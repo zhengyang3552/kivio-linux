@@ -22,6 +22,9 @@
 //!    shell 环境变量）。把供应商片段里的 `default_model` / `[providers.*]` / `[models.*]`
 //!    合并进现有文件；`managed:kimi-code` OAuth 段与其它用户配置原样保留。首次接管前
 //!    整份备份，切回「CLI 自身配置」时还原。
+//! 7. **dsh 的 Kivio 私有 profile** —— provider 本体由 `dsh_profile.rs` 写进
+//!    `profiles/kivio/cordis.patch.yml` 的 `llm-pi-ai.providers`；本层只负责把 `apiKeyEnv`
+//!    指向的 Key 注入 Kivio 启动的进程，不改用户的 `settings.yaml` 或其它 profile。
 //!
 //! 物化时机是**保存 / 切换供应商那一次**（`commands::chat_external_cli_provider_apply`），
 //! 不是每轮。ccgui 用的是 per-turn 临时目录 + `Drop` 删除，那套在 Kivio 会把常驻 claude
@@ -325,8 +328,8 @@ fn read_grok_state(path: &Path) -> Result<GrokManagedState, String> {
     if !path.is_file() {
         return Ok(GrokManagedState::default());
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(GrokManagedState::default());
     }
@@ -371,9 +374,7 @@ fn merge_grok_provider_config(base: &str, provider_config: &str) -> Result<Strin
         .and_then(|v| v.as_table())
         .is_some_and(|t| !t.is_empty());
     if !has_models && !has_model {
-        return Err(
-            "Grok 供应商 config.toml 缺少 [models].default 或 [model.*] 段".to_string(),
-        );
+        return Err("Grok 供应商 config.toml 缺少 [models].default 或 [model.*] 段".to_string());
     }
 
     if let Some(models) = provider_doc.get("models").and_then(|v| v.as_table()) {
@@ -489,8 +490,8 @@ fn read_kimi_state(path: &Path) -> Result<KimiManagedState, String> {
     if !path.is_file() {
         return Ok(KimiManagedState::default());
     }
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
     if text.trim().is_empty() {
         return Ok(KimiManagedState::default());
     }
@@ -1430,7 +1431,8 @@ pub fn cleanup(
             }
         }
         "opencode" | "pi" => {
-            if let Err(err) = cleanup_native(agent_id, provider_id, native_provider_id, provider_name)
+            if let Err(err) =
+                cleanup_native(agent_id, provider_id, native_provider_id, provider_name)
             {
                 eprintln!("[external-agent] 清理 {agent_id} 原生供应商失败：{err}");
             }
@@ -1474,9 +1476,8 @@ fn cleanup_native_at(
     if native_ids.is_empty() {
         return Ok(());
     }
-    let matches_id = |value: Option<&str>| {
-        value.is_some_and(|value| native_ids.iter().any(|id| id == value))
-    };
+    let matches_id =
+        |value: Option<&str>| value.is_some_and(|value| native_ids.iter().any(|id| id == value));
     let mut state = read_managed_state(&paths.state)?;
     match agent_id {
         "opencode" => {
@@ -1648,12 +1649,18 @@ mod tests {
 
     #[test]
     fn slugify_provider_key_keeps_dot_and_underscore() {
-        assert_eq!(slugify_provider_key("My.Relay").as_deref(), Some("my.relay"));
+        assert_eq!(
+            slugify_provider_key("My.Relay").as_deref(),
+            Some("my.relay")
+        );
         assert_eq!(
             slugify_provider_key("hello_world").as_deref(),
             Some("hello_world")
         );
-        assert_eq!(slugify_provider_key("Relay One").as_deref(), Some("relay-one"));
+        assert_eq!(
+            slugify_provider_key("Relay One").as_deref(),
+            Some("relay-one")
+        );
         assert_eq!(slugify_provider_key("a--b").as_deref(), Some("a-b"));
     }
 
@@ -1728,10 +1735,7 @@ mod tests {
         materialize_native_at("opencode", &config, &paths).unwrap();
         let merged: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.config).unwrap()).unwrap();
-        assert_eq!(
-            merged["provider"]["relay-one"]["headerTimeout"],
-            12_000
-        );
+        assert_eq!(merged["provider"]["relay-one"]["headerTimeout"], 12_000);
         assert_eq!(
             merged["provider"]["relay-one"]["models"]["gpt-test"]["variants"]["high"]
                 ["reasoningEffort"],
@@ -2090,8 +2094,11 @@ mod tests {
             r#"{"relay-one":{"type":"api_key","key":"new"},"kivio-p-msoeiznl":{"type":"api_key","key":"old"}}"#,
         )
         .unwrap();
-        std::fs::write(paths.settings.as_ref().unwrap(), r#"{"defaultProvider":"relay-one"}"#)
-            .unwrap();
+        std::fs::write(
+            paths.settings.as_ref().unwrap(),
+            r#"{"defaultProvider":"relay-one"}"#,
+        )
+        .unwrap();
         std::fs::write(
             &paths.state,
             r#"{"managedProviderIds":["relay-one","kivio-p-msoeiznl"],"defaultsManaged":false}"#,
@@ -2475,21 +2482,17 @@ display_name = "GPT 5"
             doc.get("default_model").and_then(|v| v.as_str()),
             Some("relay/gpt-5")
         );
-        assert!(
-            doc.get("thinking")
-                .and_then(|v| v.get("enabled"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        );
+        assert!(doc
+            .get("thinking")
+            .and_then(|v| v.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false));
         let managed = doc
             .get("providers")
             .and_then(|v| v.get("managed:kimi-code"))
             .and_then(|v| v.as_table())
             .expect("managed provider kept");
-        assert_eq!(
-            managed.get("type").and_then(|v| v.as_str()),
-            Some("kimi")
-        );
+        assert_eq!(managed.get("type").and_then(|v| v.as_str()), Some("kimi"));
         let relay = doc
             .get("providers")
             .and_then(|v| v.get("relay"))
@@ -2631,10 +2634,7 @@ max_context_size = 200000
             "claude-sonnet-4-6-20250929",
             "claude-opus-5",
         ] {
-            assert!(
-                is_pi_adaptive_thinking_model(id),
-                "expected adaptive: {id}"
-            );
+            assert!(is_pi_adaptive_thinking_model(id), "expected adaptive: {id}");
         }
         for id in [
             "claude-sonnet-4-5",
@@ -2698,10 +2698,7 @@ max_context_size = 200000
         .cloned()
         .unwrap();
         ensure_pi_adaptive_thinking_compat(&mut openai);
-        assert!(openai
-            .get("models")
-            .and_then(Value::as_array)
-            .unwrap()[0]
+        assert!(openai.get("models").and_then(Value::as_array).unwrap()[0]
             .get("compat")
             .is_none());
     }
