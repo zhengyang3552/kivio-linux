@@ -5,7 +5,7 @@
 <h1 align="center">Kivio Desktop</h1>
 
 <p align="center">
-  <strong>macOS / Windows 屏幕级 AI 助手：一个 Agentic AI 客户端，加上即时翻译、截图 OCR、视觉问答 —— 全部一键呼出，全部用你自己的 API Key。</strong>
+  <strong>Linux 屏幕级 AI 助手：一个 Agentic AI 客户端，加上即时翻译、截图 OCR、视觉问答 —— 全部一键呼出，全部用你自己的 API Key。</strong>
 </p>
 
 <p align="center">
