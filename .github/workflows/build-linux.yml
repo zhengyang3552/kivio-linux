@@ -1,0 +1,110 @@
+name: Build Linux Binary
+
+# 产出 Linux x64 可直接运行的 tar.gz 包(Tauri 主二进制 + skills 资源 + OCR sidecar stub)。
+# 前端资源由 Tauri 编译期嵌入二进制(frontendDist),不随包分发。
+#
+# 手动触发(workflow_dispatch):只产出 artifact,从 Actions 页下载后手动上传到 Release。
+# tag 推送的构建+Release 发布已归口到 package-linux.yml(避免两个工作流抢建 Release),
+# 本工作流不再监听 tag;下方的 Attach 步骤保留,若将来恢复 tag 触发仍可用。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号(用于产物文件名,例如 2.8.9)'
+        required: true
+        default: '2.8.9'
+
+permissions:
+  contents: write # tag 触发时附加资产到 Release 需要
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # 与本地开发环境保持一致;升级 Node 时记得同步,避免编译产物行为漂移。
+          node-version: '20'
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev >/dev/null
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            # tag 触发:从 v2.8.9 这样的 ref name 去掉前导 v
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── sidecar stub ─────────────────────────────────────────────────────
+      # kivio-ocr-helper 真实实现是 macOS Swift;非 macOS 平台该脚本写空 stub,
+      # 让 Tauri externalBin 校验通过,运行时按平台禁用、不会 spawn。
+      - name: Build sidecar stub
+        run: npm run build:swift
+
+      # ── 编译后端二进制 ────────────────────────────────────────────────────
+      # beforeBuildCommand 会自动跑 npm run build:ui(pyodide 资产 + vite build),
+      # 前端产物 dist/ 编译期嵌入二进制。
+      # --no-bundle:只编译主二进制,不产出 deb/appimage 等捆绑格式。
+      - name: Compile Linux x64 binary
+        run: npx tauri build --no-bundle
+
+      # ── 组装可运行目录并打包 tar.gz ──────────────────────────────────────
+      # 解压后得到一个自包含的 kivio/ 目录:二进制 + skills 资源。
+      # 用户解压后直接 ./kivio/kivio 即可运行(tar 保留了 +x 权限位)。
+      - name: Assemble package
+        run: |
+          # mainBinaryName 未显式配置,产物名可能是 kivio 或 kivio-desktop,两者都探测
+          if [ -x src-tauri/target/release/kivio-desktop ]; then
+            BIN=src-tauri/target/release/kivio-desktop
+          elif [ -x src-tauri/target/release/kivio ]; then
+            BIN=src-tauri/target/release/kivio
+          else
+            echo "::error::未找到构建二进制"
+            ls -l src-tauri/target/release
+            exit 1
+          fi
+          mkdir -p /tmp/pkg/kivio/skills
+          install -m755 "$BIN" /tmp/pkg/kivio/kivio
+          # skills 资源必须与二进制同目录(Tauri 资源路径按 exe 所在目录解析)
+          cp -r src-tauri/resources/skills/. /tmp/pkg/kivio/skills/
+          # OCR sidecar 在 Linux 下是空 stub,随包保持 externalBin 布局完整
+          STUB="$(ls src-tauri/binaries/kivio-ocr-helper-* 2>/dev/null | head -1)"
+          if [ -n "$STUB" ]; then
+            install -m755 "$STUB" /tmp/pkg/kivio/kivio-ocr-helper
+          fi
+          # sanity:确认可执行文件在位
+          test -x /tmp/pkg/kivio/kivio
+          cd /tmp/pkg
+          tar czf "/tmp/Kivio_${{ steps.ver.outputs.version }}_linux_x64.tar.gz" kivio/
+          ls -lh "/tmp/Kivio_${{ steps.ver.outputs.version }}_linux_x64.tar.gz"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Kivio_${{ steps.ver.outputs.version }}_linux_x64
+          path: /tmp/Kivio_${{ steps.ver.outputs.version }}_linux_x64.tar.gz
+          retention-days: 30
+
+      # tag 触发时自动附加到对应版本的 GitHub Release;手动触发只产出 artifact 供下载。
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: /tmp/Kivio_${{ steps.ver.outputs.version }}_linux_x64.tar.gz

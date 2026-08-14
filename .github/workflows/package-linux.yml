@@ -1,0 +1,513 @@
+name: Package Linux
+
+# 仓库从上游同步(push 到 main)后自动编译并打包全部 Linux 发行版格式;也可手动触发。
+# 发布:网页上创建 Release(写说明)时,自动把最近一次成功构建的产物原样挂上,不重新编译。
+#
+# 产物(均为 amd64 / x86_64):
+#   - Kivio_<ver>_linux_x64.tar.gz                便携 tar.gz
+#   - kivio-desktop_<ver>_amd64.deb               Debian / Ubuntu / Mint
+#   - kivio-desktop-<ver>-1-x86_64.pkg.tar.zst    Arch / Manjaro
+#   - kivio-desktop-<ver>-x86_64.AppImage         AppImage
+#   - kivio-desktop-bin-<ver>-nix/                NixOS 二进制包(nix-store closure 导出 + derivation)
+#   - kivio-desktop-<ver>.tar.gz                  源码包(git archive)
+#
+# 打包布局约定:
+#   /opt/kivio-desktop/   kivio 主二进制 + skills/ 资源 + kivio-ocr-helper stub
+#                         (Tauri 资源路径按 "exe 所在目录" 解析,二进制必须与 skills/ 同目录)
+#   /usr/bin/kivio-desktop  启动器(ci/linux/launcher.sh 生成)
+#                           数据目录由 Tauri 管理:~/.local/share/com.zmair.kivio
+
+on:
+  push:
+    branches: [main]   # 上游同步:只构建打包,产物供下载测试
+  # 网页上创建 Release(写说明)时,自动把最近一次成功构建的产物原样挂上——
+  # 不重新编译,测过的包就是发布的包
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号覆盖(默认取 src-tauri/tauri.conf.json 的 version)'
+        required: false
+        default: ''
+      tag:
+        description: '仅挂载模式:填已有 tag(如 v2.8.9)把最新构建产物补挂到该 Release;留空=正常构建'
+        required: false
+        default: ''
+
+concurrency:
+  group: package-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # tag 触发时发布 Release 需要;read 不够
+  actions: write # 流程末尾删除中转 artifact(linux-payload)需要
+
+env:
+  # 与 build-linux.yml / ci.yml 保持一致;升级 Node 时同步改
+  NODE_VERSION: '20'
+
+jobs:
+  build:
+    name: Compile (tauri build)
+    if: github.event_name != 'release' && github.event.inputs.tag == ''
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version || '' }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)"
+          fi
+          if [ -z "$V" ]; then
+            echo "::error::无法解析版本号"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version: $V"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev >/dev/null
+
+      # ubuntu-24.04 runner 不再预装 ImageMagick,图标缩放需要显式安装
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get install -y -qq imagemagick >/dev/null
+
+      - name: Install dependencies
+        run: npm ci
+
+      # kivio-ocr-helper 真实实现是 macOS Swift;非 macOS 写空 stub 让
+      # Tauri externalBin 校验通过(运行时按平台禁用,不会 spawn)
+      - name: Build sidecar stub
+        run: npm run build:swift
+
+      # ── 编译主二进制 ─────────────────────────────────────────────────────
+      # beforeBuildCommand 自动构建前端(pyodide 资产 + vite build)并嵌入二进制;
+      # --no-bundle 只产出主二进制,deb/arch/appimage 等格式全部在下方手工打,
+      # 以统一 /opt/kivio-desktop 布局约定(见文件头注释)。
+      - name: Compile Linux x64 binary
+        run: npx tauri build --no-bundle
+
+      - name: Assemble payload
+        run: |
+          # mainBinaryName 未显式配置,产物名可能是 kivio 或 kivio-desktop,两者都探测
+          if [ -x src-tauri/target/release/kivio-desktop ]; then
+            BIN=src-tauri/target/release/kivio-desktop
+          elif [ -x src-tauri/target/release/kivio ]; then
+            BIN=src-tauri/target/release/kivio
+          else
+            echo "::error::未找到构建二进制"
+            ls -l src-tauri/target/release
+            exit 1
+          fi
+          mkdir -p payload/kivio/skills payload/meta/icons
+          install -m755 "$BIN" payload/kivio/kivio
+          # skills 资源必须与二进制同目录(Tauri 资源路径按 exe 所在目录解析)
+          cp -r src-tauri/resources/skills/. payload/kivio/skills/
+          # OCR sidecar 在 Linux 下是空 stub,随包保持 externalBin 布局完整
+          STUB="$(ls src-tauri/binaries/kivio-ocr-helper-* 2>/dev/null | head -1)"
+          if [ -n "$STUB" ]; then
+            install -m755 "$STUB" payload/kivio/kivio-ocr-helper
+          fi
+          # sanity:确认主二进制在位
+          test -x payload/kivio/kivio
+
+          cp ci/linux/kivio-desktop.desktop payload/meta/
+          install -m755 ci/linux/launcher.sh payload/meta/launcher.sh
+          install -m755 ci/linux/appimage-apprun.sh payload/meta/apprun.sh
+
+          # hicolor 图标集(源:src-tauri/icons/icon.png)
+          IM="$(command -v magick || command -v convert)"
+          for s in 32 48 64 128 256; do
+            "$IM" src-tauri/icons/icon.png -resize "${s}x${s}" "payload/meta/icons/kivio-desktop-${s}.png"
+          done
+          echo "${{ steps.ver.outputs.version }}" > payload/version.txt
+
+      - name: Upload payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-payload
+          path: payload
+          retention-days: 7
+
+  package:
+    name: Package (deb / arch / appimage / nix / tar.gz)
+    needs: build
+    if: github.event_name != 'release' && github.event.inputs.tag == ''
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # upload 时以 payload/ 内容为 artifact 根,下载到 payload/ 目录还原布局
+      - name: Download payload
+        uses: actions/download-artifact@v7
+        with:
+          name: linux-payload
+          path: payload
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd libarchive-tools >/dev/null
+
+      # ── 1) 便携 tar.gz ───────────────────────────────────────────────────
+      - name: Package portable tar.gz
+        run: |
+          cd payload
+          tar czf "../Kivio_${V}_linux_x64.tar.gz" kivio/
+          ls -lh "../Kivio_${V}_linux_x64.tar.gz"
+
+      # ── 2) Debian 包(amd64)────────────────────────────────────────────
+      - name: Build deb (amd64)
+        run: |
+          ROOT=debroot
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/opt/kivio-desktop" "$ROOT/usr/bin" \
+            "$ROOT/usr/share/applications"
+          cp -r payload/kivio/. "$ROOT/opt/kivio-desktop/"
+          install -m755 payload/meta/launcher.sh "$ROOT/usr/bin/kivio-desktop"
+          install -m644 payload/meta/kivio-desktop.desktop "$ROOT/usr/share/applications/"
+          for s in 32 48 64 128 256; do
+            install -Dm644 "payload/meta/icons/kivio-desktop-${s}.png" \
+              "$ROOT/usr/share/icons/hicolor/${s}x${s}/apps/kivio-desktop.png"
+          done
+
+          INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "$ROOT" | cut -f1)"
+          {
+            echo "Package: kivio-desktop"
+            echo "Version: ${V}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: amd64"
+            echo "Maintainer: zhengyang3552 <zhengyang3552@users.noreply.github.com>"
+            echo "Installed-Size: ${INSTALLED_SIZE}"
+            # Tauri(WebKit)应用,链接系统 webkit/gtk 运行库,必须声明依赖
+            echo "Depends: libwebkit2gtk-4.1-0, libgtk-3-0t64 | libgtk-3-0, librsvg2-2"
+            echo "Homepage: https://github.com/zhengyang3552/kivio-linux"
+            echo "Description: Kivio Desktop — screen-level AI assistant for Linux"
+            echo " Screen-level AI assistant built with Tauri. Installs the main binary"
+            echo " with skills resources under /opt/kivio-desktop; the frontend is"
+            echo " embedded in the binary. The OCR sidecar is macOS-only and ships as"
+            echo " a disabled stub on Linux. Data is stored in"
+            echo " ~/.local/share/com.zmair.kivio (managed by Tauri)."
+          } > "$ROOT/DEBIAN/control"
+
+          dpkg-deb --build --root-owner-group "$ROOT" "kivio-desktop_${V}_amd64.deb"
+          dpkg-deb --info "kivio-desktop_${V}_amd64.deb"
+
+      # ── 3) Arch 包(x86_64, .pkg.tar.zst)──────────────────────────────
+      - name: Build Arch pkg.tar.zst (x86_64)
+        run: |
+          ROOT=archroot
+          mkdir -p "$ROOT/opt/kivio-desktop" "$ROOT/usr/bin" "$ROOT/usr/share/applications"
+          cp -r payload/kivio/. "$ROOT/opt/kivio-desktop/"
+          install -m755 payload/meta/launcher.sh "$ROOT/usr/bin/kivio-desktop"
+          install -m644 payload/meta/kivio-desktop.desktop "$ROOT/usr/share/applications/"
+          for s in 32 48 64 128 256; do
+            install -Dm644 "payload/meta/icons/kivio-desktop-${s}.png" \
+              "$ROOT/usr/share/icons/hicolor/${s}x${s}/apps/kivio-desktop.png"
+          done
+
+          SIZE="$(du -sb "$ROOT" | cut -f1)"
+          {
+            echo "pkgname = kivio-desktop"
+            echo "pkgver = ${V}-1"
+            echo "pkgdesc = Kivio Desktop — screen-level AI assistant (self-contained Linux binary)"
+            echo "url = https://github.com/zhengyang3552/kivio-linux"
+            echo "builddate = $(date +%s)"
+            echo "packager = kivio-linux CI"
+            echo "size = ${SIZE}"
+            echo "arch = x86_64"
+            echo "license = GPL3"
+            # Tauri(WebKit)应用的运行库依赖
+            echo "depend = glibc"
+            echo "depend = webkit2gtk-4.1"
+            echo "depend = gtk3"
+            echo "depend = librsvg"
+          } > "$ROOT/.PKGINFO"
+
+          # .MTREE 与 makepkg 相同的字段集;包内文件强制 root:root
+          ( cd "$ROOT" && bsdtar --uid 0 --gid 0 --uname root --gname root \
+              -czf .MTREE --format mtree \
+              --options '!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link' \
+              .PKGINFO usr opt )
+          ( cd "$ROOT" && bsdtar --uid 0 --gid 0 --uname root --gname root \
+              --zstd -cf "../kivio-desktop-${V}-1-x86_64.pkg.tar.zst" \
+              .PKGINFO .MTREE usr opt )
+          ls -lh "kivio-desktop-${V}-1-x86_64.pkg.tar.zst"
+
+      # ── 4) AppImage(x86_64)────────────────────────────────────────────
+      # 注意:暂不内置 webkit/gtk 系统库,目标机需已安装(见 ci/linux/README.md)
+      - name: Build AppImage
+        run: |
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x /tmp/appimagetool
+
+          APPDIR=AppDir
+          mkdir -p "$APPDIR"
+          # 二进制与 skills/ 必须同层(Tauri 资源路径按 exe 目录解析),直接平铺在 AppDir 根
+          cp -r payload/kivio/. "$APPDIR/"
+          cp payload/meta/kivio-desktop.desktop "$APPDIR/"
+          cp payload/meta/icons/kivio-desktop-256.png "$APPDIR/kivio-desktop.png"
+          install -m755 payload/meta/apprun.sh "$APPDIR/AppRun"
+
+          # runner 无 FUSE,用 extract-and-run 模式
+          ARCH=x86_64 /tmp/appimagetool --appimage-extract-and-run \
+            "$APPDIR" "kivio-desktop-${V}-x86_64.AppImage"
+          ls -lh "kivio-desktop-${V}-x86_64.AppImage"
+
+      # ── 5) 源码包(git archive,仅含被跟踪文件)─────────────────────────
+      - name: Source package
+        run: |
+          git archive --format=tar.gz --prefix="kivio-desktop-${V}/" \
+            -o "kivio-desktop-${V}.tar.gz" HEAD
+          tar tzf "kivio-desktop-${V}.tar.gz" | head
+          ls -lh "kivio-desktop-${V}.tar.gz"
+
+      # ── 6) NixOS 二进制包 kivio-desktop-bin ─────────────────────────────
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build kivio-desktop-bin & export closure
+        run: |
+          nix-build --show-trace -E "
+            let pkgs = import <nixpkgs> {};
+            in pkgs.callPackage ${GITHUB_WORKSPACE}/ci/nix/kivio-desktop-bin.nix {
+              version = \"${V}\";
+              src = ${GITHUB_WORKSPACE}/Kivio_${V}_linux_x64.tar.gz;
+            }"
+          STORE_PATH="$(readlink -f ./result)"
+          echo "Nix store path: $STORE_PATH"
+
+          # closure 导出 = 可离线 import 的二进制包
+          nix-store --export $(nix-store -qR "$STORE_PATH") > /tmp/closure.tar
+          zstd -19 -T0 /tmp/closure.tar -o "kivio-desktop-bin-${V}-nix-closure.tar.zst"
+
+          mkdir -p nix-artifact
+          cp "kivio-desktop-bin-${V}-nix-closure.tar.zst" nix-artifact/
+          cp ci/nix/kivio-desktop-bin.nix nix-artifact/
+          {
+            echo "# kivio-desktop-bin ${V} — NixOS 二进制包"
+            echo ""
+            echo "Store path: \`${STORE_PATH}\`"
+            echo ""
+            echo "## 安装(x86_64-linux,任意 Nix/NixOS 机器)"
+            echo ""
+            echo "\`\`\`bash"
+            echo "# 多用户安装(需要 sudo);单用户安装去掉 sudo"
+            echo "zstd -d -c kivio-desktop-bin-${V}-nix-closure.tar.zst | sudo nix-store --import"
+            echo ""
+            echo "# 装入用户环境"
+            echo "nix-env -i ${STORE_PATH}"
+            echo "# 或 nix profile install ${STORE_PATH}"
+            echo "\`\`\`"
+            echo ""
+            echo "之后运行 \`kivio-desktop\`。数据目录由 Tauri 管理,默认"
+            echo "~/.local/share/com.zmair.kivio。"
+            echo ""
+            echo "附带的 \`kivio-desktop-bin.nix\` 也可从 Release 资产 URL 直接构建:"
+            echo ""
+            echo "\`\`\`bash"
+            echo "nix-build -E '(import <nixpkgs> {}).callPackage ./kivio-desktop-bin.nix {"
+            echo "  version = \"${V}\"; sha256 = \"<sha256 of Kivio_${V}_linux_x64.tar.gz>\"; }'"
+            echo "\`\`\`"
+          } > nix-artifact/README.md
+
+      # ── 上传全部产物 ───────────────────────────────────────────────────
+      - name: Upload portable tar.gz
+        uses: actions/upload-artifact@v7
+        with:
+          name: Kivio_${{ env.V }}_linux_x64.tar.gz
+          path: Kivio_${{ env.V }}_linux_x64.tar.gz
+          retention-days: 30
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v7
+        with:
+          name: kivio-desktop_${{ env.V }}_amd64.deb
+          path: kivio-desktop_${{ env.V }}_amd64.deb
+          retention-days: 30
+
+      - name: Upload Arch package
+        uses: actions/upload-artifact@v7
+        with:
+          name: kivio-desktop-${{ env.V }}-1-x86_64.pkg.tar.zst
+          path: kivio-desktop-${{ env.V }}-1-x86_64.pkg.tar.zst
+          retention-days: 30
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v7
+        with:
+          name: kivio-desktop-${{ env.V }}-x86_64.AppImage
+          path: kivio-desktop-${{ env.V }}-x86_64.AppImage
+          retention-days: 30
+
+      - name: Upload source package
+        uses: actions/upload-artifact@v7
+        with:
+          name: kivio-desktop-${{ env.V }}.tar.gz
+          path: kivio-desktop-${{ env.V }}.tar.gz
+          retention-days: 30
+
+      - name: Upload NixOS binary package
+        uses: actions/upload-artifact@v7
+        with:
+          name: kivio-desktop-bin-${{ env.V }}-nix
+          path: nix-artifact
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "### 打包产物 (v${V})" >> "$GITHUB_STEP_SUMMARY"
+          ls -lh \
+            "Kivio_${V}_linux_x64.tar.gz" \
+            "kivio-desktop_${V}_amd64.deb" \
+            "kivio-desktop-${V}-1-x86_64.pkg.tar.zst" \
+            "kivio-desktop-${V}-x86_64.AppImage" \
+            "kivio-desktop-${V}.tar.gz" \
+            "kivio-desktop-bin-${V}-nix-closure.tar.zst" >> "$GITHUB_STEP_SUMMARY"
+
+      # linux-payload 只是 build→package 两个 job 之间的编译中转件,不是交付产物,
+      # 全部产物上传成功后删除,避免混进产物列表(失败时保留便于排查)
+      - name: Remove intermediate payload artifact
+        run: |
+          ART_ID="$(curl -s -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?name=linux-payload&per_page=1" \
+            | python3 -c "import json,sys; a=json.load(sys.stdin).get('artifacts',[]); print(a[0]['id'] if a else '')")"
+          if [ -n "$ART_ID" ]; then
+            curl -s -o /dev/null -w "delete linux-payload(#${ART_ID}): %{http_code}\n" -X DELETE \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/${ART_ID}"
+          else
+            echo "no linux-payload artifact found"
+          fi
+
+  # ── 创建 Release 时:把最近一次成功构建的产物原样挂上(不重新编译)─────────
+  # 你下载测试过的包 = 发布出去的包。说明由你在 Release 里写,这里只挂资产。
+  publish:
+    name: Attach latest CI build to Release
+    if: github.event_name == 'release' || github.event.inputs.tag != ''
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Resolve tag / version
+        id: t
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+          case "$TAG" in
+            v*) V="${TAG#v}" ;;
+            *)  V="$TAG"; TAG="v$TAG" ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG (version $V)"
+
+      # 只认 push 触发的成功构建(release/dispatch 触发的运行没有产物)
+      - name: Find latest successful build run
+        id: run
+        run: |
+          RUN_ID="$(gh run list -R "$REPO" -w package-linux.yml -b main -s success -e push \
+            --json databaseId --limit 1 --jq '.[0].databaseId')"
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::main 上没有成功的构建运行"
+            exit 1
+          fi
+          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "latest successful build run: $RUN_ID"
+
+      # 防止:上游刚同步、新版本的包还没构建完就建了 Release
+      - name: Verify build version matches release
+        run: |
+          V="${{ steps.t.outputs.version }}"
+          if ! gh api "repos/$REPO/actions/runs/${{ steps.run.outputs.id }}/artifacts" \
+              --jq '.artifacts[].name' | grep -qx "kivio-desktop_${V}_amd64.deb"; then
+            echo "::error::最近一次构建不是 v${V}——等新版构建完成后再建 Release,或先 Sync fork"
+            exit 1
+          fi
+
+      - name: Download that run's artifacts
+        run: |
+          V="${{ steps.t.outputs.version }}"
+          mkdir -p files
+          for n in \
+            "Kivio_${V}_linux_x64.tar.gz" \
+            "kivio-desktop_${V}_amd64.deb" \
+            "kivio-desktop-${V}-1-x86_64.pkg.tar.zst" \
+            "kivio-desktop-${V}-x86_64.AppImage" \
+            "kivio-desktop-${V}.tar.gz" \
+            "kivio-desktop-bin-${V}-nix"
+          do
+            gh run download "${{ steps.run.outputs.id }}" -R "$REPO" -n "$n" -D files
+          done
+          ls -lh files
+
+      # gh release upload 按 tag 查不到 draft Release,改走 API:
+      # 列表接口能拿到 draft,用其 upload_url 直传资产
+      - name: Attach to Release (含 draft,说明一字不动)
+        run: |
+          V="${{ steps.t.outputs.version }}"
+          TAG="${{ steps.t.outputs.tag }}"
+          REL="$(gh api "repos/$REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | {id, upload_url, draft} | @json" | head -n1)"
+          if [ -z "$REL" ]; then
+            echo "::error::找不到 Release ${TAG}"
+            exit 1
+          fi
+          REL_ID="$(echo "$REL" | jq -r .id)"
+          UPLOAD_URL="$(echo "$REL" | jq -r .upload_url | sed 's/{?name,label}//')"
+          echo "release #${REL_ID} draft=$(echo "$REL" | jq -r .draft)"
+
+          FILES=(
+            "files/Kivio_${V}_linux_x64.tar.gz"
+            "files/kivio-desktop_${V}_amd64.deb"
+            "files/kivio-desktop-${V}-1-x86_64.pkg.tar.zst"
+            "files/kivio-desktop-${V}-x86_64.AppImage"
+            "files/kivio-desktop-${V}.tar.gz"
+            "files/kivio-desktop-bin-${V}-nix-closure.tar.zst"
+            "files/kivio-desktop-bin.nix"
+          )
+          for f in "${FILES[@]}"; do
+            name="$(basename "$f")"
+            # clobber:先删同名旧资产
+            OLD_ID="$(gh api "repos/$REPO/releases/$REL_ID/assets" \
+              --jq ".[] | select(.name == \"$name\") | .id" | head -n1)"
+            if [ -n "$OLD_ID" ]; then
+              gh api -X DELETE "repos/$REPO/releases/$REL_ID/assets/$OLD_ID"
+            fi
+            curl -s -o /dev/null -w "upload ${name}: %{http_code}\n" -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              "${UPLOAD_URL}?name=${name}" --data-binary @"$f"
+          done
+          echo "attached to release ${TAG}"

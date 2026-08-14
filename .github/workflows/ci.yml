@@ -1,20 +1,17 @@
 name: CI
 
 on:
-  pull_request:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
-  quality:
-    # 应用只发 macOS / Windows；在 macOS runner 上跑全部检查，使 cargo test 在真实目标平台编译
-    # （Linux 分支如 rapidocr 的 ONNX 动态库下载是不维护的死代码，无法在 Linux 编过）。
-    runs-on: macos-latest
-
+  app-checks:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -22,26 +19,34 @@ jobs:
           node-version: '20'
           cache: npm
 
-      - name: Install frontend dependencies
+      - name: Install dependencies
         run: npm ci
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build Swift sidecar
-        run: npm run build:swift
 
       - name: Lint
         run: npm run lint
 
-      # typecheck 本身就串了 protocol:check（见 package.json），生成物漂移在这一步拦住。
-      - name: Typecheck
+      # typecheck 本身就串了 protocol:check(见 package.json),生成物漂移在这一步拦住。
+      - name: Type check
         run: npm run typecheck
 
-      - name: Frontend tests
+      - name: Run unit tests
         run: npm run test
 
-      # tauri-build 会校验 externalBin（kivio-ocr-helper）对应当前 target triple 的二进制存在。
-      # 上面的 build:swift 在 macOS 上构建真实 Swift sidecar 满足校验，否则这一步会在 build-script 阶段失败。
-      - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build frontend
+        run: npm run build:ui
+
+      # RELEASE_PACKAGING.md 要求 package.json / package-lock.json / tauri.conf.json /
+      # Cargo.toml 四处版本同步,这里在 CI 就拦住漂移,不用等发版时才发现。
+      # (package-lock 与 package.json 不同步时 npm ci 本身也会失败)
+      - name: Check version consistency
+        run: |
+          V_PKG="$(node -p "require('./package.json').version")"
+          V_TAU="$(grep -oP '"version":\s*"\K[^"]+' src-tauri/tauri.conf.json | head -1)"
+          V_CARGO="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+          echo "package.json=$V_PKG tauri.conf.json=$V_TAU Cargo.toml=$V_CARGO"
+          if [ "$V_PKG" != "$V_TAU" ] || [ "$V_PKG" != "$V_CARGO" ]; then
+            echo "::error::版本号不一致: package.json=$V_PKG / tauri.conf.json=$V_TAU / Cargo.toml=$V_CARGO"
+            exit 1
+          fi
+
+  # Rust/Tauri 侧门禁在 rust-check.yml(仅 src-tauri 变更时触发),与本文件职责分开。

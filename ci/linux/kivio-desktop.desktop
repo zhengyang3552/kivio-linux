@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Kivio Desktop
+GenericName=AI Assistant
+Comment=Screen-level AI assistant
+Exec=kivio-desktop
+Icon=kivio-desktop
+Terminal=false
+Categories=Utility;Chat;
+Keywords=ai;assistant;kivio;
