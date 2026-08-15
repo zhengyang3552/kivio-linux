@@ -323,6 +323,143 @@ describe('ToolCallBlock', () => {
     expect(within(button).queryByText(/file_path/)).not.toBeInTheDocument()
   })
 
+  it('shows live dsh subagent steps instead of a frozen 运行中', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'subagent',
+          source: 'external_cli',
+          status: 'running',
+          arguments: {
+            description: '搜索最新AI资讯',
+            prompt: '去网上搜最近的模型发布',
+          },
+          structured_content: {
+            backgroundTaskId: 'child-9',
+            subagentProgress: {
+              taskId: 'child-9',
+              status: 'running',
+              preview: '正在检索…',
+              steps: ['web_search 最新AI资讯'],
+            },
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText('SUBAGENT')).toBeInTheDocument()
+    expect(screen.getByText('web_search 最新AI资讯')).toBeInTheDocument()
+    expect(screen.queryByText('运行中…')).not.toBeInTheDocument()
+  })
+
+  it('keeps a dsh background subagent launch as running, not completed', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'subagent',
+          source: 'external_cli',
+          status: 'success',
+          arguments: {
+            description: '搜索最新AI资讯',
+            prompt: '去网上搜最近的模型发布',
+          },
+          result_preview: 'started subagent 018b08fc-ee7f-4ea5-b77c-9c5d1c6ecf50',
+        })}
+      />,
+    )
+    expect(screen.getByText('SUBAGENT')).toBeInTheDocument()
+    expect(screen.getByText('运行中…')).toBeInTheDocument()
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument()
+    expect(screen.queryByText(/started subagent/)).not.toBeInTheDocument()
+  })
+
+  it('renders a dsh subagent call as a SUBAGENT consult card', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'subagent',
+          source: 'external_cli',
+          status: 'running',
+          arguments: {
+            description: '读协议',
+            prompt: '把 dsh 的 session 事件对上 Kivio',
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText('SUBAGENT')).toBeInTheDocument()
+    expect(screen.getByText('读协议')).toBeInTheDocument()
+  })
+
+  it('maps dsh str_replace_editor and job_output off the raw JSON row', () => {
+    const { unmount } = render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'str_replace_editor',
+          source: 'external_cli',
+          arguments: JSON.stringify({
+            command: 'str_replace',
+            path: 'E:/proj/src/chat/segments.ts',
+            old_str: 'a',
+            new_str: 'b',
+          }),
+        })}
+      />,
+    )
+    let button = screen.getByRole('button')
+    expect(within(button).getByText('Edit')).toBeInTheDocument()
+    expect(within(button).getByText('segments.ts')).toBeInTheDocument()
+    expect(within(button).queryByText(/str_replace_editor/)).not.toBeInTheDocument()
+    unmount()
+
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'job_output',
+          source: 'external_cli',
+          arguments: JSON.stringify({ job_id: 'job_12' }),
+        })}
+      />,
+    )
+    button = screen.getByRole('button')
+    expect(within(button).getByText('Run')).toBeInTheDocument()
+    expect(within(button).getByText('job_12')).toBeInTheDocument()
+  })
+
+  it('maps dsh run_code to the Python verb, not the raw name', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'run_code',
+          source: 'external_cli',
+          arguments: JSON.stringify({ code: 'console.log(1)' }),
+        })}
+      />,
+    )
+    const button = screen.getByRole('button')
+    expect(within(button).getByText('Python')).toBeInTheDocument()
+    expect(within(button).queryByText(/run_code/)).not.toBeInTheDocument()
+  })
+
+  it('maps dsh pwsh to Run + the description, not the raw JSON', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'pwsh',
+          source: 'external_cli',
+          arguments: JSON.stringify({
+            command: 'python -X utf8 -c "print(1)"',
+            description: 'Show sheet structure of three Excel files',
+          }),
+        })}
+      />,
+    )
+    const button = screen.getByRole('button')
+    expect(within(button).getByText('Run')).toBeInTheDocument()
+    expect(within(button).getByText('Show sheet structure of three Excel files')).toBeInTheDocument()
+    expect(within(button).queryByText(/pwsh/)).not.toBeInTheDocument()
+    expect(within(button).queryByText(/"command"/)).not.toBeInTheDocument()
+  })
+
   it('maps claude Bash to Run + the command', () => {
     render(
       <ToolCallBlock
@@ -417,6 +554,74 @@ describe('ToolCallBlock', () => {
     expect(screen.queryByText('指数退避')).not.toBeInTheDocument()
   })
 
+  it('does not treat claude ExitPlanMode as the ask-user card', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'ExitPlanMode',
+          source: 'external_cli',
+          status: 'running',
+          arguments: { plan: '先改测试再改实现。' },
+        })}
+      />,
+    )
+    expect(screen.queryByText(/等待你回答/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/等待用户确认/)).not.toBeInTheDocument()
+  })
+
+  it('renders dsh exit_plan_mode as the ask-user card', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'exit_plan_mode',
+          source: 'external_cli',
+          status: 'running',
+          structured_content: {
+            askUser: {
+              phase: 'awaiting',
+              questions: [{
+                id: 'plan',
+                prompt: '按这份计划执行？',
+                options: [{ id: '0', label: '执行' }, { id: '1', label: '再改改' }],
+                allow_multiple: false,
+                allow_custom: true,
+              }],
+              answers: {},
+            },
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText(/等待你回答/)).toBeInTheDocument()
+  })
+
+  it('renders dsh ask_user_question as the same inline ask-user trace', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'ask_user_question',
+          source: 'external_cli',
+          status: 'running',
+          structured_content: {
+            askUser: {
+              phase: 'awaiting',
+              questions: [{
+                id: 'runtime',
+                prompt: '用哪个运行时？',
+                options: [{ id: '0', label: 'Bun' }, { id: '1', label: 'Node' }],
+                allow_multiple: false,
+                allow_custom: true,
+              }],
+              answers: {},
+            },
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText(/等待你回答/)).toBeInTheDocument()
+    expect(screen.queryByRole('option')).not.toBeInTheDocument()
+  })
+
   it('maps claude WebFetch / TodoWrite through the snake_case aliases', () => {
     const { unmount } = render(
       <ToolCallBlock
@@ -449,6 +654,85 @@ describe('ToolCallBlock', () => {
     button = screen.getByRole('button')
     expect(within(button).getByText('Update todos')).toBeInTheDocument()
     expect(within(button).getByText('1/2')).toBeInTheDocument()
+  })
+
+  it('renders dsh todo_write as the same todo card', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'todo_write',
+          source: 'external_cli',
+          arguments: JSON.stringify({
+            todos: [
+              { content: '读协议', status: 'completed' },
+              { content: '接线', status: 'in_progress' },
+            ],
+          }),
+        })}
+      />,
+    )
+    const button = screen.getByRole('button')
+    expect(within(button).getByText('Update todos')).toBeInTheDocument()
+    expect(within(button).getByText('1/2')).toBeInTheDocument()
+  })
+
+  it('renders claude TaskCreate / TaskUpdate as readable task rows', () => {
+    const { unmount } = render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'TaskCreate',
+          source: 'external_cli',
+          arguments: JSON.stringify({
+            subject: 'Phase 0：安装 .NET 10 SDK',
+            activeForm: '安装 .NET 10 SDK',
+          }),
+        })}
+      />,
+    )
+    let button = screen.getByRole('button')
+    expect(within(button).getByText('Create task')).toBeInTheDocument()
+    expect(within(button).getByText('Phase 0：安装 .NET 10 SDK')).toBeInTheDocument()
+    unmount()
+
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'TaskUpdate',
+          source: 'external_cli',
+          arguments: JSON.stringify({ taskId: '1', status: 'in_progress' }),
+        })}
+      />,
+    )
+    button = screen.getByRole('button')
+    expect(within(button).getByText('Update task')).toBeInTheDocument()
+    expect(within(button).getByText(/进行中/)).toBeInTheDocument()
+    expect(within(button).getByText(/1/)).toBeInTheDocument()
+  })
+
+  it('renders claude TaskCreate with todoState as the shared todo card', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'TaskCreate',
+          source: 'external_cli',
+          status: 'success',
+          arguments: JSON.stringify({ subject: '整理工作目录文件' }),
+          structured_content: {
+            subject: '整理工作目录文件',
+            todoState: {
+              items: [
+                { id: '1', content: '整理工作目录文件', status: 'pending' },
+                { id: '2', content: '写一个示例脚本', status: 'pending' },
+              ],
+              updated_at: 1,
+            },
+          },
+        })}
+      />,
+    )
+    const button = screen.getByRole('button')
+    expect(within(button).getByText('Update todos')).toBeInTheDocument()
+    expect(within(button).getByText('0/2')).toBeInTheDocument()
   })
 
   it('keeps MCP tool names verbatim (normalization must not lowercase the display name)', () => {

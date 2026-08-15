@@ -46,6 +46,7 @@ import {
   buildSlashCommands,
   commandMatches,
   shouldOpenSlashPopover,
+  matchComposerSlashCommand,
   type SlashCommandDefinition,
   type SlashSkill,
 } from './slashCommands'
@@ -402,6 +403,8 @@ export interface InputBarProps {
   layout?: 'footer' | 'inline'
   /** 外部 CLI 模式：斜杠命令直通 Agent，不展示 Kivio 弹层 */
   usesExternalRuntime?: boolean
+  /** Kivio Chat：不提供 /plan /orchestrate / 技能斜杠（那些是 Agent 能力） */
+  usesChatRuntime?: boolean
   externalAgentName?: string | null
   conversationId?: string | null
   /** 本会话挂载的知识库 id；缺省时 knowledge_search 检索全部库 */
@@ -427,6 +430,13 @@ export interface InputBarProps {
   modeOptions?: ModeOption[]
   modeValue?: string
   onModeChange?: (value: string) => void | Promise<void>
+  /** dsh Agent 模式胶囊，画在权限胶囊左边。空表 = 不渲染。 */
+  presetOptions?: ModeOption[]
+  presetValue?: string
+  onPresetChange?: (value: string) => void | Promise<void>
+  /** 已有对话内容后锁定（dsh 只允许空白 agent 换 preset）。 */
+  presetLocked?: boolean
+  presetLockedReason?: string
   /** Git 状态胶囊：Dock 解析出的工作目录；空则不渲染 */
   gitWorkdir?: string | null
   gitLang?: Lang
@@ -469,6 +479,7 @@ export const InputBar = memo(function InputBar({
   autoFocus,
   layout = 'footer',
   usesExternalRuntime = false,
+  usesChatRuntime = false,
   externalAgentName = null,
   conversationId = null,
   knowledgeBaseIds = [],
@@ -486,6 +497,11 @@ export const InputBar = memo(function InputBar({
   modeOptions = [],
   modeValue = '',
   onModeChange,
+  presetOptions = [],
+  presetValue = '',
+  onPresetChange,
+  presetLocked = false,
+  presetLockedReason,
   gitWorkdir = null,
   gitLang,
   onOpenGitPanel,
@@ -506,6 +522,7 @@ export const InputBar = memo(function InputBar({
   const [dragActive, setDragActive] = useState(false)
   const [toolPanelOpen, setToolPanelOpen] = useState(false)
   const [modeMenuOpen, setModeMenuOpen] = useState(false)
+  const [presetMenuOpen, setPresetMenuOpen] = useState(false)
   const [projectMenuOpen, setProjectMenuOpen] = useState(false)
   const [projectOptions, setProjectOptions] = useState<ChatProject[]>([])
   const [projectOptionsLoading, setProjectOptionsLoading] = useState(false)
@@ -521,6 +538,7 @@ export const InputBar = memo(function InputBar({
   const [slashPanelLeft, setSlashPanelLeft] = useState(0)
   const innerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const slashHighlightRef = useRef<HTMLDivElement>(null)
   // 草稿持久化：会话 key 变化（切对话且未卸载）时载入对应草稿；每次内容变化写回内存 store。
   // keyRef 保证写回落到当前会话，不串到刚切走的会话。
   const draftKeyRef = useRef(draftKeyValue)
@@ -561,6 +579,7 @@ export const InputBar = memo(function InputBar({
   // 专家入口:欢迎页与对话中都显示,未选时为「选择专家」图标,已选时高亮 + 清除按钮。
   const showAssistantEntry = Boolean(onOpenAssistantCenter)
   const modeEntryEnabled = Boolean(onModeChange) && modeOptions.length > 0
+  const presetEntryEnabled = Boolean(onPresetChange) && presetOptions.length > 0
   // 状态条只放「你在哪」—— 当前项目或集。Git 分支/diff 归下面的工具栏。
   const gitStatusEnabled = Boolean(gitWorkdir && gitLang && onOpenGitPanel)
   const todoBarVisible = (agentTodoState?.items?.length ?? 0) > 0
@@ -569,6 +588,8 @@ export const InputBar = memo(function InputBar({
   )
   const activeModeOption = modeOptions.find((option) => option.value === modeValue) ?? modeOptions[0]
   const activeModePillClass = MODE_PILL_CLASS[activeModeOption?.tone ?? 'neutral']
+  const activePresetOption = presetOptions.find((option) => option.value === presetValue) ?? presetOptions[0]
+  const activePresetPillClass = MODE_PILL_CLASS[activePresetOption?.tone ?? 'neutral']
 
   const closeProjectMenu = useCallback(() => {
     setProjectMenuOpen(false)
@@ -576,6 +597,10 @@ export const InputBar = memo(function InputBar({
 
   const closeModeMenu = useCallback(() => {
     setModeMenuOpen(false)
+  }, [])
+
+  const closePresetMenu = useCallback(() => {
+    setPresetMenuOpen(false)
   }, [])
 
   const attachmentsFromPaths = useCallback(
@@ -745,12 +770,14 @@ export const InputBar = memo(function InputBar({
   }, [closeProjectMenu])
 
   const allSlashCommands = useMemo(
-    () => (
-      usesExternalRuntime
-        ? externalCliSlashCommands
-        : buildSlashCommands(LOCAL_SLASH_COMMANDS, enabledSkills)
-    ),
-    [enabledSkills, externalCliSlashCommands, usesExternalRuntime],
+    () => {
+      if (usesExternalRuntime) return externalCliSlashCommands
+      const local = usesChatRuntime
+        ? LOCAL_SLASH_COMMANDS.filter((command) => command.id !== 'plan' && command.id !== 'orchestrate')
+        : LOCAL_SLASH_COMMANDS
+      return buildSlashCommands(local, usesChatRuntime ? [] : enabledSkills)
+    },
+    [enabledSkills, externalCliSlashCommands, usesChatRuntime, usesExternalRuntime],
   )
 
   useEffect(() => {
@@ -790,6 +817,21 @@ export const InputBar = memo(function InputBar({
     )),
     [allSlashCommands, activeSlashToken?.query],
   )
+  const slashHighlight = useMemo(
+    () => matchComposerSlashCommand(input, allSlashCommands),
+    [allSlashCommands, input],
+  )
+
+  const syncSlashHighlightScroll = useCallback(() => {
+    const textarea = textareaRef.current
+    const overlay = slashHighlightRef.current
+    if (!textarea || !overlay) return
+    overlay.scrollTop = textarea.scrollTop
+    overlay.scrollLeft = textarea.scrollLeft
+  }, [])
+  useLayoutEffect(() => {
+    syncSlashHighlightScroll()
+  }, [input, slashHighlight, syncSlashHighlightScroll])
   const visibleProjectOptions = useMemo(() => {
     const query = projectSearchQuery.trim().toLowerCase()
     return [...projectOptions]
@@ -929,21 +971,47 @@ export const InputBar = memo(function InputBar({
     setToolPanelOpen(false)
     closeProjectMenu()
     closeModeMenu()
+    closePresetMenu()
     if (value !== modeValue) {
       await onModeChange(value)
     }
     requestAnimationFrame(() => {
       textareaRef.current?.focus({ preventScroll: true })
     })
-  }, [closeModeMenu, closeProjectMenu, disabled, modeValue, onModeChange])
+  }, [closeModeMenu, closePresetMenu, closeProjectMenu, disabled, modeValue, onModeChange])
 
   const toggleModeMenu = useCallback(() => {
     if (disabled || !modeEntryEnabled) return
     setSlashPanelOpen(false)
     setToolPanelOpen(false)
     closeProjectMenu()
+    closePresetMenu()
     setModeMenuOpen((open) => !open)
-  }, [closeProjectMenu, disabled, modeEntryEnabled])
+  }, [closePresetMenu, closeProjectMenu, disabled, modeEntryEnabled])
+
+  const pickPreset = useCallback(async (value: string) => {
+    if (disabled || presetLocked || !onPresetChange) return
+    setSlashPanelOpen(false)
+    setToolPanelOpen(false)
+    closeProjectMenu()
+    closeModeMenu()
+    closePresetMenu()
+    if (value !== presetValue) {
+      await onPresetChange(value)
+    }
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus({ preventScroll: true })
+    })
+  }, [closeModeMenu, closePresetMenu, closeProjectMenu, disabled, onPresetChange, presetLocked, presetValue])
+
+  const togglePresetMenu = useCallback(() => {
+    if (disabled || !presetEntryEnabled) return
+    setSlashPanelOpen(false)
+    setToolPanelOpen(false)
+    closeProjectMenu()
+    closeModeMenu()
+    setPresetMenuOpen((open) => !open)
+  }, [closeModeMenu, closeProjectMenu, disabled, presetEntryEnabled])
 
   // Shift+Tab 在胶囊当前那套档位里循环，跟看得见的控件保持一致。
   const cycleMode = useCallback(async () => {
@@ -1087,22 +1155,44 @@ export const InputBar = memo(function InputBar({
     } else {
       sendingDraftKeyRef.current = draftKeyRef.current
       setSendPending(true)
+      const sentSnapshot = {
+        input,
+        quotes: [...quotes],
+        attachments: [...attachments],
+      }
       let acceptedNotified = false
+      let clearedDraftKey: string | null = null
       const notifyAccepted = () => {
         if (acceptedNotified) return
         acceptedNotified = true
-        clearSentDraft(sendingDraftKeyRef.current ?? draftKeyRef.current)
+        // 必须读 ref：欢迎页首发会把 `__new__` 迁到真实会话 id，冻在发送开始会清错键。
+        clearedDraftKey = sendingDraftKeyRef.current ?? draftKeyRef.current
+        clearSentDraft(clearedDraftKey)
         sendingDraftKeyRef.current = null
         // 后端生成仍在继续，但输入框已经可以接收下一条排队消息。
         setSendPending(false)
       }
+      const restoreRejectedDraft = () => {
+        if (!acceptedNotified || !clearedDraftKey) return
+        const typedAfterAccept = (textareaRef.current?.value ?? '').trim().length > 0
+        if (draftKeyRef.current !== clearedDraftKey || typedAfterAccept) return
+        setComposerDraft(clearedDraftKey, sentSnapshot)
+        setInput(sentSnapshot.input)
+        setQuotes(sentSnapshot.quotes)
+        setAttachments(sentSnapshot.attachments)
+        if (textareaRef.current) applyComposerAutoHeight(textareaRef.current)
+      }
       try {
         const accepted = await onSend(content, attachments, { onAccepted: notifyAccepted })
-        if (accepted === false) return
+        if (accepted === false) {
+          restoreRejectedDraft()
+          return
+        }
         // 兼容没有“已接收”通知的普通 onSend：Promise 完成后再按旧语义清理。
         notifyAccepted()
       } catch (error) {
         console.error('Failed to submit composer message:', error)
+        restoreRejectedDraft()
       } finally {
         sendingDraftKeyRef.current = null
         setSendPending(false)
@@ -1859,32 +1949,51 @@ export const InputBar = memo(function InputBar({
               这样下面的 `right-2` 和改动前落在同一像素（shell 的 px-3 不随容器查询变，
               这 12px 是常量）。垂直方向仍旧不写死数值——shell 的 py 在容器查询里会变。 */}
           <div className="relative -mr-3 pr-3">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              readOnly={sendPending}
-              aria-busy={sendPending}
-              onChange={handleInput}
-              onPaste={(e) => void handlePaste(e)}
-              onKeyDown={handleKeyDown}
-              onSelect={handleSelect}
-              autoCapitalize="off"
-              autoCorrect="off"
-              autoComplete="off"
-              spellCheck={false}
-              placeholder={
-                usesExternalRuntime
-                  ? t.chatCliCommandPlaceholder.replace('{agent}', cliAgentLabel)
-                  : 'Ask me anything...'
-              }
-              rows={1}
-              /* 宽度用 calc 收 28px（= 发送键 28 宽 + right-2 的 8 − 与滚动条留的 4px 呼吸）而不是
-                 w-full + pr-*：滚动条长在**盒子右边缘**，padding 挡不住它，只有把盒子本身收窄
-                 才能让它落到绝对定位的发送键左侧（原来 pr-10 只挡住了文字，滚动条仍压在键下）。
-                 不用 margin —— w-full 是 width:100%，再加 margin 会溢出容器 28px。
-                 custom-scrollbar：与全站同一根 8px 细条，否则这里是 WebView2 原生带箭头的粗条。 */
-              className="custom-scrollbar block max-h-40 min-h-[28px] w-[calc(100%-1.75rem)] select-text resize-none overflow-y-hidden border-0 bg-transparent py-1.5 pl-1 pr-1 text-[15px] leading-relaxed text-neutral-900 outline-none placeholder:text-neutral-400 disabled:opacity-50 [field-sizing:content] dark:text-neutral-100"
-            />
+            <div className="relative w-[calc(100%-1.75rem)]">
+              {slashHighlight && (
+                <div
+                  ref={slashHighlightRef}
+                  aria-hidden
+                  className="chat-composer-highlight py-1.5 pl-1 pr-1 text-[15px] leading-relaxed text-neutral-900 dark:text-neutral-100"
+                >
+                  {slashHighlight.prefix}
+                  <span className="chat-composer-slash">{slashHighlight.command}</span>
+                  {slashHighlight.rest}
+                  {input.endsWith('\n') ? '\u200b' : null}
+                </div>
+              )}
+              <textarea
+                ref={textareaRef}
+                value={input}
+                readOnly={sendPending}
+                aria-busy={sendPending}
+                onChange={handleInput}
+                onPaste={(e) => void handlePaste(e)}
+                onKeyDown={handleKeyDown}
+                onSelect={handleSelect}
+                onScroll={syncSlashHighlightScroll}
+                autoCapitalize="off"
+                autoCorrect="off"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder={
+                  usesExternalRuntime
+                    ? t.chatCliCommandPlaceholder.replace('{agent}', cliAgentLabel)
+                    : 'Ask me anything...'
+                }
+                rows={1}
+                /* 宽度用 calc 收 28px（= 发送键 28 宽 + right-2 的 8 − 与滚动条留的 4px 呼吸）而不是
+                   w-full + pr-*：滚动条长在**盒子右边缘**，padding 挡不住它，只有把盒子本身收窄
+                   才能让它落到绝对定位的发送键左侧（原来 pr-10 只挡住了文字，滚动条仍压在键下）。
+                   不用 margin —— w-full 是 width:100%，再加 margin 会溢出容器 28px。
+                   custom-scrollbar：与全站同一根 8px 细条，否则这里是 WebView2 原生带箭头的粗条。 */
+                className={`custom-scrollbar block max-h-40 min-h-[28px] w-full select-text resize-none overflow-y-hidden border-0 bg-transparent py-1.5 pl-1 pr-1 text-[15px] leading-relaxed outline-none placeholder:text-neutral-400 disabled:opacity-50 [field-sizing:content] ${
+                  slashHighlight
+                    ? 'is-slash-highlight'
+                    : 'text-neutral-900 dark:text-neutral-100'
+                }`}
+              />
+            </div>
 
             {/* 发送 / 停止：绝对定位在输入行右侧。两按钮共存于同一槽位，做 opacity+scale
                 crossfade。谁占槽位见 `stopOwnsSendSlot`：生成中打了字就归发送键。 */}
@@ -2026,6 +2135,86 @@ export const InputBar = memo(function InputBar({
 
             <div className="ml-auto flex items-center gap-1.5">
             {usageSlot}
+            {presetEntryEnabled && activePresetOption && (
+              <div className="relative shrink-0 self-center">
+                <button
+                  type="button"
+                  onClick={togglePresetMenu}
+                  onMouseDown={(event) => event.preventDefault()}
+                  disabled={disabled}
+                  className={`inline-flex h-[26px] max-w-full items-center gap-0.5 rounded-full px-1.5 text-left text-[12px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-300/60 dark:focus-visible:ring-neutral-600 ${
+                    presetMenuOpen
+                      ? 'bg-neutral-200 text-neutral-800 dark:bg-neutral-700 dark:text-neutral-100'
+                      : activePresetPillClass.idle
+                  } disabled:cursor-default disabled:opacity-50`}
+                  aria-expanded={presetMenuOpen}
+                  aria-haspopup="menu"
+                  title={presetLocked && presetLockedReason ? presetLockedReason : t.chatSwitchAgentPreset}
+                >
+                  <activePresetOption.icon
+                    size={13}
+                    strokeWidth={1.9}
+                    className={`shrink-0 ${activePresetPillClass.iconColor}`}
+                  />
+                  <span className="min-w-0 truncate">{activePresetOption.label}</span>
+                  <ChevronDown
+                    size={12}
+                    strokeWidth={2}
+                    className={`shrink-0 text-neutral-400 transition-transform ${
+                      presetMenuOpen ? 'rotate-180' : ''
+                    }`}
+                  />
+                </button>
+                {presetMenuOpen && (
+                  <>
+                    <div className="fixed inset-0 z-30" onClick={closePresetMenu} aria-hidden />
+                    <div
+                      className={`chat-motion-popover absolute right-0 z-40 w-[min(236px,calc(100vw-32px))] overflow-visible kv-menu ${projectPanelPlacementClass}`}
+                      style={{ ['--chat-popover-origin' as string]: modePanelOrigin }}
+                      data-tauri-drag-region="false"
+                      role="menu"
+                    >
+                      {presetOptions.map((option) => {
+                        const active = option.value === presetValue
+                        const Icon = option.icon
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={active}
+                            disabled={presetLocked && !active}
+                            onClick={() => void pickPreset(option.value)}
+                            className={`kv-menu-row transition-colors ${
+                              active
+                                ? 'bg-neutral-100 text-neutral-950 dark:bg-neutral-800 dark:text-neutral-50'
+                                : 'text-neutral-800 hover:bg-neutral-100 dark:text-neutral-200 dark:hover:bg-neutral-800'
+                            } disabled:cursor-default disabled:opacity-50`}
+                          >
+                            <Icon
+                              size={14}
+                              strokeWidth={1.8}
+                              className={`shrink-0 ${MODE_PILL_CLASS[option.tone].iconColor}`}
+                            />
+                            <span className="min-w-0 flex-1 leading-tight">
+                              <span className="block truncate text-[12px] font-semibold">{option.label}</span>
+                              {option.description && (
+                                <span className="block truncate text-[10px] font-medium text-neutral-400 dark:text-neutral-500">
+                                  {option.description}
+                                </span>
+                              )}
+                            </span>
+                            {active && (
+                              <Check size={13} strokeWidth={2} className="shrink-0 text-neutral-500 dark:text-neutral-300" />
+                            )}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             {modeEntryEnabled && activeModeOption && (
               <div className="relative shrink-0 self-center">
                 <button

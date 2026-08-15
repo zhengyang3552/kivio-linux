@@ -46,7 +46,7 @@ import { ModelSelector } from './ModelSelector'
 import { ThinkingLevelSelector } from './ThinkingLevelSelector'
 import { ExternalModelSelector, RuntimePicker } from './RuntimePicker'
 import { PermissionPicker } from './PermissionPicker'
-import { derivePermissionModes, useDetectedExternalAgents } from './permissionModes'
+import { deriveDshPresetModes, derivePermissionModes, useDetectedExternalAgents } from './permissionModes'
 import { BackgroundJobsIndicator } from './BackgroundJobsIndicator'
 import { ContextIndicator } from './ContextIndicator'
 import { isExecutableAgentPlanText } from './agentPlan'
@@ -57,6 +57,7 @@ import {
   normalizeAgentRuntime,
   type AgentRuntimeConfig,
 } from './api'
+import { loadLastAgentRuntime, saveLastAgentRuntime } from './lastAgentRuntime'
 import {
   chatTitlebarMacInsetClass,
   chatTitlebarRowClass,
@@ -93,6 +94,7 @@ import {
   type ChatMcpServer,
   type ChatToolProgressPayload,
   type ChatUserPromptPayload,
+  type ChatSubagentPayload,
 } from '../api/tauri'
 import { getSettingsCached, refreshSettings, saveSettingsCached } from '../api/settingsCache'
 import { OnboardingShell } from '../onboarding/OnboardingShell'
@@ -151,7 +153,7 @@ import {
   restoreGroupArm,
   touchGroup,
 } from './groupStreamingStore'
-import { compareTimelineSegments, isUserSteerToolCall, segmentStepNumber, segmentToolCallId } from './segments'
+import { compareTimelineSegments, isExternalSubagentToolCall, isUserSteerToolCall, segmentStepNumber, segmentToolCallId } from './segments'
 import { latestCompactionBoundaryId, mergeCompactionContextState } from './compactionBoundary'
 import { applyLiveContextUsage } from './contextPanel'
 import { measureChatSurface, onChatPerfProfiler, useChatPerfLongTaskProbe, useChatPerfRenderProbe } from './chatPerformanceProbe'
@@ -752,6 +754,80 @@ function applyToolRecordToSnapshot(
   snapshot.segments = upsertToolStreamSegment(snapshot.segments, record)
 }
 
+function messageToolCalls(message: ChatMessage): ToolCallRecord[] {
+  return message.toolCalls ?? message.tool_calls ?? []
+}
+
+function toolStructured(tool: ToolCallRecord): Record<string, unknown> {
+  const value = tool.structuredContent ?? tool.structured_content
+  return value && typeof value === 'object' ? { ...(value as Record<string, unknown>) } : {}
+}
+
+function matchesSubagentTool(tool: ToolCallRecord, payload: ChatSubagentPayload): boolean {
+  if (payload.parentToolCallId && tool.id === payload.parentToolCallId) return true
+  const structured = toolStructured(tool)
+  if (structured.backgroundTaskId === payload.taskId) return true
+  if (structured.childSessionId === payload.taskId) return true
+  const progress = structured.subagentProgress
+  return Boolean(
+    progress
+    && typeof progress === 'object'
+    && (progress as { taskId?: unknown }).taskId === payload.taskId,
+  )
+}
+
+function findSubagentToolIndex(tools: ToolCallRecord[], payload: ChatSubagentPayload): number {
+  const exact = tools.findIndex((item) => matchesSubagentTool(item, payload))
+  if (exact >= 0) return exact
+  // ponytail: dsh 派出回执是 jobId，session.event 是 child session.id。单卡时绑上去。
+  const running = tools
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.status === 'running' && isExternalSubagentToolCall(item))
+  return running.length === 1 ? running[0].index : -1
+}
+
+function mergeSubagentProgress(
+  tool: ToolCallRecord,
+  payload: ChatSubagentPayload,
+): ToolCallRecord {
+  const existing = toolStructured(tool)
+  const previous = existing.subagentProgress && typeof existing.subagentProgress === 'object'
+    ? existing.subagentProgress as { preview?: string; steps?: string[] }
+    : {}
+  const steps = payload.steps?.length ? payload.steps : previous.steps ?? []
+  const preview = payload.preview || previous.preview || ''
+  const nextStructured = {
+    ...existing,
+    ...(payload.taskId
+      && existing.backgroundTaskId !== payload.taskId
+      ? { childSessionId: payload.taskId }
+      : {}),
+    subagentProgress: {
+      taskId: existing.backgroundTaskId ?? payload.taskId,
+      name: payload.name,
+      model: payload.model ?? '',
+      depth: payload.depth,
+      status: payload.status,
+      preview,
+      steps,
+    },
+  }
+  const terminal = payload.status !== 'running'
+  return {
+    ...tool,
+    status: terminal
+      ? payload.status === 'failed'
+        ? 'error'
+        : payload.status === 'cancelled'
+          ? 'cancelled'
+          : 'success'
+      : tool.status,
+    result_preview: terminal && payload.preview ? payload.preview : tool.result_preview,
+    structuredContent: nextStructured,
+    structured_content: nextStructured,
+  }
+}
+
 function normalizeSkill(skill: import('../api/tauri').SkillMeta): SkillMeta {
   return {
     id: skill.id,
@@ -998,7 +1074,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   // 多模型一问多答（任务 06-30）：欢迎页（尚无会话）时的多答模型草稿；首次发送建会话时落到会话上。
   const [draftReplyModels, setDraftReplyModels] = useState<ModelRef[]>([])
   const [draftAgentRuntime, setDraftAgentRuntime] = useState<AgentRuntimeConfig>(
-    BUILTIN_AGENT_RUNTIME,
+    () => loadLastAgentRuntime() ?? BUILTIN_AGENT_RUNTIME,
   )
   const [skills, setSkills] = useState<SkillMeta[]>([])
   const [disabledSkillIds, setDisabledSkillIds] = useState<string[]>([])
@@ -1417,6 +1493,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     [currentConversation, draftAgentRuntime],
   )
   const usesExternalRuntime = activeAgentRuntime.kind === 'external' && !!activeAgentRuntime.externalAgentId
+  const usesChatRuntime = activeAgentRuntime.kind === 'chat'
   // 底栏模式胶囊：内置 Agent = Act/Plan/Orchestrate；Kivio Chat 无此胶囊；本地 CLI = 沙盒档位。
   // CLI 没有档位时返回空表 → 胶囊隐藏。
   const detectedExternalAgents = useDetectedExternalAgents(currentConversation?.id ?? null)
@@ -1431,6 +1508,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       agentPlanMode: activeAgentPlanMode,
     }),
     [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode],
+  )
+  const composerPresets = useMemo(
+    () => deriveDshPresetModes(activeAgentRuntime),
+    [activeAgentRuntime],
   )
   const currentConversationIsBlank = isPlainBlankConversation(currentConversation)
   const activeProviderId = currentConversation && !currentConversationIsBlank
@@ -2503,49 +2584,40 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   }, [showStreamSnapshotIfCurrent])
 
   useTauriEvent(api.onChatSubagent, (payload) => {
-      // A subagent progress event must address an existing snapshot for
-      // the parent conversation (do NOT create one — that would resurrect a
-      // finalized conversation). Accept whenever the conversation is in-flight
-      // or a snapshot already exists.
-      const existingSnapshot = streamSnapshotsRef.current[payload.parentConversationId]
+      // 父轮还在飞：写流快照。父轮已经收尾后 streamSnapshotsRef 仍可能留着死快照，
+      // 不能再当直播通道，否则步骤写进看不见的对象，卡上永远「运行中…」。
       const inFlight = isConversationInFlight(
         inFlightConversationsRef.current,
         payload.parentConversationId,
       )
-      if (!inFlight && !existingSnapshot) return
-      const snapshot = ensureStreamSnapshot(payload.parentConversationId)
-      // Match the active run when known; only drop when both ids are set and differ.
-      if (payload.parentRunId && snapshot.runId && snapshot.runId !== payload.parentRunId) return
-      const index = snapshot.toolCalls.findIndex((item) => item.id === payload.parentToolCallId)
-      if (index < 0) return
-      const progress = {
-        taskId: payload.taskId,
-        name: payload.name,
-        model: payload.model ?? '',
-        depth: payload.depth,
-        status: payload.status,
-        preview: payload.preview ?? '',
-        steps: payload.steps ?? [],
+      if (inFlight) {
+        const snapshot = ensureStreamSnapshot(payload.parentConversationId)
+        // Match the active run when known; only drop when both ids are set and differ.
+        if (payload.parentRunId && snapshot.runId && snapshot.runId !== payload.parentRunId) return
+        const index = findSubagentToolIndex(snapshot.toolCalls, payload)
+        if (index < 0) return
+        snapshot.toolCalls = snapshot.toolCalls.map((item, i) => (
+          i === index ? mergeSubagentProgress(item, payload) : item
+        ))
+        showStreamSnapshotIfCurrent(payload.parentConversationId, snapshot)
+        return
       }
-      // Sub-agents run blocking + single-result: the parent tool card transitions
-      // running→done via the tool update flow (the inline result), while these
-      // subagent events drive the live nested progress (steps/preview).
-      snapshot.toolCalls = snapshot.toolCalls.map((item, i) => {
-        if (i !== index) return item
-        const existing =
-          item.structuredContent && typeof item.structuredContent === 'object'
-            ? (item.structuredContent as Record<string, unknown>)
-            : {}
-        const nextStructured: Record<string, unknown> = {
-          ...existing,
-          subagentProgress: progress,
-        }
-        return {
-          ...item,
-          structuredContent: nextStructured,
-        }
+      if (currentConversationIdRef.current !== payload.parentConversationId) return
+      setCurrentConversation((prev) => {
+        if (!prev || prev.id !== payload.parentConversationId) return prev
+        let changed = false
+        const messages = prev.messages.map((message) => {
+          const tools = messageToolCalls(message)
+          const index = findSubagentToolIndex(tools, payload)
+          if (index < 0) return message
+          changed = true
+          const nextTools = tools.map((item, i) => (
+            i === index ? mergeSubagentProgress(item, payload) : item
+          ))
+          return { ...message, toolCalls: nextTools, tool_calls: nextTools }
+        })
+        return changed ? { ...prev, messages } : prev
       })
-      showStreamSnapshotIfCurrent(payload.parentConversationId, snapshot)
   }, [ensureStreamSnapshot, showStreamSnapshotIfCurrent])
 
   useTauriEvent(api.onChatUserPrompt, (payload) => {
@@ -2929,6 +3001,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     setDraftProviderId(activeProviderId)
     setDraftModel(activeModel)
     setDraftAgentRuntime(activeAgentRuntime)
+    saveLastAgentRuntime(activeAgentRuntime)
     setDraftKnowledgeBaseIds([])
     setDraftForceKnowledgeSearch(false)
     currentConversationIdRef.current = null
@@ -3440,11 +3513,14 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         setStreamCoarse({ streaming: true })
       }
     }
-    const attachmentSkillId = options.forceNewConversation
-      ? inferSingleAttachmentSkillId(attachments, enabledSkills)
-      : effectiveSkillId ?? inferSingleAttachmentSkillId(attachments, enabledSkills)
+    const attachmentSkillId = usesChatRuntime
+      ? null
+      : options.forceNewConversation
+        ? inferSingleAttachmentSkillId(attachments, enabledSkills)
+        : effectiveSkillId ?? inferSingleAttachmentSkillId(attachments, enabledSkills)
 
     let persistedConversation: Conversation | null = null
+    let sendAccepted = false
     try {
       const updatedConv = await chatApi.sendMessage(
         conversationId,
@@ -3453,6 +3529,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         attachmentSkillId,
       )
       persistedConversation = updatedConv
+      sendAccepted = true
       if (currentConversationIdRef.current === conversationId) {
         applyAssistantStreamStats(updatedConv)
         setPendingUserMessage(null)
@@ -3493,6 +3570,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       const message = typeof err === 'string' ? err : (err as Error).message || '发送失败'
       setStreamErrorForConversation(conversationId, message)
       if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
+      // 用户消息已落盘 → 草稿清掉是对的；否则 InputBar 必须把原文回填，不能 return true。
+      sendAccepted = Boolean(keptConversation)
     } finally {
       clearConversationInFlight(conversationId)
       // 多答组收尾：sendMessage 返回时所有臂已结束，持久化后的会话已 applyConversation（含 N 条
@@ -3510,7 +3589,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
       }
     }
-    return true
+    return sendAccepted
   }, [
     activeModel,
     activeProviderId,
@@ -3528,6 +3607,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     draftWebSearchMode,
     effectiveSkillId,
     enabledSkills,
+    usesChatRuntime,
     ensureStreamSnapshot,
     finishStreamingRunWithConversation,
     flushPendingStreamDone,
@@ -4056,6 +4136,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
 
   const handleRuntimeChange = useCallback(async (runtime: AgentRuntimeConfig) => {
     setDraftAgentRuntime(runtime)
+    saveLastAgentRuntime(runtime)
     if (!currentConversation) return
     const conversationId = currentConversation.id
     try {
@@ -4091,6 +4172,15 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     await handleRuntimeChange(next)
   }, [activeAgentRuntime, handleRuntimeChange])
 
+  const handleExternalPresetChange = useCallback(async (preset: string) => {
+    const next: AgentRuntimeConfig = {
+      ...activeAgentRuntime,
+      kind: 'external',
+      externalAgentPreset: preset,
+    }
+    await handleRuntimeChange(next)
+  }, [activeAgentRuntime, handleRuntimeChange])
+
   const persistApprovedExternalSandbox = useCallback(async (
     conversationId: string,
     runtime: AgentRuntimeConfig,
@@ -4105,6 +4195,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       const updated = await chatApi.setAgentRuntime(conversationId, next)
       if (applyConversationIfCurrent(conversationId, updated)) {
         setDraftAgentRuntime(next)
+        saveLastAgentRuntime(next)
       }
     } catch (error) {
       console.error('Failed to persist the post-approval permission mode:', error)
@@ -4338,9 +4429,21 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         lang={uiLang}
         apiFormats={providerApiFormats}
         defaultApiFormat={currentConversation ? (providerApiFormats[currentConversation.provider_id] ?? '') : ''}
+        cacheIncludedInInput={
+          usesExternalRuntime
+            ? activeAgentRuntime.externalAgentId === 'codex'
+            : undefined
+        }
       />
     ),
-    [currentConversation, displayMessages, providerApiFormats, uiLang],
+    [
+      activeAgentRuntime.externalAgentId,
+      currentConversation,
+      displayMessages,
+      providerApiFormats,
+      uiLang,
+      usesExternalRuntime,
+    ],
   )
 
   const emptyHeroGreeting = useMemo(
@@ -4771,27 +4874,31 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onApprovalPolicyChange={handleApprovalPolicyChange}
           />
         </div>
-        <div className="shrink-0" data-tauri-drag-region="false">
-          <BackgroundJobsIndicator
-            conversationId={currentConversation?.id ?? null}
-            onOpen={handleOpenDockTasks}
-          />
-        </div>
+        {!usesChatRuntime && (
+          <div className="shrink-0" data-tauri-drag-region="false">
+            <BackgroundJobsIndicator
+              conversationId={currentConversation?.id ?? null}
+              onOpen={handleOpenDockTasks}
+            />
+          </div>
+        )}
       </div>
       <div className="min-w-5 flex-1" data-tauri-drag-region />
-      <div className="flex min-w-0 shrink items-center justify-end gap-1">
-        <div className="shrink-0" data-tauri-drag-region="false">
-          <IconButton
-            label={i18n[uiLang].dockToggle}
-            size="sm"
-            variant="ghost"
-            className={dockOpen ? 'bg-black/5 text-neutral-800 dark:bg-white/10 dark:text-neutral-100' : ''}
-            onClick={handleToggleDock}
-          >
-            <PanelRight size={15} />
-          </IconButton>
+      {!usesChatRuntime && (
+        <div className="flex min-w-0 shrink items-center justify-end gap-1">
+          <div className="shrink-0" data-tauri-drag-region="false">
+            <IconButton
+              label={i18n[uiLang].dockToggle}
+              size="sm"
+              variant="ghost"
+              className={dockOpen ? 'bg-black/5 text-neutral-800 dark:bg-white/10 dark:text-neutral-100' : ''}
+              onClick={handleToggleDock}
+            >
+              <PanelRight size={15} />
+            </IconButton>
+          </div>
         </div>
-      </div>
+      )}
     </>
   ), [
     activeAgentRuntime,
@@ -4809,6 +4916,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     handleThinkingLevelChange,
     handleToggleDock,
     uiLang,
+    usesChatRuntime,
     usesExternalRuntime,
   ])
 
@@ -4841,7 +4949,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     agentPlanState: currentConversation?.agent_plan_state ?? currentConversation?.agentPlanState ?? null,
     agentTodoState: currentConversation?.agent_todo_state ?? currentConversation?.agentTodoState ?? null,
     onAgentPlanModeChange: handleAgentPlanModeChange,
-    enabledSkills: slashSkills,
+    usesChatRuntime,
+    enabledSkills: usesChatRuntime ? [] : slashSkills,
     onOpenSkillSettings: openSkillCenter,
     selectedProject,
     conversationProject,
@@ -4868,12 +4977,17 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     replyModels: activeReplyModels,
     onChangeReplyModels: handleChangeReplyModels,
     contextSlot: composerContextSlot,
-    gitWorkdir: dockWorkdir || null,
+    gitWorkdir: usesChatRuntime ? null : dockWorkdir || null,
     gitLang: uiLang,
     onOpenGitPanel: handleOpenDockGit,
     modeOptions: composerModes.options,
     modeValue: composerModes.current,
     onModeChange: handleComposerModeChange,
+    presetOptions: composerPresets.options,
+    presetValue: composerPresets.current,
+    onPresetChange: handleExternalPresetChange,
+    presetLocked: Boolean(currentConversation) && !currentConversationIsBlank,
+    presetLockedReason: i18n[uiLang].chatAgentPresetLocked,
     usageSlot: composerUsageSlot,
   }), [
     activeAgentRuntime.externalAgentId,
@@ -4881,6 +4995,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     activeReplyModels,
     activeWebSearchMode,
     composerModes,
+    composerPresets,
     composerContextSlot,
     composerCurrentAssistant,
     composerForceKnowledgeSearch,
@@ -4888,6 +5003,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     composerUsageSlot,
     conversationProject,
     currentConversation,
+    currentConversationIsBlank,
     dockWorkdir,
     enabledTools,
     handleAgentPlanModeChange,
@@ -4897,6 +5013,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     handleClearChat,
     handleCompressContext,
     handleComposerModeChange,
+    handleExternalPresetChange,
     handleOpenChatSettings,
     handleOpenDockGit,
     handleQueueMessage,
@@ -4920,6 +5037,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     toolStatusHint,
     sendDisabledReason,
     uiLang,
+    usesChatRuntime,
     usesExternalRuntime,
   ])
 
@@ -5293,7 +5411,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           />
         )}
         </ChatRouteKeepAlive>
-        {chatView === 'conversation' && (
+        {chatView === 'conversation' && !usesChatRuntime && (
           <RightDock
             open={dockOpen}
             width={dockWidth}

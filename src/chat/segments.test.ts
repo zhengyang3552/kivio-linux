@@ -101,6 +101,25 @@ describe('groupTimelineSegments', () => {
       source: 'external_cli',
       status: 'running',
     }))).toBe(true)
+    expect(isStandaloneToolCard(tool({
+      id: 'ask-dsh',
+      name: 'ask_user_question',
+      source: 'external_cli',
+      status: 'running',
+    }))).toBe(true)
+    expect(isStandaloneToolCard(tool({
+      id: 'ask-dsh-plan',
+      name: 'exit_plan_mode',
+      source: 'external_cli',
+      status: 'running',
+    }))).toBe(true)
+    // claude 的计划批准也是一次人为决定，但不走问用户卡。
+    expect(isStandaloneToolCard(tool({
+      id: 'plan-exit',
+      name: 'ExitPlanMode',
+      source: 'external_cli',
+      status: 'running',
+    }))).toBe(true)
     // 载荷认得出来也算（工具名被改过/缺失时的兜底）。
     expect(isStandaloneToolCard(tool({
       id: 'ask-3',
@@ -125,6 +144,23 @@ describe('groupTimelineSegments', () => {
       source: 'external_cli',
       status: 'completed',
     }))).toBe(true)
+    expect(isStandaloneToolCard(tool({
+      id: 'dsh-subagent',
+      name: 'subagent',
+      source: 'external_cli',
+      status: 'running',
+    }))).toBe(true)
+    expect(isStandaloneToolCard(tool({
+      id: 'dsh-workflow',
+      name: 'workflow',
+      source: 'external_cli',
+      status: 'running',
+    }))).toBe(true)
+    expect(isStandaloneToolCard(tool({
+      id: 'dsh-list-agents',
+      name: 'list_agents',
+      source: 'external_cli',
+    }))).toBe(false)
     // MCP 服务器恰好有个叫 agent 的工具：不是子代理，照常折叠。
     expect(isStandaloneToolCard(tool({
       id: 'mcp-agent-1',
@@ -313,6 +349,45 @@ describe('summarizeToolGroup', () => {
     // 重复 read 去重，未知工具(other)被剔除；m===1 → 读取片段（count 只数 read）
     expect(summary.text).toBe('读取 2 个文件')
     expect(summary.categories).toEqual(['read'])
+  })
+
+  it('maps dsh pwsh and claude Bash to the run-command summary', () => {
+    const segments = [toolSegment('t1', 1, 'c1'), toolSegment('t2', 2, 'c2')]
+    const toolCalls = [
+      tool({ id: 'c1', name: 'pwsh' }),
+      tool({ id: 'c2', name: 'Bash' }),
+    ]
+    const summary = summarizeToolGroup(segments, toolCalls)
+    expect(summary.text).toBe('执行 2 条命令')
+    expect(summary.icon).toBe('runCommand')
+    expect(summary.categories).toEqual(['runCommand'])
+  })
+
+  it('maps dsh job / editor / run_code / image tools off the generic fallback', () => {
+    expect(summarizeToolGroup(
+      [toolSegment('t1', 1, 'c1')],
+      [tool({ id: 'c1', name: 'job_output' })],
+    ).text).toBe('执行 1 条命令')
+    expect(summarizeToolGroup(
+      [toolSegment('t1', 1, 'c1')],
+      [tool({
+        id: 'c1',
+        name: 'str_replace_editor',
+        arguments: { command: 'str_replace', path: 'a.ts', old_str: 'a', new_str: 'b' },
+      })],
+    ).text).toBe('编辑 1 个文件')
+    expect(summarizeToolGroup(
+      [toolSegment('t1', 1, 'c1')],
+      [tool({ id: 'c1', name: 'str_replace_editor', arguments: { command: 'view', path: 'a.ts' } })],
+    ).text).toBe('读取 1 个文件')
+    expect(summarizeToolGroup(
+      [toolSegment('t1', 1, 'c1')],
+      [tool({ id: 'c1', name: 'run_code' })],
+    ).text).toBe('运行代码')
+    expect(summarizeToolGroup(
+      [toolSegment('t1', 1, 'c1')],
+      [tool({ id: 'c1', name: 'read_image' })],
+    ).text).toBe('读取 1 个文件')
   })
 
   it('falls back to a step count when every category is unknown (m===0)', () => {

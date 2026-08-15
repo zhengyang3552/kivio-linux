@@ -1712,6 +1712,8 @@ mod tests {
             UnifiedAgentEvent::UserSteer { .. } => "UserSteer",
             UnifiedAgentEvent::StatusNote { .. } => "StatusNote",
             UnifiedAgentEvent::BackgroundTask { .. } => "BackgroundTask",
+            UnifiedAgentEvent::TodoWrite { .. } => "TodoWrite",
+            UnifiedAgentEvent::SubagentProgress { .. } => "SubagentProgress",
         }
     }
 

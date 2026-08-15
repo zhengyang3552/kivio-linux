@@ -33,7 +33,8 @@ import type { LucideIcon } from 'lucide-react'
 import type { AgentTodoItem, AgentTodoState, AgentTodoStatus, ToolCallRecord, ToolCallStatus } from './types'
 import { normalizeToolCallStatus } from './toolStatus'
 import { formatToolResultPreview } from './toolResultPreview'
-import { isExternalSubagentToolCall, toolCallDiffStats, toolRecordRawName } from './segments'
+import { hasAskUserStructuredContent, isAskUserToolName } from './askUserTools'
+import { canonicalToolName, isExternalSubagentToolCall, toolCallDiffStats, toolRecordRawName } from './segments'
 import { requestDockDiffPreview, requestDockPreview } from './dock/dockPreview'
 import { DiffView } from './dock/DiffView'
 import { knowledgeSearchHits, type KbHitView } from './knowledgeBaseHits'
@@ -105,39 +106,12 @@ function parsedArguments(toolCall: ToolCallRecord): Record<string, unknown> | nu
   }
 }
 
-/** 外部 CLI 的内置工具名 → 本文件各 switch 使用的规范名（Kivio 原生工具的 snake_case）。
- *
- *  key 是「小写 + 去掉下划线/连字符/空格」后的形态，所以 `WebFetch` 与 `web_fetch` 归到
- *  同一个 key。表里**只列本文件确实有对应分支**的工具；其余（`Task` / `Skill` 的独有语义等）
- *  保持原名走 default —— 显示工具本名，比映射到一个语义不符的分支好。 */
-const CLI_TOOL_NAME_ALIASES: Record<string, string> = {
-  webfetch: 'web_fetch',
-  websearch: 'web_search',
-  todowrite: 'todo_write',
-  // claude 的 MultiEdit 用 `edits[]`，正是 `fileToolArgumentPreview` 的 edit 分支已支持的形状。
-  multiedit: 'edit',
-  // NotebookEdit 的目标路径在 `notebook_path`，见 `toolPathArgument`。
-  notebookedit: 'edit',
-  // claude 的 `AskUserQuestion` 就是 Kivio 的问用户卡片：宿主已经把它的入参映射成 `askUser`
-  // 结构化载荷、答复也走同一条 `chat_submit_user_choice`（`external_agents/run.rs` 的
-  // `ask_user_prompt_from_claude_input` / `claude_ask_user_updated_input`）。少了这条别名，
-  // `isAskUserTool` 认不出它 ⇒ 渲染成一张普通工具卡 ⇒ 用户**没有任何控件可答**，只能看它
-  // 转到 600s 超时、被当成拒绝回给 CLI。整条链路后端全通，唯一的断点就是这一行。
-  askuserquestion: 'ask_user',
-}
-
-/** 展示映射用的规范工具名。
- *
- *  `toolRecordRawName` 原样返回工具名、不做归一化，而下面所有 switch 分支写的都是小写
- *  snake_case —— claude Code 的内置工具是 PascalCase 的 `Read` / `Bash` / `Grep` / `Glob` /
- *  `Edit` / `WebFetch` / `TodoWrite`，于是**全部落进 default**：`getToolTarget` 返回 ''，
- *  折叠行退到 `previewValue(arguments)`，显示一坨 220 字符截断的 JSON，完全不可扫读。
+/** 展示映射用的规范工具名（别名表在 `canonicalToolName`）。
  *
  *  **只用于 switch 匹配，不要拿它当显示文案**：MCP 工具名（`mcp__server__toolName`）的
  *  大小写有意义，`getToolName` 的 default 分支必须回落 `toolRecordRawName` 的原名。 */
 function toolRawName(toolCall: ToolCallRecord): string {
-  const lower = toolRecordRawName(toolCall).toLowerCase()
-  return CLI_TOOL_NAME_ALIASES[lower.replace(/[_\-\s]/g, '')] ?? lower
+  return canonicalToolName(toolCall)
 }
 
 /** 文件类工具的目标路径。
@@ -204,6 +178,9 @@ function toolGlyph(toolCall: ToolCallRecord): LucideIcon | ComponentType<{ size?
       return ScrollText
     case 'todo_write':
     case 'todo_update':
+    case 'taskcreate':
+    case 'taskupdate':
+    case 'tasklist':
       return ListChecks
     case 'memory_read':
     case 'memory_search':
@@ -233,7 +210,8 @@ function toolGlyph(toolCall: ToolCallRecord): LucideIcon | ComponentType<{ size?
 }
 
 function isAskUserTool(toolCall: ToolCallRecord): boolean {
-  return toolRawName(toolCall) === 'ask_user'
+  return hasAskUserStructuredContent(toolCall.structured_content ?? toolCall.structuredContent)
+    || isAskUserToolName(toolRecordRawName(toolCall))
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -263,7 +241,8 @@ function normalizeTodoItem(value: unknown): AgentTodoItem | null {
   const status = typeof item.status === 'string' ? item.status : ''
   if (!id && !content) return null
   return {
-    id,
+    // dsh 的 todo_write 没有 id，官方用 content 当身份。
+    id: id || content,
     content,
     status: (status === 'completed' || status === 'in_progress' || status === 'pending'
       ? status
@@ -414,6 +393,20 @@ function subagentPrompt(args: Record<string, unknown> | null): string {
   return stringValue(args?.prompt)
 }
 
+/** dsh 后台子代理的 tool/result 只是派出回执，不是跑完。 */
+function isSubagentLaunchReceipt(text: string | undefined): boolean {
+  const trimmed = text?.trim() ?? ''
+  return trimmed.startsWith('started subagent ')
+    || trimmed.startsWith('started background subagent task ')
+}
+
+function subagentDisplayStatus(toolCall: ToolCallRecord, status: ToolCallStatus): ToolCallStatus {
+  if (status === 'completed' && isSubagentLaunchReceipt(getResultPreview(toolCall))) {
+    return 'running'
+  }
+  return status
+}
+
 function subagentStatusLine(view: SubagentView | null, status: ToolCallStatus): string {
   if (status === 'completed') return '已完成'
   if (status === 'error') return view?.error ? compactText(view.error, 160) : '运行失败'
@@ -537,14 +530,14 @@ function ConsultCard({
 }
 
 function SubAgentCard({ toolCall }: ToolCallBlockProps) {
-  const status = normalizeToolCallStatus(toolCall.status)
+  const status = subagentDisplayStatus(toolCall, normalizeToolCallStatus(toolCall.status))
   const view = useMemo(() => structuredSubagent(toolCall), [toolCall])
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
 
   const agentType = subagentAgentType(view, args)
   const name = subagentName(view, args)
   const model = view?.model || ''
-  const duration = formatDuration(getDuration(toolCall))
+  const duration = status === 'running' ? '' : formatDuration(getDuration(toolCall))
   const statusLine = subagentStatusLine(view, status)
   const prompt = subagentPrompt(args)
   // 内置 agent 的最终结果在 structured content 里；外部 CLI（claude Agent/Task）没有
@@ -1203,6 +1196,10 @@ function getToolName(toolCall: ToolCallRecord): string {
   if (raw === 'mixer_vision') return 'Vision'
   if (raw === 'mixer_generate_image') return 'Generate image'
   if (raw === 'todo_write' || raw === 'todo_update') return 'Update todos'
+  if (structuredTodoState(toolCall)) return 'Update todos'
+  if (raw === 'taskcreate') return 'Create task'
+  if (raw === 'taskupdate') return 'Update task'
+  if (raw === 'tasklist') return 'List tasks'
   return displayName
 }
 
@@ -1257,7 +1254,7 @@ function getToolTarget(toolCall: ToolCallRecord): string {
       }
       case 'bash':
       case 'run_command':
-        return compactText(firstString(args?.description, args?.command), 160)
+        return compactText(firstString(args?.description, args?.command, args?.job_id, args?.jobId), 160)
       case 'grep':
       case 'search_files':
         return compactText(firstString(args?.query, args?.pattern), 140)
@@ -1287,9 +1284,24 @@ function getToolTarget(toolCall: ToolCallRecord): string {
       case 'knowledge_search':
         return compactText(firstString(args?.query), 140)
       case 'todo_write': {
-        const counts = formatTodoCounts(normalizeTodoItems(args?.todos))
-        return counts
+        const counts = formatTodoCounts(
+          structuredTodoState(toolCall)?.items ?? normalizeTodoItems(args?.todos),
+        )
+        return counts || compactText(firstString(args?.objective, args?.content), 140)
       }
+      case 'taskcreate': {
+        const counts = formatTodoCounts(structuredTodoState(toolCall)?.items)
+        return counts || compactText(firstString(args?.subject, args?.content), 140)
+      }
+      case 'taskupdate': {
+        const counts = formatTodoCounts(structuredTodoState(toolCall)?.items)
+        if (counts) return counts
+        const status = typeof args?.status === 'string' ? todoStatusLabel(args.status) : ''
+        const target = firstString(args?.subject, args?.taskId, args?.id, args?.task_id)
+        return [status, compactText(target, 120)].filter(Boolean).join(' · ')
+      }
+      case 'tasklist':
+        return formatTodoCounts(structuredTodoState(toolCall)?.items)
       case 'todo_update':
         return compactText(firstString(args?.content, args?.id), 120)
       case 'mixer_vision': {
@@ -1357,9 +1369,10 @@ function getArgumentPreview(toolCall: ToolCallRecord): string {
 
 function getResultPreview(toolCall: ToolCallRecord): string {
   const rawName = toolRawName(toolCall)
-  if (rawName === 'todo_write' || rawName === 'todo_update') {
+  const todoItems = structuredTodoState(toolCall)?.items
+  if (rawName === 'todo_write' || rawName === 'todo_update' || todoItems) {
     if (normalizeToolCallStatus(toolCall.status) !== 'completed') return ''
-    const counts = formatTodoCounts(structuredTodoState(toolCall)?.items)
+    const counts = formatTodoCounts(todoItems)
     return counts ? `已同步 ${counts}` : '已同步'
   }
   const fileMutation = structuredFileMutation(toolCall)

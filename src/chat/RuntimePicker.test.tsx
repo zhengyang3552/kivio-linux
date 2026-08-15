@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ExternalModelSelector, RuntimePicker } from './RuntimePicker'
+import { LAST_AGENT_RUNTIME_KEY } from './lastAgentRuntime'
 import type { AgentRuntimeConfig } from './types'
 
 const detectModels = vi.fn()
@@ -137,6 +138,94 @@ describe('ExternalModelSelector', () => {
     expect(onModelChange).not.toHaveBeenCalled()
   })
 
+  it('dsh 的 off 是真档位：胶囊显示 Off，菜单里保留 Off', async () => {
+    detectModels.mockResolvedValue({
+      models: [
+        { id: 'default', label: 'Default' },
+        { id: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash' },
+      ],
+      reasoningOptions: [
+        { id: 'default', label: 'Default' },
+        { id: 'off', label: 'Off' },
+        { id: 'high', label: 'High' },
+        { id: 'max', label: 'Max' },
+      ],
+      source: 'probed',
+      currentModel: 'deepseek-v4-flash',
+      currentReasoning: 'off',
+    })
+
+    render(
+      <ExternalModelSelector
+        agentRuntime={runtime}
+        onModelChange={() => {}}
+        conversationId={null}
+      />,
+    )
+    await waitFor(() =>
+      expect(screen.getByLabelText('思考等级：Off')).toBeInTheDocument(),
+    )
+    act(() => {
+      fireEvent.click(screen.getByLabelText('思考等级：Off'))
+    })
+    expect(screen.getByRole('button', { name: 'Off' })).toBeInTheDocument()
+    expect(screen.queryByLabelText('思考等级：Auto')).not.toBeInTheDocument()
+  })
+
+  it('ACP 只报 on/off 开关时不显示思考档位胶囊', async () => {
+    detectModels.mockResolvedValue({
+      models: [{ id: 'default', label: 'Default' }],
+      reasoningOptions: [
+        { id: 'on', label: 'On' },
+        { id: 'off', label: 'Off' },
+      ],
+      source: 'probed',
+      currentModel: null,
+      currentReasoning: 'off',
+    })
+
+    render(
+      <ExternalModelSelector
+        agentRuntime={runtime}
+        onModelChange={() => {}}
+        conversationId={null}
+      />,
+    )
+    await waitFor(() => expect(screen.getByRole('button')).toHaveTextContent('Auto'))
+    expect(screen.queryByLabelText(/思考等级/)).not.toBeInTheDocument()
+  })
+
+  it('有 CLI 当前模型/推理时胶囊显示真实名字而不是 Auto', async () => {
+    detectModels.mockResolvedValue({
+      models: [
+        { id: 'default', label: 'Default' },
+        { id: 'deepseek-v4-flash', label: 'DeepSeek-V4-Flash' },
+      ],
+      reasoningOptions: [
+        { id: 'default', label: 'Default' },
+        { id: 'off', label: 'Off' },
+        { id: 'high', label: 'High' },
+        { id: 'max', label: 'Max' },
+      ],
+      source: 'probed',
+      currentModel: 'deepseek-v4-flash',
+      currentReasoning: 'high',
+    })
+
+    render(
+      <ExternalModelSelector
+        agentRuntime={runtime}
+        onModelChange={() => {}}
+        conversationId={null}
+      />,
+    )
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /DeepSeek-V4-Flash/ })).toBeInTheDocument(),
+    )
+    expect(screen.getByLabelText('思考等级：High')).toBeInTheDocument()
+    expect(screen.queryByText('Auto')).not.toBeInTheDocument()
+  })
+
   it('无当前模型概念时胶囊显示「Auto」', async () => {
     detectModels.mockResolvedValue({
       models: [{ id: 'default', label: 'Default' }],
@@ -235,6 +324,66 @@ describe('RuntimePicker（一 agent 一对话绑定锁）', () => {
     expect(screen.getByRole('radio', { name: /Cursor Agent/ })).not.toBeDisabled()
   })
 
+
+  it('再点当前外部代理不把模型和思考重置成 default', async () => {
+    const onRuntimeChange = vi.fn()
+    const claudeRuntime: AgentRuntimeConfig = {
+      kind: 'external',
+      externalAgentId: 'claude',
+      externalModel: 'claude-opus-5',
+      externalReasoning: 'high',
+    }
+    render(
+      <RuntimePicker
+        agentRuntime={claudeRuntime}
+        onRuntimeChange={onRuntimeChange}
+        conversationId="c1"
+      />,
+    )
+    await waitFor(() => expect(detectAgents).toHaveBeenCalled())
+    act(() => {
+      fireEvent.click(screen.getAllByRole('button')[0])
+    })
+    act(() => {
+      fireEvent.click(screen.getByRole('radio', { name: /Claude Code/ }))
+    })
+    expect(onRuntimeChange).not.toHaveBeenCalled()
+  })
+
+  it('切到 Claude Code 时带回该代理上次的模型和思考档', async () => {
+    window.localStorage.setItem(LAST_AGENT_RUNTIME_KEY, JSON.stringify({
+      kind: 'external',
+      externalAgentId: 'dsh',
+      externalModel: 'deepseek-v4-flash',
+      byAgent: {
+        claude: { externalModel: 'claude-opus-5', externalReasoning: 'high' },
+      },
+    }))
+    const onRuntimeChange = vi.fn()
+    render(
+      <RuntimePicker
+        agentRuntime={runtime}
+        onRuntimeChange={onRuntimeChange}
+        conversationId={null}
+      />,
+    )
+    await waitFor(() => expect(detectAgents).toHaveBeenCalled())
+    act(() => {
+      fireEvent.click(screen.getAllByRole('button')[0])
+    })
+    act(() => {
+      fireEvent.click(screen.getByRole('radio', { name: /Claude Code/ }))
+    })
+    expect(onRuntimeChange).toHaveBeenCalledWith({
+      kind: 'external',
+      externalAgentId: 'claude',
+      externalModel: 'claude-opus-5',
+      externalReasoning: 'high',
+      externalSandbox: null,
+      externalAgentPreset: null,
+    })
+    window.localStorage.removeItem(LAST_AGENT_RUNTIME_KEY)
+  })
 
   it('未 locked 时切换项可用', async () => {
     const onRuntimeChange = vi.fn()

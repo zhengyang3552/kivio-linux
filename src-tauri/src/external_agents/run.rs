@@ -13,8 +13,8 @@ use crate::chat::commands::{
 use crate::chat::memory::l1_prompt_block;
 use crate::chat::model::ModelUsage;
 use crate::chat::types::{
-    ChatMessageSegment, ChatMessageSegmentKind, ChatMessageSegmentPhase, CompactionBoundaryRecord,
-    ToolCallRecord, ToolCallStatus,
+    AgentTodoState, ChatMessageSegment, ChatMessageSegmentKind, ChatMessageSegmentPhase,
+    CompactionBoundaryRecord, ToolCallRecord, ToolCallStatus,
 };
 use crate::chat::Conversation;
 use crate::external_agents::defs::claude::append_system_prompt_file_args;
@@ -386,6 +386,9 @@ pub async fn run_external_cli_reply(
     let mut segment_order = 0u32;
     let mut segments: Vec<ChatMessageSegment> = Vec::new();
     let mut segment_tracker = StreamSegmentTracker::default();
+    // Claude Task* 是补丁，不是 DSH 那种整表快照。流上按顺序累加，立刻发 TodoUpdated；
+    // 落盘仍走 mutate 补丁，避免并发 spawn 用过期整表把后写的条目盖掉。
+    let mut todo_state = conversation.agent_todo_state.clone();
     let conversation_id = conversation.id.clone();
     let started_at = Instant::now();
     // 缓存 key 用探测 cwd（resolve_detection_cwd，非项目会话 = __global__），与斜杠探测的
@@ -421,24 +424,28 @@ pub async fn run_external_cli_reply(
             &mut segment_order,
             &mut segment_tracker,
             &mut cli_compactions,
+            &mut todo_state,
             event,
         );
     };
 
     let cancel_check = || !state.is_chat_generation_active(&conversation_id, run_generation);
 
-    // 本轮接不接工具审批。**判据取自即将启动的 argv 本身**，而不是再抄一遍「哪些档位会询问」
-    // 的规则：真正决定 CLI 会不会问的就是那个 flag（`--permission-prompt-tool stdio`），
-    // 从 argv 读回来就不可能与 `build_args` 的决定分叉（spec 第 2 条）。
-    let approval_host = turn_asks_for_permission(&args).then(|| ApprovalHost {
+    // 本轮接不接工具审批 / 问用户。claude 的判据取自即将启动的 argv 本身
+    // （`--permission-prompt-tool stdio`），从 argv 读回来就不可能与 `build_args` 分叉。
+    // 没有这条 flag 的 CLI（dsh 的 `session/ask`）靠 `ask_user::needs_host` 开通道，
+    // 否则问用户会卡在 `NO_PROVIDER`。
+    let approval_host = turn_needs_approval_host(&args, &agent_id).then(|| ApprovalHost {
         app,
         state,
         conversation_id: &conversation_id,
         run_id: &run_id,
         generation: run_generation,
+        agent_id: &agent_id,
         auto_allow_tools: std::sync::atomic::AtomicBool::new(
             permission_mode_from_args(&args)
-                .is_some_and(crate::external_agents::defs::claude::claude_mode_auto_allows_tools),
+                .is_some_and(crate::external_agents::defs::claude::claude_mode_auto_allows_tools)
+                || crate::external_agents::ask_user::auto_allow_ordinary_tools(&agent_id),
         ),
     });
 
@@ -458,6 +465,7 @@ pub async fn run_external_cli_reply(
             conversation.agent_runtime.external_model.as_deref(),
             conversation.agent_runtime.external_reasoning.as_deref(),
             conversation.agent_runtime.external_sandbox.as_deref(),
+            conversation.agent_runtime.external_agent_preset.as_deref(),
             system_prompt_file
                 .as_ref()
                 .map(|_| stable_prompt_hash(daemon_instructions.trim()))
@@ -476,6 +484,7 @@ pub async fn run_external_cli_reply(
             wire_model.clone(),
             conversation.agent_runtime.external_reasoning.clone(),
             conversation.agent_runtime.external_sandbox.clone(),
+            conversation.agent_runtime.external_agent_preset.clone(),
             persistent_mcp,
             &launch_config,
             &composed.full_prompt,
@@ -775,6 +784,7 @@ async fn run_persistent_turn<E, C>(
     model: Option<String>,
     reasoning: Option<String>,
     sandbox: Option<String>,
+    preset: Option<String>,
     mcp_servers: Vec<AcpMcpServer>,
     launch_config: &LaunchConfig,
     first_prompt: &str,
@@ -854,9 +864,11 @@ where
                 model.as_deref(),
                 reasoning.as_deref(),
                 sandbox.as_deref(),
+                preset.as_deref(),
                 &mcp_servers,
                 resume_native.clone(),
                 Some(background_task_sink(app, conversation_id)),
+                Some(dsh_idle_sink(app, conversation_id)),
             )
             .await
             {
@@ -887,9 +899,11 @@ where
                         model.as_deref(),
                         reasoning.as_deref(),
                         sandbox.as_deref(),
+                        preset.as_deref(),
                         &mcp_servers,
                         None,
                         Some(background_task_sink(app, conversation_id)),
+                        Some(dsh_idle_sink(app, conversation_id)),
                     )
                     .await?
                 }
@@ -1036,6 +1050,7 @@ where
             model.as_deref(),
             reasoning.as_deref(),
             sandbox.as_deref(),
+            preset.as_deref(),
             &mcp_servers,
             launch_config,
             resumable_native.clone(),
@@ -1084,6 +1099,7 @@ async fn reconnect_fresh(
     model: Option<&str>,
     reasoning: Option<&str>,
     sandbox: Option<&str>,
+    preset: Option<&str>,
     mcp_servers: &[AcpMcpServer],
     launch_config: &LaunchConfig,
     resume_native: Option<String>,
@@ -1111,9 +1127,11 @@ async fn reconnect_fresh(
         model,
         reasoning,
         sandbox,
+        preset,
         mcp_servers,
         resume_native,
         Some(background_task_sink(app, conversation_id)),
+        Some(dsh_idle_sink(app, conversation_id)),
     )
     .await?;
     let _ = save_live_handle(
@@ -1145,7 +1163,7 @@ async fn reconnect_fresh(
 /// 本轮的启动配置指纹。
 ///
 /// Claude and dsh both have process-bound settings. Claude fingerprints launch flags/system prompt;
-/// dsh fingerprints initialize model, profile reasoning/provider, and sandbox environment. Without
+/// dsh fingerprints initialize model, profile reasoning/provider, sandbox, and agent preset. Without
 /// this, the UI can show a new configuration while the resident process keeps running the old one.
 ///
 /// ACP / codex 能在会话内改模型与推理档位（`session/set_config_option` / 每轮 `turn/start`
@@ -1177,15 +1195,17 @@ fn launch_config_for_turn(
     model: Option<&str>,
     reasoning: Option<&str>,
     sandbox: Option<&str>,
+    preset: Option<&str>,
     instructions_hash: Option<&str>,
 ) -> LaunchConfig {
     if matches!(protocol, StreamFormat::DshJsonRpc) {
         return LaunchConfig {
             flags: format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 model.unwrap_or_default(),
                 reasoning.unwrap_or_default(),
                 sandbox.unwrap_or_default(),
+                crate::external_agents::dsh_profile::normalize_agent_preset(preset),
                 dsh_provider_fingerprint()
             ),
             // dsh 的会话级指令在首轮正文里，不是启动配置；指令变化不需要为了它单独重连。
@@ -1301,7 +1321,9 @@ fn persistent_failure_action(
     // resume 失效：**必须排在下面那条 auth / retried 之前**。它不是瞬时故障（重连同一份 argv
     // 一定再失败），也不是认证问题，而是一个有确定处置的状态：换个新会话继续。
     // 同样只降级一次 —— 摘掉 resume 之后还失败说明是别的原因。
-    if crate::external_agents::stream::claude::is_missing_session_error(err) {
+    if crate::external_agents::stream::claude::is_missing_session_error(err)
+        || crate::external_agents::session::dsh_jsonrpc::is_missing_session_error(err)
+    {
         return if dropped_resume {
             PersistentFailureAction::Fatal
         } else {
@@ -1368,6 +1390,13 @@ fn cancel_should_escalate(
 /// 更不容易分叉 —— 那份规则的唯一副本在 `defs::claude::claude_permission_prompt_args`。
 fn turn_asks_for_permission(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--permission-prompt-tool")
+}
+
+/// 本轮要不要建审批 / 问用户宿主。claude 看 argv 上的 `--permission-prompt-tool`；
+/// 没有这条 flag 的 CLI（dsh 的 `session/ask`）靠 `ask_user::needs_host` —— 加了
+/// codec 就会开通道。
+fn turn_needs_approval_host(args: &[String], agent_id: &str) -> bool {
+    turn_asks_for_permission(args) || crate::external_agents::ask_user::needs_host(agent_id)
 }
 
 /// 本轮 argv 里的权限档位（`--permission-mode` 的值）。
@@ -1537,8 +1566,11 @@ struct ApprovalHost<'a> {
     conversation_id: &'a str,
     run_id: &'a str,
     generation: u64,
+    /// 用来找 `ask_user::codec_for`。问用户按 agent 分发，不按折叠后的工具名
+    /// （`AskUserQuestion` 和 `ask_user_question` 折叠后一样）。
+    agent_id: &'a str,
     /// 普通工具就地放行、不弹卡（「完全」档；见 `claude_mode_auto_allows_tools`）。
-    /// 这一档接上询问通道**只为了** `AskUserQuestion` / `ExitPlanMode`，不是为了开始审批。
+    /// 这一档接上询问通道**只为了**问用户 / 计划卡，不是为了开始审批。
     ///
     /// 可变（`AtomicBool`）是因为用户可以在**轮中**用「批准并自动放行」把整轮切进这一档。
     auto_allow_tools: std::sync::atomic::AtomicBool,
@@ -1575,62 +1607,33 @@ impl ApprovalHost<'_> {
             span_id: None,
             structured_content: None,
         };
-        // `AskUserQuestion` 不是「要不要放行这个工具」，而是「claude 在问用户一个问题」。
-        // 官方答法是从**同一条** `can_use_tool` 通道回 `allow + updatedInput.answers`
-        // （没有第二条控制请求）。宿主这边把它转成 Kivio 已有的问用户卡片 —— 那套 UI 的
-        // 形状（问题 + 选项 + 单选/多选 + 自定义文本）与 claude 的入参一一对得上，
-        // 不该为它再造第二套卡片（spec 第 2 条）。
-        if crate::external_agents::session::claude_stream::is_ask_user_question(&ask.tool_name) {
-            if let Some(prompt) = ask_user_prompt_from_claude_input(&ask.input) {
-                let answered = crate::chat::commands::interaction::request_user_response(
-                    self.app,
-                    self.state,
-                    self.conversation_id,
-                    self.run_id,
-                    self.generation,
-                    &record,
-                    prompt.clone(),
-                )
-                .await;
-                // 答完把**带答案**的记录补发一次，消息流里才留得下「问了什么 + 选了什么」。
-                // 少了这一步，那条工具卡的载荷永远停在「等待作答」，而 claude 随后回的
-                // `tool_result` 又不带结构化内容 ⇒ 看着像「答完什么都没留下」。
-                // 内置 agent 那条路早就这么做了（`agent/execute.rs` 的 ask_user 分支）。
-                let mut answered_record = record.clone();
-                answered_record.status = ToolCallStatus::Success;
-                answered_record.completed_at = Some(chrono::Local::now().timestamp());
-                answered_record.sensitive = false;
-                answered_record.structured_content =
-                    Some(crate::chat::ask_user::structured_content(
-                        &prompt,
-                        &answered.phase,
-                        &answered.answers,
-                    ));
-                crate::chat::commands::interaction::emit_chat_tool_record(
-                    self.app,
-                    self.run_id,
-                    &answered_record,
-                );
-                // 同一份载荷再留一份给**落盘记录**：那条 tool 记录是流解析层建的
-                // （`structured_content` 是 claude 的原始入参），答案只有这里知道。
-                // 不留的话刷新一次「问了什么 + 选了什么」就没了（见 AppState 上的说明）。
-                if let Some(content) = answered_record.structured_content.clone() {
-                    self.state
-                        .answered_ask_user_content
-                        .lock()
-                        .unwrap_or_else(|err| err.into_inner())
-                        .insert(answered_record.id.clone(), content);
-                }
-                let approved = answered.phase == crate::chat::ask_user::ASK_USER_PHASE_ANSWERED;
+        // 问用户不是「要不要放行这个工具」，而是 CLI 在问用户一个问题。
+        // 官方答法走各 CLI 自己的线（claude: 同一条 `can_use_tool` 回
+        // `allow + updatedInput`；dsh: `session/ask` 回 `{ answers }`），
+        // 卡片是 Kivio 已有的那张 —— 不该为每条 CLI 再造一套（spec 第 2 条）。
+        if let Some(codec) =
+            crate::external_agents::ask_user::codec_for(self.agent_id, &ask.tool_name)
+        {
+            if let Some(prompt) = (codec.parse)(&ask.input) {
+                return self
+                    .present_ask_user(&ask, record, prompt, |prompt, answered| {
+                        (codec.encode)(&ask.input, prompt, answered)
+                    })
+                    .await;
+            }
+            if matches!(
+                codec.unknown_shape,
+                crate::external_agents::ask_user::UnknownAskShape::Reject
+            ) {
+                // 形状不认识：回拒。退审批卡没有意义（这条 CLI 等的不是 allow/deny）。
                 return crate::external_agents::session::live::ApprovalDecision {
                     request_id: ask.request_id,
-                    approved,
-                    updated_input: approved
-                        .then(|| claude_ask_user_updated_input(&ask.input, &answered)),
+                    approved: false,
+                    updated_input: None,
                     set_permission_mode: None,
                 };
             }
-            // 入参形状不认识（CLI 改了 schema）：退回普通审批卡，别静默吞掉这次询问。
+            // FallbackApproval：退回普通审批卡，别静默吞掉这次询问。
         }
         // `ExitPlanMode` = 「计划写完了，批准我照着做」。走普通审批卡（卡片上就是计划正文，
         // 见 `format_tool_approval_summary`），但批准时**必须额外切档位** —— CLI 不会因为这次
@@ -1726,6 +1729,64 @@ impl ApprovalHost<'_> {
         }
     }
 
+    /// 弹 Kivio 已有的问用户卡，答完补发带答案的工具记录并落盘。
+    ///
+    /// 答完把**带答案**的记录补发一次，消息流里才留得下「问了什么 + 选了什么」。
+    /// 少了这一步，那条工具卡的载荷永远停在「等待作答」，而 CLI 随后回的
+    /// `tool_result` 又不带结构化内容 ⇒ 看着像「答完什么都没留下」。
+    /// 内置 agent 那条路早就这么做了（`agent/execute.rs` 的 ask_user 分支）。
+    /// 同一份载荷再留一份给**落盘记录**：流解析层建的 tool 记录只有原始入参，
+    /// 答案只有这里知道。不留的话刷新一次「问了什么 + 选了什么」就没了。
+    async fn present_ask_user(
+        &self,
+        ask: &crate::external_agents::session::live::ApprovalAsk,
+        record: ToolCallRecord,
+        prompt: crate::chat::ask_user::AskUserPromptPayload,
+        encode: impl FnOnce(
+            &crate::chat::ask_user::AskUserPromptPayload,
+            &crate::chat::ask_user::AskUserResponseResult,
+        ) -> serde_json::Value,
+    ) -> crate::external_agents::session::live::ApprovalDecision {
+        let answered = crate::chat::commands::interaction::request_user_response(
+            self.app,
+            self.state,
+            self.conversation_id,
+            self.run_id,
+            self.generation,
+            &record,
+            prompt.clone(),
+        )
+        .await;
+        let mut answered_record = record;
+        answered_record.status = ToolCallStatus::Success;
+        answered_record.completed_at = Some(chrono::Local::now().timestamp());
+        answered_record.sensitive = false;
+        answered_record.structured_content = Some(crate::chat::ask_user::structured_content(
+            &prompt,
+            &answered.phase,
+            &answered.answers,
+        ));
+        crate::chat::commands::interaction::emit_chat_tool_record(
+            self.app,
+            self.run_id,
+            &answered_record,
+        );
+        if let Some(content) = answered_record.structured_content.clone() {
+            self.state
+                .answered_ask_user_content
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .insert(answered_record.id.clone(), content);
+        }
+        let approved = answered.phase == crate::chat::ask_user::ASK_USER_PHASE_ANSWERED;
+        crate::external_agents::session::live::ApprovalDecision {
+            request_id: ask.request_id.clone(),
+            approved,
+            updated_input: approved.then(|| encode(&prompt, &answered)),
+            set_permission_mode: None,
+        }
+    }
+
     /// 扫掉本轮问过的挂起条目。异常出口（EOF / 硬 Close）下 `ask` 的 future 会被直接丢弃，
     /// 它没机会自己清理，不扫就在这张进程级的表里永久留一条。
     ///
@@ -1746,151 +1807,21 @@ impl ApprovalHost<'_> {
                 pending.remove(id);
             }
         }
+        {
+            let mut pending = self
+                .state
+                .pending_chat_user_prompts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in tool_call_ids {
+                pending.remove(id);
+            }
+        }
         for id in tool_call_ids {
             crate::chat::commands::interaction::withdraw_tool_confirm(self.app, id);
+            crate::chat::protocol::resolve_user_prompt(self.app, self.run_id, id);
         }
     }
-}
-
-/// claude `AskUserQuestion` 的入参 → Kivio 的问用户卡片载荷。
-///
-/// 入参形状（官方工具 schema）：
-/// `{"questions":[{"question":"…","header":"…","multiSelect":bool,
-///   "options":[{"label":"…","description":"…"}]}]}`
-///
-/// 映射到 Kivio 的 `AskUserQuestion` 时，选项 id 用**下标**（claude 的选项没有 id，
-/// 只有 label），答复时再按同一个下标翻回 label —— 见 `claude_ask_user_updated_input`。
-/// 形状不认识（CLI 改了 schema）返回 `None`，调用方退回普通审批卡。
-fn ask_user_prompt_from_claude_input(
-    input: &serde_json::Value,
-) -> Option<crate::chat::ask_user::AskUserPromptPayload> {
-    let raw = input.get("questions")?.as_array()?;
-    let questions: Vec<crate::chat::ask_user::AskUserQuestion> = raw
-        .iter()
-        .enumerate()
-        .filter_map(|(qi, question)| {
-            let text = question.get("question")?.as_str()?.trim().to_string();
-            if text.is_empty() {
-                return None;
-            }
-            let options: Vec<crate::chat::ask_user::AskUserOption> = question
-                .get("options")
-                .and_then(|v| v.as_array())
-                .map(|options| {
-                    options
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(oi, option)| {
-                            let label = option.get("label")?.as_str()?.trim().to_string();
-                            if label.is_empty() {
-                                return None;
-                            }
-                            Some(crate::chat::ask_user::AskUserOption {
-                                id: oi.to_string(),
-                                label,
-                                description: option
-                                    .get("description")
-                                    .and_then(|v| v.as_str())
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .map(str::to_string),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if options.is_empty() {
-                return None;
-            }
-            Some(crate::chat::ask_user::AskUserQuestion {
-                id: qi.to_string(),
-                prompt: text,
-                options,
-                allow_multiple: question
-                    .get("multiSelect")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-                // claude 的 schema 里没有「自定义文本」这一档，但用户总该能不选任何预设项
-                // 直接说自己的想法 —— 这是 Kivio 卡片本来就有的能力，白给。
-                allow_custom: true,
-            })
-        })
-        .collect();
-    (!questions.is_empty()).then_some(crate::chat::ask_user::AskUserPromptPayload {
-        title: None,
-        questions,
-    })
-}
-
-/// 用户的选择 → claude 要的 `updatedInput`。
-///
-/// 官方形状：`{"questions": <原样回传>, "answers": {"<问题文本>": "<选中的 label>"}}`。
-/// 多选时把多个 label 用 `, ` 拼起来（官方文档只给了单选的例子，多选的分隔符**未核实**；
-/// 拼串至少保证 claude 拿到的是它认识的字符串类型，而不是一个它可能不接受的数组）。
-/// 用户填的自定义文本优先于预设项 —— 那是他真正想说的话。
-///
-/// **回的是「原入参 + answers」而不是重新拼一个 `{questions, answers}`**（paseo 的写法：
-/// `{...permission.request.input, answers}`）。`updatedInput` 会**整个替换**这次调用的入参，
-/// 自己拼就意味着 CLI 哪天给 schema 加个字段、我们就静默把它丢了 —— paseo 那边这个坑是
-/// 真踩过的（CHANGELOG #760「Answering an interactive question from a Claude agent now
-/// reaches Claude correctly instead of being dropped」）。
-fn claude_ask_user_updated_input(
-    original_input: &serde_json::Value,
-    answered: &crate::chat::ask_user::AskUserResponseResult,
-) -> serde_json::Value {
-    let mut answers = serde_json::Map::new();
-    let raw = original_input
-        .get("questions")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for (qi, question) in raw.iter().enumerate() {
-        let Some(text) = question.get("question").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(answer) = answered.answers.get(&qi.to_string()) else {
-            continue;
-        };
-        if let Some(custom) = answer
-            .custom_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            answers.insert(
-                text.to_string(),
-                serde_json::Value::String(custom.to_string()),
-            );
-            continue;
-        }
-        let labels: Vec<String> = answer
-            .selected_option_ids
-            .iter()
-            .filter_map(|id| {
-                let index: usize = id.parse().ok()?;
-                question
-                    .get("options")?
-                    .as_array()?
-                    .get(index)?
-                    .get("label")?
-                    .as_str()
-                    .map(str::to_string)
-            })
-            .collect();
-        if !labels.is_empty() {
-            answers.insert(
-                text.to_string(),
-                serde_json::Value::String(labels.join(", ")),
-            );
-        }
-    }
-    let mut updated = original_input
-        .as_object()
-        .cloned()
-        .unwrap_or_else(serde_json::Map::new);
-    updated.insert("questions".to_string(), serde_json::Value::Array(raw));
-    updated.insert("answers".to_string(), serde_json::Value::Object(answers));
-    serde_json::Value::Object(updated)
 }
 
 fn persistent_protocol_tag(protocol: StreamFormat) -> &'static str {
@@ -1952,6 +1883,161 @@ fn background_task_sink(
             });
         }
     })
+}
+
+fn dsh_idle_sink(
+    app: &AppHandle,
+    conversation_id: &str,
+) -> crate::external_agents::session::dsh_jsonrpc::DshIdleSink {
+    use crate::external_agents::session::dsh_jsonrpc::DshIdleEffect;
+    let app = app.clone();
+    let conversation_id = conversation_id.to_string();
+    std::sync::Arc::new(move |effect| match effect {
+        DshIdleEffect::Event(event) => apply_idle_dsh_event(&app, &conversation_id, event),
+        DshIdleEffect::Wake { text, model, usage } => {
+            let app = app.clone();
+            let conversation_id = conversation_id.clone();
+            tauri::async_runtime::spawn(async move {
+                append_wake_turn_message(app, conversation_id, text, model, usage).await;
+            });
+        }
+    })
+}
+
+fn apply_idle_dsh_event(app: &AppHandle, conversation_id: &str, event: UnifiedAgentEvent) {
+    match event {
+        UnifiedAgentEvent::BackgroundTask {
+            task_id,
+            status,
+            kind,
+            description,
+            summary,
+        } => {
+            app.state::<AppState>().upsert_external_background_task(
+                conversation_id,
+                &task_id,
+                &status,
+                kind.as_deref(),
+                description.as_deref(),
+                summary.as_deref(),
+            );
+            if status == "running" && summary.is_none() {
+                return;
+            }
+            let preview = summary.clone().unwrap_or_default();
+            emit_live_subagent_progress(
+                app,
+                conversation_id,
+                &task_id,
+                &status,
+                preview.clone(),
+                Vec::new(),
+            );
+            persist_dsh_subagent_card(
+                app.clone(),
+                conversation_id.to_string(),
+                task_id,
+                status,
+                preview,
+                Vec::new(),
+                summary,
+            );
+        }
+        UnifiedAgentEvent::SubagentProgress {
+            task_id,
+            status,
+            preview,
+            steps,
+        } => {
+            emit_live_subagent_progress(
+                app,
+                conversation_id,
+                &task_id,
+                &status,
+                preview.clone(),
+                steps.clone(),
+            );
+            persist_dsh_subagent_card(
+                app.clone(),
+                conversation_id.to_string(),
+                task_id,
+                status,
+                preview,
+                steps,
+                None,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn emit_live_subagent_progress(
+    app: &AppHandle,
+    conversation_id: &str,
+    task_id: &str,
+    status: &str,
+    preview: String,
+    steps: Vec<String>,
+) {
+    crate::chat::protocol::emit_live_run_event(
+        app,
+        conversation_id,
+        crate::chat::protocol::ChatRunEvent::SubagentUpdated {
+            parent_tool_call_id: String::new(),
+            task_id: task_id.to_string(),
+            name: "subagent".to_string(),
+            model: None,
+            depth: 1,
+            status: status.to_string(),
+            preview: (!preview.is_empty()).then_some(preview),
+            steps,
+        },
+    );
+}
+
+fn persist_dsh_subagent_card(
+    app: AppHandle,
+    conversation_id: String,
+    task_id: String,
+    status: String,
+    preview: String,
+    steps: Vec<String>,
+    summary: Option<String>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let now = Local::now().timestamp();
+        if let Err(err) = crate::chat::repository::repository(&app)
+            .mutate(&app, &conversation_id, move |conversation| {
+                for message in conversation.messages.iter_mut().rev() {
+                    let Some(record) = find_dsh_subagent_record(&mut message.tool_calls, &task_id)
+                    else {
+                        continue;
+                    };
+                    if !steps.is_empty() || !preview.is_empty() {
+                        merge_subagent_progress(record, &preview, &steps, &status, &task_id);
+                    } else {
+                        attach_child_session_id(record, &task_id);
+                    }
+                    if status != "running" {
+                        record.status = match status.as_str() {
+                            "failed" => ToolCallStatus::Error,
+                            "stopped" | "cancelled" => ToolCallStatus::Cancelled,
+                            _ => ToolCallStatus::Success,
+                        };
+                        if let Some(summary) = summary.as_ref().filter(|text| !text.is_empty()) {
+                            record.result_preview = Some(truncate_for_preview(summary, 800));
+                        }
+                        record.completed_at = Some(now);
+                    }
+                    return Ok(());
+                }
+                Ok(())
+            })
+            .await
+        {
+            eprintln!("[external-agent] persist dsh subagent card failed: {err}");
+        }
+    });
 }
 
 /// 把唤醒轮（后台任务完成后 CLI 自起的一轮）的正文落成一条真正的助手消息，
@@ -2018,8 +2104,8 @@ async fn append_wake_turn_message(
 /// Connect (or resume) a persistent protocol session, returning its control channel, native id,
 /// and whether a resume actually succeeded. Falls back to a fresh session if resume fails.
 ///
-/// `background_task_sink`：claude 轮间空闲读到的后台任务事件旁路（→ AppState 注册表），
-/// 其余协议无后台任务概念，忽略。
+/// `background_task_sink`：claude 轮间空闲读到的后台任务事件旁路（→ AppState 注册表）。
+/// `dsh_idle_sink`：dsh 轮间的任务边沿 + 子代理进度 + 唤醒轮正文。
 #[allow(clippy::too_many_arguments)]
 async fn connect_persistent_session(
     protocol: StreamFormat,
@@ -2029,11 +2115,13 @@ async fn connect_persistent_session(
     model: Option<&str>,
     reasoning: Option<&str>,
     sandbox: Option<&str>,
+    preset: Option<&str>,
     mcp_servers: &[AcpMcpServer],
     resume_native: Option<String>,
     background_task_sink: Option<
         crate::external_agents::session::claude_stream::BackgroundTaskSink,
     >,
+    dsh_idle_sink: Option<crate::external_agents::session::dsh_jsonrpc::DshIdleSink>,
 ) -> Result<PersistentConnection, String> {
     use crate::external_agents::session::acp::{spawn_acp_session_actor, AcpSession};
     use crate::external_agents::session::claude_stream::{
@@ -2043,7 +2131,7 @@ async fn connect_persistent_session(
         spawn_codex_session_actor, CodexAppServerSession,
     };
     use crate::external_agents::session::dsh_jsonrpc::{
-        spawn_dsh_session_actor, DshJsonRpcSession,
+        spawn_dsh_session_actor_with_sink, DshJsonRpcSession,
     };
 
     match protocol {
@@ -2176,7 +2264,10 @@ async fn connect_persistent_session(
             })
         }
         StreamFormat::DshJsonRpc => {
-            let session = DshJsonRpcSession::connect(
+            // 与 ACP / codex 同口径：续接失败且目标原生会话已经不在，降级开新会话，
+            // 而不是把 session/open 的原文甩成一轮硬失败。resume mismatch / 其它握手错误
+            // 仍 fail-loud（那不是「会话没了」）。
+            let session = match DshJsonRpcSession::connect(
                 resolved_bin,
                 args,
                 cwd,
@@ -2184,13 +2275,40 @@ async fn connect_persistent_session(
                 model,
                 reasoning,
                 sandbox,
+                preset,
             )
-            .await?;
+            .await
+            {
+                Ok(session) => session,
+                Err(err)
+                    if resume_native.as_deref().is_some_and(|id| !id.trim().is_empty())
+                        && crate::external_agents::session::dsh_jsonrpc::is_missing_session_error(
+                            &err,
+                        ) =>
+                {
+                    eprintln!(
+                        "[external-agent] dsh resume failed (session {}), connecting fresh: {err}",
+                        resume_native.as_deref().unwrap_or("")
+                    );
+                    DshJsonRpcSession::connect(
+                        resolved_bin,
+                        args,
+                        cwd,
+                        None,
+                        model,
+                        reasoning,
+                        sandbox,
+                        preset,
+                    )
+                    .await?
+                }
+                Err(err) => return Err(err),
+            };
             let id = session.session_id().to_string();
             let resumed = session.resumed();
             let child_pid = session.child_pid();
             Ok(PersistentConnection {
-                control: spawn_dsh_session_actor(session),
+                control: spawn_dsh_session_actor_with_sink(session, dsh_idle_sink),
                 native_id: id,
                 resumed,
                 child_pid,
@@ -2356,6 +2474,7 @@ fn apply_unified_event(
     segment_order: &mut u32,
     segment_tracker: &mut StreamSegmentTracker,
     cli_compactions: &mut Vec<CompactionBoundaryRecord>,
+    todo_state: &mut AgentTodoState,
     event: UnifiedAgentEvent,
 ) {
     let now = Local::now().timestamp();
@@ -2417,13 +2536,7 @@ fn apply_unified_event(
         } => {
             if let Some(idx) = tool_map.get(&tool_use_id).copied() {
                 if let Some(record) = tool_calls.get_mut(idx) {
-                    record.status = if is_error {
-                        ToolCallStatus::Error
-                    } else {
-                        ToolCallStatus::Success
-                    };
-                    record.result_preview = Some(truncate_for_preview(&result_content, 800));
-                    record.completed_at = Some(now);
+                    apply_external_tool_result(record, &result_content, is_error, now);
                     // 问用户答完时留下的 `askUser` 载荷（问题 + 用户选的答案）在这里落进记录，
                     // 覆盖流解析层塞的原始入参 —— 否则消息流里那块刷新一次就只剩一行灰字。
                     if let Some(answered) = app
@@ -2435,7 +2548,36 @@ fn apply_unified_event(
                     {
                         record.structured_content = Some(answered);
                     }
-                    emit_chat_tool_record(app, run_id, record);
+                    let claude_todo = if !is_error
+                        && crate::external_agents::claude_todo::is_claude_todo_tool(&record.name)
+                    {
+                        Some((
+                            record.name.clone(),
+                            record
+                                .structured_content
+                                .clone()
+                                .unwrap_or(serde_json::Value::Null),
+                            result_content.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((name, input, result)) = claude_todo {
+                        if let Some(next) = crate::external_agents::claude_todo::apply_claude_todo_tool(
+                            todo_state,
+                            &name,
+                            &input,
+                            &result,
+                        ) {
+                            *todo_state = next;
+                            publish_todo_state(app, run_id, record, todo_state);
+                            persist_claude_todo(app, conversation_id, name, input, result);
+                        } else {
+                            emit_chat_tool_record(app, run_id, record);
+                        }
+                    } else {
+                        emit_chat_tool_record(app, run_id, record);
+                    }
                 }
             }
         }
@@ -2544,9 +2686,309 @@ fn apply_unified_event(
                 description.as_deref(),
                 summary.as_deref(),
             );
+            // dsh 后台子代理的 tool/result 只是派出回执。终态走 BackgroundTask，
+            // 同一轮里把对应工具卡从 Running 收掉（跨轮要靠空闲读，目前 dsh 没有）。
+            if status != "running" {
+                if let Some(record) = find_dsh_subagent_record(tool_calls, &task_id) {
+                    record.status = match status.as_str() {
+                        "failed" => ToolCallStatus::Error,
+                        "stopped" => ToolCallStatus::Cancelled,
+                        _ => ToolCallStatus::Success,
+                    };
+                    if let Some(summary) = summary.filter(|text| !text.is_empty()) {
+                        record.result_preview = Some(truncate_for_preview(&summary, 800));
+                    }
+                    record.completed_at = Some(now);
+                    emit_chat_tool_record(app, run_id, record);
+                }
+            }
+        }
+        UnifiedAgentEvent::SubagentProgress {
+            task_id,
+            status,
+            preview,
+            steps,
+        } => {
+            if let Some(record) = find_dsh_subagent_record(tool_calls, &task_id) {
+                merge_subagent_progress(record, &preview, &steps, &status, &task_id);
+                emit_chat_tool_record(app, run_id, record);
+                crate::chat::protocol::emit_run_event(
+                    app,
+                    run_id,
+                    crate::chat::protocol::ChatRunEvent::SubagentUpdated {
+                        parent_tool_call_id: record.id.clone(),
+                        task_id,
+                        name: record.name.clone(),
+                        model: None,
+                        depth: 1,
+                        status,
+                        preview: (!preview.is_empty()).then_some(preview),
+                        steps,
+                    },
+                );
+            }
+        }
+        UnifiedAgentEvent::TodoWrite { todos } => {
+            let Some(state) =
+                crate::external_agents::session::dsh_jsonrpc::todo_state_from_write(&todos)
+            else {
+                return;
+            };
+            *todo_state = state.clone();
+            if let Some(record) = tool_calls
+                .iter_mut()
+                .rev()
+                .find(|record| record.name.eq_ignore_ascii_case("todo_write"))
+            {
+                publish_todo_state(app, run_id, record, todo_state);
+            } else {
+                crate::chat::protocol::emit_run_event(
+                    app,
+                    run_id,
+                    crate::chat::protocol::ChatRunEvent::TodoUpdated {
+                        todo_state: (&state).into(),
+                    },
+                );
+            }
+            let app = app.clone();
+            let conversation_id = conversation_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                match crate::chat::repository::repository(&app)
+                    .update_todo(&app, &conversation_id, state)
+                    .await
+                {
+                    Ok(persisted) => crate::chat::todo::emit_chat_todo_state(
+                        &app,
+                        &conversation_id,
+                        persisted.revision,
+                        &persisted.agent_todo_state,
+                    ),
+                    Err(err) => {
+                        eprintln!("[external-agent] persist dsh todo failed: {err}");
+                    }
+                }
+            });
         }
         _ => {}
     }
+}
+
+fn apply_external_tool_result(
+    record: &mut ToolCallRecord,
+    result_content: &str,
+    is_error: bool,
+    now: i64,
+) {
+    if !is_error {
+        if let Some(task_id) = crate::external_agents::session::dsh_jsonrpc::subagent_launch_task_id(
+            &record.name,
+            result_content,
+        ) {
+            record.status = ToolCallStatus::Running;
+            record.completed_at = None;
+            record.result_preview = None;
+            attach_background_task_id(record, &task_id);
+            return;
+        }
+    }
+    record.status = if is_error {
+        ToolCallStatus::Error
+    } else {
+        ToolCallStatus::Success
+    };
+    record.result_preview = Some(truncate_for_preview(result_content, 800));
+    record.completed_at = Some(now);
+}
+
+fn attach_background_task_id(record: &mut ToolCallRecord, task_id: &str) {
+    let mut payload = record
+        .structured_content
+        .clone()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "backgroundTaskId".to_string(),
+            serde_json::Value::String(task_id.to_string()),
+        );
+    }
+    record.structured_content = Some(payload);
+}
+
+fn merge_subagent_progress(
+    record: &mut ToolCallRecord,
+    preview: &str,
+    steps: &[String],
+    status: &str,
+    incoming_task_id: &str,
+) {
+    attach_child_session_id(record, incoming_task_id);
+    let mut payload = record
+        .structured_content
+        .clone()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "subagentProgress".to_string(),
+            serde_json::json!({
+                "taskId": background_task_id(record)
+                    .or_else(|| (!incoming_task_id.is_empty()).then(|| incoming_task_id.to_string())),
+                "name": record.name,
+                "status": status,
+                "preview": preview,
+                "steps": steps,
+                "depth": 1,
+            }),
+        );
+    }
+    record.structured_content = Some(payload);
+}
+
+fn structured_string_field(record: &ToolCallRecord, key: &str) -> Option<String> {
+    record
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+fn background_task_id(record: &ToolCallRecord) -> Option<String> {
+    structured_string_field(record, "backgroundTaskId")
+}
+
+fn child_session_id(record: &ToolCallRecord) -> Option<String> {
+    structured_string_field(record, "childSessionId")
+}
+
+fn attach_child_session_id(record: &mut ToolCallRecord, task_id: &str) {
+    if task_id.is_empty() || background_task_id(record).as_deref() == Some(task_id) {
+        return;
+    }
+    if child_session_id(record).as_deref() == Some(task_id) {
+        return;
+    }
+    let mut payload = record
+        .structured_content
+        .clone()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "childSessionId".to_string(),
+            serde_json::Value::String(task_id.to_string()),
+        );
+    }
+    record.structured_content = Some(payload);
+}
+
+/// 派出回执是 `jobs` 的 `jobId`（`subagent-1`），子会话 `session.event` 是另一个
+/// `session.id`。对得上就精确绑；对不上且只有一张 Running 子代理卡时绑到那张。
+fn find_dsh_subagent_record<'a>(
+    tool_calls: &'a mut [ToolCallRecord],
+    task_id: &str,
+) -> Option<&'a mut ToolCallRecord> {
+    if !task_id.is_empty() {
+        if let Some(index) = tool_calls.iter().rposition(|record| {
+            background_task_id(record).as_deref() == Some(task_id)
+                || child_session_id(record).as_deref() == Some(task_id)
+        }) {
+            return tool_calls.get_mut(index);
+        }
+    }
+    // ponytail: 并行多个子代理时不猜，避免把 A 的步骤写到 B 上。
+    let running: Vec<usize> = tool_calls
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            record.status == ToolCallStatus::Running
+                && crate::external_agents::session::dsh_jsonrpc::is_subagent_tool_name(&record.name)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    if running.len() == 1 {
+        return tool_calls.get_mut(running[0]);
+    }
+    None
+}
+
+/// 立刻把对话 Todo 条和工具卡接到同一份快照上（DSH 整表 / Claude 补丁共用）。
+fn publish_todo_state(
+    app: &AppHandle,
+    run_id: &str,
+    record: &mut ToolCallRecord,
+    state: &AgentTodoState,
+) {
+    crate::chat::protocol::emit_run_event(
+        app,
+        run_id,
+        crate::chat::protocol::ChatRunEvent::TodoUpdated {
+            todo_state: state.into(),
+        },
+    );
+    let mut payload = record
+        .structured_content
+        .clone()
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        if let Ok(todo) = serde_json::to_value(state) {
+            object.insert("todoState".to_string(), todo);
+        }
+    }
+    record.structured_content = Some(payload);
+    emit_chat_tool_record(app, run_id, record);
+}
+
+/// Claude Code 的 Task / 旧 TodoWrite 成功之后，在对话锁里补丁列表再发协议事件。
+///
+/// 必须进 `mutate`：`TaskUpdate` 是补丁，不能拿一份过期快照 `update_todo` 整表盖掉。
+fn persist_claude_todo(
+    app: &AppHandle,
+    conversation_id: &str,
+    name: String,
+    input: serde_json::Value,
+    result: String,
+) {
+    if crate::external_agents::claude_todo::apply_claude_todo_tool(
+        &crate::chat::types::AgentTodoState::default(),
+        &name,
+        &input,
+        &result,
+    )
+    .is_none()
+    {
+        return;
+    }
+    let app = app.clone();
+    let conversation_id = conversation_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        match crate::chat::repository::repository(&app)
+            .mutate(&app, &conversation_id, move |conversation| {
+                if let Some(next) = crate::external_agents::claude_todo::apply_claude_todo_tool(
+                    &conversation.agent_todo_state,
+                    &name,
+                    &input,
+                    &result,
+                ) {
+                    conversation.agent_todo_state = next;
+                }
+                Ok(())
+            })
+            .await
+        {
+            Ok(persisted) => crate::chat::todo::emit_chat_todo_state(
+                &app,
+                &conversation_id,
+                persisted.revision,
+                &persisted.agent_todo_state,
+            ),
+            Err(err) => {
+                eprintln!("[external-agent] persist claude todo failed: {err}");
+            }
+        }
+    });
 }
 
 /// 本轮的失败判据：读流错误与**协议层自报的失败**（`UnifiedAgentEvent::Error`）共用
@@ -2645,6 +3087,136 @@ mod tests {
     #[test]
     fn clean_turn_has_no_error() {
         assert_eq!(resolve_turn_error(None, None), None);
+    }
+
+    #[test]
+    fn subagent_launch_receipt_keeps_the_tool_card_running() {
+        let mut record = ToolCallRecord {
+            id: "c1".into(),
+            name: "subagent".into(),
+            source: "external_cli".into(),
+            server_id: None,
+            arguments: "{}".into(),
+            status: ToolCallStatus::Running,
+            result_preview: None,
+            error: None,
+            duration_ms: None,
+            started_at: Some(1),
+            completed_at: None,
+            round: 1,
+            sensitive: false,
+            artifacts: vec![],
+            trace_id: None,
+            span_id: None,
+            structured_content: Some(serde_json::json!({ "description": "搜资讯" })),
+        };
+        apply_external_tool_result(
+            &mut record,
+            "started subagent 018b08fc-ee7f-4ea5-b77c-9c5d1c6ecf50",
+            false,
+            99,
+        );
+        assert_eq!(record.status, ToolCallStatus::Running);
+        assert_eq!(record.completed_at, None);
+        assert_eq!(record.result_preview, None);
+        assert_eq!(
+            background_task_id(&record).as_deref(),
+            Some("018b08fc-ee7f-4ea5-b77c-9c5d1c6ecf50")
+        );
+    }
+
+    #[test]
+    fn subagent_progress_lands_on_the_parent_tool_card() {
+        let mut record = ToolCallRecord {
+            id: "c1".into(),
+            name: "subagent".into(),
+            source: "external_cli".into(),
+            server_id: None,
+            arguments: "{}".into(),
+            status: ToolCallStatus::Running,
+            result_preview: None,
+            error: None,
+            duration_ms: None,
+            started_at: Some(1),
+            completed_at: None,
+            round: 1,
+            sensitive: false,
+            artifacts: vec![],
+            trace_id: None,
+            span_id: None,
+            structured_content: Some(serde_json::json!({
+                "backgroundTaskId": "child-9",
+                "description": "搜资讯"
+            })),
+        };
+        merge_subagent_progress(
+            &mut record,
+            "正在检索",
+            &["web_search 最新AI".to_string()],
+            "running",
+            "child-9",
+        );
+        let progress = record
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get("subagentProgress"))
+            .expect("progress");
+        assert_eq!(progress["taskId"], "child-9");
+        assert_eq!(progress["status"], "running");
+        assert_eq!(progress["preview"], "正在检索");
+        assert_eq!(progress["steps"][0], "web_search 最新AI");
+        assert_eq!(
+            record.structured_content.as_ref().unwrap()["backgroundTaskId"],
+            "child-9"
+        );
+    }
+
+    #[test]
+    fn subagent_progress_binds_child_session_to_the_launch_receipt_card() {
+        let mut tools = vec![ToolCallRecord {
+            id: "c1".into(),
+            name: "subagent".into(),
+            source: "external_cli".into(),
+            server_id: None,
+            arguments: "{}".into(),
+            status: ToolCallStatus::Running,
+            result_preview: None,
+            error: None,
+            duration_ms: None,
+            started_at: Some(1),
+            completed_at: None,
+            round: 1,
+            sensitive: false,
+            artifacts: vec![],
+            trace_id: None,
+            span_id: None,
+            structured_content: Some(serde_json::json!({
+                "backgroundTaskId": "subagent-1",
+                "description": "搜资讯"
+            })),
+        }];
+        {
+            let record = find_dsh_subagent_record(&mut tools, "018b08fc-session").expect("bind");
+            merge_subagent_progress(
+                record,
+                "正在检索",
+                &["web_search 最新AI".to_string()],
+                "running",
+                "018b08fc-session",
+            );
+        }
+        assert_eq!(
+            tools[0].structured_content.as_ref().unwrap()["childSessionId"],
+            "018b08fc-session"
+        );
+        assert_eq!(
+            tools[0].structured_content.as_ref().unwrap()["subagentProgress"]["steps"][0],
+            "web_search 最新AI"
+        );
+        assert!(
+            find_dsh_subagent_record(&mut tools, "018b08fc-session").is_some(),
+            "later events must exact-match the stored child session id"
+        );
     }
 
     /// 端到端：claude 未登录的**真实样本**从流解析一路走到气泡文案。
@@ -2886,6 +3458,10 @@ mod tests {
         assert!(!turn_asks_for_permission(&[]));
         // 值出现在别处（比如某个 prompt 里）不算 —— 判据只认 flag 本身。
         assert!(!turn_asks_for_permission(&["stdio".to_string()]));
+        // dsh 没有 `--permission-prompt-tool`：问用户靠 codec 开通道。
+        assert!(turn_needs_approval_host(&[], "dsh"));
+        assert!(!turn_needs_approval_host(&[], "cursor"));
+        assert!(!turn_needs_approval_host(&[], "claude"));
     }
 
     /// 「完全」档接上询问通道之后**用户感知不到差别**：普通工具原地放行，只有问用户卡会弹。
@@ -3158,6 +3734,26 @@ mod tests {
         );
     }
 
+    const REAL_DSH_MISSING_SESSION_ERROR: &str =
+        "dsh session/open: session \"kivio-old\" not found";
+
+    #[test]
+    fn a_missing_dsh_resume_target_reconnects_without_resume_exactly_once() {
+        assert_eq!(
+            persistent_failure_action(REAL_DSH_MISSING_SESSION_ERROR, "dsh", false, false, false),
+            PersistentFailureAction::ReconnectWithoutResume
+        );
+        assert_eq!(
+            persistent_failure_action(REAL_DSH_MISSING_SESSION_ERROR, "dsh", false, false, true),
+            PersistentFailureAction::Fatal
+        );
+        // 宽到 "Session not found" 会把无关失败拽进降级；dsh 必须带 session/open 前缀。
+        assert_ne!(
+            persistent_failure_action("Session not found: abc", "dsh", false, false, false),
+            PersistentFailureAction::ReconnectWithoutResume
+        );
+    }
+
     /// 启动阶段暴露的那条（`connect()` 的 `try_wait` 抓到「立刻退出」+ stderr 尾部）
     /// 必须命中同一条判据 —— 判据是 `contains`，不是全等。
     #[test]
@@ -3298,126 +3894,6 @@ mod tests {
         ));
     }
 
-    /// claude 的 `AskUserQuestion` 入参必须能映射成 Kivio 的问用户卡片，否则这个功能
-    /// 就退回到「当场拒」——claude 在 Kivio 里从此不能反问用户。
-    #[test]
-    fn claude_ask_user_input_maps_to_the_ask_user_card() {
-        let input = serde_json::json!({
-            "questions": [{
-                "question": "用哪种缓存？",
-                "header": "Cache",
-                "multiSelect": false,
-                "options": [
-                    { "label": "Redis", "description": "跨进程共享" },
-                    { "label": "内存", "description": null },
-                ],
-            }],
-        });
-        let prompt = ask_user_prompt_from_claude_input(&input).expect("必须能映射");
-        assert_eq!(prompt.questions.len(), 1);
-        let question = &prompt.questions[0];
-        assert_eq!(question.prompt, "用哪种缓存？");
-        assert!(!question.allow_multiple);
-        // 选项 id 是**下标**（claude 的选项没有 id），答复时按同一个下标翻回 label。
-        assert_eq!(question.options[0].id, "0");
-        assert_eq!(question.options[0].label, "Redis");
-        assert_eq!(
-            question.options[0].description.as_deref(),
-            Some("跨进程共享")
-        );
-        assert_eq!(question.options[1].id, "1");
-        assert!(question.options[1].description.is_none());
-    }
-
-    /// 形状不认识时必须返回 `None` —— 调用方据此退回普通审批卡，而不是静默吞掉询问
-    /// （吞掉 = CLI 那条 promise 永远等不到回复 = 整轮挂死）。
-    #[test]
-    fn unknown_ask_user_shapes_degrade_to_none() {
-        assert!(ask_user_prompt_from_claude_input(&serde_json::json!({})).is_none());
-        // 没有选项的问题不成卡片。
-        assert!(ask_user_prompt_from_claude_input(&serde_json::json!({
-            "questions": [{ "question": "空的", "options": [] }],
-        }))
-        .is_none());
-    }
-
-    /// 答复必须按官方形状回：`{questions: <原样>, answers: {"<问题文本>": "<label>"}}`。
-    /// 键是**问题文本**而不是下标 —— 用错就等于没答，claude 会当成没选。
-    #[test]
-    fn ask_user_answers_use_the_question_text_as_key() {
-        let input = serde_json::json!({
-            "questions": [{
-                "question": "用哪种缓存？",
-                "options": [{ "label": "Redis" }, { "label": "内存" }],
-            }],
-        });
-        let answered = crate::chat::ask_user::AskUserResponseResult {
-            phase: crate::chat::ask_user::ASK_USER_PHASE_ANSWERED.to_string(),
-            answers: std::collections::HashMap::from([(
-                "0".to_string(),
-                crate::chat::ask_user::AskUserAnswer {
-                    selected_option_ids: vec!["1".to_string()],
-                    custom_text: None,
-                },
-            )]),
-        };
-        let updated = claude_ask_user_updated_input(&input, &answered);
-        assert_eq!(
-            updated["answers"]["用哪种缓存？"],
-            serde_json::json!("内存")
-        );
-        // 原问题必须原样回传（官方要求）。
-        assert_eq!(updated["questions"], input["questions"]);
-    }
-
-    /// 用户填的自定义文本优先于预设项 —— 那是他真正想说的话。
-    #[test]
-    fn custom_text_wins_over_selected_options() {
-        let input = serde_json::json!({
-            "questions": [{ "question": "怎么做？", "options": [{ "label": "A" }] }],
-        });
-        let answered = crate::chat::ask_user::AskUserResponseResult {
-            phase: crate::chat::ask_user::ASK_USER_PHASE_ANSWERED.to_string(),
-            answers: std::collections::HashMap::from([(
-                "0".to_string(),
-                crate::chat::ask_user::AskUserAnswer {
-                    selected_option_ids: vec!["0".to_string()],
-                    custom_text: Some("都不要，换个思路".to_string()),
-                },
-            )]),
-        };
-        let updated = claude_ask_user_updated_input(&input, &answered);
-        assert_eq!(
-            updated["answers"]["怎么做？"],
-            serde_json::json!("都不要，换个思路")
-        );
-    }
-
-    /// `updatedInput` **整个替换**这次调用的入参，所以原入参里我们不认识的字段必须原样带回，
-    /// 不能自己拼一个 `{questions, answers}` 了事 —— 那样 CLI 加个字段我们就静默丢了它
-    /// （paseo 踩过这个坑，见 `claude_ask_user_updated_input` 的说明）。
-    #[test]
-    fn unknown_input_fields_survive_the_round_trip() {
-        let input = serde_json::json!({
-            "questions": [{ "question": "去哪？", "options": [{ "label": "左" }] }],
-            "someFutureField": { "kept": true },
-        });
-        let answered = crate::chat::ask_user::AskUserResponseResult {
-            phase: crate::chat::ask_user::ASK_USER_PHASE_ANSWERED.to_string(),
-            answers: std::collections::HashMap::from([(
-                "0".to_string(),
-                crate::chat::ask_user::AskUserAnswer {
-                    selected_option_ids: vec!["0".to_string()],
-                    custom_text: None,
-                },
-            )]),
-        };
-        let updated = claude_ask_user_updated_input(&input, &answered);
-        assert_eq!(updated["someFutureField"], input["someFutureField"]);
-        assert_eq!(updated["questions"], input["questions"]);
-        assert_eq!(updated["answers"]["去哪？"], serde_json::json!("左"));
-    }
-
     /// Claude fingerprints launch flags/instructions; dsh fingerprints model/reasoning/sandbox/provider.
     /// ACP / codex / pi can apply their relevant settings without this process-level fingerprint.
     #[test]
@@ -3427,37 +3903,64 @@ mod tests {
             Some("opus"),
             Some("high"),
             Some("plan"),
+            None,
             Some("hash-1"),
         );
         // model **不进指纹**：它能在会话内换（`set_model`），不需要换进程。
         assert_eq!(claude.flags, "high|plan");
         assert_eq!(claude.instructions.as_deref(), Some("hash-1"));
 
-        let dsh = |model, reasoning, sandbox| {
+        let dsh = |model, reasoning, sandbox, preset| {
             launch_config_for_turn(
                 StreamFormat::DshJsonRpc,
                 model,
                 reasoning,
                 sandbox,
+                preset,
                 Some("ignored-instructions"),
             )
         };
-        let dsh_base = dsh(Some("deepseek-v4-flash"), Some("off"), Some("read-only"));
+        let dsh_base = dsh(
+            Some("deepseek-v4-flash"),
+            Some("off"),
+            Some("read-only"),
+            None,
+        );
         assert!(dsh_base.instructions.is_none());
         assert_ne!(
             dsh_base,
-            dsh(Some("deepseek-v4-pro"), Some("off"), Some("read-only"))
+            dsh(
+                Some("deepseek-v4-pro"),
+                Some("off"),
+                Some("read-only"),
+                None
+            )
         );
         assert_ne!(
             dsh_base,
-            dsh(Some("deepseek-v4-flash"), Some("high"), Some("read-only"))
+            dsh(
+                Some("deepseek-v4-flash"),
+                Some("high"),
+                Some("read-only"),
+                None
+            )
         );
         assert_ne!(
             dsh_base,
             dsh(
                 Some("deepseek-v4-flash"),
                 Some("off"),
-                Some("workspace-write")
+                Some("workspace-write"),
+                None
+            )
+        );
+        assert_ne!(
+            dsh_base,
+            dsh(
+                Some("deepseek-v4-flash"),
+                Some("off"),
+                Some("read-only"),
+                Some("minimal")
             )
         );
         let provider_a = crate::settings::ExternalCliProvider {
@@ -3489,6 +3992,7 @@ mod tests {
                     Some("opus"),
                     Some("high"),
                     Some("plan"),
+                    None,
                     Some("h")
                 ),
                 LaunchConfig::default(),
@@ -3507,6 +4011,7 @@ mod tests {
                 model,
                 reasoning,
                 sandbox,
+                None,
                 hash,
             )
         };
@@ -3535,6 +4040,7 @@ mod tests {
                 model,
                 Some("high"),
                 Some("plan"),
+                None,
                 Some("h1"),
             )
         };

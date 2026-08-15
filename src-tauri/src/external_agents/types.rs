@@ -49,6 +49,9 @@ pub enum SlashStrategy {
     CodexAppServer,
     /// Discover via the Pi RPC `get_commands` request.
     PiRpc,
+    /// Official dsh `/` menu. JSON-RPC has no command-list RPC, so this is the
+    /// shipped names; Kivio only lists them and sends the slash line through.
+    Dsh,
     /// No discoverable slash commands for this CLI in headless mode.
     None,
 }
@@ -285,7 +288,9 @@ pub enum UnifiedAgentEvent {
     ///
     /// claude 的来源是 `system/task_started`（→ status `running`）与
     /// `system/task_notification`（→ 终态 `completed`/`failed`/`stopped`），见
-    /// `stream/claude.rs`。其余 CLI 目前没有对应协议，不发这条。
+    /// `stream/claude.rs`。dsh 走 `tool/result` 的 job id、`user/message`
+    /// （`source.plugin=tool-jobs`）终态通知，以及 `subagent.started` /
+    /// `subagent.finished` JSON-RPC 边沿。
     BackgroundTask {
         /// CLI 侧的任务 id（claude 的短 id，如 `b2foykvcu`）。注册表按它 upsert。
         task_id: String,
@@ -298,6 +303,24 @@ pub enum UnifiedAgentEvent {
         description: Option<String>,
         /// 终态摘要（notification 帧的 `summary`：命令退出码文案 / 子代理最终回复）。
         summary: Option<String>,
+    },
+    /// dsh `todo_write` 校验通过后写入会话日志的整表快照（`todo/write`）。
+    ///
+    /// 官方 UI 认这条事件，不认 `tool/call` 入参（入参可能随后被 execute 拒掉）。
+    /// 条目只有 `content` + `status`，没有 id。
+    TodoWrite {
+        todos: Value,
+    },
+    /// dsh 后台子代理（另一个 `sessionId`）的嵌套进度。
+    ///
+    /// 不能走 `TextDelta` / `ToolUse`：那些会进父气泡。前端已有
+    /// `subagent_updated` → `structuredContent.subagentProgress`。
+    /// `task_id` 是子会话 id，对应派出回执 / `subagent.started` 的 `childSessionId`。
+    SubagentProgress {
+        task_id: String,
+        status: String,
+        preview: String,
+        steps: Vec<String>,
     },
 }
 

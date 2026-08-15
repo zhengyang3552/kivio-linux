@@ -7,6 +7,7 @@ import { chatTitlebarPillButtonClass } from './platform'
 import { IconButton } from '../components/Button'
 import { usePopoverMaxHeight } from './usePopoverMaxHeight'
 import type { AgentRuntimeConfig } from './types'
+import { rememberedExternalRuntime } from './lastAgentRuntime'
 import './runtimePicker.css'
 
 const KIVIO_LOGO_SRC = '/logo-mark.png'
@@ -59,18 +60,20 @@ const CHAT: AgentRuntimeConfig = {
   externalReasoning: null,
 }
 
-function externalRuntime(agentId: string, model?: string | null): AgentRuntimeConfig {
-  return {
-    kind: 'external',
-    externalAgentId: agentId,
-    externalModel: model ?? 'default',
-    externalReasoning: null,
-  }
-}
-
 // 胶囊显示：把裸 "Default" 映射为「自动」（不再向用户暴露内部占位名）。
 function mapDefaultLabel(label: string): string {
   return label === 'Default' ? 'Auto' : label
+}
+
+/** ACP 探测常把思考开关报成 on/off，那不是档位。dsh 的 `off` 是真档位，会跟 high/max 一起出现。 */
+const ACP_SWITCH_IDS = ['on', 'off', 'true', 'false', 'enabled', 'disabled']
+
+function isAcpSwitchId(id: string): boolean {
+  return ACP_SWITCH_IDS.includes(id.toLowerCase())
+}
+
+function isAcpSwitchOnlyList(options: { id: string }[]): boolean {
+  return options.length > 0 && options.every((option) => isAcpSwitchId(option.id))
 }
 
 // 胶囊只显示模型名尾巴，去掉 provider 前缀（"foo/mimo-v2.5-pro" → "mimo-v2.5-pro"），
@@ -157,10 +160,13 @@ function RuntimePickerBase({ agentRuntime, onRuntimeChange, conversationId, lock
   const selectExternal = (agent: DetectedExternalAgent) => {
     if (locked) return
     if (!agent.available) return
-    // 隐式契约（D3）：后端各探测路径都把合成的 "default" 占位放在 models[0]
-    // （default_model_option / fallback_models 首项），因此这里取 [0] 即「让 CLI 用自己的默认模型」。
-    const defaultModel = agent.models[0]?.id ?? 'default'
-    onRuntimeChange(externalRuntime(agent.id, defaultModel))
+    // 已选中的代理再点一次只关菜单。重发 default 会把用户刚选的模型和思考档清成 Auto。
+    if (agentRuntime.kind === 'external' && agentRuntime.externalAgentId === agent.id) {
+      setOpen(false)
+      return
+    }
+    // 换代理时带回该 CLI 上次的模型/思考档。没有记录才走 default（胶囊显示 Auto）。
+    onRuntimeChange(rememberedExternalRuntime(agent.id))
     setOpen(false)
   }
 
@@ -302,6 +308,7 @@ function ExternalModelSelectorBase({
   // CLI 自己当前配置的模型（codex config.toml / ACP currentModelId / claude resolved）。用于胶囊
   // 显示真实名字并在用户未显式选择时自动同步；null = 该 CLI 无「当前」概念 → 显示「自动」。
   const [currentModel, setCurrentModel] = useState<string | null>(null)
+  const [currentReasoning, setCurrentReasoning] = useState<string | null>(null)
   // 请求代际：agent 切换/卸载时使在途请求失效，防止旧结果覆盖新 agent 或卸载后 setState。
   const modelsReqIdRef = useRef(0)
   // 上次探测的 agent：仅在真正切换 agent 时清空 currentModel。模型列表刻意跨请求保留（防闪），
@@ -326,6 +333,7 @@ function ExternalModelSelectorBase({
           setReasoningByModel(result.reasoningByModel ?? {})
           setSource(result.source)
           setCurrentModel(result.currentModel ?? null)
+          setCurrentReasoning(result.currentReasoning ?? null)
           // 自动同步 CLI 当前配置：仅当用户未显式选择（externalModel 空 / 'default'）时。
           const rt = runtimeRef.current
           const explicitModel = !!rt.externalModel && rt.externalModel !== 'default'
@@ -372,6 +380,7 @@ function ExternalModelSelectorBase({
       lastAgentIdRef.current = agentId
       // 换 agent：旧 CLI 的 currentModel 立刻失效（探测中显示「获取中…」而非上个 CLI 的模型名）。
       setCurrentModel(null)
+      setCurrentReasoning(null)
       setReasoningByModel({})
     }
     if (!agentId) {
@@ -396,37 +405,39 @@ function ExternalModelSelectorBase({
     if (modelId && Object.prototype.hasOwnProperty.call(reasoningByModel, modelId)) {
       return reasoningByModel[modelId] ?? []
     }
-    // 过滤 ACP 误报的 On-only 开关，避免胶囊显示「On」。
-    const filtered = reasoningOptions.filter(
-      (o) => !['on', 'off', 'true', 'false', 'enabled', 'disabled'].includes(o.id.toLowerCase()),
-    )
-    // 若过滤后只剩空、或原来就只有开关——不显示档位。
-    if (
-      reasoningOptions.length > 0 &&
-      reasoningOptions.every((o) =>
-        ['on', 'off', 'true', 'false', 'enabled', 'disabled'].includes(o.id.toLowerCase()),
-      )
-    ) {
+    // 整表都是 ACP 开关才藏档位。不要从混有 high/max 的表里单独抠掉 off——dsh 的 off 是真档位。
+    if (isAcpSwitchOnlyList(reasoningOptions)) {
       return []
     }
-    return filtered.length > 0 ? filtered : reasoningOptions
+    return reasoningOptions
   }, [agentRuntime.externalModel, currentModel, reasoningByModel, reasoningOptions])
 
   const reasoningPillValue = agentRuntime.externalReasoning ?? 'default'
   const currentReasoningLabel = useMemo(() => {
-    const opt = activeReasoningOptions.find((o) => o.id === reasoningPillValue)
-    const raw = opt?.label ?? reasoningPillValue
-    // 未显式选择推理等级（default）时显示「自动」，不再暴露裸 "Default"。
-    // 残留的 on/off 也当自动（不是档位名）。
+    const explicit =
+      !!agentRuntime.externalReasoning && agentRuntime.externalReasoning !== 'default'
+    // 未显式选择时跟模型胶囊同一口径：优先展示 CLI 实际在用的档位，而不是「Auto」。
+    const displayId = explicit
+      ? reasoningPillValue
+      : currentReasoning && currentReasoning !== 'default'
+        ? currentReasoning
+        : reasoningPillValue
+    const opt = activeReasoningOptions.find((o) => o.id === displayId)
+    if (opt) {
+      return mapDefaultLabel(opt.label || displayId)
+    }
+    const raw = displayId
+    // 未显式选择且探测也没有档位时显示「自动」，不再暴露裸 "Default"。
+    // 残留的 ACP on/off 开关也当自动（不是档位名）。列表里的 off（dsh）走上面的 opt 分支。
     if (
       raw === 'Default' ||
-      reasoningPillValue === 'default' ||
-      ['on', 'off', 'true', 'false'].includes(String(reasoningPillValue).toLowerCase())
+      displayId === 'default' ||
+      isAcpSwitchId(String(displayId))
     ) {
       return 'Auto'
     }
     return raw
-  }, [activeReasoningOptions, reasoningPillValue])
+  }, [activeReasoningOptions, agentRuntime.externalReasoning, currentReasoning, reasoningPillValue])
   const displayName = useMemo(() => {
     const currentId = agentRuntime.externalModel
     const explicit = !!currentId && currentId !== 'default'

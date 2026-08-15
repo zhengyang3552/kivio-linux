@@ -24,9 +24,38 @@
 //! `cordis.patch.yml` 中的 `llm-deepseek.reasoningEffort`（档位）—— 见 `dsh_profile.rs`。
 
 use super::super::types::{
-    PromptInputFormat, RuntimeAgentDef, RuntimeBuildOptions, RuntimeContext, SlashStrategy,
-    StreamFormat,
+    ExternalCliSlashCommand, PromptInputFormat, RuntimeAgentDef, RuntimeBuildOptions,
+    RuntimeContext, SlashStrategy, StreamFormat,
 };
+
+/// Commands the Kivio bridge can actually execute via `ctx.commands.execute`.
+/// Official web-only entries (`export` / `model` / `permission` / `plan`) stay
+/// off the menu — Kivio already has model / permission / mode pills.
+const DSH_SLASH_COMMANDS: &[(&str, &str, Option<&str>)] = &[
+    ("compact", "Compact older conversation history", None),
+    (
+        "feedback",
+        "record feedback about this session",
+        Some("<text>"),
+    ),
+    (
+        "goal",
+        "set or view the goal for a long-running task",
+        Some("[<objective>|clear|edit <objective>|pause|resume]"),
+    ),
+];
+
+pub fn builtin_slash_commands() -> Vec<ExternalCliSlashCommand> {
+    DSH_SLASH_COMMANDS
+        .iter()
+        .map(|(name, description, hint)| ExternalCliSlashCommand {
+            slash: format!("/{name}"),
+            name: (*name).to_string(),
+            description: Some((*description).to_string()),
+            argument_hint: hint.map(|value| (*value).to_string()),
+        })
+        .collect()
+}
 
 /// dsh 自带 DeepSeek 适配器（`deepseek-official` 路由）的两个模型。真实列表由
 /// `detection::read_dsh_settings_models` 从 `~/.dsh/settings.yaml` 读出（含用户在
@@ -82,8 +111,8 @@ pub const DSH_AGENT_DEF: RuntimeAgentDef = RuntimeAgentDef {
     models_from_stderr: false,
     model_probe: None,
     model_probe_args: None,
-    // dsh 有 `ctx.commands` 服务，但 Kivio bridge 不暴露命令列表；不能编一张假清单。
-    slash_strategy: SlashStrategy::None,
+    // 官方 `/` 菜单：只列能走 `session/command` 的条目；run_turn 拦截后交给 registry。
+    slash_strategy: SlashStrategy::Dsh,
     // 遥测默认关：任何非空值都算关（上游的隐私开关刻意「误关优于误开」）。用户想开就
     // 在 `~/.dsh/.env` 里自己设 —— 那份 env 由 dsh 自己加载，覆盖不到这里。
     env: &[("DSH_TELEMETRY_DISABLED", "1")],
@@ -158,11 +187,19 @@ mod tests {
             DSH_AGENT_DEF.stream_format,
             StreamFormat::DshJsonRpc
         ));
-        assert!(matches!(DSH_AGENT_DEF.slash_strategy, SlashStrategy::None));
+        assert!(matches!(DSH_AGENT_DEF.slash_strategy, SlashStrategy::Dsh));
         assert!(!DSH_AGENT_DEF.supports_steering);
         assert!(!DSH_AGENT_DEF.supports_native_image);
         assert!(!DSH_AGENT_DEF.resumes_session_via_cli);
         assert!(DSH_AGENT_DEF.model_probe.is_none());
         assert!(DSH_AGENT_DEF.auth_probe_args.is_none());
+    }
+
+    #[test]
+    fn lists_the_official_slash_menu() {
+        let commands = builtin_slash_commands();
+        let names: Vec<&str> = commands.iter().map(|command| command.name.as_str()).collect();
+        assert_eq!(names, ["compact", "feedback", "goal"]);
+        assert!(commands.iter().all(|command| command.slash.starts_with('/')));
     }
 }
