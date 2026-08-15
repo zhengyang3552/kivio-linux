@@ -170,6 +170,16 @@ Kivio Desktop 常驻托盘 / 菜单栏，工作在整个**屏幕**层面，而�
 
 Kivio Desktop 启动后会检查 GitHub Releases 的新版本（可关闭），并支持应用内直接下载安装更新。
 
+**Debian / Ubuntu / Mint 用户推荐使用 apt 源**，一次配置，之后常规 `apt upgrade` 自动拿新版：
+
+```bash
+curl -fsSL https://zhengyang3552.github.io/kivio-linux/key.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/kivio-desktop.gpg
+echo "deb [signed-by=/usr/share/keyrings/kivio-desktop.gpg] https://zhengyang3552.github.io/kivio-linux/ ./" \
+  | sudo tee /etc/apt/sources.list.d/kivio-desktop.list
+sudo apt update && sudo apt install kivio-desktop
+```
+
 ## 新版本 —— v2.9.0
 
 - **DeepSeek Harness** —— 新增 dsh 作为外部 CLI 代理：官方供应商、四档 Agent 模式、插件页、斜杠命令（已知命令高亮）、工具卡、压缩，以及 `/compact` `/goal` `/feedback`。重启或改启动配置后仍续上原生会话；顶栏显示实际模型与思考档。后台子代理显示实时进度，完成后把汇报写回父对话，和官方 web 一致。用量条不再把已排除的缓存输入减第二次。
@@ -424,6 +434,17 @@ All hotkeys act as toggles and are remappable in Settings (with conflict detecti
 4. **Go.** Tray → Open AI Client for chat, tools, and documents; or press a hotkey anywhere for translation and Lens.
 
 Kivio Desktop checks GitHub Releases for updates shortly after launch (can be disabled) and can download and install the update in-app.
+
+**Debian / Ubuntu / Mint users should prefer the apt repository** — set it up once and
+regular `apt upgrade` will pick up new versions automatically:
+
+```bash
+curl -fsSL https://zhengyang3552.github.io/kivio-linux/key.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/kivio-desktop.gpg
+echo "deb [signed-by=/usr/share/keyrings/kivio-desktop.gpg] https://zhengyang3552.github.io/kivio-linux/ ./" \
+  | sudo tee /etc/apt/sources.list.d/kivio-desktop.list
+sudo apt update && sudo apt install kivio-desktop
+```
 
 ## What's New — v2.9.0
 
