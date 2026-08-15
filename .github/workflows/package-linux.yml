@@ -142,11 +142,18 @@ jobs:
           done
           echo "${{ steps.ver.outputs.version }}" > payload/version.txt
 
+      # artifact 的 zip 格式不保留权限位(下载后全部变 644);先 tar 打包(tar 保留
+      # exec 位)再上传 tar 文件,package job 解包后二进制仍是 755,deb 装完无需 chmod +x
+      - name: Pack payload into tarball
+        run: |
+          tar -czf payload.tar.gz -C payload .
+          ls -lh payload.tar.gz
+
       - name: Upload payload
         uses: actions/upload-artifact@v7
         with:
           name: linux-payload
-          path: payload
+          path: payload.tar.gz
           retention-days: 7
 
   package:
@@ -160,12 +167,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # upload 时以 payload/ 内容为 artifact 根,下载到 payload/ 目录还原布局
+      # 产物是 payload.tar.gz(tar 保留权限位,绕开 zip artifact 全部落 644 的问题);
+      # 下载后解包到 payload/ 还原布局
       - name: Download payload
         uses: actions/download-artifact@v7
         with:
           name: linux-payload
-          path: payload
+          path: payload-tar
+
+      - name: Extract payload
+        run: |
+          mkdir -p payload
+          tar -xzf payload-tar/payload.tar.gz -C payload
+          rm -rf payload-tar
+          # sanity:确认 exec 位挺过了 artifact 往返
+          test -x payload/kivio/kivio
+          ls -l payload/kivio/
 
       - name: Install packaging tools
         run: |
