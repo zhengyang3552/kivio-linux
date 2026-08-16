@@ -1,35 +1,35 @@
 -----BEGIN PGP SIGNED MESSAGE-----
 Hash: SHA512
 
-Date: Sun, 16 Aug 2026 04:44:49 +0000
+Date: Sun, 16 Aug 2026 09:04:43 +0000
 Description: Kivio Desktop Linux packages
 Label: kivio-desktop
 Origin: kivio-desktop
 MD5Sum:
- cd156e37fc535d3ede3f14920d40fde4             2613 Packages
- 93643afa2bf18d72bab5a26a6d21f275              726 Packages.gz
+ d0abf7be5eac071dfa08d858d7028847             2418 Packages
+ 7a9e2ae818b6584fdf348948d50e8438              699 Packages.gz
 SHA1:
- a7b9bf1575996759fd3652641f01865a1bf850f2             2613 Packages
- 100356e019667f463fca824bdbb9ffd318391247              726 Packages.gz
+ ce5e0a0ddb7a9d287318a9d415547a6b2f77365a             2418 Packages
+ d5214ddc81a43345e15ae16c34ebe10a680650cb              699 Packages.gz
 SHA256:
- 309fd214fe5d358cae3a65a3855f185edc3d34ced1e9892ed8ee3311a0264db4             2613 Packages
- d9f28f835651b4b15ebc81a5dc65ae6faa8fe0d240ebf852d5b888334f54ceb5              726 Packages.gz
+ 399ae96aa2f78dfe6f9865204e02853b02965d136a472a5f933b42a87f8802da             2418 Packages
+ 62c1e2a28b48ef4c13975263b5a7625c915dfe69d0e2c5fa27988d300da2f636              699 Packages.gz
 SHA512:
- a496093eff2b2613279fd337af5f2b790d4a4405a0e1be1fb5cab880392eac8c286db9c212ec4c12bdcfc8d2e217fcea03097000b749cbeb64206e84c1cea62a             2613 Packages
- fdd9dea721e55c901e448a812c924f950a2be51b1dfb34ca5909fc81ed7251024b84c6f88a02d4be2a3410fe8e29fffa6e46e17d7b7962ab0443d2cd370d5e27              726 Packages.gz
+ c21e4300ccc604d6bf8bb3d31ef278360bc78b2dd578fddd7923ba2da43363119f8c2e43ff94569efe62b1a4632eec8678b320ca2c339a85356ff314510aa409             2418 Packages
+ 412c8a441095b9f67d68c86771530fd57bd0612a89a76acf33b3819d24388f9b5bfd7ecb7d07396e6833932f7e8c3090983df089a43c0ea160c4570926fbd9cc              699 Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQIzBAEBCgAdFiEEUOLS4OPA2rOUoNI5d0Qz6ZOwtTMFAmqBQEEACgkQd0Qz6ZOw
-tTMYmA//fiFOZxLfgCSthsmJsnbcEyWuKueflXSM8WjRwF81QDDdr2HClah5UGeU
-9X3Lyo/8OoA1qAi+HB/7eVCLS3MxZ4P7pd928E42h4bdNKeY2m5lDS4NUTWro6y2
-MreJnlKa2PUWc6AbBjQjRwDNOLiwOoCOLAU4kM3mU4NuBc9RiVlrsNrWu0AIe15j
-y721zsGO484dPhKt+EF29OIKpIcGdgsJ6fTxDEYgPHcnTeWvM87MLlTuOb1jCFXg
-TMfjVq6HYKPdR4cocwn3Kjd8Ot4xph4uqKKBjJOZYUoEaKpgBhlGkWKTbjWLnQFP
-bnqhVFQrKRn/nMWgdAKii0KTTmkqX4fFnJg1Cqbo2l1ePwXFwbKDxKkBaNR1SBqn
-1dw28mBBfsi3YDiizy0pJoyV8LqcQ7B9g5cZitwUNt5R+hrT/NbM/ES1D5McEcFe
-9STiYy2WspidIL4g6semyjx3UQ4tWe//sb4WgZgCS8rOn2ZXQ1LejfmCWh51p2Jn
-jwD8vZYxgi4W0KFQA2uadlKEvhtbLhU8SABLS4MEfilDjALxVSb4uxyWvhUmYZi1
-m1vzKZIoTpMcekxgZ9is7QEgZyskysbTEpqhCx8XdCPkp6nQfArzpKGbzmf3OILS
-C1lHrScUQun3GG0InzuTuufKtoWcyuNcMbPmvfWo5HihriZFAos=
-=HMin
+iQIzBAEBCgAdFiEEUOLS4OPA2rOUoNI5d0Qz6ZOwtTMFAmqBfSsACgkQd0Qz6ZOw
+tTMp5hAAiTy/d97bF0paeXfUnLsIP+QhwoqhOjx74YWkUYeGVAAwpV13w1k597ez
+jMPGB96K8q9ROZayOxa8Z8rJa8hGGzlVTCLz3puXsopO1ZhH9OdZ9qB4l1SgeIyG
+eEx0Ng5vM9hCwMgxQsZjQrotPTjtfAujrcRRk0pYonpeeBCq0ZZBIn8KnxSWl7+N
+HKilvy0xZsVQoL0ohq2uTyw1EA2K6kIlHFtS1wA8P9HDCTi/tXPN/2b5RX5Fc9a8
+au5Fr4hJIHz8Z7BFcnkqPkGVx9mYATUW9xMt1tSIAKr2dMj9V/fGUDxT+i23rXlv
+d0PSf7uhfsHXE7ykykd9dWHKdns2f6gRN73Kus4FFvHRYIm2lG1r5J6d/vLsmpXk
+vrOX02kD5nIADapx1rLHCtKqgMJdQ3GazpJbZ7TMqa52Ws8kQ7HSs5gjliX2CvaA
+UgDAIGXh7dOGpI3iX3KB6IqypGf3mi/r+Maajx+dw7czjsirXDxS9J026KLdlU64
+GT0/GuuHBnXitCyyywR9WkN6Tq0TD+TdG75MgExCCgy0cel6ub+K8j0i/+CtUnBA
+JaoNNcikdnpJcwZttxbT0HBJw21Ad/t4gF02mUQaikhq2ixvBlAvkxKXRnizwm1m
+X8/GisabPf+0TsIp4giWHWQPg13IGp3EgH4tTDoIiGwyqDTk5v0=
+=6v3n
 -----END PGP SIGNATURE-----

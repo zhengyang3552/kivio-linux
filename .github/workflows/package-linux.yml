@@ -2,8 +2,9 @@ name: Package Linux
 
 # 仓库从上游同步(push 到 main)后自动编译并打包全部 Linux 发行版格式;也可手动触发。
 # 发布:网页上创建 Release(写说明)时,自动把最近一次成功构建的产物原样挂上,不重新编译。
-# apt 源:正式 Release 挂完资产后,更新 Pages 托管的 apt 索引(Packages/Release/InRelease),
-#        索引里 Filename 直接指向 Release 资产 URL,deb 本体不入库;用户 apt upgrade 自动拿新版。
+# apt 源:正式 Release 挂完资产后,更新 Pages 托管的 apt 仓库(deb 拷入 pool/ + 重建索引),
+#        Filename 写相对路径,deb 随 Pages 一起托管(apt 不支持绝对 URL Filename);
+#        用户 apt upgrade 自动拿新版。
 #        签名密钥:仓库 Secret APT_GPG_PRIVATE_KEY(Kivio Desktop apt signing,无私钥口令)。
 #
 # 产物(均为 amd64 / x86_64):
@@ -543,9 +544,9 @@ jobs:
           done
           echo "attached to release ${TAG}"
 
-  # ── 正式 Release 发布后:更新 apt 源索引,用户可通过 apt upgrade 升级 ─────
-  # 索引(Packages/Release/InRelease)提交到 main 根目录由 Pages 托管;
-  # Packages 的 Filename 指向 Release 资产绝对 URL,deb 不重复入库。
+  # ── 正式 Release 发布后:更新 apt 源,用户可通过 apt upgrade 升级 ─────────
+  # deb 拷入仓库 pool/、索引(Packages/Release/InRelease)重建,一起提交到 main 由 Pages 托管;
+  # apt 按 "Pages base URL + 相对 Filename" 下载,deb 必须入库(apt 不认绝对 URL Filename)。
   # draft Release 的资产匿名不可下载,跳过。
   apt:
     name: Update apt repository
@@ -607,8 +608,7 @@ jobs:
         if: steps.draft.outputs.draft == 'false'
         run: |
           bash ci/apt/update-apt-repo.sh \
-            "files/kivio-desktop_${{ steps.t.outputs.version }}_amd64.deb" \
-            "${{ steps.t.outputs.tag }}" "$REPO"
+            "files/kivio-desktop_${{ steps.t.outputs.version }}_amd64.deb"
 
       # 用默认 GITHUB_TOKEN 推 main 会再次触发工作流,不会死循环
       - name: Commit & push index (Pages)
@@ -616,7 +616,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Packages Packages.gz Release Release.gpg InRelease
+          git add Packages Packages.gz Release Release.gpg InRelease pool
           if git diff --cached --quiet; then
             echo "索引无变化,跳过提交"
           else
