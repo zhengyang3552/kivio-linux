@@ -4984,6 +4984,34 @@ input[type="password"]::-ms-clear {
   height: 28px;
   font-size: 11px;
 }
+.kv-native-model-caps {
+  margin: 8px 38px 2px 36px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kv-native-model-caps > .kv-native-model-switches {
+  margin-top: 0;
+}
+.kv-native-model-efforts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.kv-native-model-efforts > span:first-child {
+  color: var(--text-muted);
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+.kv-native-model-efforts .kv-seg {
+  display: flex;
+  flex-wrap: wrap;
+}
+.kv-native-model-efforts small {
+  color: var(--text-faint);
+  font-size: 10px;
+}
 .kv-native-model-switches {
   display: flex;
   align-items: center;
@@ -5229,6 +5257,7 @@ input[type="password"]::-ms-clear {
     padding-top: 2px;
     overflow-x: auto;
   }
+  .kv-native-model-caps,
   .kv-native-model-advanced {
     margin: 9px 30px 0 32px;
   }
@@ -5381,6 +5410,34 @@ input[type="password"]::-ms-clear {
   color: var(--text-muted);
   white-space: pre-wrap;
   word-break: break-all;
+}
+.kv-cli-install-banner {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  font-weight: 550;
+}
+.kv-cli-install-banner.running {
+  background: var(--bg-sidebar);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.kv-cli-install-banner.ok {
+  background: var(--success-soft);
+  color: var(--success);
+  border: 1px solid color-mix(in srgb, var(--success) 35%, transparent);
+}
+.kv-cli-install-banner.warn {
+  background: color-mix(in srgb, var(--warn, #c47b16) 14%, transparent);
+  color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--warn, #c47b16) 35%, transparent);
+}
+.kv-cli-install-banner.fail {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
 }
 .kv-cli-search {
   flex-shrink: 0;

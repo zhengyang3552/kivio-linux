@@ -28,6 +28,7 @@ import type { NativeProviderSummary } from '../chat/types'
 import { Input, Toggle } from './components'
 import { i18n, type Lang } from './i18n'
 import { Button, IconButton } from '../components/Button'
+import { dshNativeDetailToProvider } from './cliNativeProviderConfigs'
 import { CliProviderModal } from './CliProviderModal'
 import { DshPluginsSettings } from './DshPluginsSettings'
 import { CcSwitchImportModal } from './CcSwitchImportModal'
@@ -341,13 +342,16 @@ function AgentDetail({
       ? isVersionNewer(localVersion, info.latestVersion)
       : null
   const updateAvailable = versionComparison ?? info?.updateAvailable ?? false
+  const needsRepair = Boolean(agent.available && !localVersion && info?.command)
   const versionStatus = !agent.available
     ? null
     : checking
       ? { label: t.externalAgentsCheckingVersion, tone: '' }
       : !info
         ? { label: t.externalAgentsVersionCheckFailed, tone: 'warn' }
-        : !localVersion || !info.latestVersion
+        : !localVersion
+          ? { label: t.externalAgentsLocalVersionUnknown, tone: 'warn' }
+          : !info.latestVersion
           ? { label: t.externalAgentsLatestVersionUnknown, tone: 'warn' }
           : updateAvailable
             ? {
@@ -359,7 +363,7 @@ function AgentDetail({
               }
             : { label: t.externalAgentsUpToDate, tone: 'ok' }
   const showInstallAction = Boolean(
-    info?.command && !checking && (!agent.available || updateAvailable),
+    info?.command && !checking && (!agent.available || updateAvailable || needsRepair),
   )
 
   if (showPlugins && agent.id === 'dsh') {
@@ -386,7 +390,10 @@ function AgentDetail({
             </a>
           )}
         </span>
-        <span className="kv-cli-pill">{localVersion ?? t.externalAgentsNotInstalled}</span>
+        <span className="kv-cli-pill">
+          {localVersion
+            ?? (agent.available ? t.externalAgentsInstalled : t.externalAgentsNotInstalled)}
+        </span>
         {versionStatus && (
           <span className={`kv-tag ${versionStatus.tone}`}>{versionStatus.label}</span>
         )}
@@ -408,8 +415,32 @@ function AgentDetail({
           <RefreshCw size={13} className={checking ? 'animate-spin' : ''} />
         </IconButton>
       </div>
+      {(running || result) && (
+        <div
+          className={`kv-cli-install-banner ${running ? 'running' : result === 'ok' ? (needsRepair ? 'warn' : 'ok') : 'fail'}`}
+          role="status"
+        >
+          {running
+            ? t.externalAgentsInstalling
+            : result === 'ok'
+              ? (needsRepair ? t.externalAgentsInstallNeedsRepair : t.externalAgentsInstallDone)
+              : t.externalAgentsInstallFailed}
+        </div>
+      )}
       {agent.id === 'dsh' && !agent.available && (
         <p className="kv-row-desc">{t.externalAgentsDshInstallHint}</p>
+      )}
+      {(running || result === 'fail') && (
+        <div className="kv-cli-card">
+          <div className="kv-row-stack">
+            <div className="kv-row-text">
+              <div className="kv-row-label">{t.externalAgentsInstallLog}</div>
+            </div>
+            <pre ref={logRef} className="kv-cli-log">
+              {log.length > 0 ? log.join('\n') : t.externalAgentsInstalling}
+            </pre>
+          </div>
+        </div>
       )}
 
       {agent.id === 'dsh' && <DshOfficialKeyCard lang={lang} />}
@@ -435,26 +466,6 @@ function AgentDetail({
             <ChevronRight size={14} aria-hidden="true" />
           </span>
         </button>
-      )}
-
-      {(log.length > 0 || result) && (
-        <div className="kv-cli-card">
-          <div className="kv-row-stack">
-            <div className="kv-row-text">
-              <div className="kv-row-label">{t.externalAgentsInstallLog}</div>
-              {result && (
-                <p className="kv-row-desc">
-                  {result === 'ok' ? t.externalAgentsInstallDone : t.externalAgentsInstallFailed}
-                </p>
-              )}
-            </div>
-            {log.length > 0 && (
-              <pre ref={logRef} className="kv-cli-log">
-                {log.join('\n')}
-              </pre>
-            )}
-          </div>
-        </div>
       )}
 
       <div className="kv-cli-card">
@@ -552,6 +563,7 @@ function AgentDetail({
         nativeProviders={agent.nativeProviders ?? []}
         current={config.currentProvider ?? ''}
         onPatch={onPatch}
+        reloadAgents={reloadAgents}
       />
     </>
   )
@@ -659,11 +671,15 @@ function NativeProviderRow({
   provider,
   current,
   onUseCliConfig,
+  onEdit,
+  onDelete,
 }: {
   lang: Lang
   provider: NativeProviderSummary
   current: string
   onUseCliConfig: () => void
+  onEdit?: () => void
+  onDelete?: () => void
 }) {
   const t = i18n[lang]
   const official = provider.id === DSH_OFFICIAL_PROVIDER_ID
@@ -698,6 +714,16 @@ function NativeProviderRow({
                 ? t.externalAgentsDshOfficialProvider
                 : t.externalAgentsNativeProviderBadge}
           </span>
+        )}
+        {onEdit && (
+          <IconButton size="sm" label={t.externalAgentsProviderEdit} onClick={onEdit}>
+            <Pencil size={13} />
+          </IconButton>
+        )}
+        {onDelete && (
+          <IconButton size="sm" label={t.externalAgentsRemove} onClick={onDelete}>
+            <Trash2 size={13} />
+          </IconButton>
         )}
       </div>
     </div>
@@ -748,6 +774,7 @@ function ProviderSection({
   nativeProviders,
   current,
   onPatch,
+  reloadAgents,
 }: {
   lang: Lang
   agentId: string
@@ -756,25 +783,46 @@ function ProviderSection({
   nativeProviders: NonNullable<DetectedExternalAgent['nativeProviders']>
   current: string
   onPatch: (patch: Partial<ExternalCliAgentConfig>) => void
+  reloadAgents: (force?: boolean) => Promise<void>
 }) {
   const t = i18n[lang]
   const [editing, setEditing] = useState<ExternalCliProvider | null | undefined>(undefined)
   const [importing, setImporting] = useState(false)
-  const listedNatives = withOfficialDshProviders(agentId, nativeProviders)
+  const adoptedNativeIds = new Set(
+    providers
+      .map((provider) => provider.nativeProviderId?.trim())
+      .filter((id): id is string => Boolean(id)),
+  )
+  const listedNatives = withOfficialDshProviders(agentId, nativeProviders).filter(
+    (provider) => provider.id === DSH_OFFICIAL_PROVIDER_ID || !adoptedNativeIds.has(provider.id),
+  )
   const hideGenericLocal = agentId === 'dsh'
 
   const save = (provider: ExternalCliProvider) => {
     const exists = providers.some((p) => p.id === provider.id)
+    const adoptInUse = agentId === 'dsh'
+      && !current
+      && !exists
+      && Boolean(provider.nativeProviderId)
+      && nativeProviders.some((native) => native.id === provider.nativeProviderId && native.isDefault)
     onPatch({
       providers: exists
         ? providers.map((p) => (p.id === provider.id ? provider : p))
         : [...providers, provider],
+      ...(adoptInUse ? { currentProvider: provider.id } : {}),
     })
     setEditing(undefined)
   }
 
   const remove = (provider: ExternalCliProvider) => {
-    if (!window.confirm(t.externalAgentsProviderDeleteConfirm.replace('{name}', provider.name))) return
+    const deletesNativeFile = Boolean(
+      provider.nativeProviderId
+      && nativeProviders.some((native) => native.id === provider.nativeProviderId),
+    )
+    const confirmText = deletesNativeFile
+      ? t.externalAgentsDshNativeDeleteConfirm
+      : t.externalAgentsProviderDeleteConfirm
+    if (!window.confirm(confirmText.replace('{name}', provider.name))) return
     onPatch({
       providers: providers.filter((p) => p.id !== provider.id),
       ...(current === provider.id ? { currentProvider: '' } : {}),
@@ -785,6 +833,44 @@ function ProviderSection({
       provider.nativeProviderId,
       provider.name,
     )
+    if (agentId === 'dsh' && provider.nativeProviderId) {
+      void chatApi.dshNativeProviderDelete(provider.nativeProviderId)
+        .then(() => reloadAgents(true))
+        .catch(() => {})
+    }
+  }
+
+  const editNative = async (native: NativeProviderSummary) => {
+    try {
+      const detail = await chatApi.dshNativeProviderGet(native.id)
+      setEditing(dshNativeDetailToProvider(detail))
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const removeNative = async (native: NativeProviderSummary) => {
+    if (!window.confirm(t.externalAgentsDshNativeDeleteConfirm.replace('{name}', native.name))) return
+    try {
+      await chatApi.dshNativeProviderDelete(native.id)
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : String(err))
+      return
+    }
+    const adopted = providers.find((provider) => provider.nativeProviderId === native.id)
+    if (adopted) {
+      onPatch({
+        providers: providers.filter((provider) => provider.id !== adopted.id),
+        ...(current === adopted.id ? { currentProvider: '' } : {}),
+      })
+      void chatApi.externalCliProviderCleanup(
+        agentId,
+        adopted.id,
+        adopted.nativeProviderId,
+        adopted.name,
+      )
+    }
+    await reloadAgents(true)
   }
 
   const importFromCcSwitch = (items: CcSwitchProvider[]) => {
@@ -859,6 +945,12 @@ function ProviderSection({
                 provider={provider}
                 current={current}
                 onUseCliConfig={() => onPatch({ currentProvider: '' })}
+                onEdit={provider.id === DSH_OFFICIAL_PROVIDER_ID
+                  ? undefined
+                  : () => void editNative(provider)}
+                onDelete={provider.id === DSH_OFFICIAL_PROVIDER_ID
+                  ? undefined
+                  : () => void removeNative(provider)}
               />
             ))}
             {providers.map((provider) => (
@@ -928,13 +1020,17 @@ function ProviderSection({
   )
 }
 
+/** 切走再回来时还要看得到刚装完的日志，不能跟 AgentDetail 一起卸掉。 */
+const installMemory = new Map<string, { log: string[]; result: 'ok' | 'fail' | null }>()
+
 /** 版本检查 + 一键安装/更新的状态机。只被 AgentDetail 用，抽出来纯粹是别让它涨到 200 行。 */
 function useInstall(agentId: string, reloadAgents: (force?: boolean) => Promise<void>) {
+  const remembered = installMemory.get(agentId)
   const [info, setInfo] = useState<ExternalCliInstallInfo | null>(null)
   const [checking, setChecking] = useState(true)
   const [running, setRunning] = useState(false)
-  const [log, setLog] = useState<string[]>([])
-  const [result, setResult] = useState<'ok' | 'fail' | null>(null)
+  const [log, setLog] = useState<string[]>(() => remembered?.log ?? [])
+  const [result, setResult] = useState<'ok' | 'fail' | null>(() => remembered?.result ?? null)
   const logRef = useRef<HTMLPreElement | null>(null)
 
   const refresh = useCallback(async () => {
@@ -953,13 +1049,39 @@ function useInstall(agentId: string, reloadAgents: (force?: boolean) => Promise<
   }, [refresh])
 
   useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
+    installMemory.set(agentId, { log, result })
+  }, [agentId, log, result])
+
+  useEffect(() => {
+    const node = logRef.current
+    if (node && typeof node.scrollTo === 'function') {
+      node.scrollTo({ top: node.scrollHeight })
+    }
   }, [log])
+
+  useEffect(() => {
+    if (!result && !running) return
+    const node = logRef.current
+    if (node && typeof node.scrollIntoView === 'function') {
+      node.scrollIntoView({ block: 'nearest' })
+    }
+  }, [result, running])
+
+  useEffect(() => {
+    if (result !== 'ok' || running) return
+    const timer = window.setTimeout(() => {
+      setLog([])
+      setResult(null)
+      installMemory.delete(agentId)
+    }, 4000)
+    return () => window.clearTimeout(timer)
+  }, [agentId, result, running])
 
   const runInstall = async () => {
     setRunning(true)
     setResult(null)
     setLog([])
+    installMemory.set(agentId, { log: [], result: null })
     // 监听要在 invoke 之前挂上：安装命令的头几行（`$ …`）是同步发出来的。
     const unlisten = await onExternalCliInstallLog((event) => {
       if (event.agentId !== agentId) return
