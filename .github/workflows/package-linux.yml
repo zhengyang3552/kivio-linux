@@ -517,6 +517,17 @@ jobs:
             "files/kivio-desktop-bin-${V}-nix-closure.tar.zst"
             "files/kivio-desktop-bin.nix"
           )
+          # 幂等:资产已齐全则跳过重挂(dispatch 补跑 apt 源时无需重挂;
+          # 部分触发身份的资产删/传接口会 404,不必要的写操作直接免掉)
+          EXISTING="$(gh api "repos/$REPO/releases/$REL_ID/assets?per_page=100" --paginate --jq '.[].name')"
+          MISSING=0
+          for f in "${FILES[@]}"; do
+            grep -qx "$(basename "$f")" <<<"$EXISTING" || { echo "缺少资产: $(basename "$f")"; MISSING=1; }
+          done
+          if [ "$MISSING" -eq 0 ]; then
+            echo "资产已齐全,跳过重挂"
+            exit 0
+          fi
           for f in "${FILES[@]}"; do
             name="$(basename "$f")"
             # clobber:先删同名旧资产
