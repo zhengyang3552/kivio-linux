@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { chatApi, type DshPluginSettingsSnapshot } from '../chat/api'
 import { DshPluginsSettings } from './DshPluginsSettings'
@@ -64,6 +64,10 @@ describe('DshPluginsSettings', () => {
     })
     render(<DshPluginsSettings lang="zh" />)
     await waitFor(() => expect(screen.getByText('终端')).toBeInTheDocument())
+    // 快照加载发生在 act 之外,ShellCard 的挂载同步 effect 可能晚于上面的 waitFor 才 flush;
+    // 若它在 fireEvent.change 之后才跑,会把刚编辑的值重置回快照值,dirty 归零,"保存"按钮不出现(偶发挂)。
+    // 这里先 flush 掉挂起的 effects 再交互,消除竞态。
+    await act(async () => {})
     expect(screen.getByText('Agent 循环')).toBeInTheDocument()
     expect(screen.getByText('网页搜索')).toBeInTheDocument()
     expect(screen.getByText('已覆盖')).toBeInTheDocument()
