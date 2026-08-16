@@ -609,7 +609,8 @@ jobs:
           if git diff --cached --quiet; then
             echo "索引无变化,跳过提交"
           else
-            git pull --rebase origin main
+            # 先提交再 rebase:有暂存变更时 git pull --rebase 会直接拒绝(exit 128)
             git commit -m "apt: publish kivio-desktop ${{ steps.t.outputs.version }}"
+            git pull --rebase origin main
             git push
           fi
