@@ -215,7 +215,11 @@ fn run_portal_runtime(rx: mpsc::Receiver<PortalCmd>) {
     let mut active_session: Option<tokio::task::JoinHandle<()>> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            PortalCmd::RegisterShortcuts { app, entries, reply } => {
+            PortalCmd::RegisterShortcuts {
+                app,
+                entries,
+                reply,
+            } => {
                 if let Some(handle) = active_session.take() {
                     handle.abort();
                 }
@@ -301,7 +305,9 @@ pub fn screenshot_permission_granted() -> bool {
     {
         return false;
     }
-    reply_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+    reply_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or(false)
 }
 
 /// 请求屏幕捕获权限：优先触发系统授权弹窗（调用方窗口应处于聚焦状态），
@@ -361,7 +367,7 @@ async fn create_shortcut_session(
         .await
         .map_err(|e| format!("D-Bus session bus unavailable: {e}"))?;
     // 先创建消息流再订阅匹配规则，避免遗漏信号
-    let mut stream = MessageStream::from(&conn);
+    let stream = MessageStream::from(&conn);
     let dbus_proxy = DBusProxy::new(&conn)
         .await
         .map_err(|e| format!("DBus proxy init failed: {e}"))?;
@@ -437,12 +443,7 @@ async fn bind_shortcuts(
         })
         .collect();
     let bind_options: HashMap<String, Value<'static>> = HashMap::new();
-    let body = (
-        session.session_handle.clone(),
-        shortcuts,
-        "",
-        bind_options,
-    );
+    let body = (session.session_handle.clone(), shortcuts, "", bind_options);
     let reply = session
         .conn
         .call_method(
@@ -484,9 +485,7 @@ async fn run_shortcut_event_loop(app: &AppHandle, session: &mut ShortcutSession)
             continue;
         }
         let header = msg.header();
-        let interface = header
-            .interface()
-            .map(|name| name.as_str().to_string());
+        let interface = header.interface().map(|name| name.as_str().to_string());
         let member = header.member().map(|name| name.as_str().to_string());
         match (interface.as_deref(), member.as_deref()) {
             (Some(GLOBAL_SHORTCUTS_IFACE), Some("Activated")) => {
@@ -597,20 +596,20 @@ async fn portal_screenshot_inner() -> Result<PathBuf, String> {
         .deserialize()
         .map_err(|e| format!("Screenshot reply parse failed: {e}"))?;
     let (resp, results) =
-        await_request_response(&mut stream, request_path.as_str(), Duration::from_secs(30))
-            .await?;
+        await_request_response(&mut stream, request_path.as_str(), Duration::from_secs(30)).await?;
     if resp != 0 {
         if !permission_granted_inner().await {
-            return Err("屏幕捕获权限未授予。请在「设置 → 通用 → 权限状态」中点击「授权屏幕捕获」后重试。".to_string());
+            return Err(
+                "屏幕捕获权限未授予。请在「设置 → 通用 → 权限状态」中点击「授权屏幕捕获」后重试。"
+                    .to_string(),
+            );
         }
         return Err(format!("portal screenshot was cancelled (resp={resp})"));
     }
     let uri = results
         .get("uri")
-        .and_then(|value| match value {
-            OwnedValue::Str(s) => Some(s.as_str().to_string()),
-            _ => None,
-        })
+        .and_then(|value| <&str>::try_from(value).ok())
+        .map(|value| value.to_string())
         .ok_or_else(|| "portal screenshot response missing uri".to_string())?;
     file_uri_to_path(&uri)
 }

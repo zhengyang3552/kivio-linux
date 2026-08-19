@@ -469,7 +469,7 @@ enum HotkeyErrorKind {
 }
 
 /// 热键所属的功能范围。前端按它查"翻译器"/"截图翻译"等本地化名称。
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum HotkeyScope {
     Translator,
