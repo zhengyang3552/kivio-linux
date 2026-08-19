@@ -665,6 +665,8 @@ pub struct SubAgentRequest {
     pub parent_run_id: String,
     pub parent_tool_call_id: String,
     pub parent_generation: u64,
+    /// 父对话工作目录，用于扫描项目 `.kivio/skills` 与 `.agents/skills`。
+    pub skill_project_cwd: Option<std::path::PathBuf>,
 }
 
 /// Run a sub-agent to completion. Builds an isolated config and reuses
@@ -716,7 +718,6 @@ async fn run_sub_agent(app: AppHandle, req: SubAgentRequest) -> Result<AgentRunR
         let executor = SubAgentToolExecutor { app: app.clone() };
 
         let thinking_enabled = req.settings.chat.thinking_enabled;
-        let stream_enabled = req.settings.chat.stream_enabled;
         let max_output_tokens = req.max_output_tokens;
         let retry_attempts = if req.settings.retry_enabled {
             req.settings.retry_attempts as usize
@@ -745,13 +746,13 @@ async fn run_sub_agent(app: AppHandle, req: SubAgentRequest) -> Result<AgentRunR
             thinking_level: None,
             // 子代理不做联网搜索（父代理的搜索结果已在上下文里）。
             web_search_mode: crate::chat::types::WebSearchMode::Off,
-            stream_enabled,
             max_output_tokens,
             retry_attempts,
             assistant_snapshot: None,
             provider_tools_fallback_system_prompt: req.system_prompt.clone(),
             initial_anchor_total_tokens: None,
             initial_anchor_trailing_estimate: 0,
+            skill_project_cwd: req.skill_project_cwd.clone(),
         };
 
         // No wall-clock cap: a sub-agent now runs to natural completion or until
@@ -1123,21 +1124,22 @@ pub fn handle_agent_spawn<'a>(
         // Compose the sub-agent system prompt: persona prefix + base chat
         // system prompt. No todo context is injected — the worker is not aware
         // of and cannot touch the parent's todo list.
-        let himalaya_binary = crate::connectors::himalaya::resolve_himalaya_binary_when_active(
-            &settings.email_accounts,
-        )
-        .map(|path| path.display().to_string());
-        let email_accounts_prompt = crate::settings::email_accounts_system_prompt(
-            &settings.email_accounts,
-            himalaya_binary.as_deref(),
-        );
         // Real skill registry (was `SkillRegistry::default()` — an empty catalog,
         // so the skill tools the filter deliberately keeps had nothing to find).
         // Always the FULL registry: `def.skills` is a preload list, not a
         // visibility narrowing, so the sub-agent can still activate other skills.
-        let skill_registry =
-            crate::skills::build_registry(ctx.app, &settings.chat_tools.skill_scan_paths)
-                .unwrap_or_default();
+        let skill_cwd = crate::chat::storage::resolve_conversation_working_directory(
+            ctx.app,
+            &parent_conversation,
+            &settings.chat_tools.native_tools.working_directory,
+        )
+        .ok();
+        let skill_registry = crate::skills::build_registry_in(
+            ctx.app,
+            &settings.chat_tools.skill_scan_paths,
+            skill_cwd.as_deref(),
+        )
+        .unwrap_or_default();
         let persona =
             compose_persona_with_preloaded_skills(&def.system_prompt, &skill_registry, &def.skills);
         let system_prompt = build_chat_system_prompt(
@@ -1171,8 +1173,6 @@ pub fn handle_agent_spawn<'a>(
             None,
             (!settings.obsidian_vault_path.trim().is_empty())
                 .then_some(settings.obsidian_vault_path.as_str()),
-            &settings.email_accounts,
-            email_accounts_prompt.as_deref(),
         );
 
         let task_id = format!("agent-{}", uuid::Uuid::new_v4().simple());
@@ -1244,6 +1244,7 @@ pub fn handle_agent_spawn<'a>(
             parent_run_id: parent_run_id.clone(),
             parent_tool_call_id: parent_tool_call_id.clone(),
             parent_generation: ctx.native_ctx.generation,
+            skill_project_cwd: skill_cwd.clone(),
         };
 
         // Owned context the finalizer needs.
@@ -2430,8 +2431,7 @@ mod tests {
     /// 把一份非流式 chat-completion JSON 固件转成 SSE 响应体。
     ///
     /// 「要完整结果」的模型调用现在**一律走流式线**（见 planning.rs 上
-    /// `call_chat_completion_output_with_usage` 的注释），`stream_enabled=false` 只表示
-    /// 「不往 host 发增量」。固件用非流式 JSON 写着更好读，所以在出口做一次机械转换
+    /// `call_chat_completion_output_with_usage` 的注释）。固件用非流式 JSON 写着更好读，所以在出口做一次机械转换
     /// （与 `agent/loop_tests.rs::sse_from_completion_json` 同形；两个测试模块互不可见，
     /// 为二十行搭一个共享 test-util 模块不划算）。
     fn sse_body_from_completion_json(body: &str) -> String {
@@ -2667,13 +2667,13 @@ mod tests {
             thinking_level: None,
             // 子代理不做联网搜索（父代理的搜索结果已在上下文里）。
             web_search_mode: crate::chat::types::WebSearchMode::Off,
-            stream_enabled: false,
             max_output_tokens: 1024,
             retry_attempts: 1,
             assistant_snapshot: None,
             provider_tools_fallback_system_prompt: String::new(),
             initial_anchor_total_tokens: None,
             initial_anchor_trailing_estimate: 0,
+            skill_project_cwd: None,
         }
     }
 

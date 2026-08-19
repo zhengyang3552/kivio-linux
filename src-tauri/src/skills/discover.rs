@@ -11,6 +11,7 @@ use super::{
 };
 
 const MAX_SCAN_DEPTH: usize = 6;
+const MAX_PROJECT_WALK: usize = 24;
 
 const SKIP_DIR_NAMES: &[&str] = &[".git", "node_modules", ".svn", ".hg"];
 
@@ -19,14 +20,79 @@ struct SkillScanRoot {
     source: &'static str,
 }
 
-pub fn user_skills_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|err| format!("app_data_dir unavailable: {err}"))?
-        .join("skills");
+/// 共享 Agent Skills 目录：`~/.agents/skills`（Codex / OpenCode / Pi 等共用）。
+/// 只扫描，Kivio 不往这里写、也不从这里删。
+pub fn home_agents_skills_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|base| base.home_dir().join(".agents").join("skills"))
+}
+
+/// Kivio 自己的个人技能目录：`~/.kivio/skills`（对齐 `~/.claude/skills` / `~/.codex/skills`）。
+pub fn kivio_skills_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|base| base.home_dir().join(".kivio").join("skills"))
+}
+
+/// 旧版个人目录：`{app_data}/skills`。只扫已有内容，不再写入。
+pub fn legacy_app_data_skills_dir() -> Option<PathBuf> {
+    crate::app_data::app_data_dir().map(|dir| dir.join("skills"))
+}
+
+/// 个人 Skill 写入目录（导入 / 打开文件夹）：`~/.kivio/skills`。
+pub fn user_skills_dir(_app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = kivio_skills_dir().ok_or_else(|| "home directory unavailable".to_string())?;
     fs::create_dir_all(&dir).map_err(|err| format!("create skills dir failed: {err}"))?;
     Ok(dir)
+}
+
+/// 从 `cwd` 向上收集项目技能目录（近的在前）。碰到 `.git` 或家目录停止。
+/// 每一层先 `.kivio/skills`（Kivio 自己的，对齐 `.claude/skills`），再 `.agents/skills`（共享）。
+/// 跳过全局 `~/.kivio/skills` 与 `~/.agents/skills`，避免把家目录当成项目。
+pub fn project_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let skip: Vec<PathBuf> = [kivio_skills_dir(), home_agents_skills_dir()]
+        .into_iter()
+        .flatten()
+        .collect();
+    project_skill_dirs_inner(cwd, &skip)
+}
+
+fn project_skill_dirs_inner(cwd: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
+    let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+    let mut out = Vec::new();
+    let mut current = cwd.to_path_buf();
+    for _ in 0..MAX_PROJECT_WALK {
+        for rel in [".kivio", ".agents"] {
+            let skills = current.join(rel).join("skills");
+            if skills.is_dir() && !is_skipped(&skills, skip) {
+                out.push(skills);
+            }
+        }
+        if current.join(".git").exists() {
+            break;
+        }
+        if home.as_ref().is_some_and(|home| paths_eq(&current, Some(home))) {
+            break;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current.as_path() {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    out
+}
+
+fn is_skipped(path: &Path, skip: &[PathBuf]) -> bool {
+    skip.iter().any(|other| paths_eq(path, Some(other)))
+}
+
+fn paths_eq(path: &Path, other: Option<&Path>) -> bool {
+    let Some(other) = other else {
+        return false;
+    };
+    let left = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let right = fs::canonicalize(other).unwrap_or_else(|_| other.to_path_buf());
+    left == right
 }
 
 fn bundled_skills_dir(app: &AppHandle) -> Option<PathBuf> {
@@ -40,136 +106,86 @@ fn bundled_skills_dir(app: &AppHandle) -> Option<PathBuf> {
 fn scan_root_entries(
     app: &AppHandle,
     extra_paths: &[String],
+    project_cwd: Option<&Path>,
 ) -> Result<Vec<SkillScanRoot>, String> {
     let mut roots = Vec::new();
     if let Some(path) = bundled_skills_dir(app) {
-        roots.push(SkillScanRoot {
-            path,
-            source: "builtin",
-        });
+        push_root(&mut roots, path, "builtin");
     }
-    roots.push(SkillScanRoot {
-        path: user_skills_dir(app)?,
-        source: "user",
-    });
+    // 项目优先于全局（同 id 近处覆盖远处）：`.kivio/skills` 再 `.agents/skills`，cwd → git 根。
+    if let Some(cwd) = project_cwd {
+        for path in project_skill_dirs(cwd) {
+            push_root(&mut roots, path, "project");
+        }
+    }
     // 仅「已启用」插件的附属 Skill 进入扫描；关闭插件后立刻从 registry 消失。
     for path in crate::plugins::enabled_skill_roots() {
-        roots.push(SkillScanRoot {
-            path,
-            source: "plugin",
-        });
+        push_root(&mut roots, path, "plugin");
+    }
+    if let Some(path) = kivio_skills_dir() {
+        push_root(&mut roots, path, "user");
+    }
+    if let Some(path) = legacy_app_data_skills_dir() {
+        push_root(&mut roots, path, "user");
+    }
+    if let Some(path) = home_agents_skills_dir() {
+        push_root(&mut roots, path, "agents");
     }
     append_external_roots(&mut roots, extra_paths);
     Ok(roots)
 }
 
-/// Resolve the same per-user skills directory the GUI uses
-/// (`<app_data_dir>/skills`), but WITHOUT a Tauri `AppHandle`. `app_data_dir`
-/// is derived from the `directories` crate against the bundle identifier
-/// `com.zmair.kivio`, via `crate::app_data::app_data_dir`.
-///
-/// Returns `None` only when no home/data directory can be determined. The
-/// directory is created if missing so the user has a place to drop skills.
-pub fn user_skills_dir_headless() -> Option<PathBuf> {
-    let dir = crate::app_data::app_data_dir()?.join("skills");
-    // Best-effort create; ignore failures (read-only / permission) — discovery
-    // simply finds nothing rather than erroring.
-    let _ = fs::create_dir_all(&dir);
-    Some(dir)
-}
-
-/// Headless variant of [`scan_root_entries`]: resolves skill roots without an
-/// `AppHandle`. Built-in (bundled) skills are resolved relative to the running
-/// executable's resource layout when present; the user skills dir comes from
-/// [`user_skills_dir_headless`]; `extra_paths` are appended as external roots.
-fn scan_root_entries_headless(extra_paths: &[String]) -> Vec<SkillScanRoot> {
-    let mut roots = Vec::new();
-    if let Some(path) = bundled_skills_dir_headless() {
-        roots.push(SkillScanRoot {
-            path,
-            source: "builtin",
-        });
+fn push_root(roots: &mut Vec<SkillScanRoot>, path: PathBuf, source: &'static str) {
+    if !path.is_dir() {
+        return;
     }
-    if let Some(path) = user_skills_dir_headless() {
-        roots.push(SkillScanRoot {
-            path,
-            source: "user",
-        });
+    if roots.iter().any(|root| root.path == path) {
+        return;
     }
-    for path in crate::plugins::enabled_skill_roots() {
-        roots.push(SkillScanRoot {
-            path,
-            source: "plugin",
-        });
-    }
-    append_external_roots(&mut roots, extra_paths);
-    roots
-}
-
-/// Best-effort location of bundled skills next to the executable when running
-/// headless (no Tauri `resource_dir`). Checks `<exe_dir>/skills` and, for the
-/// macOS app-bundle layout, `<exe_dir>/../Resources/skills`. Returns `None`
-/// when neither exists (e.g. plain `cargo run`), which is fine — the CLI then
-/// surfaces only user skills.
-fn bundled_skills_dir_headless() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    bundled_skills_dir_from_exe(&exe)
-}
-
-/// Pure path logic for [`bundled_skills_dir_headless`]: given an executable
-/// path, canonicalize it (so a PATH symlink resolves to the real binary's
-/// directory) and probe the bundled-skills candidates next to it.
-///
-/// `current_exe()` does not resolve symlinks on macOS, so a PATH symlink
-/// (e.g. `~/.cargo/bin/kivio-code -> target/debug/kivio-code`) would otherwise
-/// point `exe_dir` at the symlink's directory — where `skills/` doesn't exist —
-/// and built-in skills would silently go missing. Canonicalizing reaches the
-/// real binary's directory.
-fn bundled_skills_dir_from_exe(exe: &Path) -> Option<PathBuf> {
-    let real = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
-    let exe_dir = real.parent()?;
-    let candidates = [
-        exe_dir.join("skills"),
-        exe_dir.join("..").join("Resources").join("skills"),
-    ];
-    candidates.into_iter().find(|dir| dir.is_dir())
+    roots.push(SkillScanRoot { path, source });
 }
 
 fn append_external_roots(roots: &mut Vec<SkillScanRoot>, extra_paths: &[String]) {
-    roots.extend(extra_paths.iter().map(PathBuf::from).filter_map(|path| {
-        path.is_dir().then_some(SkillScanRoot {
-            path,
-            source: "external",
-        })
-    }));
+    for raw in extra_paths {
+        push_root(roots, PathBuf::from(raw), "external");
+    }
 }
 
 pub fn build_registry(app: &AppHandle, extra_paths: &[String]) -> Result<SkillRegistry, String> {
-    build_registry_inner(app, extra_paths, true)
+    build_registry_in(app, extra_paths, None)
+}
+
+pub fn build_registry_in(
+    app: &AppHandle,
+    extra_paths: &[String],
+    project_cwd: Option<&Path>,
+) -> Result<SkillRegistry, String> {
+    build_registry_inner(app, extra_paths, project_cwd, true)
 }
 
 pub fn build_registry_metadata(
     app: &AppHandle,
     extra_paths: &[String],
 ) -> Result<SkillRegistry, String> {
-    build_registry_inner(app, extra_paths, false)
+    build_registry_inner(app, extra_paths, None, false)
+}
+
+pub fn build_registry_metadata_in(
+    app: &AppHandle,
+    extra_paths: &[String],
+    project_cwd: Option<&Path>,
+) -> Result<SkillRegistry, String> {
+    build_registry_inner(app, extra_paths, project_cwd, false)
 }
 
 fn build_registry_inner(
     app: &AppHandle,
     extra_paths: &[String],
+    project_cwd: Option<&Path>,
     include_files: bool,
 ) -> Result<SkillRegistry, String> {
-    let roots = scan_root_entries(app, extra_paths)?;
+    let roots = scan_root_entries(app, extra_paths, project_cwd)?;
     Ok(build_registry_from_roots(roots, include_files))
-}
-
-/// Headless registry builder (no `AppHandle`): discovers user-dir + bundled +
-/// `extra_paths` skills exactly like [`build_registry`], indexing skill files so
-/// the activated skill's `<skill_resources>` list is populated. Used by the
-/// `kivio-code` CLI.
-pub fn build_registry_headless(extra_paths: &[String]) -> SkillRegistry {
-    build_registry_from_roots(scan_root_entries_headless(extra_paths), true)
 }
 
 fn build_registry_from_roots(roots: Vec<SkillScanRoot>, include_files: bool) -> SkillRegistry {
@@ -195,11 +211,16 @@ fn dedup_records(records: &mut Vec<super::types::SkillRecord>, warnings: &mut Ve
     let mut out: Vec<super::types::SkillRecord> = Vec::new();
     for record in records.drain(..) {
         let key = record.meta.id.clone();
-        if let Some(index) = seen.get(&key) {
-            warnings.push(format!(
-                "Skill {} shadowed duplicate id {}",
-                out[*index].meta.name, record.meta.name
-            ));
+        if let Some(&index) = seen.get(&key) {
+            // 近处覆盖远处是扫描顺序的设计：内置 / 项目 / 插件 / 个人 / ~/.agents 同 id 只留一份。
+            // 跨源 overlay 不必报给用户（Cursor 的 frontend-design 与内置撞名是常态）。
+            // 同一源里出现两份才是真冲突。
+            if out[index].meta.source == record.meta.source {
+                warnings.push(format!(
+                    "Skill {} shadowed duplicate id {}",
+                    out[index].meta.name, record.meta.name
+                ));
+            }
             continue;
         }
         seen.insert(key, out.len());
@@ -373,38 +394,156 @@ description: Test skill.
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Regression test for non-deterministic bundled-skill discovery: a PATH
-    /// symlink to the real binary must still resolve `skills/` next to the real
-    /// binary (macOS `current_exe()` does not resolve symlinks).
-    #[cfg(unix)]
+    fn write_skill(dir: &Path, id: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {id}\n---\n"),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn bundled_skills_dir_resolves_through_path_symlink() {
-        let base =
-            std::env::temp_dir().join(format!("kivio-skill-symlink-{}", uuid::Uuid::new_v4()));
-        // Real binary lives in `bin_dir`, with `bin_dir/skills/<name>/SKILL.md`.
-        let bin_dir = base.join("real");
-        let skills_dir = bin_dir.join("skills").join("demo");
-        fs::create_dir_all(&skills_dir).unwrap();
-        fs::write(skills_dir.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
-        let real_bin = bin_dir.join("kivio-code");
-        fs::write(&real_bin, "#!/bin/sh\n").unwrap();
-
-        // Symlink in a separate dir (e.g. ~/.cargo/bin) with NO skills/ alongside.
-        let link_dir = base.join("path");
-        fs::create_dir_all(&link_dir).unwrap();
-        let link = link_dir.join("kivio-code");
-        std::os::unix::fs::symlink(&real_bin, &link).unwrap();
-
-        // Resolving via the symlink must reach the real binary's skills dir.
-        let found = bundled_skills_dir_from_exe(&link).unwrap();
-        assert_eq!(
-            fs::canonicalize(found).unwrap(),
-            fs::canonicalize(bin_dir.join("skills")).unwrap()
+    fn project_walk_prefers_nearest_and_stops_at_git() {
+        let base = std::env::temp_dir().join(format!("kivio-agents-walk-{}", uuid::Uuid::new_v4()));
+        let root = base.join("repo");
+        let nested = root.join("packages").join("app");
+        write_skill(&root.join(".agents").join("skills").join("root-skill"), "root-skill");
+        write_skill(
+            &nested.join(".agents").join("skills").join("nested-skill"),
+            "nested-skill",
         );
+        write_skill(
+            &base.join(".agents").join("skills").join("outside"),
+            "outside",
+        );
+        fs::create_dir_all(root.join(".git")).unwrap();
 
-        // And of course resolving via the real path also works.
-        assert!(bundled_skills_dir_from_exe(&real_bin).is_some());
+        let dirs = project_skill_dirs_inner(&nested, &[]);
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].ends_with(Path::new(".agents").join("skills")));
+        assert!(dirs[0].starts_with(&nested));
+        assert!(dirs[1].starts_with(&root));
+        assert!(!dirs.iter().any(|d| d.starts_with(&base.join(".agents"))));
 
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn project_walk_skips_global_home_agents() {
+        let base = std::env::temp_dir().join(format!("kivio-agents-skip-{}", uuid::Uuid::new_v4()));
+        let global = base.join(".agents").join("skills");
+        write_skill(&global.join("shared"), "shared");
+        fs::create_dir_all(base.join(".git")).unwrap();
+        let dirs = project_skill_dirs_inner(&base, &[global]);
+        assert!(dirs.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn same_id_prefers_project_over_agents() {
+        let base = std::env::temp_dir().join(format!("kivio-agents-dedup-{}", uuid::Uuid::new_v4()));
+        let project_root = base.join("project").join(".agents").join("skills");
+        let agents_root = base.join("home").join(".agents").join("skills");
+        write_skill(&project_root.join("shared"), "shared");
+        write_skill(&agents_root.join("shared"), "shared");
+
+        let registry = build_registry_from_roots(
+            vec![
+                SkillScanRoot {
+                    path: project_root,
+                    source: "project",
+                },
+                SkillScanRoot {
+                    path: agents_root,
+                    source: "agents",
+                },
+            ],
+            false,
+        );
+        assert_eq!(registry.records.len(), 1);
+        assert_eq!(registry.records[0].meta.source, "project");
+        assert!(
+            registry.warnings.is_empty(),
+            "cross-source overlay is expected, not a user warning: {:?}",
+            registry.warnings
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn same_source_duplicate_id_warns() {
+        let base = std::env::temp_dir().join(format!("kivio-agents-samedup-{}", uuid::Uuid::new_v4()));
+        let one = base.join("a");
+        let two = base.join("b");
+        write_skill(&one.join("shared"), "shared");
+        write_skill(&two.join("shared"), "shared");
+
+        let registry = build_registry_from_roots(
+            vec![
+                SkillScanRoot {
+                    path: one,
+                    source: "user",
+                },
+                SkillScanRoot {
+                    path: two,
+                    source: "user",
+                },
+            ],
+            false,
+        );
+        assert_eq!(registry.records.len(), 1);
+        assert_eq!(registry.warnings.len(), 1);
+        assert!(
+            registry.warnings[0].contains("shadowed duplicate id"),
+            "{:?}",
+            registry.warnings
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn project_walk_kivio_before_agents_at_same_level() {
+        let base = std::env::temp_dir().join(format!("kivio-proj-both-{}", uuid::Uuid::new_v4()));
+        let root = base.join("repo");
+        write_skill(
+            &root.join(".kivio").join("skills").join("kivio-one"),
+            "kivio-one",
+        );
+        write_skill(
+            &root.join(".agents").join("skills").join("agents-one"),
+            "agents-one",
+        );
+        fs::create_dir_all(root.join(".git")).unwrap();
+
+        let dirs = project_skill_dirs_inner(&root, &[]);
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs[0].ends_with(Path::new(".kivio").join("skills")));
+        assert!(dirs[1].ends_with(Path::new(".agents").join("skills")));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn project_walk_skips_global_home_kivio() {
+        let base = std::env::temp_dir().join(format!("kivio-home-skip-{}", uuid::Uuid::new_v4()));
+        let global = base.join(".kivio").join("skills");
+        write_skill(&global.join("shared"), "shared");
+        fs::create_dir_all(base.join(".git")).unwrap();
+        let dirs = project_skill_dirs_inner(&base, &[global]);
+        assert!(dirs.is_empty());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn kivio_skills_dir_is_dot_kivio_skills() {
+        let dir = kivio_skills_dir().expect("home directory");
+        assert!(
+            dir.ends_with(Path::new(".kivio").join("skills")),
+            "expected ~/.kivio/skills, got {}",
+            dir.display()
+        );
     }
 }

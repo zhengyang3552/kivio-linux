@@ -9,10 +9,12 @@
 //! 客户端请求：
 //! - `initialize { cwd, provider, model, maxTokens? }`
 //! - `session/open { sessionId, resume }`
-//! - `session/prompt { sessionId, contentBlocks }`
+//! - `session/prompt { sessionId, contentBlocks }`（官方：`agent.followup()`，下一轮 FIFO；
+//!    用户本轮 `RunTurn` 与运行中 follow-up 都走它）
 //! - `session/command { sessionId, line }`（bridge：`ctx.commands.execute`，不进模型）
 //! - `session/commands { sessionId }`（bridge：`ctx.commands.list`，斜杠菜单发现）
 //! - `session/stop-job { sessionId, jobId }`（bridge：`ctx.jobs.kill`，子代理走 `subagents.interrupt`）
+//! - `session/steer { sessionId, contentBlocks }`（bridge：`agent.steer()`，当前轮 next-step）
 //! - `session/cancel { sessionId }`
 //! - `shutdown`
 //!
@@ -34,7 +36,7 @@
 //! `turn/end` 时落成一条助手消息，不能只留任务边沿。Kivio bridge 直接调用 dsh
 //! 公共的 `agents.resume()` 与 `agent.cancel()`，所以进程重建和用户停止都不会再丢失原生会话。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -48,7 +50,8 @@ use uuid::Uuid;
 use crate::chat::model::ModelUsage;
 use crate::external_agents::prompt::is_cli_slash_input;
 use crate::external_agents::session::live::{
-    ApprovalAsk, ApprovalBridge, ApprovalDecision, SessionCommand, CANCELLED_SESSION_LOST,
+    ApprovalAsk, ApprovalBridge, ApprovalDecision, MessageInjectionKind, SessionCommand,
+    CANCELLED_SESSION_LOST,
 };
 use crate::external_agents::types::{ExternalCliSlashCommand, UnifiedAgentEvent};
 use crate::proc::NoConsoleWindow;
@@ -121,6 +124,42 @@ struct PendingBackground {
     description: Option<String>,
 }
 
+struct PendingSteer {
+    id: String,
+    text: String,
+    kind: MessageInjectionKind,
+    accepted: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[derive(Default)]
+struct PendingSteers {
+    inner: HashMap<u64, PendingSteer>,
+}
+
+impl Drop for PendingSteers {
+    fn drop(&mut self) {
+        for (_, pending) in self.inner.drain() {
+            let _ = pending.accepted.send(false);
+        }
+    }
+}
+
+impl PendingSteers {
+    fn insert(&mut self, rpc_id: u64, pending: PendingSteer) {
+        if let Some(replaced) = self.inner.insert(rpc_id, pending) {
+            let _ = replaced.accepted.send(false);
+        }
+    }
+
+    fn take(&mut self, rpc_id: u64) -> Option<PendingSteer> {
+        self.inner.remove(&rpc_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
 #[derive(Default)]
 struct ChildProgress {
     steps: Vec<String>,
@@ -140,11 +179,13 @@ pub enum DshIdleEffect {
 
 pub type DshIdleSink = std::sync::Arc<dyn Fn(DshIdleEffect) + Send + Sync>;
 
+#[derive(Debug)]
 enum DshIdlePump {
     Quiet,
     Hiccup,
     Dead,
     Reply(String),
+    Ask(Value),
     Event(UnifiedAgentEvent),
     Wake {
         text: String,
@@ -189,7 +230,13 @@ impl DshJsonRpcSession {
     ) -> Result<Self, String> {
         let _profile_boot_guard = DSH_PROFILE_BOOT_LOCK.lock().await;
         let route = resolve_model_route_for_turn(model)?;
-        if crate::external_agents::overrides::active_provider("dsh").is_none()
+        let managed_provider =
+            crate::external_agents::overrides::agent_config("dsh").is_some_and(|config| {
+                config.providers.iter().any(|provider| {
+                    !provider.disabled && provider.native_provider_id.trim() == route.provider
+                })
+            });
+        if !managed_provider
             && !crate::external_agents::dsh_plugins::credentials_ready_for_provider(
                 &route.provider,
                 Some(cwd),
@@ -331,6 +378,14 @@ impl DshJsonRpcSession {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             if resumed != wants_resume {
+                // requested=true but actual=false is the official "this native id is gone"
+                // shape from our own handshake. Phrase it as a missing session so
+                // `is_missing_session_error` / fresh-connect fallback can fire.
+                if wants_resume && !resumed {
+                    return Err(format!(
+                        "dsh session/open: session \"{session_id}\" not found"
+                    ));
+                }
                 return Err(format!(
                     "dsh session/open: resume mismatch (requested={wants_resume}, actual={resumed})"
                 ));
@@ -394,6 +449,10 @@ impl DshJsonRpcSession {
     }
 
     /// 在同一个 live agent 上执行一轮，直到匹配 session 的 `turn/end` + `status:idle`。
+    ///
+    /// 运行中 `FollowUp` 走官方 `session/prompt`（下一轮 FIFO）。对端若在两轮之间
+    /// 发 `idle`，这里按已 ACK 的 follow-up 数继续读，避免把下一轮丢给空闲泵；
+    /// 没有用户 follow-up 时仍在**第一次** idle 返回，把 tool-jobs 的汇报留给空闲泵。
     pub async fn run_turn(
         &mut self,
         prompt: &str,
@@ -402,6 +461,8 @@ impl DshJsonRpcSession {
         events: &mpsc::Sender<UnifiedAgentEvent>,
         control: &mut mpsc::Receiver<SessionCommand>,
         mut approvals: Option<&mut ApprovalBridge>,
+        mut idle_approvals: Option<&mut ApprovalBridge>,
+        idle_pending_asks: &mut std::collections::HashMap<String, Value>,
     ) -> Result<(), String> {
         let requested_route = resolve_model_route_for_turn(model)?;
         if requested_route != self.route {
@@ -426,15 +487,21 @@ impl DshJsonRpcSession {
         let mut cancel_id: Option<u64> = None;
         let mut cancel_started: Option<std::time::Instant> = None;
         let mut pending_asks: std::collections::HashMap<String, Value> =
-            std::collections::HashMap::new();
-        let mut last_user_question_call: Option<(String, String)> = None;
+            std::mem::take(idle_pending_asks);
+        let mut pending_steers = PendingSteers::default();
+        let mut pending_user_question_calls: VecDeque<PendingUserQuestionCall> = VecDeque::new();
+        let mut followup_acked: u32 = 0;
+        let mut turns_ended: u32 = 0;
+        let mut deferred_idle = false;
 
         loop {
-            if let Some(bridge) = approvals.as_deref_mut() {
-                while let Ok(decision) = bridge.decisions.try_recv() {
-                    settle_session_ask(&mut self.stdin, &mut pending_asks, decision).await?;
-                }
-            }
+            drain_ask_decisions(
+                &mut self.stdin,
+                &mut pending_asks,
+                approvals.as_deref_mut(),
+                idle_approvals.as_deref_mut(),
+            )
+            .await?;
 
             match control.try_recv() {
                 Ok(SessionCommand::Cancel) => cancel_requested = true,
@@ -448,11 +515,52 @@ impl DshJsonRpcSession {
                     .await;
                     return Err("closed".to_string());
                 }
-                Ok(SessionCommand::Steer { accepted, .. }) => {
-                    let _ = accepted.send(false);
+                Ok(SessionCommand::Steer {
+                    id,
+                    text,
+                    images,
+                    kind,
+                    accepted,
+                }) => {
+                    if !dsh_can_accept_injection(
+                        prompt_acknowledged,
+                        is_slash,
+                        cancel_requested,
+                        kind,
+                    ) {
+                        let _ = accepted.send(false);
+                    } else {
+                        let rpc_id = self.next_id;
+                        self.next_id += 1;
+                        let display_text = if text.trim().is_empty() && !images.is_empty()
+                        {
+                            format!("附带图片（{}）", images.len())
+                        } else {
+                            text.clone()
+                        };
+                        let (method, params) =
+                            dsh_injection_rpc(kind, &self.session_id, &text, &images);
+                        match write_rpc(&mut self.stdin, rpc_id, method, params).await {
+                            Ok(()) => pending_steers.insert(
+                                rpc_id,
+                                PendingSteer {
+                                    id,
+                                    text: display_text,
+                                    kind,
+                                    accepted,
+                                },
+                            ),
+                            Err(_) => {
+                                let _ = accepted.send(false);
+                            }
+                        }
+                    }
                 }
                 Ok(SessionCommand::RunTurn { done, .. }) => {
                     let _ = done.send(Err("session busy".to_string()));
+                }
+                Ok(SessionCommand::PiSession { reply, .. }) => {
+                    let _ = reply.send(Err("Pi session commands are unsupported".to_string()));
                 }
                 Ok(SessionCommand::StopTask { task_id }) => {
                     self.send_stop_task(&task_id).await;
@@ -527,6 +635,56 @@ impl DshJsonRpcSession {
                 return Err("cancelled".to_string());
             }
 
+            if let Some(rpc_id) = value.get("id").and_then(Value::as_u64) {
+                if value.get("method").is_none() {
+                    if let Some(pending) = pending_steers.take(rpc_id) {
+                        let ok = value.get("result").is_some() && value.get("error").is_none();
+                        let _ = pending.accepted.send(ok);
+                        if ok {
+                            if pending.kind == MessageInjectionKind::FollowUp {
+                                followup_acked = followup_acked.saturating_add(1);
+                            }
+                            let event = match pending.kind {
+                                MessageInjectionKind::Steer => UnifiedAgentEvent::UserSteer {
+                                    id: pending.id,
+                                    text: pending.text,
+                                },
+                                MessageInjectionKind::FollowUp => UnifiedAgentEvent::UserFollowUp {
+                                    id: pending.id,
+                                    text: pending.text,
+                                },
+                            };
+                            let _ = events.send(event).await;
+                        }
+                        if deferred_idle
+                            && started
+                            && terminal.is_some()
+                            && cancel_id.is_none()
+                        {
+                            match dsh_idle_action(
+                                pending_steers.is_empty(),
+                                turns_ended,
+                                followup_acked,
+                            ) {
+                                DshIdleAction::Defer => {}
+                                DshIdleAction::Stay => {
+                                    started = false;
+                                    terminal = None;
+                                    deferred_idle = false;
+                                }
+                                DshIdleAction::Done => {
+                                    if pending_asks.is_empty() {
+                                        self.context_window = self.map_state.context_window;
+                                        return terminal.take().expect("checked above");
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
             if value.get("id").and_then(Value::as_u64) == Some(prompt_id) {
                 if let Some(error) = rpc_error_message(&value) {
                     self.context_window = self.map_state.context_window;
@@ -565,7 +723,7 @@ impl DshJsonRpcSession {
                     &value,
                     approvals.as_deref_mut(),
                     &mut pending_asks,
-                    last_user_question_call.as_ref(),
+                    &mut pending_user_question_calls,
                 )
                 .await?;
                 continue;
@@ -607,15 +765,24 @@ impl DshJsonRpcSession {
                 "session.status" => match params.get("status").and_then(Value::as_str) {
                     Some("running") => started = true,
                     Some("idle") if started && terminal.is_some() && cancel_id.is_none() => {
-                        reject_pending_asks(
-                            &mut self.stdin,
-                            &mut pending_asks,
-                            "ASK_ABORTED",
-                            "ask_user_question was aborted before the user answered",
-                        )
-                        .await;
-                        self.context_window = self.map_state.context_window;
-                        return terminal.take().expect("checked above");
+                        match dsh_idle_action(
+                            pending_steers.is_empty(),
+                            turns_ended,
+                            followup_acked,
+                        ) {
+                            DshIdleAction::Defer => deferred_idle = true,
+                            DshIdleAction::Stay => {
+                                started = false;
+                                terminal = None;
+                                deferred_idle = false;
+                            }
+                            DshIdleAction::Done => {
+                                if pending_asks.is_empty() {
+                                    self.context_window = self.map_state.context_window;
+                                    return terminal.take().expect("checked above");
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 },
@@ -629,20 +796,23 @@ impl DshJsonRpcSession {
                         started = true;
                     }
                     let mut mapped = Vec::new();
-                    if let Some(result) = map_session_event(
-                        event_type,
-                        data,
-                        &mut self.map_state,
-                        &mut |event| mapped.push(event),
-                    ) {
+                    if let Some(result) =
+                        map_session_event(event_type, data, &mut self.map_state, &mut |event| {
+                            mapped.push(event)
+                        })
+                    {
                         terminal = Some(result);
+                        turns_ended = turns_ended.saturating_add(1);
                     }
                     self.context_window = self.map_state.context_window;
                     for event in mapped {
-                        if let UnifiedAgentEvent::ToolUse { id, name, .. } = &event {
-                            if is_user_question_tool(name) {
-                                last_user_question_call = Some((id.clone(), name.clone()));
-                            }
+                        if let UnifiedAgentEvent::ToolUse { id, name, input } = &event {
+                            remember_user_question_call(
+                                &mut pending_user_question_calls,
+                                id,
+                                name,
+                                input,
+                            );
                         }
                         let _ = events.send(event).await;
                     }
@@ -715,22 +885,15 @@ impl DshJsonRpcSession {
 
     fn classify_idle_value(&mut self, value: &Value) -> DshIdlePump {
         if is_incoming_rpc_request(value) {
-            let Some(id) = rpc_id(value) else {
-                return DshIdlePump::Quiet;
-            };
-            return DshIdlePump::Reply(rpc_error_line(
-                &id,
-                -32000,
-                "no user-questions provider is registered",
-                Some(json!({ "code": "NO_PROVIDER" })),
-            ));
+            return classify_idle_incoming_rpc(value);
         }
         let Some(method) = value.get("method").and_then(Value::as_str) else {
             return DshIdlePump::Quiet;
         };
         let params = value.get("params").unwrap_or(&Value::Null);
         if matches!(method, "subagent.started" | "subagent.finished") {
-            if params.get("parentSessionId").and_then(Value::as_str) != Some(self.session_id.as_str())
+            if params.get("parentSessionId").and_then(Value::as_str)
+                != Some(self.session_id.as_str())
             {
                 return DshIdlePump::Quiet;
             }
@@ -756,12 +919,8 @@ impl DshJsonRpcSession {
         };
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
         let data = event.get("data").unwrap_or(&Value::Null);
-        let folded = fold_idle_parent_session(
-            event_type,
-            data,
-            &mut self.map_state,
-            &mut self.idle_wake,
-        );
+        let folded =
+            fold_idle_parent_session(event_type, data, &mut self.map_state, &mut self.idle_wake);
         self.context_window = self.map_state.context_window;
         match folded {
             IdleParentFold::Quiet => DshIdlePump::Quiet,
@@ -785,23 +944,31 @@ impl DshJsonRpcSession {
 
 /// actor 与其他常驻协议同契约：所有 event 先入队，`done` 最后发。
 pub fn spawn_dsh_session_actor(session: DshJsonRpcSession) -> mpsc::Sender<SessionCommand> {
-    spawn_dsh_session_actor_with_sink(session, None)
+    spawn_dsh_session_actor_with_sink(session, None, None)
 }
 
 /// 带轮间空闲读的 actor。官方 subagent 默认后台，父轮 `turn/end` 之后孩子还在往
 /// stdout 写 `session.event`；不读的话工具卡永远停在「运行中…」。
+///
+/// `idle_approvals`：父轮已经结束时，后台子代理的 `session/ask` 仍要弹问用户卡。
+/// 通道挂在会话寿命上；没有它时 idle `session/ask` 仍回 `NO_PROVIDER`。
 pub fn spawn_dsh_session_actor_with_sink(
     mut session: DshJsonRpcSession,
     sink: Option<DshIdleSink>,
+    mut idle_approvals: Option<ApprovalBridge>,
 ) -> mpsc::Sender<SessionCommand> {
     enum ActorStep {
         Cmd(Option<SessionCommand>),
         Idle(DshIdlePump),
+        IdleDecision(Option<ApprovalDecision>),
     }
     let (tx, mut rx) = mpsc::channel::<SessionCommand>(8);
     tokio::spawn(async move {
         let mut idle_dead = false;
         let mut idle_hiccups = 0u32;
+        let mut idle_pending_asks: HashMap<String, Value> = HashMap::new();
+        let mut idle_pending_user_question_calls: VecDeque<PendingUserQuestionCall> =
+            VecDeque::new();
         if !session.slash_commands.is_empty() {
             if let Some(sink) = sink.as_ref() {
                 sink(DshIdleEffect::Event(UnifiedAgentEvent::SlashCommands {
@@ -816,9 +983,29 @@ pub fn spawn_dsh_session_actor_with_sink(
                 tokio::select! {
                     cmd = rx.recv() => ActorStep::Cmd(cmd),
                     pump = session.read_idle_frame() => ActorStep::Idle(pump),
+                    decision = async {
+                        match idle_approvals.as_mut() {
+                            Some(bridge) => bridge.decisions.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => ActorStep::IdleDecision(decision),
                 }
             };
             let cmd = match step {
+                ActorStep::IdleDecision(decision) => {
+                    if let Some(decision) = decision {
+                        if let Err(err) = settle_session_ask(
+                            &mut session.stdin,
+                            &mut idle_pending_asks,
+                            decision,
+                        )
+                        .await
+                        {
+                            eprintln!("[external-agent] dsh idle session/ask settle failed: {err}");
+                        }
+                    }
+                    continue;
+                }
                 ActorStep::Idle(pump) => {
                     match pump {
                         DshIdlePump::Quiet => idle_hiccups = 0,
@@ -828,10 +1015,34 @@ pub fn spawn_dsh_session_actor_with_sink(
                                 idle_dead = true;
                             }
                         }
-                        DshIdlePump::Dead => idle_dead = true,
+                        DshIdlePump::Dead => {
+                            idle_dead = true;
+                            reject_pending_asks(
+                                &mut session.stdin,
+                                &mut idle_pending_asks,
+                                "ASK_ABORTED",
+                                "ask_user_question was aborted before the user answered",
+                            )
+                            .await;
+                        }
                         DshIdlePump::Reply(line) => {
                             idle_hiccups = 0;
                             session.write_control_line(&line).await;
+                        }
+                        DshIdlePump::Ask(value) => {
+                            idle_hiccups = 0;
+                            if let Err(err) = handle_incoming_request(
+                                &mut session.stdin,
+                                &session.session_id,
+                                &value,
+                                idle_approvals.as_mut(),
+                                &mut idle_pending_asks,
+                                &mut idle_pending_user_question_calls,
+                            )
+                            .await
+                            {
+                                eprintln!("[external-agent] dsh idle session/ask failed: {err}");
+                            }
                         }
                         DshIdlePump::Event(event) => {
                             idle_hiccups = 0;
@@ -876,12 +1087,23 @@ pub fn spawn_dsh_session_actor_with_sink(
                             &events,
                             &mut rx,
                             approvals.as_mut(),
+                            idle_approvals.as_mut(),
+                            &mut idle_pending_asks,
                         )
                         .await;
+                    let closed = matches!(&result, Err(err) if err == "closed" || err == CANCELLED_SESSION_LOST);
                     let _ = done.send(result);
+                    if closed {
+                        session.close().await;
+                        return;
+                    }
                 }
                 SessionCommand::Steer { accepted, .. } => {
+                    // 空闲时没有在飞轮次：引导和 follow-up 都拒，前端按普通新轮发出。
                     let _ = accepted.send(false);
+                }
+                SessionCommand::PiSession { reply, .. } => {
+                    let _ = reply.send(Err("Pi session commands are unsupported".to_string()));
                 }
                 SessionCommand::Cancel => {}
                 SessionCommand::StopTask { task_id } => {
@@ -898,13 +1120,134 @@ pub fn spawn_dsh_session_actor_with_sink(
 }
 
 const SESSION_ASK_METHOD: &str = "session/ask";
+const ASK_USER_QUESTION_TOOL: &str = "ask_user_question";
+const EXIT_PLAN_MODE_TOOL: &str = "exit_plan_mode";
 
 pub fn is_user_question_tool(name: &str) -> bool {
     crate::external_agents::ask_user::matches_tool("dsh", name)
 }
 
+/// 尚未被 `session/ask` 认领的问用户工具卡。官方 RPC 不带 callId，
+/// 并行 ask 不能共用最后一个槽位，否则两张卡的 `pending_chat_user_prompts`
+/// 会写进同一个 toolCallId。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUserQuestionCall {
+    id: String,
+    name: String,
+    question_ids: Vec<String>,
+}
+
+fn remember_user_question_call(
+    pending: &mut VecDeque<PendingUserQuestionCall>,
+    id: &str,
+    name: &str,
+    input: &Value,
+) {
+    if !is_user_question_tool(name) {
+        return;
+    }
+    pending.push_back(PendingUserQuestionCall {
+        id: id.to_string(),
+        name: name.to_string(),
+        question_ids: question_ids(input.get("questions")),
+    });
+}
+
+fn question_ids(questions: Option<&Value>) -> Vec<String> {
+    questions
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_plan_review_questions(questions: &Value) -> bool {
+    questions.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("id").and_then(Value::as_str) == Some("plan-review")
+                || item
+                    .get("intent")
+                    .and_then(|intent| intent.get("kind"))
+                    .and_then(Value::as_str)
+                    == Some("plan-review")
+        })
+    })
+}
+
+fn expected_ask_tool_name(questions: &Value) -> &'static str {
+    if is_plan_review_questions(questions) {
+        EXIT_PLAN_MODE_TOOL
+    } else {
+        ASK_USER_QUESTION_TOOL
+    }
+}
+
+fn names_match(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// 把一条 `session/ask` 绑到一张尚未认领的工具卡上：先对问题 id，再对工具名。
+/// 队列空时退回 RPC request id，避免把答案写进上一张已经在等的卡。
+fn take_user_question_call(
+    pending: &mut VecDeque<PendingUserQuestionCall>,
+    questions: &Value,
+    request_id: &str,
+) -> (String, String) {
+    let ask_ids = question_ids(Some(questions));
+    if !ask_ids.is_empty() {
+        if let Some(index) = pending
+            .iter()
+            .position(|call| !call.question_ids.is_empty() && call.question_ids == ask_ids)
+        {
+            let call = pending.remove(index).expect("index from position");
+            return (call.id, call.name);
+        }
+    }
+    let expected = expected_ask_tool_name(questions);
+    if let Some(index) = pending
+        .iter()
+        .position(|call| names_match(&call.name, expected))
+    {
+        let call = pending.remove(index).expect("index from position");
+        return (call.id, call.name);
+    }
+    if let Some(call) = pending.pop_front() {
+        return (call.id, call.name);
+    }
+    (request_id.to_string(), expected.to_string())
+}
+
 fn is_incoming_rpc_request(value: &Value) -> bool {
     value.get("method").and_then(Value::as_str).is_some() && rpc_id(value).is_some()
+}
+
+/// 空闲泵收到的入站 RPC：`session/ask` 交给宿主审批通道，其余仍 fail-close。
+fn classify_idle_incoming_rpc(value: &Value) -> DshIdlePump {
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    if method == SESSION_ASK_METHOD {
+        return DshIdlePump::Ask(value.clone());
+    }
+    let Some(id) = rpc_id(value) else {
+        return DshIdlePump::Quiet;
+    };
+    DshIdlePump::Reply(rpc_error_line(
+        &id,
+        -32000,
+        "no user-questions provider is registered",
+        Some(json!({ "code": "NO_PROVIDER" })),
+    ))
+}
+
+/// 本进程只服务这一条 Kivio 对话。`askViaHost` 会带 `request.agent.id`（子代理
+/// 自己的 session id），不能要求它等于父 `session/open` 的 id。
+fn session_ask_id_accepted(ask_session_id: Option<&str>) -> bool {
+    ask_session_id.is_some_and(|id| !id.trim().is_empty())
 }
 
 fn rpc_id(value: &Value) -> Option<Value> {
@@ -928,7 +1271,7 @@ async fn handle_incoming_request(
     value: &Value,
     approvals: Option<&mut ApprovalBridge>,
     pending_asks: &mut std::collections::HashMap<String, Value>,
-    last_user_question_call: Option<&(String, String)>,
+    pending_user_question_calls: &mut VecDeque<PendingUserQuestionCall>,
 ) -> Result<(), String> {
     let Some(id) = rpc_id(value) else {
         return Ok(());
@@ -945,12 +1288,13 @@ async fn handle_incoming_request(
         .await;
     }
     let params = value.get("params").unwrap_or(&Value::Null);
-    if params.get("sessionId").and_then(Value::as_str) != Some(session_id) {
+    let _ = session_id;
+    if !session_ask_id_accepted(params.get("sessionId").and_then(Value::as_str)) {
         return write_rpc_error(
             stdin,
             &id,
             -32602,
-            "session/ask sessionId does not match the open session",
+            "session/ask sessionId must be a non-empty string",
             Some(json!({ "code": "ASK_MISSING_AGENT" })),
         )
         .await;
@@ -989,9 +1333,8 @@ async fn handle_incoming_request(
         )
         .await;
     };
-    let (tool_call_id, tool_name) = last_user_question_call
-        .cloned()
-        .unwrap_or_else(|| (request_id.clone(), "ask_user_question".to_string()));
+    let (tool_call_id, tool_name) =
+        take_user_question_call(pending_user_question_calls, questions, &request_id);
     pending_asks.insert(request_id.clone(), id.clone());
     if bridge
         .requests
@@ -1014,6 +1357,22 @@ async fn handle_incoming_request(
             Some(json!({ "code": "ASK_ABORTED" })),
         )
         .await;
+    }
+    Ok(())
+}
+
+async fn drain_ask_decisions(
+    stdin: &mut ChildStdin,
+    pending_asks: &mut std::collections::HashMap<String, Value>,
+    mut turn_approvals: Option<&mut ApprovalBridge>,
+    mut idle_approvals: Option<&mut ApprovalBridge>,
+) -> Result<(), String> {
+    for bridge in [&mut turn_approvals, &mut idle_approvals] {
+        if let Some(bridge) = bridge.as_deref_mut() {
+            while let Ok(decision) = bridge.decisions.try_recv() {
+                settle_session_ask(stdin, pending_asks, decision).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -1175,16 +1534,25 @@ fn rpc_error_message(value: &Value) -> Option<String> {
 
 pub fn is_missing_session_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
-    lower.contains("dsh session/open:")
-        && (lower.contains("session \"") && lower.contains("\" not found"))
+    if !lower.contains("dsh session/open:") {
+        return false;
+    }
+    // Checksum / auth failures are not "the native id is gone" — fail loud.
+    if lower.contains("checksum") {
+        return false;
+    }
+    let not_found = lower.contains("not found")
+        || lower.contains("no such session")
+        || lower.contains("unknown session");
+    let resume_miss = lower.contains("resume mismatch") && lower.contains("requested=true");
+    not_found || resume_miss
 }
 
 /// Official SDK throws this when initialize names a pi-ai route that settings.yaml
 /// has not registered yet. Transient: retry initialize. Permanent after retries:
 /// the route is missing and the user should see this error.
 fn is_adapter_not_registered(err: &str) -> bool {
-    err.to_ascii_lowercase()
-        .contains("no adapter registered")
+    err.to_ascii_lowercase().contains("no adapter registered")
 }
 
 fn resolve_model_route_for_turn(selected: Option<&str>) -> Result<ModelRoute, String> {
@@ -1231,6 +1599,98 @@ fn normalize_sandbox(sandbox: Option<&str>) -> &'static str {
     }
 }
 
+fn dsh_can_accept_injection(
+    prompt_acknowledged: bool,
+    is_slash: bool,
+    cancel_requested: bool,
+    kind: MessageInjectionKind,
+) -> bool {
+    prompt_acknowledged
+        && !is_slash
+        && !cancel_requested
+        && matches!(
+            kind,
+            MessageInjectionKind::Steer | MessageInjectionKind::FollowUp
+        )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DshIdleAction {
+    /// 还有引导 / follow-up RPC 没回执：这一帧 idle 先记下，ACK 后再判。
+    Defer,
+    /// 用户 follow-up 还在 FIFO 里，对端只是轮间短暂 idle。
+    Stay,
+    /// 本轮（含已 ACK 的 follow-up 轮）都结束了。
+    Done,
+}
+
+/// `RunTurn` 自己算 1 轮；每 ACK 一条 follow-up 再加一轮。
+/// 没有用户 follow-up 时第一次 idle 就 Done，把 tool-jobs 汇报留给空闲泵。
+fn dsh_idle_action(
+    pending_injections_empty: bool,
+    turns_ended: u32,
+    followup_acked: u32,
+) -> DshIdleAction {
+    if !pending_injections_empty {
+        return DshIdleAction::Defer;
+    }
+    if turns_ended >= 1 + followup_acked {
+        DshIdleAction::Done
+    } else {
+        DshIdleAction::Stay
+    }
+}
+
+fn dsh_injection_rpc(
+    kind: MessageInjectionKind,
+    session_id: &str,
+    text: &str,
+    images: &[crate::external_agents::attachments::ImageBlock],
+) -> (&'static str, Value) {
+    let method = match kind {
+        MessageInjectionKind::Steer => "session/steer",
+        MessageInjectionKind::FollowUp => "session/prompt",
+    };
+    (method, steer_rpc(session_id, text, images))
+}
+
+fn prompt_content_blocks(
+    text: &str,
+    images: &[crate::external_agents::attachments::ImageBlock],
+) -> Vec<Value> {
+    let mut content_blocks = vec![json!({ "type": "text", "text": text })];
+    for image in images {
+        let media_type = if image.mime == "image/jpg" {
+            "image/jpeg"
+        } else {
+            image.mime.as_str()
+        };
+        let name = image
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("image");
+        content_blocks.push(json!({
+            "type": "image",
+            "data": image.data_base64,
+            "mediaType": media_type,
+            "name": name,
+        }));
+    }
+    content_blocks
+}
+
+fn steer_rpc(
+    session_id: &str,
+    text: &str,
+    images: &[crate::external_agents::attachments::ImageBlock],
+) -> Value {
+    json!({
+        "sessionId": session_id,
+        "contentBlocks": prompt_content_blocks(text, images),
+    })
+}
+
 fn turn_rpc(
     session_id: &str,
     prompt: &str,
@@ -1245,30 +1705,11 @@ fn turn_rpc(
             }),
         )
     } else {
-        let mut content_blocks = vec![json!({ "type": "text", "text": prompt })];
-        for image in images {
-            let media_type = if image.mime == "image/jpg" {
-                "image/jpeg"
-            } else {
-                image.mime.as_str()
-            };
-            let name = image
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("image");
-            content_blocks.push(json!({
-                "type": "image",
-                "data": image.data_base64,
-                "mediaType": media_type,
-                "name": name,
-            }));
-        }
         (
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "contentBlocks": content_blocks,
+                "contentBlocks": prompt_content_blocks(prompt, images),
             }),
         )
     }
@@ -1516,18 +1957,30 @@ pub(crate) fn is_subagent_tool_name(name: &str) -> bool {
     )
 }
 
-/// 派出回执（`started subagent <id>`）不是子代理跑完。调用方应保持工具卡 Running。
-pub(crate) fn subagent_launch_task_id(name: &str, content: &str) -> Option<String> {
-    if !is_subagent_tool_name(name) {
-        return None;
-    }
+/// 派出回执不是子代理跑完。调用方应保持工具卡 Running。
+///
+/// 官方 `dsh-tool-subagent`（0.1.0-rc.7）两条：
+/// - 一次性后台：`started background subagent job <jobId>`
+/// - 可续跑：`started subagent <subagentId>`
+/// `… task …` 是早期误读，继续认以免旧回执把卡打成 Success。
+const SUBAGENT_LAUNCH_PREFIXES: &[&str] = &[
+    "started background subagent job ",
+    "started background subagent task ",
+    "started subagent ",
+];
+
+fn is_subagent_launch_receipt(content: &str) -> bool {
     let text = content.trim();
-    if !(text.starts_with("started subagent ")
-        || text.starts_with("started background subagent task "))
-    {
+    SUBAGENT_LAUNCH_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+pub(crate) fn subagent_launch_task_id(name: &str, content: &str) -> Option<String> {
+    if !is_subagent_tool_name(name) || !is_subagent_launch_receipt(content) {
         return None;
     }
-    parse_background_task_id(text)
+    parse_background_task_id(content.trim())
 }
 
 fn optional_string(value: &Value, key: &str) -> Option<String> {
@@ -1559,11 +2012,11 @@ fn parse_background_task_id(content: &str) -> Option<String> {
             }
         }
     }
-    for prefix in [
-        "started background job ",
-        "started background subagent task ",
-        "started subagent ",
-    ] {
+    for prefix in SUBAGENT_LAUNCH_PREFIXES
+        .iter()
+        .copied()
+        .chain(std::iter::once("started background job "))
+    {
         if let Some(rest) = content.strip_prefix(prefix) {
             let id = rest
                 .split_whitespace()
@@ -1791,9 +2244,7 @@ fn fold_child_session_event(
     if session_id.is_empty() {
         return None;
     }
-    let progress = child_progress
-        .entry(session_id.to_string())
-        .or_default();
+    let progress = child_progress.entry(session_id.to_string()).or_default();
     let mut force = false;
     match event_type {
         "tool/call" => {
@@ -1836,7 +2287,8 @@ fn fold_child_session_event(
             }
         }
         "assistant/message" => {
-            let text = content_blocks_text(data.get("message").and_then(|value| value.get("content")));
+            let text =
+                content_blocks_text(data.get("message").and_then(|value| value.get("content")));
             if text.is_empty() {
                 return None;
             }
@@ -2046,7 +2498,7 @@ fn map_tool_results(
             .and_then(Value::as_bool)
             .unwrap_or_else(|| data.get("error").is_some());
         if let Some(pending) = state.background_calls.remove(&tool_use_id) {
-            if let Some(task_id) = parse_background_task_id(&content) {
+            if let Some(task_id) = parse_background_task_id(content.trim()) {
                 sink(UnifiedAgentEvent::BackgroundTask {
                     task_id,
                     status: "running".to_string(),
@@ -2123,14 +2575,151 @@ mod tests {
     }
 
     #[test]
+    fn parallel_session_asks_bind_distinct_tool_cards() {
+        let mut pending = VecDeque::new();
+        remember_user_question_call(
+            &mut pending,
+            "call_tea",
+            "ask_user_question",
+            &json!({ "questions": [{ "id": "q-tea", "question": "Tea?" }] }),
+        );
+        remember_user_question_call(
+            &mut pending,
+            "call_coffee",
+            "ask_user_question",
+            &json!({ "questions": [{ "id": "q-coffee", "question": "Coffee?" }] }),
+        );
+        assert_eq!(
+            take_user_question_call(
+                &mut pending,
+                &json!([{ "id": "q-coffee", "question": "Coffee?" }]),
+                "req_coffee",
+            ),
+            ("call_coffee".into(), "ask_user_question".into())
+        );
+        assert_eq!(
+            take_user_question_call(
+                &mut pending,
+                &json!([{ "id": "q-tea", "question": "Tea?" }]),
+                "req_tea",
+            ),
+            ("call_tea".into(), "ask_user_question".into())
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn plan_review_ask_does_not_steal_an_ask_user_question_card() {
+        let mut pending = VecDeque::new();
+        remember_user_question_call(
+            &mut pending,
+            "call_ask",
+            "ask_user_question",
+            &json!({ "questions": [{ "id": "q1", "question": "Ship it?" }] }),
+        );
+        remember_user_question_call(
+            &mut pending,
+            "call_plan",
+            "exit_plan_mode",
+            &json!({ "plan": "# Do the thing\n\n1. Start" }),
+        );
+        assert_eq!(
+            take_user_question_call(
+                &mut pending,
+                &json!([{
+                    "id": "plan-review",
+                    "header": "Plan review",
+                    "question": "Approve this plan and leave plan mode?",
+                    "intent": { "kind": "plan-review", "approve": "Approve" }
+                }]),
+                "req_plan",
+            ),
+            ("call_plan".into(), "exit_plan_mode".into())
+        );
+        assert_eq!(
+            take_user_question_call(
+                &mut pending,
+                &json!([{ "id": "q1", "question": "Ship it?" }]),
+                "req_ask",
+            ),
+            ("call_ask".into(), "ask_user_question".into())
+        );
+    }
+
+    #[test]
+    fn unmatched_session_ask_falls_back_to_the_rpc_request_id() {
+        let mut pending = VecDeque::new();
+        assert_eq!(
+            take_user_question_call(
+                &mut pending,
+                &json!([{ "id": "q1", "question": "Tea or coffee?" }]),
+                "req_orphan",
+            ),
+            ("req_orphan".into(), "ask_user_question".into())
+        );
+    }
+
+    #[test]
     fn classifies_only_missing_resume_targets_for_fresh_fallback() {
         assert!(is_missing_session_error(
             "dsh session/open: session \"kivio-old\" not found"
+        ));
+        assert!(is_missing_session_error(
+            "dsh session/open: session 'kivio-old' not found"
+        ));
+        assert!(is_missing_session_error(
+            "dsh session/open: Session kivio-old not found"
+        ));
+        assert!(is_missing_session_error(
+            "dsh session/open: resume mismatch (requested=true, actual=false)"
+        ));
+        assert!(!is_missing_session_error(
+            "dsh session/open: resume mismatch (requested=false, actual=true)"
         ));
         assert!(!is_missing_session_error(
             "dsh session/open: persisted log checksum mismatch"
         ));
         assert!(!is_missing_session_error("dsh initialize: auth failed"));
+    }
+
+    #[test]
+    fn idle_session_ask_is_parked_instead_of_no_provider() {
+        let ask = json!({
+            "jsonrpc": "2.0",
+            "id": "req_idle",
+            "method": "session/ask",
+            "params": {
+                "sessionId": "child-agent-1",
+                "questions": [{ "id": "q1", "question": "Ship it?" }]
+            }
+        });
+        match classify_idle_incoming_rpc(&ask) {
+            DshIdlePump::Ask(value) => {
+                assert_eq!(value["id"], "req_idle");
+                assert_eq!(value["method"], "session/ask");
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+        match classify_idle_incoming_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/unknown",
+            "params": {}
+        })) {
+            DshIdlePump::Reply(line) => {
+                assert!(line.contains("NO_PROVIDER"));
+            }
+            other => panic!("expected Reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_ask_accepts_any_non_empty_session_id_from_this_process() {
+        assert!(session_ask_id_accepted(Some("kivio-parent")));
+        assert!(session_ask_id_accepted(Some("child-subagent-9")));
+        assert!(!session_ask_id_accepted(Some("")));
+        assert!(!session_ask_id_accepted(Some("   ")));
+        assert!(!session_ask_id_accepted(None));
     }
 
     #[test]
@@ -2349,7 +2938,10 @@ mod tests {
     #[test]
     fn maps_compaction_summary_and_end_to_one_cli_compacted() {
         let events = map_events(&[
-            ("compaction/start", json!({ "compactionId": "c1", "turn": 2 })),
+            (
+                "compaction/start",
+                json!({ "compactionId": "c1", "turn": 2 }),
+            ),
             (
                 "compaction/summary",
                 json!({
@@ -2412,7 +3004,10 @@ mod tests {
     #[test]
     fn compaction_error_is_a_status_note_not_a_divider() {
         let events = map_events(&[
-            ("compaction/start", json!({ "compactionId": "c3", "turn": 1 })),
+            (
+                "compaction/start",
+                json!({ "compactionId": "c3", "turn": 1 }),
+            ),
             (
                 "compaction/end",
                 json!({
@@ -2519,6 +3114,40 @@ mod tests {
                 && status == "running"
                 && kind.as_deref() == Some("local_agent")
                 && description.as_deref() == Some("搜索最新AI资讯")
+        ));
+    }
+
+    #[test]
+    fn background_subagent_job_receipt_emits_a_running_task() {
+        let events = map_events(&[
+            (
+                "tool/call",
+                json!({
+                    "callId": "call_sa",
+                    "name": "subagent",
+                    "arguments": "{\"description\":\"搜索最新AI资讯\",\"prompt\":\"去搜\"}"
+                }),
+            ),
+            (
+                "tool/result",
+                json!({ "message": { "content": [{
+                    "type": "tool-result",
+                    "toolCallId": "call_sa",
+                    "content": [{ "type": "text", "text": "started background subagent job job_9" }],
+                    "isError": false
+                }] } }),
+            ),
+        ]);
+        assert!(matches!(
+            events.iter().find(|event| matches!(event, UnifiedAgentEvent::BackgroundTask { .. })),
+            Some(UnifiedAgentEvent::BackgroundTask {
+                task_id,
+                status,
+                kind,
+                ..
+            }) if task_id == "job_9"
+                && status == "running"
+                && kind.as_deref() == Some("local_agent")
         ));
     }
 
@@ -2644,15 +3273,13 @@ mod tests {
                     "web_fetch https://example.com".to_string()
                 ]
         ));
-        assert!(
-            fold_child_session_event(
-                "child-9",
-                "turn/end",
-                &json!({ "reason": { "kind": "completed" } }),
-                &mut progress,
-            )
-            .is_none()
-        );
+        assert!(fold_child_session_event(
+            "child-9",
+            "turn/end",
+            &json!({ "reason": { "kind": "completed" } }),
+            &mut progress,
+        )
+        .is_none());
     }
 
     #[test]
@@ -2717,6 +3344,11 @@ mod tests {
             Some("018b08fc-ee7f-4ea5-b77c-9c5d1c6ecf50")
         );
         assert_eq!(
+            subagent_launch_task_id("subagent_fork", "started background subagent job job_9")
+                .as_deref(),
+            Some("job_9")
+        );
+        assert_eq!(
             subagent_launch_task_id("subagent_fork", "started background subagent task job_9")
                 .as_deref(),
             Some("job_9")
@@ -2759,6 +3391,78 @@ mod tests {
     }
 
     #[test]
+    fn steer_rpc_reuses_prompt_content_blocks() {
+        let image = crate::external_agents::attachments::ImageBlock {
+            data_base64: "Zm9v".to_string(),
+            mime: "image/png".to_string(),
+            path: PathBuf::from("shot.png"),
+        };
+        let params = steer_rpc("kivio-1", "改用 rg", &[image]);
+        assert_eq!(params["sessionId"], "kivio-1");
+        assert_eq!(params["contentBlocks"][0]["text"], "改用 rg");
+        assert_eq!(params["contentBlocks"][1]["type"], "image");
+        assert_eq!(params["contentBlocks"][1]["data"], "Zm9v");
+        assert_eq!(params["contentBlocks"][1]["mediaType"], "image/png");
+        assert_eq!(params["contentBlocks"][1]["name"], "shot.png");
+    }
+
+    #[test]
+    fn injection_is_only_accepted_on_an_acknowledged_agent_turn() {
+        assert!(dsh_can_accept_injection(
+            true,
+            false,
+            false,
+            MessageInjectionKind::Steer,
+        ));
+        assert!(dsh_can_accept_injection(
+            true,
+            false,
+            false,
+            MessageInjectionKind::FollowUp,
+        ));
+        assert!(!dsh_can_accept_injection(
+            false,
+            false,
+            false,
+            MessageInjectionKind::Steer,
+        ));
+        assert!(!dsh_can_accept_injection(
+            true,
+            true,
+            false,
+            MessageInjectionKind::FollowUp,
+        ));
+        assert!(!dsh_can_accept_injection(
+            true,
+            false,
+            true,
+            MessageInjectionKind::FollowUp,
+        ));
+    }
+
+    #[test]
+    fn follow_up_reuses_prompt_and_steer_uses_bridge_method() {
+        let (steer_method, steer_params) =
+            dsh_injection_rpc(MessageInjectionKind::Steer, "kivio-1", "改用 rg", &[]);
+        assert_eq!(steer_method, "session/steer");
+        assert_eq!(steer_params["contentBlocks"][0]["text"], "改用 rg");
+        let (follow_method, follow_params) =
+            dsh_injection_rpc(MessageInjectionKind::FollowUp, "kivio-1", "接着做", &[]);
+        assert_eq!(follow_method, "session/prompt");
+        assert_eq!(follow_params["contentBlocks"][0]["text"], "接着做");
+    }
+
+    #[test]
+    fn idle_waits_for_acked_follow_up_turns_but_not_tool_jobs() {
+        assert_eq!(dsh_idle_action(false, 1, 0), DshIdleAction::Defer);
+        assert_eq!(dsh_idle_action(true, 1, 0), DshIdleAction::Done);
+        assert_eq!(dsh_idle_action(true, 1, 1), DshIdleAction::Stay);
+        assert_eq!(dsh_idle_action(true, 2, 1), DshIdleAction::Done);
+        assert_eq!(dsh_idle_action(true, 3, 1), DshIdleAction::Done);
+        assert_eq!(dsh_idle_action(true, 0, 0), DshIdleAction::Stay);
+    }
+
+    #[test]
     fn parses_discovered_slash_commands_from_the_bridge_list() {
         let commands = parse_dsh_slash_commands(&json!({
             "commands": [
@@ -2773,7 +3477,10 @@ mod tests {
                 { "name": "" },
             ]
         }));
-        let names: Vec<&str> = commands.iter().map(|command| command.name.as_str()).collect();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
         assert_eq!(names, ["compact", "feedback", "goal"]);
         assert_eq!(
             commands
@@ -2840,6 +3547,8 @@ mod tests {
                 &event_tx,
                 &mut control_rx,
                 None,
+                None,
+                &mut std::collections::HashMap::new(),
             )
             .await
             .expect("live dsh turn");
@@ -2906,6 +3615,8 @@ mod tests {
                 &event_tx,
                 &mut control_rx,
                 None,
+                None,
+                &mut std::collections::HashMap::new(),
             )
             .await
             .expect("first dsh turn");
@@ -2932,6 +3643,8 @@ mod tests {
                 &event_tx,
                 &mut control_rx,
                 None,
+                None,
+                &mut std::collections::HashMap::new(),
             )
             .await
             .expect("second dsh turn after process restart");
@@ -2998,6 +3711,8 @@ mod tests {
                 &event_tx,
                 &mut control_rx,
                 None,
+                None,
+                &mut std::collections::HashMap::new(),
             )
             .await
             .expect_err("cancel must stop the active dsh turn");
@@ -3011,6 +3726,8 @@ mod tests {
                 &event_tx,
                 &mut control_rx,
                 None,
+                None,
+                &mut std::collections::HashMap::new(),
             )
             .await
             .expect("session should remain usable after cancel");

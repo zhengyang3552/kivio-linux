@@ -26,7 +26,6 @@ use crate::external_agents::prompt::{
 use crate::external_agents::registry::get_agent_def;
 use crate::external_agents::session::acp::AcpMcpServer;
 use crate::external_agents::session::live::LaunchConfig;
-use crate::external_agents::session::pi_rpc::run_pi_rpc_session;
 use crate::external_agents::session::{
     persist_delivered_session, resolve_agent_resume_context, stable_prompt_hash,
 };
@@ -39,7 +38,7 @@ use crate::external_agents::types::{
     RuntimeBuildOptions, RuntimeContext, StreamFormat, UnifiedAgentEvent,
 };
 use crate::external_agents::workspace::{ensure_effective_cwd, extra_allowed_dirs_for_agent};
-use crate::skills::read_skill_detail;
+use crate::skills::read_skill_detail_in;
 use crate::state::AppState;
 
 /// Emitted (as a leading text banner) when a persistent-session turn expected to resume a native
@@ -153,7 +152,13 @@ pub async fn run_external_cli_reply(
     let skill_detail = if is_slash {
         None
     } else if let Some(skill_id) = active_skill_id.filter(|s| !s.is_empty()) {
-        read_skill_detail(app, &settings.chat_tools.skill_scan_paths, skill_id).ok()
+        read_skill_detail_in(
+            app,
+            &settings.chat_tools.skill_scan_paths,
+            skill_id,
+            Some(cwd.as_path()),
+        )
+        .ok()
     } else {
         None
     };
@@ -343,15 +348,15 @@ pub async fn run_external_cli_reply(
     let _protocol_guard =
         crate::chat::protocol::RegisteredRunGuard::new(app, &run_id, conversation.revision);
 
-    // Phase 2 / B1: claude、codex app-server、ACP 家族与 dsh SDK JSON-RPC 都通过
-    // live-session 注册表把进程跨轮保活。只剩 `PiRpc` 每轮起一个新子进程（见下面
-    // `_ =>` 分支的注释）。
+    // All rich external protocols, including Pi RPC, use the live-session registry so one child
+    // process serves multiple turns for the same Kivio conversation.
     let persistent = matches!(
         def.stream_format,
         StreamFormat::ClaudeStreamJson
             | StreamFormat::CodexAppServer
             | StreamFormat::AcpJsonRpc
             | StreamFormat::DshJsonRpc
+            | StreamFormat::PiRpc
     );
     let mut spawned_opt = if persistent {
         None
@@ -393,6 +398,15 @@ pub async fn run_external_cli_reply(
     // 落盘仍走 mutate 补丁，避免并发 spawn 用过期整表把后写的条目盖掉。
     let mut todo_state = conversation.agent_todo_state.clone();
     let conversation_id = conversation.id.clone();
+    // Keep Pi native-session ownership stable through both the RPC turn and Kivio persistence.
+    // Fork/clone moves the actor only after this guard drops.
+    let pi_operation_lock = matches!(def.stream_format, StreamFormat::PiRpc)
+        .then(|| state.pi_session_control_lock_for(&conversation_id));
+    let _pi_operation = if let Some(lock) = pi_operation_lock.as_ref() {
+        Some(lock.lock().await)
+    } else {
+        None
+    };
     let started_at = Instant::now();
     // 缓存 key 用探测 cwd（resolve_detection_cwd，非项目会话 = __global__），与斜杠探测的
     // 读取 key 一致——运行时从 CLI init 学到的真实命令列表才能覆盖探测缓存（含空负缓存）。
@@ -503,17 +517,13 @@ pub async fn run_external_cli_reply(
         )
         .await
     } else {
-        // 常驻改造（B1）之后，非常驻路径**只剩 `PiRpc`** —— 上面的 `persistent` 谓词把
-        // claude / codex / ACP 全收走了，而 `StreamFormat` 一共就这四个变体。此前这里还留着
-        // `CodexAppServer` / `AcpJsonRpc` / `_` 三条臂（连带 `run_acp_session` 与
-        // `run_codex_app_server_session` 两个一次性驱动，共约 470 行），全部不可达 ——
-        // 那正是 rmcp 那次重构刚在 MCP 上消灭掉的「同一个协议两份实现」。
+        // Defensive fallback for any future protocol intentionally left outside the live registry.
         debug_assert_eq!(def.stream_format, StreamFormat::PiRpc);
         let spawned = spawned_opt
             .as_mut()
             .expect("non-persistent path spawns a child");
         let model = conversation.agent_runtime.external_model.as_deref();
-        run_pi_rpc_session(
+        crate::external_agents::session::pi_rpc::run_pi_rpc_session(
             &mut spawned.child,
             &composed.full_prompt,
             model,
@@ -643,11 +653,16 @@ pub async fn run_external_cli_reply(
         }
     }
 
+    let actual_native_session_id = matches!(def.stream_format, StreamFormat::PiRpc)
+        .then(|| crate::external_agents::session::load_live_handle(app, &conversation_id))
+        .flatten()
+        .map(|handle| handle.native_id);
     persist_delivered_session(
         app,
         &conversation_id,
         def.id,
         &resume_ctx,
+        actual_native_session_id.as_deref(),
         // 哈希只覆盖**会话级常量**（系统提示 + Memory + cwd 提示）。skill 正文是 per-turn 的，
         // 不进哈希——否则换 skill 会被当成「instructions 变了」而重发一遍会话级指令。
         &daemon_instructions,
@@ -872,6 +887,7 @@ where
                 resume_native.clone(),
                 Some(background_task_sink(app, conversation_id)),
                 Some(dsh_idle_sink(app, conversation_id)),
+                dsh_idle_approvals_for(protocol, app, conversation_id),
             )
             .await
             {
@@ -883,6 +899,9 @@ where
                     if !dropped_resume
                         && (crate::external_agents::stream::claude::is_missing_session_error(&err)
                             || crate::external_agents::session::dsh_jsonrpc::is_missing_session_error(
+                                &err,
+                            )
+                            || crate::external_agents::session::pi_rpc::is_missing_pi_session_error(
                                 &err,
                             )) =>
                 {
@@ -907,6 +926,7 @@ where
                         None,
                         Some(background_task_sink(app, conversation_id)),
                         Some(dsh_idle_sink(app, conversation_id)),
+                        dsh_idle_approvals_for(protocol, app, conversation_id),
                     )
                     .await?
                 }
@@ -927,6 +947,7 @@ where
                     agent_id: agent_id.to_string(),
                     protocol: protocol_tag.to_string(),
                     native_id,
+                    native_path: None,
                     cwd: cwd_str.clone(),
                 },
             );
@@ -1135,6 +1156,7 @@ async fn reconnect_fresh(
         resume_native,
         Some(background_task_sink(app, conversation_id)),
         Some(dsh_idle_sink(app, conversation_id)),
+        dsh_idle_approvals_for(protocol, app, conversation_id),
     )
     .await?;
     let _ = save_live_handle(
@@ -1144,6 +1166,7 @@ async fn reconnect_fresh(
             agent_id: agent_id.to_string(),
             protocol: protocol_tag.to_string(),
             native_id: native_id.clone(),
+            native_path: None,
             cwd: cwd_str.to_string(),
         },
     );
@@ -1175,13 +1198,15 @@ async fn reconnect_fresh(
 /// dsh 相反：model 是进程级 `initialize` 后创建 agent 时固定的，reasoning 是 profile patch，
 /// sandbox 是进程环境变量；三者都没有 session 级修改 RPC。任一变化都必须换进程，但 Kivio
 /// bridge 会用同一个 native session id 调 `agents.resume()`，所以历史上下文继续保留。
-fn dsh_provider_fingerprint_for(provider: Option<&crate::settings::ExternalCliProvider>) -> String {
+fn dsh_provider_fingerprint_for(
+    config: Option<&crate::settings::ExternalCliAgentConfig>,
+) -> String {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match provider {
-        Some(provider) => serde_json::to_string(provider)
-            .unwrap_or_else(|_| provider.id.clone())
+    match config {
+        Some(config) => serde_json::to_string(&(&config.current_provider, &config.providers))
+            .unwrap_or_else(|_| config.current_provider.clone())
             .hash(&mut hasher),
         None => "cli-default".hash(&mut hasher),
     }
@@ -1189,8 +1214,8 @@ fn dsh_provider_fingerprint_for(provider: Option<&crate::settings::ExternalCliPr
 }
 
 fn dsh_provider_fingerprint() -> String {
-    let provider = crate::external_agents::overrides::active_provider("dsh");
-    dsh_provider_fingerprint_for(provider.as_ref())
+    let config = crate::external_agents::overrides::agent_config("dsh");
+    dsh_provider_fingerprint_for(config.as_ref())
 }
 
 fn launch_config_for_turn(
@@ -1214,6 +1239,9 @@ fn launch_config_for_turn(
             // dsh 的会话级指令在首轮正文里，不是启动配置；指令变化不需要为了它单独重连。
             instructions: None,
         };
+    }
+    if matches!(protocol, StreamFormat::PiRpc) {
+        return LaunchConfig::for_pi(model, reasoning);
     }
     if !matches!(protocol, StreamFormat::ClaudeStreamJson) {
         return LaunchConfig::default();
@@ -1254,7 +1282,9 @@ fn persistent_turn_prompt<'a>(
     latest_user_message: &'a str,
 ) -> &'a str {
     match protocol {
-        StreamFormat::ClaudeStreamJson | StreamFormat::DshJsonRpc => composed_prompt,
+        StreamFormat::ClaudeStreamJson | StreamFormat::DshJsonRpc | StreamFormat::PiRpc => {
+            composed_prompt
+        }
         _ => latest_user_message,
     }
 }
@@ -1262,12 +1292,14 @@ fn persistent_turn_prompt<'a>(
 /// 本轮错误是否代表「用户取消」——出口走 cancelled（不弹错误气泡、不发上下文重置提示、
 /// 更不会重发这一轮 prompt）。
 fn is_cancellation(err: &str) -> bool {
-    err == "cancelled" || err == crate::external_agents::session::live::CANCELLED_SESSION_LOST
+    err == "cancelled"
+        || err == "closed"
+        || err == crate::external_agents::session::live::CANCELLED_SESSION_LOST
 }
 
 /// 这次失败之后，常驻会话能不能留在注册表里继续服下一轮。
 ///
-/// **claude / dsh**：协议级取消会一直读到当前活动完全回到 idle，流位置停在轮次边界、
+/// **claude / dsh / Pi**：协议级取消会一直读到当前活动完整回到 idle，流位置停在轮次边界、
 /// 进程与原生 session 完好，可以直接继续下一轮。
 ///
 /// **ACP / codex**：`session/cancel` / `turn/interrupt` 发出后立刻返回，reader 停在流中间
@@ -1279,7 +1311,7 @@ fn cancel_keeps_live_session(err: &str, protocol: StreamFormat) -> bool {
     err == "cancelled"
         && matches!(
             protocol,
-            StreamFormat::ClaudeStreamJson | StreamFormat::DshJsonRpc
+            StreamFormat::ClaudeStreamJson | StreamFormat::DshJsonRpc | StreamFormat::PiRpc
         )
 }
 
@@ -1326,6 +1358,7 @@ fn persistent_failure_action(
     // 同样只降级一次 —— 摘掉 resume 之后还失败说明是别的原因。
     if crate::external_agents::stream::claude::is_missing_session_error(err)
         || crate::external_agents::session::dsh_jsonrpc::is_missing_session_error(err)
+        || crate::external_agents::session::pi_rpc::is_missing_pi_session_error(err)
     {
         return if dropped_resume {
             PersistentFailureAction::Fatal
@@ -1365,6 +1398,12 @@ fn drop_resume_for_fresh_session(
     if matches!(protocol, StreamFormat::DshJsonRpc) {
         clear_live_handle(app, conversation_id);
         return args.to_vec();
+    }
+    if matches!(protocol, StreamFormat::PiRpc) {
+        let fresh_id = uuid::Uuid::new_v4().to_string();
+        replace_stored_session_id(app, conversation_id, agent_id, &fresh_id);
+        clear_live_handle(app, conversation_id);
+        return crate::external_agents::defs::pi::pi_args_fresh_session(args, &fresh_id);
     }
     if !matches!(protocol, StreamFormat::ClaudeStreamJson) {
         return args.to_vec();
@@ -1907,6 +1946,129 @@ fn dsh_idle_sink(
     })
 }
 
+fn dsh_idle_approvals_for(
+    protocol: StreamFormat,
+    app: &AppHandle,
+    conversation_id: &str,
+) -> Option<crate::external_agents::session::live::ApprovalBridge> {
+    matches!(protocol, StreamFormat::DshJsonRpc)
+        .then(|| spawn_dsh_idle_approval_bridge(app, conversation_id))
+}
+
+fn spawn_dsh_idle_approval_bridge(
+    app: &AppHandle,
+    conversation_id: &str,
+) -> crate::external_agents::session::live::ApprovalBridge {
+    use crate::external_agents::session::live::{ApprovalAsk, ApprovalBridge, ApprovalDecision};
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<ApprovalAsk>(8);
+    let (decision_tx, decision_rx) = tokio::sync::mpsc::channel::<ApprovalDecision>(8);
+    let app = app.clone();
+    let conversation_id = conversation_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ask) = request_rx.recv().await {
+            let decision =
+                present_dsh_idle_ask(app.clone(), conversation_id.clone(), ask).await;
+            if decision_tx.send(decision).await.is_err() {
+                break;
+            }
+        }
+    });
+    ApprovalBridge {
+        requests: request_tx,
+        decisions: decision_rx,
+    }
+}
+
+/// 父轮已经结束后，后台子代理仍可能 `session/ask`。`request_user_response` 在
+/// generation 已失效时会立刻当取消，所以这里开一条新的可取消 generation，并落一条
+/// 助手工具卡，让问用户 UI 有挂载点。
+async fn present_dsh_idle_ask(
+    app: AppHandle,
+    conversation_id: String,
+    ask: crate::external_agents::session::live::ApprovalAsk,
+) -> crate::external_agents::session::live::ApprovalDecision {
+    let state = app.state::<AppState>();
+    let generation = state.next_chat_generation(&conversation_id);
+    let run_id = format!("dsh-ask-{}", Uuid::new_v4());
+    let message_id = format!("msg_{}", Uuid::new_v4());
+    let arguments =
+        serde_json::to_string(&ask.input).unwrap_or_else(|_| "{}".to_string());
+    let persisted = persist_dsh_idle_ask_message(
+        &app,
+        &conversation_id,
+        &message_id,
+        &ask.tool_call_id,
+        &ask.tool_name,
+        &arguments,
+    )
+    .await;
+    if let Some(revision) = persisted {
+        crate::chat::protocol::register_run(
+            &app,
+            &conversation_id,
+            &run_id,
+            &message_id,
+            revision.saturating_sub(1),
+        );
+    }
+    let host = ApprovalHost {
+        app: &app,
+        state: &*state,
+        conversation_id: &conversation_id,
+        run_id: &run_id,
+        generation,
+        agent_id: "dsh",
+        auto_allow_tools: std::sync::atomic::AtomicBool::new(true),
+    };
+    let decision = host.ask(ask).await;
+    state.end_chat_generation(&conversation_id, generation);
+    if let Some(revision) = persisted {
+        crate::chat::protocol::finish_run(&app, &run_id, "done", "", revision);
+    }
+    decision
+}
+
+async fn persist_dsh_idle_ask_message(
+    app: &AppHandle,
+    conversation_id: &str,
+    message_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Option<u64> {
+    let message: crate::chat::types::ChatMessage = match serde_json::from_value(serde_json::json!({
+        "id": message_id,
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": tool_call_id,
+            "name": tool_name,
+            "source": "external_cli",
+            "arguments": arguments,
+            "status": "running",
+            "sensitive": true,
+            "round": 1
+        }],
+        "timestamp": Local::now().timestamp(),
+    })) {
+        Ok(message) => message,
+        Err(err) => {
+            eprintln!("[external-agent] dsh idle ask message build failed: {err}");
+            return None;
+        }
+    };
+    match crate::chat::repository::repository(app)
+        .append_message(app, conversation_id, message)
+        .await
+    {
+        Ok(conversation) => Some(conversation.revision),
+        Err(err) => {
+            eprintln!("[external-agent] dsh idle ask persist failed: {err:?}");
+            None
+        }
+    }
+}
+
 fn apply_idle_dsh_event(app: &AppHandle, conversation_id: &str, event: UnifiedAgentEvent) {
     match event {
         UnifiedAgentEvent::BackgroundTask {
@@ -2135,6 +2297,7 @@ async fn connect_persistent_session(
         crate::external_agents::session::claude_stream::BackgroundTaskSink,
     >,
     dsh_idle_sink: Option<crate::external_agents::session::dsh_jsonrpc::DshIdleSink>,
+    dsh_idle_approvals: Option<crate::external_agents::session::live::ApprovalBridge>,
 ) -> Result<PersistentConnection, String> {
     use crate::external_agents::session::acp::{spawn_acp_session_actor, AcpSession};
     use crate::external_agents::session::claude_stream::{
@@ -2321,13 +2484,36 @@ async fn connect_persistent_session(
             let resumed = session.resumed();
             let child_pid = session.child_pid();
             Ok(PersistentConnection {
-                control: spawn_dsh_session_actor_with_sink(session, dsh_idle_sink),
+                control: spawn_dsh_session_actor_with_sink(
+                    session,
+                    dsh_idle_sink,
+                    dsh_idle_approvals,
+                ),
                 native_id: id,
                 resumed,
                 child_pid,
             })
         }
-        StreamFormat::PiRpc => Err("protocol does not support persistent sessions".to_string()),
+        StreamFormat::PiRpc => {
+            let session = crate::external_agents::session::pi_rpc::PiRpcSession::connect(
+                resolved_bin,
+                args,
+                cwd,
+                resume_native.as_deref(),
+            )
+            .await?;
+            let native_id = session.session_id().to_string();
+            let resumed = session.resumed();
+            let child_pid = session.child_pid();
+            Ok(PersistentConnection {
+                control: crate::external_agents::session::pi_rpc::spawn_pi_rpc_session_actor(
+                    session,
+                ),
+                native_id,
+                resumed,
+                child_pid,
+            })
+        }
     }
 }
 
@@ -2576,12 +2762,11 @@ fn apply_unified_event(
                         None
                     };
                     if let Some((name, input, result)) = claude_todo {
-                        if let Some(next) = crate::external_agents::claude_todo::apply_claude_todo_tool(
-                            todo_state,
-                            &name,
-                            &input,
-                            &result,
-                        ) {
+                        if let Some(next) =
+                            crate::external_agents::claude_todo::apply_claude_todo_tool(
+                                todo_state, &name, &input, &result,
+                            )
+                        {
                             *todo_state = next;
                             publish_todo_state(app, run_id, record, todo_state);
                             persist_claude_todo(app, conversation_id, name, input, result);
@@ -2667,6 +2852,19 @@ fn apply_unified_event(
                 return;
             };
             let record = crate::chat::agent::steering::build_steer_record(&message, 1);
+            let segment = push_tool_segment(segments, segment_order, &record.id);
+            emit_chat_stream_delta(app, run_id, "", None, Some(&segment));
+            tool_map.insert(record.id.clone(), tool_calls.len());
+            tool_calls.push(record.clone());
+            emit_chat_tool_record(app, run_id, &record);
+        }
+        UnifiedAgentEvent::UserFollowUp { id, text } => {
+            segment_tracker.reset_text();
+            segment_tracker.reset_reasoning();
+            let Some(message) = crate::chat::agent::SteeringMessage::new(id, &text) else {
+                return;
+            };
+            let record = crate::chat::agent::steering::build_follow_up_record(&message, 1);
             let segment = push_tool_segment(segments, segment_order, &record.id);
             emit_chat_stream_delta(app, run_id, "", None, Some(&segment));
             tool_map.insert(record.id.clone(), tool_calls.len());
@@ -3136,6 +3334,39 @@ mod tests {
             background_task_id(&record).as_deref(),
             Some("018b08fc-ee7f-4ea5-b77c-9c5d1c6ecf50")
         );
+    }
+
+    #[test]
+    fn background_subagent_job_receipt_keeps_the_tool_card_running() {
+        let mut record = ToolCallRecord {
+            id: "c1".into(),
+            name: "subagent".into(),
+            source: "external_cli".into(),
+            server_id: None,
+            arguments: "{}".into(),
+            status: ToolCallStatus::Running,
+            result_preview: None,
+            error: None,
+            duration_ms: None,
+            started_at: Some(1),
+            completed_at: None,
+            round: 1,
+            sensitive: false,
+            artifacts: vec![],
+            trace_id: None,
+            span_id: None,
+            structured_content: Some(serde_json::json!({ "description": "搜资讯" })),
+        };
+        apply_external_tool_result(
+            &mut record,
+            "started background subagent job job_9",
+            false,
+            99,
+        );
+        assert_eq!(record.status, ToolCallStatus::Running);
+        assert_eq!(record.completed_at, None);
+        assert_eq!(record.result_preview, None);
+        assert_eq!(background_task_id(&record).as_deref(), Some("job_9"));
     }
 
     #[test]
@@ -3767,6 +3998,24 @@ mod tests {
         );
     }
 
+    const REAL_PI_MISSING_SESSION_ERROR: &str = "Pi session \"abc\" not found";
+
+    #[test]
+    fn a_missing_pi_resume_target_reconnects_without_resume_exactly_once() {
+        assert_eq!(
+            persistent_failure_action(REAL_PI_MISSING_SESSION_ERROR, "pi", false, false, false),
+            PersistentFailureAction::ReconnectWithoutResume
+        );
+        assert_eq!(
+            persistent_failure_action(REAL_PI_MISSING_SESSION_ERROR, "pi", false, false, true),
+            PersistentFailureAction::Fatal
+        );
+        assert_ne!(
+            persistent_failure_action("Pi RPC timed out", "pi", false, false, false),
+            PersistentFailureAction::ReconnectWithoutResume
+        );
+    }
+
     /// 启动阶段暴露的那条（`connect()` 的 `try_wait` 抓到「立刻退出」+ stderr 尾部）
     /// 必须命中同一条判据 —— 判据是 `contains`，不是全等。
     #[test]
@@ -3866,6 +4115,7 @@ mod tests {
     #[test]
     fn both_cancel_flavours_are_cancellations() {
         assert!(is_cancellation("cancelled"));
+        assert!(is_cancellation("closed"));
         assert!(is_cancellation(CANCELLED_SESSION_LOST));
         assert!(!is_cancellation("ACP session exited mid-turn"));
         assert!(!is_cancellation(""));
@@ -3875,7 +4125,7 @@ mod tests {
         );
     }
 
-    /// claude / dsh 在协议级取消完整收尾后都必须保留 live session。
+    /// claude / dsh / Pi 在协议级取消完整收尾后都必须保留 live session。
     #[test]
     fn settled_protocol_cancel_keeps_supported_live_sessions() {
         assert!(cancel_keeps_live_session(
@@ -3886,6 +4136,7 @@ mod tests {
             "cancelled",
             StreamFormat::DshJsonRpc
         ));
+        assert!(cancel_keeps_live_session("cancelled", StreamFormat::PiRpc));
         // 硬 Close / 进程已死：任何协议都不保留（留着就是个死 actor）。
         assert!(!cancel_keeps_live_session(
             CANCELLED_SESSION_LOST,
@@ -3976,29 +4227,39 @@ mod tests {
                 Some("minimal")
             )
         );
-        let provider_a = crate::settings::ExternalCliProvider {
-            id: "provider-a".to_string(),
-            config_json: "{\"baseURL\":\"https://a.example/v1\"}".to_string(),
+        let config_a = crate::settings::ExternalCliAgentConfig {
+            providers: vec![crate::settings::ExternalCliProvider {
+                id: "provider-a".to_string(),
+                config_json: "{\"baseURL\":\"https://a.example/v1\"}".to_string(),
+                ..Default::default()
+            }],
+            current_provider: "provider-a".to_string(),
             ..Default::default()
         };
-        let provider_b = crate::settings::ExternalCliProvider {
-            id: "provider-b".to_string(),
-            config_json: "{\"baseURL\":\"https://b.example/v1\"}".to_string(),
+        let config_b = crate::settings::ExternalCliAgentConfig {
+            providers: vec![crate::settings::ExternalCliProvider {
+                id: "provider-b".to_string(),
+                config_json: "{\"baseURL\":\"https://b.example/v1\"}".to_string(),
+                ..Default::default()
+            }],
+            current_provider: "provider-b".to_string(),
             ..Default::default()
         };
         assert_ne!(
-            dsh_provider_fingerprint_for(Some(&provider_a)),
-            dsh_provider_fingerprint_for(Some(&provider_b))
+            dsh_provider_fingerprint_for(Some(&config_a)),
+            dsh_provider_fingerprint_for(Some(&config_b))
+        );
+        let mut config_disabled = config_a.clone();
+        config_disabled.providers[0].disabled = true;
+        assert_ne!(
+            dsh_provider_fingerprint_for(Some(&config_a)),
+            dsh_provider_fingerprint_for(Some(&config_disabled))
         );
         assert_ne!(
             dsh_provider_fingerprint_for(None),
-            dsh_provider_fingerprint_for(Some(&provider_a))
+            dsh_provider_fingerprint_for(Some(&config_a))
         );
-        for protocol in [
-            StreamFormat::AcpJsonRpc,
-            StreamFormat::CodexAppServer,
-            StreamFormat::PiRpc,
-        ] {
+        for protocol in [StreamFormat::AcpJsonRpc, StreamFormat::CodexAppServer] {
             assert_eq!(
                 launch_config_for_turn(
                     protocol,
@@ -4012,6 +4273,21 @@ mod tests {
                 "{protocol:?} 不该参与启动指纹判定"
             );
         }
+        let pi = |model, reasoning| {
+            launch_config_for_turn(StreamFormat::PiRpc, model, reasoning, None, None, None)
+        };
+        assert_eq!(
+            pi(Some("opus"), Some("high")),
+            pi(Some("opus"), Some("high"))
+        );
+        assert_ne!(
+            pi(Some("opus"), Some("high")),
+            pi(Some("sonnet"), Some("high"))
+        );
+        assert_ne!(
+            pi(Some("opus"), Some("high")),
+            pi(Some("opus"), Some("low"))
+        );
     }
 
     /// 真正的启动 flag 任一变化都要触发重连（`accepts` 为 false）；全都没变则复用。

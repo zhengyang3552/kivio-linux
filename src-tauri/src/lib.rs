@@ -115,11 +115,16 @@ pub fn run() {
     // inherited from Finder/Dock. Windows: explorer's PATH is a stale login-time
     // snapshot, so read the current value from the registry, then also run the
     // user's PowerShell profile to pick up version-manager dirs (fnm/nvm) that
-    // never touch the registry. No-op on Linux. See `path_env` module docs.
+    // never touch the registry. No-op on Linux. Locale is the other half of
+    // the same gap (see ensure_utf8_locale below). See `path_env` module docs.
     #[cfg(target_os = "macos")]
     path_env::enrich_path_macos();
     #[cfg(target_os = "windows")]
     path_env::enrich_path_windows();
+    // Same GUI-launch gap as PATH: Finder/Dock often hands us no LANG, so libc
+    // stays in C and BSD `ls` prints `?` for CJK filenames. One process-wide
+    // fix is inherited by the dock PTY, run_command, MCP, and CLI probes.
+    path_env::ensure_utf8_locale();
 
     let autostart_plugin = {
         #[cfg(target_os = "macos")]
@@ -467,6 +472,7 @@ pub fn run() {
             windows::chat_window_apply_mica,
             windows::chat_window_set_opaque,
             windows::chat_traffic_light_center_y,
+            windows::chat_remember_last_route,
             fonts::list_system_fonts,
             commands::get_default_prompt_templates,
             commands::save_settings,
@@ -564,6 +570,13 @@ pub fn run() {
             chat::commands::interaction::chat_respond_session_consent,
             chat::commands::interaction::chat_submit_user_choice,
             chat::commands::interaction::chat_steer_message,
+            chat::commands::interaction::chat_follow_up_message,
+            external_agents::pi_session_tree::chat_pi_session_tree,
+            external_agents::pi_session_tree::chat_pi_session_entries,
+            external_agents::pi_session_tree::chat_pi_fork_messages,
+            external_agents::pi_session_tree::chat_pi_session_fork,
+            external_agents::pi_session_tree::chat_pi_session_clone,
+            external_agents::pi_session_tree::chat_pi_session_switch,
             chat::commands::interaction::chat_python_complete,
             chat::commands::attachments::chat_read_attachment,
             chat::commands::attachments::chat_open_attachment,
@@ -593,6 +606,21 @@ pub fn run() {
             external_agents::installer::chat_external_cli_install_info,
             external_agents::installer::chat_external_cli_install,
             external_agents::installer::chat_external_cli_open_config_dir,
+            external_agents::pi_extensions::chat_pi_extensions_inventory,
+            external_agents::pi_extensions::chat_pi_extension_set_enabled,
+            external_agents::pi_extensions::chat_pi_extension_install,
+            external_agents::pi_extensions::chat_pi_extension_update,
+            external_agents::pi_extensions::chat_pi_extension_remove,
+            external_agents::pi_extensions::chat_pi_extension_open,
+            external_agents::pi_extensions::chat_pi_extensions_open_dir,
+            external_agents::pi_skills::chat_pi_skills_inventory,
+            external_agents::pi_skills::chat_pi_skill_set_enabled,
+            external_agents::pi_skills::chat_pi_skill_commands_set_enabled,
+            external_agents::pi_skills::chat_pi_skill_add_path,
+            external_agents::pi_skills::chat_pi_skill_remove_path,
+            external_agents::pi_skills::chat_pi_skill_remove,
+            external_agents::pi_skills::chat_pi_skill_open,
+            external_agents::pi_skills::chat_pi_skills_open_dir,
             external_agents::dsh_plugins::chat_dsh_plugin_settings_get,
             external_agents::dsh_plugins::chat_dsh_plugin_settings_save,
             external_agents::dsh_plugins::chat_dsh_plugin_inventory,
@@ -618,13 +646,10 @@ pub fn run() {
             mcp::registry::chat_mcp_warmup,
             connectors::connector_oauth_connect,
             connectors::obsidian::list_obsidian_vaults_cmd,
-            connectors::himalaya::list_email_provider_presets,
-            connectors::himalaya::himalaya_status_cmd,
-            connectors::himalaya::himalaya_install_cmd,
-            connectors::himalaya::test_himalaya_email_cmd,
             plugins::plugins_list,
             plugins::plugins_list_cached,
             plugins::plugins_install_brief,
+            plugins::plugins_run_official_install,
             plugins::plugins_set_enabled,
             plugins::plugins_uninstall,
             notes::notes_list,

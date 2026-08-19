@@ -70,6 +70,35 @@ pub struct ApprovalBridge {
     pub decisions: mpsc::Receiver<ApprovalDecision>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageInjectionKind {
+    Steer,
+    FollowUp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PiSessionRequest {
+    GetTree,
+    GetEntries { since: Option<String> },
+    GetForkMessages,
+    Fork { entry_id: String },
+    Clone,
+    Switch { session_path: String },
+}
+
+impl PiSessionRequest {
+    pub fn changes_session(&self) -> bool {
+        matches!(self, Self::Fork { .. } | Self::Clone | Self::Switch { .. })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PiSessionRpcResult {
+    pub data: serde_json::Value,
+    /// Mutations are followed by `get_state`; this is Pi's authoritative new identity.
+    pub state: Option<serde_json::Value>,
+}
+
 /// A command sent to a live session's actor task.
 pub enum SessionCommand {
     /// Run one turn: write the prompt, stream `UnifiedAgentEvent`s into `events`, and report the
@@ -88,9 +117,11 @@ pub enum SessionCommand {
     },
     /// Interrupt the in-flight turn without killing the process (protocol-level interrupt).
     Cancel,
-    /// 运行中注入一条用户消息（steering）：不中断在飞的轮次，让 CLI 带着新指示继续。
+    /// 运行中注入一条用户消息：不中断在飞的轮次。
     ///
-    /// `accepted` 回 true 只表示**协议层受理了**（codex 的 `turn/steer` 返回了 result）。
+    /// `kind` 区分立刻引导（当前轮）与 follow-up（下一轮）。`accepted` 回 true 只表示
+    /// 协议层受理了（codex `turn/steer`、Pi `steer` / `follow_up`、dsh `session/steer` /
+    /// `session/prompt`）。
     /// 回 false 的情形都要让调用方把这条消息留在队列里、按普通消息在轮末发出去：
     /// 轮次之间没有可注入的对象、该 CLI 的协议不支持、或者对端明确拒绝
     /// （codex 的 review / compact 轮次不可 steer）。**绝不能悄悄吞掉**。
@@ -98,7 +129,14 @@ pub enum SessionCommand {
         /// 前端生成的 id，原样回到 `user_steer` 卡上供前端对账出队。
         id: String,
         text: String,
+        images: Vec<crate::external_agents::attachments::ImageBlock>,
+        kind: MessageInjectionKind,
         accepted: oneshot::Sender<bool>,
+    },
+    /// Pi session tree/query/mutation RPC. The Pi actor is the sole stdin/stdout owner.
+    PiSession {
+        request: PiSessionRequest,
+        reply: oneshot::Sender<Result<PiSessionRpcResult, String>>,
     },
     /// 停止 CLI 侧的一个后台任务（Background tasks 面板的停止按钮）。
     ///
@@ -126,9 +164,9 @@ pub const CANCELLED_SESSION_LOST: &str = "__cancelled_session_lost__";
 /// 界面显示一套、会话实际跑另一套，这**违反 spec 第 8 条**（UI 所见必须与会话实际配置一致），
 /// 是功能退步而不是缺功能。指纹变了就换个进程。
 ///
-/// 只有把这些配置放在**启动参数**里的 CLI 需要它（目前只有 claude：`--model` / `--effort` /
-/// `--permission-mode` / `--append-system-prompt-file` 全是启动 flag）。ACP / codex 能在会话内
-/// 改模型与推理档位，指纹恒为 `default()`，永不触发重连，行为不变。
+/// 只有把这些配置放在**启动参数**里的 CLI 需要它（claude：`--model` / `--effort` /
+/// `--permission-mode` / `--append-system-prompt-file`；Pi：`--model` / `--thinking`）。
+/// ACP / codex 能在会话内改模型与推理档位，指纹恒为 `default()`，永不触发重连，行为不变。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchConfig {
     /// `model|reasoning|sandbox`，恒可知。
@@ -140,6 +178,20 @@ pub struct LaunchConfig {
 }
 
 impl LaunchConfig {
+    /// Pi receives model/thinking as process launch flags. Empty selection still
+    /// fingerprints as `"|"` so it matches chat-turn fingerprints,
+    /// not `Default` (`flags == ""`).
+    pub fn for_pi(model: Option<&str>, reasoning: Option<&str>) -> Self {
+        Self {
+            flags: format!(
+                "{}|{}",
+                model.unwrap_or_default(),
+                reasoning.unwrap_or_default()
+            ),
+            instructions: None,
+        }
+    }
+
     /// 已建立的会话（`self`，注册时的配置）能否服务配置为 `incoming` 的这一轮。
     pub fn accepts(&self, incoming: &LaunchConfig) -> bool {
         if self.flags != incoming.flags {
@@ -188,6 +240,12 @@ impl TurnBusyGuard {
     pub fn new(busy: Arc<AtomicBool>) -> Self {
         busy.store(true, Ordering::Release);
         Self(busy)
+    }
+
+    pub fn try_new(busy: Arc<AtomicBool>) -> Option<Self> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(busy))
     }
 }
 
@@ -304,10 +362,23 @@ mod tests {
         assert!(established.accepts(&cfg("opus||", None)));
     }
 
-    /// 非 claude 协议指纹恒为默认值 ⇒ 永不触发重连，既有行为不变。
+    /// 非 claude / Pi 协议指纹恒为默认值 ⇒ 永不触发重连，既有行为不变。
     #[test]
     fn default_launch_config_always_accepts() {
         assert!(LaunchConfig::default().accepts(&LaunchConfig::default()));
+    }
+
+    #[test]
+    fn pi_launch_config_matches_chat_turns_even_with_empty_selection() {
+        let idle = LaunchConfig::for_pi(None, None);
+        assert_eq!(idle.flags, "|");
+        assert_ne!(idle, LaunchConfig::default());
+        assert!(idle.accepts(&LaunchConfig::for_pi(None, None)));
+        assert!(!LaunchConfig::default().accepts(&idle));
+        assert!(LaunchConfig::for_pi(Some("opus"), Some("high"))
+            .accepts(&LaunchConfig::for_pi(Some("opus"), Some("high"))));
+        assert!(!LaunchConfig::for_pi(Some("opus"), Some("high"))
+            .accepts(&LaunchConfig::for_pi(Some("opus"), Some("low"))));
     }
 
     /// 轮内重连之后，guard 必须重新挂到**新**会话上。
@@ -343,6 +414,19 @@ mod tests {
             new_session.is_idle(Duration::from_secs(0)),
             "guard 落地即清"
         );
+    }
+
+    #[test]
+    fn a_control_guard_cannot_clear_an_existing_turn_guard() {
+        let (session, _rx) = make("pi", "/proj");
+        let turn_guard = TurnBusyGuard::new(session.busy.clone());
+        assert!(TurnBusyGuard::try_new(session.busy.clone()).is_none());
+        assert!(session.busy.load(Ordering::Acquire));
+        drop(turn_guard);
+        let control_guard = TurnBusyGuard::try_new(session.busy.clone()).expect("idle session");
+        assert!(session.busy.load(Ordering::Acquire));
+        drop(control_guard);
+        assert!(!session.busy.load(Ordering::Acquire));
     }
 
     #[test]

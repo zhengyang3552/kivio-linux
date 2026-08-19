@@ -5,7 +5,7 @@ use tauri::{AppHandle, State};
 
 use crate::chat::agent::prepare as agent_prepare;
 use crate::chat::model::openai_messages_from_model_messages;
-use crate::chat::model_call::session_model_for_conversation;
+use crate::chat::session_model_for_conversation;
 use crate::chat::model_metadata::context_window_for_model;
 use crate::chat::storage::{live_set_system_prompt, load_conversation};
 use crate::chat::{
@@ -645,19 +645,34 @@ pub(super) async fn compute_context_state(
     let provider_available = provider.is_some();
     let language = crate::settings::resolve_chat_language(&settings);
     let thinking_enabled = settings.chat.thinking_enabled;
-    let skill_registry =
-        skills::build_registry(app, &settings.chat_tools.skill_scan_paths).unwrap_or_default();
+    let skill_cwd = crate::chat::storage::resolve_conversation_working_directory(
+        app,
+        conversation,
+        &settings.chat_tools.native_tools.working_directory,
+    )
+    .ok();
+    let skill_registry = skills::build_registry_in(
+        app,
+        &settings.chat_tools.skill_scan_paths,
+        skill_cwd.as_deref(),
+    )
+    .unwrap_or_default();
     let requested_skill_id = conversation.active_skill_id.as_deref();
     let active_skill_id = resolve_forced_skill_id(
         &settings.chat_tools,
         conversation.assistant_snapshot.as_ref(),
         &skill_registry,
         requested_skill_id,
-        &settings.email_accounts,
         crate::settings::obsidian_connector_configured(&settings.obsidian_vault_path),
     );
     let active_skill_detail = active_skill_id.as_deref().and_then(|id| {
-        skills::read_skill_detail(app, &settings.chat_tools.skill_scan_paths, id).ok()
+        skills::read_skill_detail_in(
+            app,
+            &settings.chat_tools.skill_scan_paths,
+            id,
+            skill_cwd.as_deref(),
+        )
+        .ok()
     });
     let mut effective_chat_tools = settings.chat_tools.clone();
     let (memory_prompt, memory_warning) = chat_memory_prompt_for_request(app, &settings);
@@ -743,13 +758,6 @@ pub(super) async fn compute_context_state(
     );
     let obsidian_vault_path = (!settings.obsidian_vault_path.trim().is_empty())
         .then_some(settings.obsidian_vault_path.as_str());
-    let himalaya_binary =
-        crate::connectors::himalaya::resolve_himalaya_binary_when_active(&settings.email_accounts)
-            .map(|path| path.display().to_string());
-    let email_accounts_prompt = crate::settings::email_accounts_system_prompt(
-        &settings.email_accounts,
-        himalaya_binary.as_deref(),
-    );
     let (system_prompt, mut segments) = agent_prepare::build_chat_system_prompt_with_segments(
         &language,
         !main_image_paths.is_empty(),
@@ -789,8 +797,6 @@ pub(super) async fn compute_context_state(
         .as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
-        &settings.email_accounts,
-        email_accounts_prompt.as_deref(),
     );
     let last_user_idx = conversation.messages.iter().rposition(|m| m.role == "user");
     let request_messages = build_chat_api_messages(

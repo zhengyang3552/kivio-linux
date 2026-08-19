@@ -22,6 +22,12 @@ import type {
 } from './types'
 import type { ThinkingLevel, WebSearchMode, ModelRef } from './types'
 import type { CliImportResult, ImportableCliSession } from './types'
+import type {
+  PiForkMessage,
+  PiSessionMutationResult,
+  PiSessionTreeSnapshot,
+  PiSessionSwitchResult,
+} from './piSessionTree'
 
 export type { DetectedExternalAgent, AgentRuntimeConfig }
 
@@ -111,6 +117,65 @@ export interface DshNativeProviderDetail {
   apiKeyEnv: string
   models: DshNativeProviderModel[]
   defaultModel: string
+}
+
+/** PI 全局 Package 与 ~/.pi/agent/extensions 的结构化清单。 */
+export interface PiExtensionInventory {
+  agentDir: string
+  extensionsDir: string
+  packages: PiExtensionPackage[]
+  localExtensions: PiLocalExtension[]
+}
+
+export interface PiExtensionPackage {
+  source: string
+  name: string
+  version: string | null
+  description: string | null
+  path: string | null
+  enabled: boolean
+  canToggle: boolean
+  hasExtensions: boolean
+  extensionEntries: number
+  resources: string[]
+}
+
+export interface PiLocalExtension {
+  relativePath: string
+  name: string
+  path: string
+  enabled: boolean
+  kind: 'file' | 'directory'
+}
+
+export interface PiExtensionCommandResult {
+  output: string
+}
+
+export interface PiSkillInventory {
+  agentDir: string
+  piSkillsDir: string
+  agentsSkillsDir: string
+  skillCommandsEnabled: boolean
+  configuredPaths: PiSkillConfiguredPath[]
+  skills: PiSkillEntry[]
+}
+
+export interface PiSkillConfiguredPath {
+  path: string
+  exists: boolean
+}
+
+export interface PiSkillEntry {
+  name: string
+  description: string | null
+  path: string
+  sourceKind: 'pi' | 'agents' | 'configured' | 'package'
+  packageSource: string | null
+  packageRoot: string | null
+  enabled: boolean
+  canToggle: boolean
+  canRemove: boolean
 }
 
 /** `chat_external_cli_install_info` 的返回。 */
@@ -1522,6 +1587,53 @@ export const chatApi = {
     })
   },
 
+  /** 原生 follow-up。成功表示 CLI 已接管这条消息；失败时调用方保留本地队列兜底。 */
+  async followUpMessage(
+    conversationId: string,
+    followUpId: string,
+    content: string,
+    attachments: PendingAttachment[] = [],
+  ): Promise<boolean> {
+    if (!isTauriRuntime()) return false
+    const diskPaths = attachments.filter((attachment) => attachment.content === undefined)
+      .map((attachment) => attachment.path)
+    const textAttachments = attachments
+      .filter((attachment): attachment is PendingAttachment & { content: string } => (
+        attachment.content !== undefined
+      ))
+      .map((attachment) => ({ name: attachment.name, content: attachment.content }))
+    return await invoke<boolean>('chat_follow_up_message', {
+      conversationId,
+      followUpId,
+      content,
+      attachments: diskPaths,
+      textAttachments,
+    })
+  },
+
+  async piSessionTree(conversationId: string): Promise<PiSessionTreeSnapshot> {
+    if (!isTauriRuntime()) return { tree: [], leafId: null, sessionId: '', sessionFile: null }
+    return invoke<PiSessionTreeSnapshot>('chat_pi_session_tree', { conversationId })
+  },
+
+  async piForkMessages(conversationId: string): Promise<PiForkMessage[]> {
+    if (!isTauriRuntime()) return []
+    const result = await invoke<{ messages?: PiForkMessage[] }>('chat_pi_fork_messages', { conversationId })
+    return result.messages ?? []
+  },
+
+  async piSessionFork(conversationId: string, entryId: string): Promise<PiSessionMutationResult> {
+    return invoke<PiSessionMutationResult>('chat_pi_session_fork', { conversationId, entryId })
+  },
+
+  async piSessionClone(conversationId: string): Promise<PiSessionMutationResult> {
+    return invoke<PiSessionMutationResult>('chat_pi_session_clone', { conversationId })
+  },
+
+  async piSessionSwitch(conversationId: string, sessionPath: string): Promise<PiSessionSwitchResult> {
+    return invoke<PiSessionSwitchResult>('chat_pi_session_switch', { conversationId, sessionPath })
+  },
+
   // 删除对话。返回未能清理的副产物说明（工作区被占用等）——对话本身一定已经删掉了，
   // 后端只有在「对话文件 / 索引」这两步失败时才抛错。
   async deleteConversation(conversationId: string): Promise<string[]> {
@@ -1694,7 +1806,7 @@ export const chatApi = {
       success: boolean
       conversation?: Conversation
       error?: string
-    }>('chat_fork_conversation', { conversationId, messageId })
+    }>('chat_fork_conversation', { conversationId, messageId, excludeAnchor: null })
     if (!result.success || !result.conversation) {
       throw new Error(result.error || 'Failed to fork conversation')
     }
@@ -1832,9 +1944,88 @@ export const chatApi = {
     await invoke('chat_external_cli_install', { agentId })
   },
 
-  async externalCliOpenConfigDir(agentId: string): Promise<void> {
+  async piExtensionsInventory(): Promise<PiExtensionInventory | null> {
+    if (!isTauriRuntime()) return null
+    return await invoke<PiExtensionInventory>('chat_pi_extensions_inventory')
+  },
+
+  async piExtensionSetEnabled(kind: 'package' | 'local', id: string, enabled: boolean): Promise<void> {
     if (!isTauriRuntime()) return
-    await invoke('chat_external_cli_open_config_dir', { agentId })
+    await invoke('chat_pi_extension_set_enabled', { kind, id, enabled })
+  },
+
+  async piExtensionInstall(source: string): Promise<PiExtensionCommandResult> {
+    return await invoke<PiExtensionCommandResult>('chat_pi_extension_install', { source })
+  },
+
+  async piExtensionUpdate(source?: string): Promise<PiExtensionCommandResult> {
+    return await invoke<PiExtensionCommandResult>('chat_pi_extension_update', {
+      source: source ?? null,
+    })
+  },
+
+  async piExtensionRemove(source: string): Promise<PiExtensionCommandResult> {
+    return await invoke<PiExtensionCommandResult>('chat_pi_extension_remove', { source })
+  },
+
+  async piExtensionOpen(kind: 'package' | 'local', id: string): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_extension_open', { kind, id })
+  },
+
+  async piExtensionsOpenDir(): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_extensions_open_dir')
+  },
+
+  async piSkillsInventory(): Promise<PiSkillInventory | null> {
+    if (!isTauriRuntime()) return null
+    return await invoke<PiSkillInventory>('chat_pi_skills_inventory')
+  },
+
+  async piSkillSetEnabled(skill: PiSkillEntry, enabled: boolean): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skill_set_enabled', {
+      path: skill.path,
+      packageSource: skill.packageSource,
+      enabled,
+    })
+  },
+
+  async piSkillCommandsSetEnabled(enabled: boolean): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skill_commands_set_enabled', { enabled })
+  },
+
+  async piSkillAddPath(path: string): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skill_add_path', { path })
+  },
+
+  async piSkillRemovePath(path: string): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skill_remove_path', { path })
+  },
+
+  async piSkillRemove(skill: PiSkillEntry): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skill_remove', {
+      path: skill.path,
+      packageSource: skill.packageSource,
+    })
+  },
+
+  async piSkillOpen(skill: PiSkillEntry): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skill_open', {
+      path: skill.path,
+      packageSource: skill.packageSource,
+    })
+  },
+
+  async piSkillsOpenDir(kind: 'pi' | 'agents'): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke('chat_pi_skills_open_dir', { kind })
   },
 
   async dshPluginSettingsGet(): Promise<DshPluginSettingsSnapshot | null> {

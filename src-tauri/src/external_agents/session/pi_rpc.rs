@@ -1,22 +1,203 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::process::Child;
+use tokio::process::{Child, ChildStdin, ChildStdout};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 use crate::external_agents::context::parse_context_window_label;
+use crate::external_agents::session::live::{
+    MessageInjectionKind, PiSessionRequest, PiSessionRpcResult,
+};
 use crate::external_agents::stream::{usage_from_parts, CliUsageParts};
 use crate::external_agents::types::{
     default_model_option, ExternalCliSlashCommand, RuntimeModelOption, UnifiedAgentEvent,
 };
 use crate::proc::NoConsoleWindow;
 
+type SharedPiWriter<W> = Arc<Mutex<W>>;
+struct PiControlWaiter {
+    completion: oneshot::Sender<Result<(), String>>,
+    injection: Option<(MessageInjectionKind, String, String)>,
+}
+
+type PiControlWaiters = Arc<Mutex<HashMap<String, PiControlWaiter>>>;
+
+fn pi_rpc_images(images: &[crate::external_agents::attachments::ImageBlock]) -> Vec<Value> {
+    images
+        .iter()
+        .map(|image| {
+            json!({
+                "type": "image",
+                "data": image.data_base64,
+                "mimeType": image.mime,
+            })
+        })
+        .collect()
+}
+
+async fn write_rpc_value<W>(stdin: &SharedPiWriter<W>, payload: &Value) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut line = serde_json::to_string(payload).map_err(|error| error.to_string())?;
+    line.push('\n');
+    stdin
+        .lock()
+        .await
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn shutdown_rpc_writer<W>(stdin: &SharedPiWriter<W>)
+where
+    W: AsyncWrite + Unpin,
+{
+    let _ = stdin.lock().await.shutdown().await;
+}
+
+async fn issue_control_command<W>(
+    stdin: &SharedPiWriter<W>,
+    waiters: &PiControlWaiters,
+    id: String,
+    injection: Option<(MessageInjectionKind, String, String)>,
+    mut payload: Value,
+) -> Result<oneshot::Receiver<Result<(), String>>, String>
+where
+    W: AsyncWrite + Unpin,
+{
+    payload["id"] = Value::String(id.clone());
+    let (tx, rx) = oneshot::channel();
+    waiters.lock().await.insert(
+        id.clone(),
+        PiControlWaiter {
+            completion: tx,
+            injection,
+        },
+    );
+    if let Err(error) = write_rpc_value(stdin, &payload).await {
+        waiters.lock().await.remove(&id);
+        return Err(error);
+    }
+    Ok(rx)
+}
+
+fn pi_session_request_payload(request: &PiSessionRequest) -> Value {
+    match request {
+        PiSessionRequest::GetTree => json!({ "type": "get_tree" }),
+        PiSessionRequest::GetEntries { since } => {
+            let mut payload = json!({ "type": "get_entries" });
+            if let Some(since) = since
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                payload["since"] = Value::String(since.to_string());
+            }
+            payload
+        }
+        PiSessionRequest::GetForkMessages => json!({ "type": "get_fork_messages" }),
+        PiSessionRequest::Fork { entry_id } => {
+            json!({ "type": "fork", "entryId": entry_id })
+        }
+        PiSessionRequest::Clone => json!({ "type": "clone" }),
+        PiSessionRequest::Switch { session_path } => {
+            json!({ "type": "switch_session", "sessionPath": session_path })
+        }
+    }
+}
+
+async fn run_idle_rpc_request<R, W>(
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    stdin: &SharedPiWriter<W>,
+    id: &str,
+    mut payload: Value,
+) -> Result<Value, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    payload["id"] = Value::String(id.to_string());
+    write_rpc_value(stdin, &payload).await?;
+    loop {
+        let raw = reader
+            .next_line()
+            .await
+            .map_err(|error| format!("read Pi RPC response: {error}"))?
+            .ok_or_else(|| "Pi RPC exited before session response".to_string())?;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(raw.trim())
+            .map_err(|error| format!("parse Pi RPC response: {error}"))?;
+        if value.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+            reject_extension_ui(stdin, &value).await?;
+            continue;
+        }
+        if value.get("type").and_then(Value::as_str) != Some("response")
+            || value.get("id").and_then(Value::as_str) != Some(id)
+        {
+            continue;
+        }
+        if value.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Pi session command failed")
+                .to_string());
+        }
+        return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+    }
+}
+
+async fn run_idle_pi_session_request<R, W>(
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    stdin: &SharedPiWriter<W>,
+    request_id: &str,
+    request: &PiSessionRequest,
+) -> Result<PiSessionRpcResult, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let data = run_idle_rpc_request(
+        reader,
+        stdin,
+        request_id,
+        pi_session_request_payload(request),
+    )
+    .await?;
+    let changed =
+        request.changes_session() && data.get("cancelled").and_then(Value::as_bool) != Some(true);
+    let needs_state = changed || matches!(request, PiSessionRequest::GetTree);
+    let state = if needs_state {
+        Some(
+            run_idle_rpc_request(
+                reader,
+                stdin,
+                &format!("{request_id}-state"),
+                json!({ "type": "get_state" }),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    Ok(PiSessionRpcResult { data, state })
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiRpcOutcome {
     Continue,
     AgentEnd,
+    AgentSettled,
 }
 
 /// Discover Pi slash commands via the RPC `get_commands` request.
@@ -143,7 +324,6 @@ const BTW_COMMANDS: &[&str] = &[
     "btw:thinking",
 ];
 const BTW_ENTRY_TYPE: &str = "btw-thread-entry";
-const BTW_COMMAND_PROBE_ID: &str = "kivio-btw-command-probe";
 const BTW_ENTRIES_REQUEST_ID: &str = "kivio-btw-entries";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,62 +360,50 @@ fn parse_pi_btw_command(prompt: &str) -> Option<PiBtwCommand> {
     })
 }
 
-fn response_registers_command(value: &Value, command_name: &str) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("response")
-        && value.get("id").and_then(Value::as_str) == Some(BTW_COMMAND_PROBE_ID)
-        && value.get("success").and_then(Value::as_bool) == Some(true)
-        && value
-            .get("data")
-            .and_then(|data| data.get("commands"))
-            .and_then(Value::as_array)
-            .is_some_and(|commands| {
-                commands.iter().any(|command| {
-                    command.get("name").and_then(Value::as_str) == Some(command_name)
-                        && command.get("source").and_then(Value::as_str) == Some("extension")
-                })
-            })
+fn flatten_pi_tool_content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(pi_tool_content_block_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| other.to_string()),
+    }
 }
 
-async fn probe_registered_btw_command<R, W>(
-    reader: &mut tokio::io::Lines<BufReader<R>>,
-    stdin: &mut W,
-    command: &PiBtwCommand,
-) -> bool
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let request = json!({
-        "id": BTW_COMMAND_PROBE_ID,
-        "type": "get_commands",
-    });
-    let Ok(mut line) = serde_json::to_string(&request) else {
-        return false;
-    };
-    line.push('\n');
-    if stdin.write_all(line.as_bytes()).await.is_err() {
-        return false;
+fn pi_tool_content_block_text(block: &Value) -> Option<String> {
+    if let Some(text) = block.as_str() {
+        return Some(text.to_string());
     }
+    match block.get("type").and_then(Value::as_str).unwrap_or("text") {
+        "image" => {
+            let mime = block
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("image");
+            Some(format!("[image: {mime}]"))
+        }
+        _ => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
 
-    let started = std::time::Instant::now();
-    while started.elapsed() <= Duration::from_secs(3) {
-        let raw = match timeout(Duration::from_millis(200), reader.next_line()).await {
-            Ok(Ok(Some(raw))) => raw,
-            Ok(Ok(None)) | Ok(Err(_)) => return false,
-            Err(_) => continue,
-        };
-        let Ok(value) = serde_json::from_str::<Value>(raw.trim()) else {
-            continue;
-        };
-        if value.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
-            let _ = reply_extension_ui(stdin, &value).await;
-            continue;
-        }
-        if value.get("id").and_then(Value::as_str) == Some(BTW_COMMAND_PROBE_ID) {
-            return response_registers_command(&value, &command.name);
-        }
+async fn fail_pending_controls(waiters: &PiControlWaiters, error: &str) {
+    let leftover: Vec<PiControlWaiter> = waiters
+        .lock()
+        .await
+        .drain()
+        .map(|(_, waiter)| waiter)
+        .collect();
+    for waiter in leftover {
+        let _ = waiter.completion.send(Err(error.to_string()));
     }
-    false
 }
 
 fn pi_btw_entry_events_from_response(
@@ -418,6 +586,7 @@ pub fn map_pi_rpc_event(value: &Value, sink: &mut dyn FnMut(UnifiedAgentEvent)) 
     match kind {
         "agent_start" => {}
         "agent_end" => return PiRpcOutcome::AgentEnd,
+        "agent_settled" => return PiRpcOutcome::AgentSettled,
         "turn_start" => {}
         "turn_end" => {
             if let Some(message) = obj.get("message").and_then(|v| v.as_object()) {
@@ -514,13 +683,10 @@ pub fn map_pi_rpc_event(value: &Value, sink: &mut dyn FnMut(UnifiedAgentEvent)) 
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let result = obj.get("result").and_then(|v| v.as_object());
-            let content = result
-                .and_then(|r| r.get("content"))
-                .map(|c| match c {
-                    Value::String(s) => s.clone(),
-                    _ => c.to_string(),
-                })
+            let content = obj
+                .get("result")
+                .and_then(|result| result.get("content"))
+                .map(flatten_pi_tool_content)
                 .unwrap_or_default();
             let is_error = obj
                 .get("isError")
@@ -598,62 +764,167 @@ pub fn map_pi_rpc_event(value: &Value, sink: &mut dyn FnMut(UnifiedAgentEvent)) 
     PiRpcOutcome::Continue
 }
 
-async fn reply_extension_ui<W>(stdin: &mut W, raw: &Value) -> Result<(), String>
+fn extension_ui_tool_name(method: &str) -> Option<&'static str> {
+    match method {
+        "confirm" => Some("PiExtensionConfirm"),
+        "select" => Some("PiExtensionSelect"),
+        "input" => Some("PiExtensionInput"),
+        "editor" => Some("PiExtensionEditor"),
+        _ => None,
+    }
+}
+
+async fn write_extension_ui_response<W>(
+    stdin: &SharedPiWriter<W>,
+    id: Value,
+    result: Value,
+) -> Result<(), String>
 where
     W: AsyncWrite + Unpin,
 {
-    let id = raw.get("id").cloned();
-    if id.is_none() {
+    let mut payload = json!({ "type": "extension_ui_response", "id": id });
+    if let (Some(payload), Some(result)) = (payload.as_object_mut(), result.as_object()) {
+        for (key, value) in result {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+    write_rpc_value(stdin, &payload).await
+}
+
+async fn reject_extension_ui<W>(stdin: &SharedPiWriter<W>, raw: &Value) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(id) = raw.get("id").cloned() else {
+        return Ok(());
+    };
+    if raw
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|method| FIRE_AND_FORGET.contains(&method))
+    {
         return Ok(());
     }
-    if let Some(method) = raw.get("method").and_then(|v| v.as_str()) {
-        if FIRE_AND_FORGET.contains(&method) {
-            return Ok(());
-        }
+    write_extension_ui_response(stdin, id, json!({ "cancelled": true })).await
+}
+
+async fn bridge_extension_ui<W>(
+    stdin: &SharedPiWriter<W>,
+    raw: &Value,
+    approvals: Option<&mut crate::external_agents::session::live::ApprovalBridge>,
+    cancel_check: &impl Fn() -> bool,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(id) = raw.get("id").cloned() else {
+        return Ok(());
+    };
+    let Some(request_id) = id.as_str().map(str::to_string) else {
+        return reject_extension_ui(stdin, raw).await;
+    };
+    let Some(method) = raw.get("method").and_then(Value::as_str) else {
+        return reject_extension_ui(stdin, raw).await;
+    };
+    let Some(tool_name) = extension_ui_tool_name(method) else {
+        return reject_extension_ui(stdin, raw).await;
+    };
+    let Some(bridge) = approvals else {
+        return reject_extension_ui(stdin, raw).await;
+    };
+
+    let ask = crate::external_agents::session::live::ApprovalAsk {
+        request_id: request_id.clone(),
+        tool_call_id: format!("pi-extension-ui-{request_id}"),
+        tool_name: tool_name.to_string(),
+        input: raw.clone(),
+        requires_user_interaction: true,
+    };
+    if bridge.requests.send(ask).await.is_err() {
+        return reject_extension_ui(stdin, raw).await;
     }
-    let result = if raw.get("method").and_then(|v| v.as_str()) == Some("confirm") {
-        json!({ "confirmed": true })
-    } else {
-        let opts = raw
-            .get("params")
-            .and_then(|p| p.get("options"))
-            .or_else(|| raw.get("options"))
-            .and_then(|v| v.as_array());
-        if let Some(opts) = opts {
-            if let Some(first) = opts.first() {
-                let value = first
-                    .as_str()
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        first
-                            .as_object()
-                            .and_then(|o| o.get("label").or_else(|| o.get("value")))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_default();
-                json!({ "value": value })
-            } else {
-                json!({ "cancelled": true })
+
+    let requested_timeout = raw
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(300_000);
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(requested_timeout.clamp(1_000, 300_000));
+    let result = loop {
+        if cancel_check() || tokio::time::Instant::now() >= deadline {
+            break json!({ "cancelled": true });
+        }
+        match timeout(Duration::from_millis(200), bridge.decisions.recv()).await {
+            Ok(Some(decision)) if decision.request_id == request_id => {
+                break if decision.approved {
+                    decision
+                        .updated_input
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| json!({ "cancelled": true }))
+                } else {
+                    json!({ "cancelled": true })
+                };
             }
-        } else {
-            json!({ "cancelled": true })
+            Ok(Some(_)) | Err(_) => continue,
+            Ok(None) => break json!({ "cancelled": true }),
         }
     };
-    let mut payload = json!({ "type": "extension_ui_response", "id": id });
-    if let Some(obj) = payload.as_object_mut() {
-        if let Some(result_obj) = result.as_object() {
-            for (k, v) in result_obj {
-                obj.insert(k.clone(), v.clone());
-            }
+    write_extension_ui_response(stdin, id, result).await
+}
+
+async fn run_pi_rpc_io<R, W>(
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    stdin: &SharedPiWriter<W>,
+    prompt: &str,
+    images: &[crate::external_agents::attachments::ImageBlock],
+    sink: &mut impl FnMut(UnifiedAgentEvent),
+    approvals: Option<&mut crate::external_agents::session::live::ApprovalBridge>,
+    pending_controls: Option<&PiControlWaiters>,
+    cancel_check: impl Fn() -> bool,
+    persistent: bool,
+) -> Result<(), String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // 内建 /compact 必须发 type:compact，走 prompt 不会执行。
+    let manual_compact = prompt.trim() == "/compact";
+
+    // pi-btw owns its sub-session and persists completed exchanges as custom session entries.
+    // Official RPC says extension commands go out as an ordinary `prompt`; enable the card
+    // adapter from the slash shape and only paint a card if a `btw-thread-entry` actually
+    // arrives. Do not probe `get_commands` first — that stalls the prompt up to 3s and can
+    // swallow leftover stdout from the resident session.
+    let btw_command = if manual_compact {
+        None
+    } else {
+        parse_pi_btw_command(prompt)
+    };
+
+    let payload = if manual_compact {
+        json!({ "id": 1, "type": "compact" })
+    } else {
+        let rpc_images = pi_rpc_images(images);
+        let mut payload = json!({ "id": 1, "type": "prompt", "message": prompt });
+        if !rpc_images.is_empty() {
+            payload["images"] = Value::Array(rpc_images);
         }
-    }
-    let mut line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-    line.push('\n');
-    stdin
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| e.to_string())
+        payload
+    };
+    write_rpc_value(stdin, &payload).await?;
+
+    drain_pi_rpc_lines(
+        reader,
+        stdin,
+        sink,
+        approvals,
+        pending_controls,
+        cancel_check,
+        btw_command.as_ref(),
+        manual_compact,
+        persistent,
+    )
+    .await
 }
 
 pub async fn run_pi_rpc_session(
@@ -663,71 +934,31 @@ pub async fn run_pi_rpc_session(
     mut sink: impl FnMut(UnifiedAgentEvent),
     cancel_check: impl Fn() -> bool,
 ) -> Result<(), String> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "stdin unavailable".to_string())?;
+    let stdin = Arc::new(Mutex::new(
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "stdin unavailable".to_string())?,
+    ));
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| "stdout unavailable".to_string())?;
     let mut reader = BufReader::new(stdout).lines();
-
-    // 内建 /compact 必须发 type:compact，走 prompt 不会执行。
-    let manual_compact = prompt.trim() == "/compact";
-
-    // pi-btw owns its sub-session and persists completed exchanges as custom session entries.
-    // Verify that the slash name is an installed extension command before enabling the adapter:
-    // an uninstalled `/btw ...` is just a normal model prompt and must keep the ordinary stream.
-    let btw_command = if manual_compact {
-        None
-    } else {
-        match parse_pi_btw_command(prompt) {
-            Some(command)
-                if probe_registered_btw_command(&mut reader, &mut stdin, &command).await =>
-            {
-                Some(command)
-            }
-            _ => None,
-        }
-    };
-
-    let prompt_line = {
-        let payload = if manual_compact {
-            json!({ "id": 1, "type": "compact" })
-        } else {
-            json!({ "id": 1, "type": "prompt", "message": prompt })
-        };
-        let mut line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-        line.push('\n');
-        line
-    };
-    stdin
-        .write_all(prompt_line.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let result = drain_pi_rpc_lines(
+    let result = run_pi_rpc_io(
         &mut reader,
-        &mut stdin,
+        &stdin,
+        prompt,
+        &[],
         &mut sink,
+        None,
+        None,
         cancel_check,
-        btw_command.as_ref(),
-        manual_compact,
+        false,
     )
     .await;
-    match &result {
-        Err(err) if err == "cancelled" => {
-            let _ = child.start_kill();
-        }
-        Ok(()) => {
-            // agent_end 已收、轮次在协议层完成。立刻终止子进程：drain 返回时 stdout 读端已随
-            // reader drop 关闭，pi 若还在冲刷输出会撞 EPIPE 以退出码 1 死掉，被出口的
-            // 「非零退出+stderr」规则误判为「生成异常结束」。主动 kill 使退出走信号
-            // （status.code()=None），出口规则不触发。
-            let _ = child.start_kill();
-        }
-        Err(_) => {}
+    if result.is_ok() || matches!(result.as_ref(), Err(err) if err == "cancelled") {
+        let _ = child.start_kill();
     }
     result
 }
@@ -744,18 +975,34 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(stdout).lines();
-    drain_pi_rpc_lines(&mut reader, stdin, sink, cancel_check, None, false).await
+    let stdin = Arc::new(Mutex::new(stdin));
+    drain_pi_rpc_lines(
+        &mut reader,
+        &stdin,
+        sink,
+        None,
+        None,
+        cancel_check,
+        None,
+        false,
+        false,
+    )
+    .await
 }
 
 async fn drain_pi_rpc_lines<R, W>(
     reader: &mut tokio::io::Lines<BufReader<R>>,
-    stdin: &mut W,
+    stdin: &SharedPiWriter<W>,
     sink: &mut impl FnMut(UnifiedAgentEvent),
+    mut approvals: Option<&mut crate::external_agents::session::live::ApprovalBridge>,
+    pending_controls: Option<&PiControlWaiters>,
     cancel_check: impl Fn() -> bool,
     btw_command: Option<&PiBtwCommand>,
     // 本次发出的是 `{"type":"compact"}` 而非 prompt：compact RPC 不产生 agent_end，
     // 以它的 response 作为轮次终点。
     manual_compact: bool,
+    // Persistent actors keep stdin/stdout open across turns and finish on `agent_settled`.
+    persistent: bool,
 ) -> Result<(), String>
 where
     R: AsyncRead + Unpin,
@@ -772,23 +1019,31 @@ where
     // Defer fatal errors until the final agent_end; otherwise a recovered retry still leaves
     // Kivio's turn permanently marked as failed.
     let mut pending_error: Option<String> = None;
+    // Special RPC commands can finish on their response while Pi still flushes a late
+    // `agent_settled`. A reused reader must not let that stale boundary finish the next prompt.
+    let mut current_turn_seen = manual_compact;
     // agent_end 后等待 pi flush + 自行退出的宽限期。带 --session-id 时 pi 收尾要落盘会话，
     // 可能不再因 stdin EOF 立即退出——宽限期一到就主动 break，不再无限等 EOF（否则 UI 转圈不止）。
     let mut ended_at: Option<std::time::Instant> = None;
     const AGENT_END_GRACE: Duration = Duration::from_secs(3);
 
     loop {
-        if cancel_check() {
+        if cancel_check() && !persistent {
             return Err("cancelled".to_string());
         }
-        if let Some(since) = ended_at {
-            if since.elapsed() > AGENT_END_GRACE {
-                break;
+        if !persistent {
+            if let Some(since) = ended_at {
+                if since.elapsed() > AGENT_END_GRACE {
+                    break;
+                }
             }
         }
 
         let line = match timeout(Duration::from_millis(200), reader.next_line()).await {
             Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) if persistent => {
+                return Err("Pi RPC process exited before agent_settled".to_string());
+            }
             Ok(Ok(None)) => break,
             Ok(Err(e)) => return Err(e.to_string()),
             Err(_) => continue,
@@ -796,10 +1051,10 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        // `agent_end` is the logical end of the turn, but Pi still flushes queued RPC output while
-        // shutting down after stdin EOF. Keep the stdout reader alive until EOF and ignore any
-        // trailing protocol lines so Pi never writes into a pipe Kivio has already dropped.
-        if agent_ended {
+        // One-shot callers stop at `agent_end` and only keep draining Pi's shutdown tail. A
+        // persistent actor must continue until `agent_settled`, because retry/compaction/queued
+        // continuations may legally follow the low-level end event.
+        if agent_ended && !persistent {
             continue;
         }
 
@@ -808,6 +1063,43 @@ where
             Err(_) => continue,
         };
 
+        if !current_turn_seen {
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let response_is_pending_control = if kind == "response" {
+                match (pending_controls, value.get("id").and_then(Value::as_str)) {
+                    (Some(waiters), Some(id)) => waiters.lock().await.contains_key(id),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            current_turn_seen = matches!(kind, "agent_start" | "turn_start" | "message_start")
+                || response_is_pending_control
+                || (kind == "response"
+                    && value.get("command").and_then(Value::as_str) == Some("prompt")
+                    && value.get("id").and_then(Value::as_i64) == Some(1));
+        }
+        if persistent && agent_ended {
+            let kind = value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if matches!(
+                kind,
+                "agent_start"
+                    | "turn_start"
+                    | "message_start"
+                    | "auto_retry_start"
+                    | "compaction_start"
+                    | "auto_compaction_start"
+            ) {
+                agent_ended = false;
+                ended_at = None;
+            }
+        }
         if value.get("type").and_then(Value::as_str) == Some("entry_appended") {
             if let (Some(command), Some(entry)) = (btw_command, value.get("entry")) {
                 if let Some(question) = command.question.as_deref() {
@@ -822,49 +1114,94 @@ where
         }
 
         if value.get("type").and_then(|v| v.as_str()) == Some("extension_ui_request") {
-            if let Some(command) = btw_command {
-                let method = value
-                    .get("method")
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if method == "notify" {
+                if let Some(message) = value
+                    .get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if method == "notify" {
-                    if let Some(message) = value.get("message").and_then(Value::as_str) {
-                        if value.get("notifyType").and_then(Value::as_str) == Some("error") {
-                            sink(UnifiedAgentEvent::Error {
-                                message: message.to_string(),
-                            });
-                        } else if !message.trim().is_empty() {
-                            sink(UnifiedAgentEvent::TextDelta {
-                                delta: message.to_string(),
-                            });
-                        }
-                    }
-                } else if method == "setStatus" {
-                    if let Some(text) = value
-                        .get("statusText")
+                    .filter(|message| !message.trim().is_empty())
+                {
+                    let level = value
+                        .get("notifyType")
                         .and_then(Value::as_str)
-                        .filter(|text| !text.trim().is_empty())
-                    {
-                        sink(UnifiedAgentEvent::StatusNote {
-                            text: text.to_string(),
-                        });
-                    }
-                } else if method == "setWidget" && command.name.starts_with("btw") {
-                    if let Some(lines) = value.get("widgetLines").and_then(Value::as_array) {
-                        if let Some(last) = lines.iter().rev().find_map(Value::as_str) {
-                            sink(UnifiedAgentEvent::StatusNote {
-                                text: last.to_string(),
-                            });
-                        }
-                    }
+                        .filter(|level| *level != "info")
+                        .map(|level| format!("[{level}] "))
+                        .unwrap_or_default();
+                    sink(UnifiedAgentEvent::StatusNote {
+                        text: format!("{level}{message}"),
+                    });
+                }
+            } else if method == "setStatus" {
+                if let Some(text) = value
+                    .get("statusText")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    sink(UnifiedAgentEvent::StatusNote {
+                        text: text.to_string(),
+                    });
+                }
+            } else if method == "setWidget" {
+                if let Some(last) = value
+                    .get("widgetLines")
+                    .and_then(Value::as_array)
+                    .and_then(|lines| lines.iter().rev().find_map(Value::as_str))
+                {
+                    sink(UnifiedAgentEvent::StatusNote {
+                        text: last.to_string(),
+                    });
                 }
             }
-            reply_extension_ui(stdin, &value).await?;
+            bridge_extension_ui(stdin, &value, approvals.as_deref_mut(), &cancel_check).await?;
             continue;
         }
 
         if value.get("type").and_then(|v| v.as_str()) == Some("response") {
+            if let (Some(waiters), Some(id)) =
+                (pending_controls, value.get("id").and_then(Value::as_str))
+            {
+                if let Some(waiter) = waiters.lock().await.remove(id) {
+                    let succeeded = value.get("success").and_then(Value::as_bool) == Some(true);
+                    if succeeded {
+                        if let Some((kind, id, text)) = waiter.injection {
+                            match kind {
+                                MessageInjectionKind::Steer => {
+                                    sink(UnifiedAgentEvent::UserSteer { id, text });
+                                }
+                                MessageInjectionKind::FollowUp => {
+                                    sink(UnifiedAgentEvent::UserFollowUp { id, text });
+                                }
+                            }
+                        }
+                    }
+                    let result = if succeeded {
+                        Ok(())
+                    } else {
+                        Err(value
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Pi rejected the control command")
+                            .to_string())
+                    };
+                    let _ = waiter.completion.send(result);
+                    continue;
+                }
+            }
+            if value
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with("kivio-control-"))
+            {
+                continue;
+            }
             if value.get("id").and_then(Value::as_str) == Some(BTW_ENTRIES_REQUEST_ID) {
+                if !btw_entries_requested {
+                    continue;
+                }
+                let mut painted = false;
                 if value.get("success").and_then(Value::as_bool) == Some(true) {
                     if let Some(command) = btw_command {
                         if let Some((started, completed)) =
@@ -872,12 +1209,20 @@ where
                         {
                             sink(started);
                             sink(completed);
+                            btw_entry_emitted = true;
+                            painted = true;
                         }
                     }
                 }
-                agent_ended = true;
-                ended_at = Some(std::time::Instant::now());
-                let _ = stdin.shutdown().await;
+                btw_entries_requested = false;
+                if painted {
+                    if persistent {
+                        break;
+                    }
+                    agent_ended = true;
+                    ended_at = Some(std::time::Instant::now());
+                    shutdown_rpc_writer(stdin).await;
+                }
                 continue;
             }
             if value.get("success").and_then(|v| v.as_bool()) == Some(false) {
@@ -901,33 +1246,26 @@ where
                     });
                     compaction_emitted = true;
                 }
+                if persistent {
+                    break;
+                }
                 agent_ended = true;
                 ended_at = Some(std::time::Instant::now());
-                let _ = stdin.shutdown().await;
+                shutdown_rpc_writer(stdin).await;
                 continue;
             }
             if !btw_entries_requested
                 && value.get("command").and_then(Value::as_str) == Some("prompt")
             {
                 if let Some(command) = btw_command {
-                    if command.question.is_none() || btw_entry_emitted {
-                        agent_ended = true;
-                        ended_at = Some(std::time::Instant::now());
-                        let _ = stdin.shutdown().await;
-                        continue;
+                    if command.question.is_some() && !btw_entry_emitted {
+                        let request = json!({
+                            "id": BTW_ENTRIES_REQUEST_ID,
+                            "type": "get_entries",
+                        });
+                        write_rpc_value(stdin, &request).await?;
+                        btw_entries_requested = true;
                     }
-                    let request = json!({
-                        "id": BTW_ENTRIES_REQUEST_ID,
-                        "type": "get_entries",
-                    });
-                    let mut request_line =
-                        serde_json::to_string(&request).map_err(|error| error.to_string())?;
-                    request_line.push('\n');
-                    stdin
-                        .write_all(request_line.as_bytes())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    btw_entries_requested = true;
                 }
             }
             continue;
@@ -951,20 +1289,37 @@ where
             }
             other => sink(other),
         });
-        if outcome == PiRpcOutcome::AgentEnd {
-            // AgentSession emits agent_end for each failed attempt. `willRetry: true` means its
-            // backoff/continuation state machine is still active, so keep both pipes open.
-            if value.get("willRetry").and_then(|v| v.as_bool()) == Some(true) {
-                continue;
+        match outcome {
+            PiRpcOutcome::AgentSettled => {
+                if persistent && !current_turn_seen {
+                    continue;
+                }
+                if btw_entries_requested {
+                    continue;
+                }
+                if let Some(message) = pending_error.take() {
+                    sink(UnifiedAgentEvent::Error { message });
+                }
+                break;
             }
-            if let Some(message) = pending_error.take() {
-                sink(UnifiedAgentEvent::Error { message });
+            PiRpcOutcome::AgentEnd => {
+                // AgentSession emits agent_end for each failed attempt. `willRetry: true` means its
+                // backoff/continuation state machine is still active, so keep both pipes open.
+                if value.get("willRetry").and_then(|v| v.as_bool()) == Some(true) {
+                    continue;
+                }
+                agent_ended = true;
+                ended_at = Some(std::time::Instant::now());
+                if !persistent {
+                    if let Some(message) = pending_error.take() {
+                        sink(UnifiedAgentEvent::Error { message });
+                    }
+                    // One-shot mode closes stdin so Pi can flush and exit. Persistent mode keeps
+                    // both pipes alive and waits for the higher-level `agent_settled` boundary.
+                    shutdown_rpc_writer(stdin).await;
+                }
             }
-            agent_ended = true;
-            ended_at = Some(std::time::Instant::now());
-            // The process may already be closing its stdin side after emitting agent_end. Shutdown
-            // is only the signal to begin Pi's flush-and-exit path, so a concurrent close is safe.
-            let _ = stdin.shutdown().await;
+            PiRpcOutcome::Continue => {}
         }
     }
 
@@ -972,7 +1327,378 @@ where
         sink(UnifiedAgentEvent::Error { message });
     }
 
-    Ok(())
+    if persistent && cancel_check() {
+        Err("cancelled".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn persistent_session_args(
+    args: &[String],
+    resume_native: Option<&str>,
+) -> Result<(Vec<String>, String, bool), String> {
+    let mut effective_args = args.to_vec();
+    let resume_native = resume_native.map(str::trim).filter(|id| !id.is_empty());
+    if let Some(id) = resume_native {
+        if let Some(index) = effective_args.iter().position(|arg| arg == "--session-id") {
+            if index + 1 < effective_args.len() {
+                effective_args[index + 1] = id.to_string();
+            } else {
+                effective_args.push(id.to_string());
+            }
+        } else {
+            effective_args.push("--session-id".to_string());
+            effective_args.push(id.to_string());
+        }
+    }
+    let session_id = effective_args
+        .windows(2)
+        .find(|pair| pair[0] == "--session-id")
+        .map(|pair| pair[1].clone())
+        .ok_or_else(|| "Pi persistent session requires --session-id".to_string())?;
+    Ok((effective_args, session_id, resume_native.is_some()))
+}
+
+/// Pi `--session-id` is create-or-resume. Claiming `resumed` from the id alone would send only
+/// the latest user message into a blank native session after the JSONL was deleted.
+pub fn is_missing_pi_session_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    (lower.contains("pi session")
+        || lower.contains("pi rpc")
+        || lower.contains("--session-id")
+        || lower.contains("native session"))
+        && (lower.contains("not found")
+            || lower.contains("no such session")
+            || lower.contains("unknown session")
+            || lower.contains("is gone"))
+}
+
+fn pi_native_session_present(session_id: &str) -> bool {
+    pi_session_file_candidates(session_id).into_iter().any(|path| path.is_file())
+}
+
+fn pi_session_file_candidates(session_id: &str) -> Vec<PathBuf> {
+    let Some(home) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) else {
+        return Vec::new();
+    };
+    let sessions = home.join(".pi").join("agent").join("sessions");
+    vec![
+        sessions.join(format!("{session_id}.jsonl")),
+        sessions.join(session_id).join("session.jsonl"),
+        sessions.join(session_id).join(format!("{session_id}.jsonl")),
+    ]
+}
+
+/// A live Pi RPC connection. The actor owns the child process while stdin/stdout are shared with
+/// the in-flight turn task so control commands can still be received during generation.
+pub struct PiRpcSession {
+    child: Child,
+    stdin: Arc<Mutex<ChildStdin>>,
+    reader: Arc<Mutex<tokio::io::Lines<BufReader<ChildStdout>>>>,
+    session_id: String,
+    resumed: bool,
+    stderr_tail: Arc<Mutex<String>>,
+    _stderr_task: tokio::task::JoinHandle<()>,
+}
+
+impl PiRpcSession {
+    pub async fn connect(
+        bin: &Path,
+        args: &[String],
+        cwd: &Path,
+        resume_native: Option<&str>,
+    ) -> Result<Self, String> {
+        // The persisted live handle is the authoritative binding for this Kivio conversation.
+        // It can exist even when the regular binding was not flushed before a crash.
+        let (effective_args, session_id, claimed_resume) =
+            persistent_session_args(args, resume_native)?;
+        let resumed = claimed_resume && pi_native_session_present(&session_id);
+
+        let mut child = crate::external_agents::spawn::cli_command(bin)
+            .args(&effective_args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .no_console_window()
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("start Pi RPC: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Pi RPC stdin unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Pi RPC stdout unavailable".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Pi RPC stderr unavailable".to_string())?;
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let stderr_capture = stderr_tail.clone();
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    eprintln!("[external-agent:pi] {line}");
+                    let mut tail = stderr_capture.lock().await;
+                    if !tail.is_empty() {
+                        tail.push('\n');
+                    }
+                    tail.push_str(&line);
+                    if tail.chars().count() > 8000 {
+                        *tail = crate::external_agents::spawn::tail_chars(&tail, 8000);
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            stdin: Arc::new(Mutex::new(stdin)),
+            reader: Arc::new(Mutex::new(BufReader::new(stdout).lines())),
+            session_id,
+            resumed,
+            stderr_tail,
+            _stderr_task: stderr_task,
+        })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn resumed(&self) -> bool {
+        self.resumed
+    }
+
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    async fn close(&mut self) {
+        crate::external_agents::spawn::kill_agent_process_tree(&mut self.child);
+        let _ = self.child.wait().await;
+    }
+}
+
+/// Spawn the actor that serializes Pi turns while keeping one RPC process alive across turns.
+pub fn spawn_pi_rpc_session_actor(
+    mut session: PiRpcSession,
+) -> mpsc::Sender<crate::external_agents::session::live::SessionCommand> {
+    use crate::external_agents::session::live::SessionCommand;
+
+    let (tx, mut rx) = mpsc::channel::<SessionCommand>(8);
+    tokio::spawn(async move {
+        let mut next_control_id = 2_u64;
+        while let Some(command) = rx.recv().await {
+            match command {
+                SessionCommand::RunTurn {
+                    prompt,
+                    images,
+                    events,
+                    done,
+                    approvals,
+                    model: _,
+                    reasoning: _,
+                } => {
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    let turn_cancelled = cancelled.clone();
+                    let reader = session.reader.clone();
+                    let stdin = session.stdin.clone();
+                    let stderr_tail = session.stderr_tail.clone();
+                    let pending_controls: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+                    let turn_pending_controls = pending_controls.clone();
+                    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                    let forward = tokio::spawn(async move {
+                        while let Some(event) = event_rx.recv().await {
+                            if events.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    let mut approvals = approvals;
+                    let mut turn = tokio::spawn(async move {
+                        let mut reader = reader.lock().await;
+                        let result = run_pi_rpc_io(
+                            &mut reader,
+                            &stdin,
+                            &prompt,
+                            &images,
+                            &mut |event| {
+                                let _ = event_tx.send(event);
+                            },
+                            approvals.as_mut(),
+                            Some(&turn_pending_controls),
+                            || turn_cancelled.load(Ordering::Acquire),
+                            true,
+                        )
+                        .await;
+                        let result = match result {
+                            Err(error) if error != "cancelled" => {
+                                let tail = stderr_tail.lock().await.clone();
+                                if tail.trim().is_empty() {
+                                    Err(error)
+                                } else {
+                                    Err(format!("{error}\n\nPi stderr:\n{tail}"))
+                                }
+                            }
+                            other => other,
+                        };
+                        drop(event_tx);
+                        let _ = forward.await;
+                        let _ = done.send(result.clone());
+                        result
+                    });
+
+                    let mut close_after_turn = false;
+                    let turn_result = loop {
+                        tokio::select! {
+                            joined = &mut turn => {
+                                break joined.unwrap_or_else(|error| Err(format!("Pi session actor task failed: {error}")));
+                            }
+                            next = rx.recv() => {
+                                match next {
+                                    Some(SessionCommand::Cancel) => {
+                                        cancelled.store(true, Ordering::Release);
+                                        let request_id = format!("kivio-control-{}", next_control_id);
+                                        next_control_id = next_control_id.saturating_add(1);
+                                        if issue_control_command(
+                                            &session.stdin,
+                                            &pending_controls,
+                                            request_id,
+                                            None,
+                                            json!({ "type": "abort" }),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            crate::external_agents::spawn::kill_agent_process_tree(&mut session.child);
+                                            close_after_turn = true;
+                                        }
+                                    }
+                                    Some(SessionCommand::Close) | None => {
+                                        cancelled.store(true, Ordering::Release);
+                                        crate::external_agents::spawn::kill_agent_process_tree(&mut session.child);
+                                        close_after_turn = true;
+                                    }
+                                    Some(SessionCommand::Steer { id, text, images, kind, accepted }) => {
+                                        let request_id = format!("kivio-control-{}", next_control_id);
+                                        next_control_id = next_control_id.saturating_add(1);
+                                        let command_type = match kind {
+                                            MessageInjectionKind::Steer => "steer",
+                                            MessageInjectionKind::FollowUp => "follow_up",
+                                        };
+                                        let display_text = if text.trim().is_empty() && !images.is_empty() {
+                                            format!("附带图片（{}）", images.len())
+                                        } else {
+                                            text.clone()
+                                        };
+                                        let mut payload = json!({ "type": command_type, "message": text });
+                                        let rpc_images = pi_rpc_images(&images);
+                                        if !rpc_images.is_empty() {
+                                            payload["images"] = Value::Array(rpc_images);
+                                        }
+                                        match issue_control_command(
+                                            &session.stdin,
+                                            &pending_controls,
+                                            request_id,
+                                            Some((kind, id, display_text)),
+                                            payload,
+                                        )
+                                        .await
+                                        {
+                                            Ok(response) => {
+                                                // Do not time out and drop the waiter. Drain may be
+                                                // blocked on extension UI, so the ack can legally
+                                                // arrive later; dropping it would ignore a success
+                                                // and let the frontend resend the same text as a
+                                                // new prompt. If the turn ends first,
+                                                // fail_pending_controls unblocks this wait as false.
+                                                tokio::spawn(async move {
+                                                    let ok = matches!(response.await, Ok(Ok(())));
+                                                    let _ = accepted.send(ok);
+                                                });
+                                            }
+                                            Err(_) => {
+                                                let _ = accepted.send(false);
+                                            }
+                                        }
+                                    }
+                                    Some(SessionCommand::RunTurn { done, .. }) => {
+                                        let _ = done.send(Err("Pi RPC session is busy".to_string()));
+                                    }
+                                    Some(SessionCommand::PiSession { reply, .. }) => {
+                                        let _ = reply.send(Err("Pi session is busy; wait for the current run to finish".to_string()));
+                                    }
+                                    Some(SessionCommand::StopTask { .. }) => {}
+                                }
+                            }
+                        }
+                    };
+                    fail_pending_controls(
+                        &pending_controls,
+                        "Pi turn ended before the control command was acknowledged",
+                    )
+                    .await;
+                    let session_lost = close_after_turn
+                        || matches!(turn_result.as_ref(), Err(error) if error != "cancelled");
+                    if session_lost {
+                        session.close().await;
+                        return;
+                    }
+                }
+                SessionCommand::PiSession { request, reply } => {
+                    let request_id = format!("kivio-session-{}", next_control_id);
+                    next_control_id = next_control_id.saturating_add(1);
+                    let result = {
+                        let mut reader = session.reader.lock().await;
+                        match timeout(
+                            Duration::from_secs(15),
+                            run_idle_pi_session_request(
+                                &mut reader,
+                                &session.stdin,
+                                &request_id,
+                                &request,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err("Pi session command timed out".to_string()),
+                        }
+                    };
+                    if let Ok(result) = &result {
+                        if let Some(session_id) = result
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.get("sessionId"))
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            session.session_id = session_id.to_string();
+                        }
+                    }
+                    let _ = reply.send(result);
+                }
+                SessionCommand::Steer { accepted, .. } => {
+                    let _ = accepted.send(false);
+                }
+                SessionCommand::Cancel => {}
+                SessionCommand::StopTask { .. } => {}
+                SessionCommand::Close => {
+                    session.close().await;
+                    return;
+                }
+            }
+        }
+        session.close().await;
+    });
+    tx
 }
 
 #[cfg(test)]
@@ -1095,6 +1821,58 @@ mod tests {
     }
 
     #[test]
+    fn map_pi_tool_execution_end_flattens_content_blocks() {
+        let raw = r#"{"type":"tool_execution_end","toolCallId":"call_1","toolName":"bash","result":{"content":[{"type":"text","text":"total 48\nfile.txt"}]},"isError":false}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let mut events = Vec::new();
+        map_pi_rpc_event(&value, &mut |e| events.push(e));
+        assert!(matches!(
+            events.as_slice(),
+            [UnifiedAgentEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error
+            }] if tool_use_id == "call_1" && content == "total 48\nfile.txt" && !*is_error
+        ));
+    }
+
+    #[test]
+    fn map_pi_tool_execution_end_keeps_legacy_string_content() {
+        let raw = r#"{"type":"tool_execution_end","toolCallId":"call_2","result":{"content":"plain"},"isError":true}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let mut events = Vec::new();
+        map_pi_rpc_event(&value, &mut |e| events.push(e));
+        assert!(matches!(
+            events.as_slice(),
+            [UnifiedAgentEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error
+            }] if tool_use_id == "call_2" && content == "plain" && *is_error
+        ));
+    }
+
+    #[test]
+    fn flatten_pi_tool_content_joins_text_blocks() {
+        assert_eq!(
+            flatten_pi_tool_content(&json!([
+                {"type": "text", "text": "one"},
+                {"type": "text", "text": "two"},
+                {"type": "image", "mimeType": "image/png"}
+            ])),
+            "one\ntwo\n[image: image/png]"
+        );
+        assert_eq!(
+            flatten_pi_tool_content(&json!([{"type": "text", "text": "total 48"}])),
+            "total 48"
+        );
+        assert_ne!(
+            flatten_pi_tool_content(&json!([{"type": "text", "text": "total 48"}])),
+            json!([{"type": "text", "text": "total 48"}]).to_string()
+        );
+    }
+
+    #[test]
     fn map_pi_text_delta() {
         let raw = r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"hi"}}"#;
         let value: Value = serde_json::from_str(raw).unwrap();
@@ -1193,30 +1971,6 @@ mod tests {
     }
 
     #[test]
-    fn command_probe_requires_the_registered_extension_source() {
-        let registered = json!({
-            "id": BTW_COMMAND_PROBE_ID,
-            "type": "response",
-            "command": "get_commands",
-            "success": true,
-            "data": { "commands": [
-                { "name": "btw", "source": "extension" },
-                { "name": "skill:btw", "source": "skill" }
-            ] }
-        });
-        assert!(response_registers_command(&registered, "btw"));
-        assert!(!response_registers_command(&registered, "btw:tangent"));
-
-        let prompt_template = json!({
-            "id": BTW_COMMAND_PROBE_ID,
-            "type": "response",
-            "success": true,
-            "data": { "commands": [{ "name": "btw", "source": "prompt" }] }
-        });
-        assert!(!response_registers_command(&prompt_template, "btw"));
-    }
-
-    #[test]
     fn maps_completed_btw_entry_to_the_existing_subagent_tool_shape() {
         let response = json!({
             "id": BTW_ENTRIES_REQUEST_ID,
@@ -1289,7 +2043,8 @@ mod tests {
             }
             stdout_writer.shutdown().await
         });
-        let (mut stdin_reader, mut stdin_writer) = duplex(4096);
+        let (mut stdin_reader, stdin_writer) = duplex(4096);
+        let stdin_writer = Arc::new(Mutex::new(stdin_writer));
         let command = PiBtwCommand {
             name: "btw".to_string(),
             question: Some("side question".to_string()),
@@ -1298,10 +2053,13 @@ mod tests {
 
         let result = drain_pi_rpc_lines(
             &mut BufReader::new(stdout_reader).lines(),
-            &mut stdin_writer,
+            &stdin_writer,
             &mut |event| events.push(event),
+            None,
+            None,
             || false,
             Some(&command),
+            false,
             false,
         )
         .await;
@@ -1326,13 +2084,15 @@ mod tests {
             for line in [
                 r#"{"type":"entry_appended","entry":{"type":"custom","id":"e10","customType":"btw-thread-entry","data":{"question":"quick aside","answer":"quick answer","provider":"p","model":"m"}}}"#,
                 r#"{"id":1,"type":"response","command":"prompt","success":true}"#,
+                r#"{"type":"agent_end"}"#,
             ] {
                 stdout_writer.write_all(line.as_bytes()).await?;
                 stdout_writer.write_all(b"\n").await?;
             }
             stdout_writer.shutdown().await
         });
-        let (mut stdin_reader, mut stdin_writer) = duplex(4096);
+        let (mut stdin_reader, stdin_writer) = duplex(4096);
+        let stdin_writer = Arc::new(Mutex::new(stdin_writer));
         let command = PiBtwCommand {
             name: "btw".to_string(),
             question: Some("quick aside".to_string()),
@@ -1341,10 +2101,13 @@ mod tests {
 
         let result = drain_pi_rpc_lines(
             &mut BufReader::new(stdout_reader).lines(),
-            &mut stdin_writer,
+            &stdin_writer,
             &mut |event| events.push(event),
+            None,
+            None,
             || false,
             Some(&command),
+            false,
             false,
         )
         .await;
@@ -1358,6 +2121,50 @@ mod tests {
             event,
             UnifiedAgentEvent::ToolUse { id, .. } if id == "pi_btw_e10"
         )));
+    }
+
+    #[tokio::test]
+    async fn btw_slash_sends_prompt_without_get_commands_probe() {
+        let (stdout_reader, mut stdout_writer) = duplex(8192);
+        let writer = tokio::spawn(async move {
+            for line in [
+                r#"{"id":1,"type":"response","command":"prompt","success":true}"#,
+                r#"{"id":"kivio-btw-entries","type":"response","command":"get_entries","success":true,"data":{"entries":[]}}"#,
+                r#"{"type":"agent_settled"}"#,
+            ] {
+                stdout_writer.write_all(line.as_bytes()).await?;
+                stdout_writer.write_all(b"\n").await?;
+            }
+            stdout_writer.shutdown().await
+        });
+        let (mut stdin_reader, stdin_writer) = duplex(4096);
+        let stdin_writer = Arc::new(Mutex::new(stdin_writer));
+        let mut events = Vec::new();
+
+        let result = run_pi_rpc_io(
+            &mut BufReader::new(stdout_reader).lines(),
+            &stdin_writer,
+            "/btw side question",
+            &[],
+            &mut |event| events.push(event),
+            None,
+            None,
+            || false,
+            true,
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(writer.await.unwrap().is_ok());
+        drop(stdin_writer);
+        let mut requests = String::new();
+        stdin_reader.read_to_string(&mut requests).await.unwrap();
+        assert!(
+            !requests.contains("get_commands"),
+            "btw must not stall on a command probe: {requests}"
+        );
+        assert!(requests.contains(r#""type":"prompt""#));
+        assert!(requests.contains("/btw side question"));
     }
 
     /// 手动 /compact：compaction_end 事件发分隔线，compact response 收尾轮次，
@@ -1376,16 +2183,20 @@ mod tests {
             }
             stdout_writer.shutdown().await
         });
-        let (_stdin_reader, mut stdin_writer) = duplex(4096);
+        let (_stdin_reader, stdin_writer) = duplex(4096);
+        let stdin_writer = Arc::new(Mutex::new(stdin_writer));
         let mut events = Vec::new();
 
         let result = drain_pi_rpc_lines(
             &mut BufReader::new(stdout_reader).lines(),
-            &mut stdin_writer,
+            &stdin_writer,
             &mut |event| events.push(event),
+            None,
+            None,
             || false,
             None,
             true,
+            false,
         )
         .await;
 
@@ -1420,16 +2231,20 @@ mod tests {
             stdout_writer.write_all(b"\n").await?;
             stdout_writer.shutdown().await
         });
-        let (_stdin_reader, mut stdin_writer) = duplex(4096);
+        let (_stdin_reader, stdin_writer) = duplex(4096);
+        let stdin_writer = Arc::new(Mutex::new(stdin_writer));
         let mut events = Vec::new();
 
         let result = drain_pi_rpc_lines(
             &mut BufReader::new(stdout_reader).lines(),
-            &mut stdin_writer,
+            &stdin_writer,
             &mut |event| events.push(event),
+            None,
+            None,
             || false,
             None,
             true,
+            false,
         )
         .await;
 
@@ -1634,6 +2449,698 @@ mod tests {
 
         assert_eq!(result, Err("cancelled".to_string()));
         drop(stdout_writer);
+    }
+
+    #[tokio::test]
+    async fn extension_ui_confirm_bridges_user_decision_and_fails_closed_without_host() {
+        let raw = json!({
+            "type": "extension_ui_request",
+            "id": "ui-1",
+            "method": "confirm",
+            "title": "Delete?",
+            "message": "Cannot be undone",
+        });
+        let (mut output_reader, output_writer) = duplex(2048);
+        let output_writer = Arc::new(Mutex::new(output_writer));
+        let (ask_tx, mut ask_rx) = mpsc::channel(1);
+        let (decision_tx, decision_rx) = mpsc::channel(1);
+        let mut bridge = crate::external_agents::session::live::ApprovalBridge {
+            requests: ask_tx,
+            decisions: decision_rx,
+        };
+        let host = async move {
+            let ask = ask_rx.recv().await.expect("extension ask");
+            assert_eq!(ask.request_id, "ui-1");
+            assert_eq!(ask.tool_name, "PiExtensionConfirm");
+            decision_tx
+                .send(crate::external_agents::session::live::ApprovalDecision {
+                    request_id: ask.request_id,
+                    approved: true,
+                    updated_input: Some(json!({ "confirmed": false })),
+                    set_permission_mode: None,
+                })
+                .await
+                .expect("decision");
+        };
+        let (result, ()) = tokio::join!(
+            bridge_extension_ui(&output_writer, &raw, Some(&mut bridge), &|| false),
+            host
+        );
+        result.expect("bridged response");
+        let line = BufReader::new(&mut output_reader)
+            .lines()
+            .next_line()
+            .await
+            .expect("read")
+            .expect("response");
+        let response: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(response["id"], "ui-1");
+        assert_eq!(response["confirmed"], false);
+
+        let (mut rejected_reader, rejected_writer) = duplex(1024);
+        let rejected_writer = Arc::new(Mutex::new(rejected_writer));
+        bridge_extension_ui(&rejected_writer, &raw, None, &|| false)
+            .await
+            .expect("fail closed response");
+        let line = BufReader::new(&mut rejected_reader)
+            .lines()
+            .next_line()
+            .await
+            .expect("read")
+            .expect("response");
+        let response: Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(response["cancelled"], true);
+        assert!(response.get("confirmed").is_none());
+    }
+
+    #[tokio::test]
+    async fn control_response_is_correlated_before_settlement() {
+        let (stdout_reader, mut stdout_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(sink()));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let response = issue_control_command(
+            &stdin,
+            &waiters,
+            "steer-1".to_string(),
+            Some((
+                MessageInjectionKind::Steer,
+                "frontend-1".to_string(),
+                "new direction".to_string(),
+            )),
+            json!({ "type": "steer", "message": "new direction" }),
+        )
+        .await
+        .expect("issue steer");
+        stdout_writer
+            .write_all(
+                b"{\"id\":\"steer-1\",\"type\":\"response\",\"command\":\"steer\",\"success\":true}\n{\"type\":\"agent_settled\"}\n",
+            )
+            .await
+            .expect("events");
+        let mut events = Vec::new();
+        let result = drain_pi_rpc_lines(
+            &mut BufReader::new(stdout_reader).lines(),
+            &stdin,
+            &mut |event| events.push(event),
+            None,
+            Some(&waiters),
+            || false,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(matches!(response.await, Ok(Ok(()))));
+        assert!(matches!(
+            events.as_slice(),
+            [UnifiedAgentEvent::UserSteer { id, text }]
+                if id == "frontend-1" && text == "new direction"
+        ));
+    }
+
+    #[tokio::test]
+    async fn leftover_control_waiters_are_failed_when_the_turn_ends() {
+        let stdin = Arc::new(Mutex::new(sink()));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let response = issue_control_command(
+            &stdin,
+            &waiters,
+            "steer-late".to_string(),
+            Some((
+                MessageInjectionKind::Steer,
+                "frontend-1".to_string(),
+                "hello".to_string(),
+            )),
+            json!({ "type": "steer", "message": "hello" }),
+        )
+        .await
+        .expect("issue steer");
+        assert!(waiters.lock().await.contains_key("steer-late"));
+        fail_pending_controls(
+            &waiters,
+            "Pi turn ended before the control command was acknowledged",
+        )
+        .await;
+        assert!(waiters.lock().await.is_empty());
+        assert!(matches!(
+            response.await,
+            Ok(Err(error)) if error.contains("turn ended")
+        ));
+    }
+
+    #[test]
+    fn session_request_payloads_match_pi_rpc_contract() {
+        assert_eq!(
+            pi_session_request_payload(&PiSessionRequest::GetEntries {
+                since: Some("entry-1".to_string()),
+            }),
+            json!({ "type": "get_entries", "since": "entry-1" })
+        );
+        assert_eq!(
+            pi_session_request_payload(&PiSessionRequest::GetForkMessages),
+            json!({ "type": "get_fork_messages" })
+        );
+        assert_eq!(
+            pi_session_request_payload(&PiSessionRequest::Clone),
+            json!({ "type": "clone" })
+        );
+        assert_eq!(
+            pi_session_request_payload(&PiSessionRequest::Switch {
+                session_path: "/tmp/session.jsonl".to_string(),
+            }),
+            json!({ "type": "switch_session", "sessionPath": "/tmp/session.jsonl" })
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_tree_request_returns_tree_and_authoritative_state() {
+        let (client_stdin, server_stdin) = duplex(4096);
+        let (client_stdout, mut server_stdout) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_stdin).lines();
+            let tree = requests.next_line().await.unwrap().unwrap();
+            let tree: Value = serde_json::from_str(&tree).unwrap();
+            assert_eq!(tree["type"], "get_tree");
+            assert_eq!(tree["id"], "tree-1");
+            server_stdout
+                .write_all(
+                    b"{\"id\":\"tree-1\",\"type\":\"response\",\"command\":\"get_tree\",\"success\":true,\"data\":{\"tree\":[],\"leafId\":null}}\n",
+                )
+                .await
+                .unwrap();
+            let state = requests.next_line().await.unwrap().unwrap();
+            let state: Value = serde_json::from_str(&state).unwrap();
+            assert_eq!(state["type"], "get_state");
+            server_stdout
+                .write_all(
+                    format!(
+                        "{{\"id\":{},\"type\":\"response\",\"command\":\"get_state\",\"success\":true,\"data\":{{\"sessionId\":\"s1\",\"sessionFile\":\"/tmp/s1.jsonl\"}}}}\n",
+                        serde_json::to_string(&state["id"]).unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        let result = run_idle_pi_session_request(
+            &mut BufReader::new(client_stdout).lines(),
+            &stdin,
+            "tree-1",
+            &PiSessionRequest::GetTree,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.data["tree"], json!([]));
+        assert_eq!(result.state.unwrap()["sessionId"], "s1");
+    }
+
+    #[tokio::test]
+    async fn idle_fork_request_uses_entry_id_and_reads_new_session_identity() {
+        let (client_stdin, server_stdin) = duplex(4096);
+        let (client_stdout, mut server_stdout) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_stdin).lines();
+            let fork = requests.next_line().await.unwrap().unwrap();
+            let fork: Value = serde_json::from_str(&fork).unwrap();
+            assert_eq!(fork["type"], "fork");
+            assert_eq!(fork["entryId"], "user-2");
+            server_stdout
+                .write_all(
+                    b"{\"id\":\"fork-1\",\"type\":\"response\",\"command\":\"fork\",\"success\":true,\"data\":{\"text\":\"second prompt\",\"cancelled\":false}}\n",
+                )
+                .await
+                .unwrap();
+            let state = requests.next_line().await.unwrap().unwrap();
+            let state: Value = serde_json::from_str(&state).unwrap();
+            server_stdout
+                .write_all(
+                    format!(
+                        "{{\"id\":{},\"type\":\"response\",\"command\":\"get_state\",\"success\":true,\"data\":{{\"sessionId\":\"forked\",\"sessionFile\":\"/tmp/forked.jsonl\"}}}}\n",
+                        serde_json::to_string(&state["id"]).unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        let result = run_idle_pi_session_request(
+            &mut BufReader::new(client_stdout).lines(),
+            &stdin,
+            "fork-1",
+            &PiSessionRequest::Fork {
+                entry_id: "user-2".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.data["text"], "second prompt");
+        assert_eq!(result.state.unwrap()["sessionId"], "forked");
+    }
+
+    #[tokio::test]
+    async fn follow_up_command_serializes_images_and_emits_distinct_event() {
+        let (stdout_reader, mut stdout_writer) = duplex(2048);
+        let (command_reader, command_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(command_writer));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let response = issue_control_command(
+            &stdin,
+            &waiters,
+            "follow-up-1".to_string(),
+            Some((
+                MessageInjectionKind::FollowUp,
+                "frontend-follow-up".to_string(),
+                "附带图片（1）".to_string(),
+            )),
+            json!({
+                "type": "follow_up",
+                "message": "",
+                "images": [{ "type": "image", "data": "abc", "mimeType": "image/png" }]
+            }),
+        )
+        .await
+        .expect("issue follow-up");
+        let mut command_lines = BufReader::new(command_reader).lines();
+        let command: Value = serde_json::from_str(
+            &command_lines
+                .next_line()
+                .await
+                .expect("command line")
+                .expect("command"),
+        )
+        .expect("json command");
+        assert_eq!(command["type"], "follow_up");
+        assert_eq!(command["images"][0]["mimeType"], "image/png");
+
+        stdout_writer
+            .write_all(
+                b"{\"id\":\"follow-up-1\",\"type\":\"response\",\"command\":\"follow_up\",\"success\":true}\n{\"type\":\"agent_settled\"}\n",
+            )
+            .await
+            .expect("events");
+        let mut events = Vec::new();
+        let result = drain_pi_rpc_lines(
+            &mut BufReader::new(stdout_reader).lines(),
+            &stdin,
+            &mut |event| events.push(event),
+            None,
+            Some(&waiters),
+            || false,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(matches!(response.await, Ok(Ok(()))));
+        assert!(matches!(
+            events.as_slice(),
+            [UnifiedAgentEvent::UserFollowUp { id, text }]
+                if id == "frontend-follow-up" && text == "附带图片（1）"
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_abort_drains_to_settled_and_returns_cancelled() {
+        let (stdout_reader, mut stdout_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(sink()));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let response = issue_control_command(
+            &stdin,
+            &waiters,
+            "abort-1".to_string(),
+            None,
+            json!({ "type": "abort" }),
+        )
+        .await
+        .expect("issue abort");
+        stdout_writer
+            .write_all(
+                b"{\"id\":\"abort-1\",\"type\":\"response\",\"command\":\"abort\",\"success\":true}\n{\"type\":\"agent_end\"}\n{\"type\":\"agent_settled\"}\n",
+            )
+            .await
+            .expect("events");
+        let result = drain_pi_rpc_lines(
+            &mut BufReader::new(stdout_reader).lines(),
+            &stdin,
+            &mut |_| {},
+            None,
+            Some(&waiters),
+            || true,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(result, Err("cancelled".to_string()));
+        assert!(matches!(response.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn pi_prompt_serializes_native_images() {
+        let (client_stdin, server_stdin) = duplex(4096);
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        let (client_stdout, mut server_stdout) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let request = BufReader::new(server_stdin)
+                .lines()
+                .next_line()
+                .await
+                .expect("read")
+                .expect("request");
+            let request: Value = serde_json::from_str(&request).expect("json");
+            assert_eq!(request["images"][0]["type"], "image");
+            assert_eq!(request["images"][0]["data"], "aGVsbG8=");
+            assert_eq!(request["images"][0]["mimeType"], "image/png");
+            server_stdout
+                .write_all(
+                    b"{\"id\":1,\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n{\"type\":\"agent_settled\"}\n",
+                )
+                .await
+                .expect("settled");
+        });
+        let mut reader = BufReader::new(client_stdout).lines();
+        let image = crate::external_agents::attachments::ImageBlock {
+            data_base64: "aGVsbG8=".to_string(),
+            mime: "image/png".to_string(),
+            path: std::path::PathBuf::from("image.png"),
+        };
+        run_pi_rpc_io(
+            &mut reader,
+            &stdin,
+            "inspect",
+            &[image],
+            &mut |_| {},
+            None,
+            None,
+            || false,
+            true,
+        )
+        .await
+        .expect("image turn");
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn persistent_eof_before_settled_is_an_error() {
+        let (stdout_reader, stdout_writer) = duplex(256);
+        drop(stdout_writer);
+        let mut reader = BufReader::new(stdout_reader).lines();
+        let stdin = Arc::new(Mutex::new(sink()));
+        let result = drain_pi_rpc_lines(
+            &mut reader,
+            &stdin,
+            &mut |_| {},
+            None,
+            None,
+            || false,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("Pi RPC process exited before agent_settled".to_string())
+        );
+    }
+
+    #[test]
+    fn persisted_live_session_id_overrides_a_fresh_argv_id() {
+        let args = vec![
+            "--mode".to_string(),
+            "rpc".to_string(),
+            "--session-id".to_string(),
+            "fresh-id".to_string(),
+        ];
+        let (effective, session_id, resumed) =
+            persistent_session_args(&args, Some("persisted-id")).expect("session args");
+        assert_eq!(session_id, "persisted-id");
+        assert!(resumed);
+        assert_eq!(
+            effective.windows(2).find(|pair| pair[0] == "--session-id"),
+            Some(&["--session-id".to_string(), "persisted-id".to_string()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_io_serves_two_turns_on_the_same_streams() {
+        let (client_stdin, server_stdin) = duplex(4096);
+        let (client_stdout, mut server_stdout) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_stdin).lines();
+            for expected in ["first", "second"] {
+                let request = requests
+                    .next_line()
+                    .await
+                    .expect("read request")
+                    .expect("request line");
+                let request: Value = serde_json::from_str(&request).expect("request json");
+                assert_eq!(request["type"], "prompt");
+                assert_eq!(request["message"], expected);
+                let delta = json!({
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": expected},
+                });
+                for event in [
+                    json!({"id": 1, "type": "response", "command": "prompt", "success": true}),
+                    delta,
+                    json!({"type": "agent_end"}),
+                    json!({"type": "agent_settled"}),
+                ] {
+                    server_stdout
+                        .write_all(format!("{event}\n").as_bytes())
+                        .await
+                        .expect("write event");
+                }
+            }
+        });
+
+        let mut reader = BufReader::new(client_stdout).lines();
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        let mut deltas = Vec::new();
+        for prompt in ["first", "second"] {
+            run_pi_rpc_io(
+                &mut reader,
+                &stdin,
+                prompt,
+                &[],
+                &mut |event| {
+                    if let UnifiedAgentEvent::TextDelta { delta } = event {
+                        deltas.push(delta);
+                    }
+                },
+                None,
+                None,
+                || false,
+                true,
+            )
+            .await
+            .expect("persistent turn");
+        }
+
+        server.await.expect("mock server");
+        assert_eq!(deltas, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn stale_settlement_after_compact_cannot_finish_the_next_prompt() {
+        let (client_stdin, server_stdin) = duplex(4096);
+        let (client_stdout, mut server_stdout) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_stdin).lines();
+            let compact = requests
+                .next_line()
+                .await
+                .expect("compact read")
+                .expect("compact request");
+            let compact: Value = serde_json::from_str(&compact).expect("compact json");
+            assert_eq!(compact["type"], "compact");
+            for event in [
+                json!({
+                    "type": "compaction_end",
+                    "reason": "manual",
+                    "aborted": false,
+                    "result": {"tokensBefore": 100, "estimatedTokensAfter": 10},
+                }),
+                json!({
+                    "id": 1,
+                    "type": "response",
+                    "command": "compact",
+                    "success": true,
+                    "data": {"tokensBefore": 100, "estimatedTokensAfter": 10},
+                }),
+                json!({"type": "agent_settled"}),
+            ] {
+                server_stdout
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .expect("compact event");
+            }
+
+            let prompt = requests
+                .next_line()
+                .await
+                .expect("prompt read")
+                .expect("prompt request");
+            let prompt: Value = serde_json::from_str(&prompt).expect("prompt json");
+            assert_eq!(prompt["message"], "after compact");
+            for event in [
+                json!({"id": 1, "type": "response", "command": "prompt", "success": true}),
+                json!({
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "real answer"},
+                }),
+                json!({"type": "agent_end"}),
+                json!({"type": "agent_settled"}),
+            ] {
+                server_stdout
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .expect("prompt event");
+            }
+        });
+
+        let mut reader = BufReader::new(client_stdout).lines();
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        run_pi_rpc_io(
+            &mut reader,
+            &stdin,
+            "/compact",
+            &[],
+            &mut |_| {},
+            None,
+            None,
+            || false,
+            true,
+        )
+        .await
+        .expect("compact turn");
+        let mut text = String::new();
+        run_pi_rpc_io(
+            &mut reader,
+            &stdin,
+            "after compact",
+            &[],
+            &mut |event| {
+                if let UnifiedAgentEvent::TextDelta { delta } = event {
+                    text.push_str(&delta);
+                }
+            },
+            None,
+            None,
+            || false,
+            true,
+        )
+        .await
+        .expect("prompt turn");
+        server.await.expect("server");
+        assert_eq!(text, "real answer");
+    }
+
+    #[tokio::test]
+    async fn leftover_btw_entries_cannot_finish_the_next_prompt() {
+        let (client_stdin, server_stdin) = duplex(4096);
+        let (client_stdout, mut server_stdout) = duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_stdin).lines();
+            let _first = requests
+                .next_line()
+                .await
+                .expect("first prompt")
+                .expect("first line");
+            for event in [
+                json!({"id": 1, "type": "response", "command": "prompt", "success": true}),
+                json!({"id": "kivio-btw-entries", "type": "response", "command": "get_entries", "success": true, "data": {"entries": []}}),
+                json!({"type": "agent_settled"}),
+                json!({"id": "kivio-btw-entries", "type": "response", "command": "get_entries", "success": true, "data": {"entries": []}}),
+            ] {
+                server_stdout
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .expect("write first turn");
+            }
+
+            let prompt = loop {
+                let line = requests
+                    .next_line()
+                    .await
+                    .expect("follow-up request")
+                    .expect("request line");
+                let value: Value = serde_json::from_str(&line).expect("request json");
+                // /btw with a question also writes get_entries on the same stdin; skip it.
+                if value.get("type").and_then(Value::as_str) == Some("get_entries") {
+                    continue;
+                }
+                break value;
+            };
+            assert_eq!(prompt["type"], "prompt");
+            assert_eq!(prompt["message"], "follow up");
+            for event in [
+                json!({"id": 1, "type": "response", "command": "prompt", "success": true}),
+                json!({
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "still here"},
+                }),
+                json!({"type": "agent_end"}),
+                json!({"type": "agent_settled"}),
+            ] {
+                server_stdout
+                    .write_all(format!("{event}\n").as_bytes())
+                    .await
+                    .expect("write second turn");
+            }
+        });
+
+        let mut reader = BufReader::new(client_stdout).lines();
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        run_pi_rpc_io(
+            &mut reader,
+            &stdin,
+            "/btw leftover",
+            &[],
+            &mut |_| {},
+            None,
+            None,
+            || false,
+            true,
+        )
+        .await
+        .expect("btw turn");
+        let mut text = String::new();
+        run_pi_rpc_io(
+            &mut reader,
+            &stdin,
+            "follow up",
+            &[],
+            &mut |event| {
+                if let UnifiedAgentEvent::TextDelta { delta } = event {
+                    text.push_str(&delta);
+                }
+            },
+            None,
+            None,
+            || false,
+            true,
+        )
+        .await
+        .expect("follow-up turn");
+        server.await.expect("server");
+        assert_eq!(text, "still here");
+    }
+
+    #[test]
+    fn missing_pi_session_file_is_not_a_successful_resume() {
+        assert!(!pi_native_session_present("kivio-missing-session-id-for-test"));
+        assert!(is_missing_pi_session_error(
+            "Pi session \"abc\" not found"
+        ));
+        assert!(!is_missing_pi_session_error("Pi RPC timed out"));
     }
 
     #[test]

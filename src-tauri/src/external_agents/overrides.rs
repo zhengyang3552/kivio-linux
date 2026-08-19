@@ -5,7 +5,7 @@
 //! 都没有 `AppHandle`（它们也被无 Tauri 上下文的路径复用），要把覆盖顺着传下去得改十几个签名。
 //!
 //! ponytail: 只在 `persist_settings` / `load_settings` 两处同步；**故意不挂在 `sanitize_settings`
-//! 上** —— `connectors/himalaya.rs` 用一个临时拼的 partial `Settings` 调它，挂上去会把真实覆盖清空。
+//! 上** —— 校验路径会用临时拼的 partial `Settings` 调它，挂上去会把真实覆盖清空。
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
@@ -53,7 +53,7 @@ pub fn active_provider(id: &str) -> Option<ExternalCliProvider> {
     }
     cfg.providers
         .into_iter()
-        .find(|provider| provider.id == cfg.current_provider)
+        .find(|provider| provider.id == cfg.current_provider && !provider.disabled)
 }
 
 /// 注入该 CLI 子进程的环境变量（`ANTHROPIC_BASE_URL` 之类的中转配置）。
@@ -103,8 +103,13 @@ pub fn env_for_bin(bin: &std::path::Path) -> HashMap<String, String> {
         guard
             .iter()
             .find(|(id, cfg)| {
-                // 只配了供应商、没手填 env 的 agent 也要命中 —— 这里判空必须把供应商算上。
-                if cfg.env.is_empty() && cfg.current_provider.is_empty() {
+                // dsh 的供应商可全部并存；即使 currentProvider 为空，显式选中其中一个模型时也要注入凭据。
+                let has_coexisting_dsh_providers =
+                    id.as_str() == "dsh" && cfg.providers.iter().any(|provider| !provider.disabled);
+                if cfg.env.is_empty()
+                    && cfg.current_provider.is_empty()
+                    && !has_coexisting_dsh_providers
+                {
                     return false;
                 }
                 if cfg.path.is_empty() {

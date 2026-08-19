@@ -405,6 +405,13 @@ pub enum WebSearchProvider {
     ExaMcp,
     Ollama,
     Grok,
+    Brave,
+    Serper,
+    Bocha,
+    Zhipu,
+    Tinyfish,
+    TinyfishMcp,
+    Searxng,
     /// 前端可能列出尚未接入后端的占位服务商；持久化时兜底为未知，避免旧值导致整份设置解析失败。
     #[serde(other)]
     Unknown,
@@ -450,6 +457,33 @@ pub struct LensWebSearchConfig {
     pub grok_base_url: String,
     #[serde(default = "default_grok_system_prompt")]
     pub grok_system_prompt: String,
+    #[serde(default)]
+    pub brave_api_key: String,
+    #[serde(default = "default_brave_base_url")]
+    pub brave_base_url: String,
+    #[serde(default)]
+    pub serper_api_key: String,
+    #[serde(default = "default_serper_base_url")]
+    pub serper_base_url: String,
+    #[serde(default)]
+    pub bocha_api_key: String,
+    #[serde(default = "default_bocha_base_url")]
+    pub bocha_base_url: String,
+    #[serde(default)]
+    pub zhipu_api_key: String,
+    #[serde(default = "default_zhipu_base_url")]
+    pub zhipu_base_url: String,
+    #[serde(default)]
+    pub tinyfish_api_key: String,
+    #[serde(default = "default_tinyfish_base_url")]
+    pub tinyfish_base_url: String,
+    #[serde(default = "default_tinyfish_mcp_url")]
+    pub tinyfish_mcp_url: String,
+    /// TinyFish MCP 走 OAuth 2.1，不贴 API Key。授权结果存在这里，搜索时带 Authorization。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tinyfish_mcp_auth: Option<ConnectorAuth>,
+    #[serde(default)]
+    pub searxng_base_url: String,
     #[serde(default = "default_web_search_max_results")]
     pub max_results: u8,
     #[serde(default = "default_web_search_depth")]
@@ -472,6 +506,19 @@ impl Default for LensWebSearchConfig {
             grok_model: default_grok_model(),
             grok_base_url: default_grok_base_url(),
             grok_system_prompt: default_grok_system_prompt(),
+            brave_api_key: String::new(),
+            brave_base_url: default_brave_base_url(),
+            serper_api_key: String::new(),
+            serper_base_url: default_serper_base_url(),
+            bocha_api_key: String::new(),
+            bocha_base_url: default_bocha_base_url(),
+            zhipu_api_key: String::new(),
+            zhipu_base_url: default_zhipu_base_url(),
+            tinyfish_api_key: String::new(),
+            tinyfish_base_url: default_tinyfish_base_url(),
+            tinyfish_mcp_url: default_tinyfish_mcp_url(),
+            tinyfish_mcp_auth: None,
+            searxng_base_url: String::new(),
             max_results: default_web_search_max_results(),
             search_depth: default_web_search_depth(),
         }
@@ -500,6 +547,30 @@ fn default_grok_model() -> String {
 
 fn default_grok_base_url() -> String {
     "https://api.x.ai/v1".to_string()
+}
+
+fn default_brave_base_url() -> String {
+    "https://api.search.brave.com".to_string()
+}
+
+fn default_serper_base_url() -> String {
+    "https://google.serper.dev".to_string()
+}
+
+fn default_bocha_base_url() -> String {
+    "https://api.bochaai.com".to_string()
+}
+
+fn default_zhipu_base_url() -> String {
+    "https://open.bigmodel.cn/api/paas/v4".to_string()
+}
+
+fn default_tinyfish_base_url() -> String {
+    "https://api.search.tinyfish.ai".to_string()
+}
+
+fn default_tinyfish_mcp_url() -> String {
+    "https://agent.tinyfish.ai/mcp".to_string()
 }
 
 pub fn default_grok_system_prompt() -> String {
@@ -690,7 +761,8 @@ pub struct ExternalCliAgentConfig {
     pub custom_models: Vec<CliCustomModel>,
     /// 该 CLI 的第三方供应商（中转站）列表。每个 CLI 各自一份，同 ccgui 的分桶方式。
     pub providers: Vec<ExternalCliProvider>,
-    /// 当前生效的供应商 id；空 = 不托管，用 CLI 自己的配置（默认）。
+    /// 当前默认供应商 id；空 = 使用 CLI 自己的默认配置。
+    /// Pi / OpenCode / dsh 的 providers 会全部并存，此字段只决定未显式选模型时的默认项。
     pub current_provider: String,
 }
 
@@ -709,6 +781,8 @@ pub struct ExternalCliProvider {
     /// 从 cc-switch 导入时**保留原 id**，这样二次导入走更新而不是新增一条重复的。
     pub id: String,
     pub name: String,
+    /// 仅对支持并存的 CLI 生效；false = 启用（兼容旧配置），true = 不物化、不注入。
+    pub disabled: bool,
     pub remark: String,
     pub env: Vec<CliEnvVar>,
     /// codex：私有 CODEX_HOME 里 config.toml 的全文；grok：写入原生 `~/.grok/config.toml` 的片段（至少含 models / model）。
@@ -1368,112 +1442,6 @@ impl KnowledgeBaseConfig {
     }
 }
 
-fn default_imap_port() -> u16 {
-    993
-}
-
-fn default_smtp_port() -> u16 {
-    587
-}
-
-fn default_imap_encryption() -> String {
-    "tls".to_string()
-}
-
-fn default_smtp_encryption() -> String {
-    "start-tls".to_string()
-}
-
-/// Himalaya 邮箱账户（IMAP 读 + SMTP 发）；凭据明文存 settings，同步到 ~/.config/himalaya/config.toml。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EmailAccountConfig {
-    /// TOML `[accounts.<id>]` 段名；空时由 email 推导。
-    pub id: String,
-    pub email: String,
-    pub display_name: String,
-    pub password: String,
-    pub imap_host: String,
-    #[serde(default = "default_imap_port")]
-    pub imap_port: u16,
-    #[serde(default = "default_imap_encryption")]
-    pub imap_encryption: String,
-    pub smtp_host: String,
-    #[serde(default = "default_smtp_port")]
-    pub smtp_port: u16,
-    #[serde(default = "default_smtp_encryption")]
-    pub smtp_encryption: String,
-    #[serde(default)]
-    pub is_default: bool,
-}
-
-impl Default for EmailAccountConfig {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            email: String::new(),
-            display_name: String::new(),
-            password: String::new(),
-            imap_host: String::new(),
-            imap_port: default_imap_port(),
-            imap_encryption: default_imap_encryption(),
-            smtp_host: String::new(),
-            smtp_port: default_smtp_port(),
-            smtp_encryption: default_smtp_encryption(),
-            is_default: false,
-        }
-    }
-}
-
-pub fn email_account_id_from_address(email: &str) -> String {
-    let slug: String = email
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let trimmed = slug.trim_matches('-');
-    if trimmed.is_empty() {
-        "default".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// 注入系统提示：已配置的 Himalaya 邮箱列表。
-pub fn email_accounts_system_prompt(
-    accounts: &[EmailAccountConfig],
-    himalaya_binary: Option<&str>,
-) -> Option<String> {
-    if accounts.is_empty() {
-        return None;
-    }
-    let lines: Vec<String> = accounts
-        .iter()
-        .map(|account| {
-            let id = if account.id.trim().is_empty() {
-                email_account_id_from_address(&account.email)
-            } else {
-                account.id.trim().to_string()
-            };
-            format!("- {} (account id: {id})", account.email.trim())
-        })
-        .collect();
-    let binary_line = himalaya_binary
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(|path| format!("Himalaya binary: {path}"));
-    Some(format!(
-        "Configured mailboxes (Himalaya CLI — activate the himalaya skill and use run_command):\n{}\nUse Himalaya installed via the Kivio Email connector, or a system PATH himalaya binary.{}{}",
-        lines.join("\n"),
-        binary_line
-            .as_ref()
-            .map(|line| format!("\n{line}"))
-            .unwrap_or_default(),
-        "\nConfirm with the user before sending, deleting, or bulk-moving mail."
-    ))
-}
-
 /**
  * 独立截图标注功能配置（截图 → 箭头/矩形/马赛克标注 → 复制/保存）
  */
@@ -1621,9 +1589,6 @@ pub struct Settings {
     /// 只在 chat 模型选择器里展示为顶部"收藏"组；失效项（provider 删/禁用/模型没了）展示时过滤。
     #[serde(default)]
     pub favorite_models: Vec<String>,
-    /// IMAP/SMTP 邮箱（Himalaya）；保存时同步到 ~/.config/himalaya/config.toml。
-    #[serde(default)]
-    pub email_accounts: Vec<EmailAccountConfig>,
     // 旧版字段，用于迁移
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<OpenAIConfig>,
@@ -1757,7 +1722,6 @@ impl Default for Settings {
             image_archive_path: String::new(),
             obsidian_vault_path: String::new(),
             favorite_models: Vec::new(),
-            email_accounts: Vec::new(),
             openai: None,
         }
     }
@@ -1799,9 +1763,6 @@ pub fn is_skill_enabled(chat_tools: &ChatToolsConfig, skill_id: &str) -> bool {
         .any(|disabled| disabled == skill_id)
 }
 
-/// Bundled skill id for the email (Himalaya) connector — hidden until configured.
-pub const EMAIL_CONNECTOR_SKILL_ID: &str = "himalaya";
-
 /// Bundled skill ids for the Obsidian connector — hidden until a vault path is
 /// configured. Adapted from kepano/obsidian-skills (see resources/skills/NOTICE.md).
 pub const OBSIDIAN_CONNECTOR_SKILL_IDS: &[&str] = &[
@@ -1811,24 +1772,13 @@ pub const OBSIDIAN_CONNECTOR_SKILL_IDS: &[&str] = &[
     "obsidian-cli",
 ];
 
-pub fn email_connector_configured(accounts: &[EmailAccountConfig]) -> bool {
-    !accounts.is_empty()
-}
-
 /// The Obsidian connector is "configured" once a vault path is set.
 pub fn obsidian_connector_configured(vault_path: &str) -> bool {
     !vault_path.trim().is_empty()
 }
 
 /// Connector-backed skills stay unavailable until their connector is configured.
-pub fn skill_connector_satisfied(
-    skill_id: &str,
-    email_accounts: &[EmailAccountConfig],
-    obsidian_vault_configured: bool,
-) -> bool {
-    if skill_id == EMAIL_CONNECTOR_SKILL_ID {
-        return email_connector_configured(email_accounts);
-    }
+pub fn skill_connector_satisfied(skill_id: &str, obsidian_vault_configured: bool) -> bool {
     if OBSIDIAN_CONNECTOR_SKILL_IDS.contains(&skill_id) {
         return obsidian_vault_configured;
     }
@@ -1840,21 +1790,19 @@ pub fn skill_connector_satisfied(
 pub fn skill_globally_available(
     chat_tools: &ChatToolsConfig,
     skill_id: &str,
-    email_accounts: &[EmailAccountConfig],
     obsidian_vault_configured: bool,
 ) -> bool {
     if !crate::plugins::plugin_skill_available(skill_id) {
         return false;
     }
     is_skill_enabled(chat_tools, skill_id)
-        && skill_connector_satisfied(skill_id, email_accounts, obsidian_vault_configured)
+        && skill_connector_satisfied(skill_id, obsidian_vault_configured)
 }
 
 /// When [`skill_globally_available`] is false, returns a loop/UI-friendly error.
 pub fn skill_global_unavailable_error(
     chat_tools: &ChatToolsConfig,
     skill_id: &str,
-    email_accounts: &[EmailAccountConfig],
     obsidian_vault_configured: bool,
     skill_name: &str,
 ) -> Option<String> {
@@ -1869,12 +1817,7 @@ pub fn skill_global_unavailable_error(
     if !is_skill_enabled(chat_tools, skill_id) {
         return Some(format!("Skill is disabled in Settings: {skill_name}"));
     }
-    if !skill_connector_satisfied(skill_id, email_accounts, obsidian_vault_configured) {
-        if skill_id == EMAIL_CONNECTOR_SKILL_ID {
-            return Some(format!(
-                "Skill requires a configured email connector: {skill_name}"
-            ));
-        }
+    if !skill_connector_satisfied(skill_id, obsidian_vault_configured) {
         return Some(format!(
             "Skill requires a configured Obsidian connector: {skill_name}"
         ));
@@ -1920,62 +1863,6 @@ fn mirror_explicit_chat_default_for_persistence(settings: &mut Settings) {
     } else {
         settings.chat_provider_id.clear();
         settings.chat_model.clear();
-    }
-}
-
-fn sanitize_email_accounts(accounts: &mut Vec<EmailAccountConfig>) {
-    accounts.retain(|account| !account.email.trim().is_empty());
-    for account in accounts.iter_mut() {
-        account.email = account.email.trim().to_string();
-        account.display_name = account.display_name.trim().to_string();
-        account.password = account.password.trim().to_string();
-        account.imap_host = account.imap_host.trim().to_string();
-        account.smtp_host = account.smtp_host.trim().to_string();
-        account.imap_encryption = account.imap_encryption.trim().to_lowercase();
-        account.smtp_encryption = account.smtp_encryption.trim().to_lowercase();
-        if account.id.trim().is_empty() {
-            account.id = email_account_id_from_address(&account.email);
-        } else {
-            account.id = account
-                .id
-                .trim()
-                .to_lowercase()
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect::<String>()
-                .trim_matches('-')
-                .to_string();
-        }
-        if account.id.is_empty() {
-            account.id = "default".to_string();
-        }
-        if account.display_name.is_empty() {
-            account.display_name = account.email.clone();
-        }
-        if account.imap_port == 0 {
-            account.imap_port = default_imap_port();
-        }
-        if account.smtp_port == 0 {
-            account.smtp_port = default_smtp_port();
-        }
-        if account.imap_encryption.is_empty() {
-            account.imap_encryption = default_imap_encryption();
-        }
-        if account.smtp_encryption.is_empty() {
-            account.smtp_encryption = default_smtp_encryption();
-        }
-    }
-    if accounts.len() == 1 {
-        accounts[0].is_default = true;
-    }
-    if !accounts.is_empty() && !accounts.iter().any(|account| account.is_default) {
-        accounts[0].is_default = true;
     }
 }
 
@@ -2334,6 +2221,38 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         settings.lens.web_search.ollama_api_key.trim().to_string();
     settings.lens.web_search.grok_api_key =
         settings.lens.web_search.grok_api_key.trim().to_string();
+    settings.lens.web_search.brave_api_key =
+        settings.lens.web_search.brave_api_key.trim().to_string();
+    settings.lens.web_search.serper_api_key =
+        settings.lens.web_search.serper_api_key.trim().to_string();
+    settings.lens.web_search.bocha_api_key =
+        settings.lens.web_search.bocha_api_key.trim().to_string();
+    settings.lens.web_search.zhipu_api_key =
+        settings.lens.web_search.zhipu_api_key.trim().to_string();
+    settings.lens.web_search.tinyfish_api_key =
+        settings.lens.web_search.tinyfish_api_key.trim().to_string();
+    settings.lens.web_search.tinyfish_mcp_url = {
+        let trimmed = settings.lens.web_search.tinyfish_mcp_url.trim();
+        if trimmed.is_empty() {
+            default_tinyfish_mcp_url()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    if let Some(auth) = settings.lens.web_search.tinyfish_mcp_auth.as_mut() {
+        auth.access_token = auth.access_token.trim().to_string();
+    }
+    if settings
+        .lens
+        .web_search
+        .tinyfish_mcp_auth
+        .as_ref()
+        .is_some_and(|auth| auth.access_token.is_empty())
+    {
+        settings.lens.web_search.tinyfish_mcp_auth = None;
+    }
+    settings.lens.web_search.searxng_base_url =
+        settings.lens.web_search.searxng_base_url.trim().to_string();
     settings.lens.web_search.grok_model = {
         let trimmed = settings.lens.web_search.grok_model.trim();
         if trimmed.is_empty() {
@@ -2595,7 +2514,6 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
     // 清理归档目录路径（去除首尾空白）
     settings.image_archive_path = settings.image_archive_path.trim().to_string();
     settings.obsidian_vault_path = settings.obsidian_vault_path.trim().to_string();
-    sanitize_email_accounts(&mut settings.email_accounts);
 
     settings.retry_attempts = clamp_retry_attempts(settings.retry_attempts);
 
@@ -2680,7 +2598,7 @@ fn sanitize_external_cli_agents(
         if !cfg
             .providers
             .iter()
-            .any(|provider| provider.id == cfg.current_provider)
+            .any(|provider| provider.id == cfg.current_provider && !provider.disabled)
         {
             cfg.current_provider = String::new();
         }
@@ -2835,7 +2753,7 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::
 
 /**
  * 从存储文件加载设置
- * 执行清理迁移；若 settings.json 中无 API Key，则从旧版 keyring 一次性迁移
+ * 执行清理迁移（legacy identifier 目录、sanitize）
  */
 pub fn load_settings(app: &AppHandle) -> Settings {
     // 入口先把旧 identifier 目录的数据搬到新目录（幂等）
@@ -4527,108 +4445,45 @@ mod tests {
     }
 
     #[test]
-    fn email_accounts_system_prompt_mentions_manual_install_and_binary() {
-        let account = EmailAccountConfig {
-            id: "work".into(),
-            email: "user@example.com".into(),
-            ..Default::default()
-        };
-        let prompt =
-            email_accounts_system_prompt(&[account], Some("/opt/kivio/himalaya")).expect("prompt");
-        assert!(prompt.contains("user@example.com"));
-        assert!(prompt.contains("Kivio Email connector"));
-        assert!(prompt.contains("Himalaya binary: /opt/kivio/himalaya"));
-        assert!(!prompt.contains("brew install"));
-
-        let en = email_accounts_system_prompt(
-            &[EmailAccountConfig {
-                email: "user@example.com".into(),
-                ..Default::default()
-            }],
-            None,
-        )
-        .expect("prompt");
-        assert!(en.contains("Kivio Email connector"));
-        assert!(!en.contains("automatically"));
-    }
-
-    #[test]
-    fn skill_globally_available_hides_himalaya_without_email() {
-        let chat_tools = ChatToolsConfig::default();
-        assert!(!skill_globally_available(
-            &chat_tools,
-            EMAIL_CONNECTOR_SKILL_ID,
-            &[],
-            false,
-        ));
-        assert!(!skill_connector_satisfied(
-            EMAIL_CONNECTOR_SKILL_ID,
-            &[],
-            false
-        ));
-        // pdf is not connector-gated
-        assert!(skill_globally_available(&chat_tools, "pdf", &[], false));
-    }
-
-    #[test]
     fn skill_globally_available_hides_obsidian_without_vault() {
         let chat_tools = ChatToolsConfig::default();
         for id in OBSIDIAN_CONNECTOR_SKILL_IDS {
             // No vault configured → each Obsidian skill is unavailable.
             assert!(
-                !skill_globally_available(&chat_tools, id, &[], false),
+                !skill_globally_available(&chat_tools, id, false),
                 "{id} should be hidden without a vault"
             );
-            assert!(!skill_connector_satisfied(id, &[], false));
-            // Vault configured → available (email state is irrelevant here).
+            assert!(!skill_connector_satisfied(id, false));
             assert!(
-                skill_globally_available(&chat_tools, id, &[], true),
+                skill_globally_available(&chat_tools, id, true),
                 "{id} should be available with a vault"
             );
-            assert!(skill_connector_satisfied(id, &[], true));
+            assert!(skill_connector_satisfied(id, true));
         }
         // Non-connector skills are unaffected by vault state.
-        assert!(skill_globally_available(&chat_tools, "pdf", &[], false));
+        assert!(skill_globally_available(&chat_tools, "pdf", false));
     }
 
     #[test]
     fn skill_global_unavailable_error_distinguishes_disabled_and_connector() {
         let mut chat_tools = ChatToolsConfig::default();
-        chat_tools.disabled_skill_ids = vec![EMAIL_CONNECTOR_SKILL_ID.to_string()];
+        chat_tools.disabled_skill_ids = vec!["obsidian-markdown".to_string()];
         assert_eq!(
             skill_global_unavailable_error(
                 &chat_tools,
-                EMAIL_CONNECTOR_SKILL_ID,
-                &[EmailAccountConfig {
-                    email: "a@example.com".into(),
-                    ..Default::default()
-                }],
-                false,
-                "himalaya",
+                "obsidian-markdown",
+                true,
+                "obsidian-markdown",
             )
             .as_deref(),
-            Some("Skill is disabled in Settings: himalaya")
+            Some("Skill is disabled in Settings: obsidian-markdown")
         );
 
         chat_tools.disabled_skill_ids.clear();
         assert_eq!(
             skill_global_unavailable_error(
                 &chat_tools,
-                EMAIL_CONNECTOR_SKILL_ID,
-                &[],
-                false,
-                "himalaya"
-            )
-            .as_deref(),
-            Some("Skill requires a configured email connector: himalaya")
-        );
-
-        // Obsidian skill without a vault → connector error; with a vault → None.
-        assert_eq!(
-            skill_global_unavailable_error(
-                &chat_tools,
                 "obsidian-markdown",
-                &[],
                 false,
                 "obsidian-markdown"
             )
@@ -4639,7 +4494,6 @@ mod tests {
             skill_global_unavailable_error(
                 &chat_tools,
                 "obsidian-markdown",
-                &[],
                 true,
                 "obsidian-markdown"
             ),

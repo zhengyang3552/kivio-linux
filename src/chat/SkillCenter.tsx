@@ -19,6 +19,7 @@ import { ChatMarkdown } from './ChatMarkdown'
 import {
   api,
   defaultNativeTools,
+  isTauriRuntime,
   type ChatToolsConfig,
   type Settings,
   type SkillDetail,
@@ -34,15 +35,16 @@ import { SkillIcon } from '../settings/NavIcons'
 interface SkillCenterProps {
   /** Skill 启用状态 / 列表变化后通知 Chat 刷新其技能列表 */
   onSkillsChanged?: () => void
+  /** 当前对话工作目录：扫描项目 `.kivio/skills` 与 `.agents/skills` */
+  projectCwd?: string
 }
 
-/** 本地 CLI 技能来源：key 用于分组，dirs 是相对家目录的技能目录（多个都扫，装哪因版本而异） */
+/** 本地 CLI 技能来源：只扫各家「自己的」目录。`~/.agents/skills` 是共享目录，Kivio 会直接扫描，不必再导入。 */
 const CLI_SKILL_SOURCES = [
   { key: 'claude', label: 'Claude Code', dirs: ['.claude/skills'] },
   { key: 'codex', label: 'Codex', dirs: ['.codex/skills'] },
   { key: 'opencode', label: 'OpenCode', dirs: ['.config/opencode/skills', '.opencode/skills'] },
-  // Pi 自有技能目录 + 它同样加载的工具无关共享目录 ~/.agents/skills
-  { key: 'pi', label: 'Pi', dirs: ['.pi/agent/skills', '.agents/skills'] },
+  { key: 'pi', label: 'Pi', dirs: ['.pi/agent/skills'] },
 ] as const
 
 type CliSkillKey = (typeof CLI_SKILL_SOURCES)[number]['key']
@@ -72,10 +74,24 @@ function isPluginSkill(skill: SkillMeta): boolean {
   return skill.source === 'plugin'
 }
 
+function isProjectSkill(skill: SkillMeta): boolean {
+  return skill.source === 'project'
+}
+
+function isGlobalAgentsSkill(skill: SkillMeta): boolean {
+  return skill.source === 'agents'
+}
+
+function canDeleteSkill(skill: SkillMeta): boolean {
+  return skill.source === 'user'
+}
+
 function skillSourceLabel(skill: SkillMeta, t: I18n): string {
   if (skill.source === 'builtin') return t.chatSkillSourceBuiltin
   if (skill.source === 'plugin') return t.chatSkillSourcePlugin
   if (skill.source === 'external') return t.chatSkillSourceWorkspace
+  if (skill.source === 'project') return t.chatSkillSourceProject
+  if (skill.source === 'agents') return t.chatSkillSourceGlobal
   return t.chatSkillSourcePersonal
 }
 
@@ -168,7 +184,7 @@ function SkillCard({
       </div>
       <div className="mt-2.5 flex min-h-6 items-center gap-1 border-t border-neutral-100 pt-2 text-[11px] text-neutral-400 dark:border-neutral-800/70 dark:text-neutral-500">
         <span className="truncate">{skillSourceLabel(skill, t)}</span>
-        {onDelete && skill.source === 'user' && !manageLocked ? (
+        {onDelete && canDeleteSkill(skill) && !manageLocked ? (
           <span
             className="ml-auto shrink-0 opacity-0 transition-opacity duration-[var(--kv-dur-fast)] focus-within:opacity-100 group-hover:opacity-100"
             onClick={(event) => event.stopPropagation()}
@@ -202,6 +218,7 @@ function SkillSection({
   collapsible = false,
   defaultCollapsed = false,
   manageLocked = false,
+  lockedActiveIds,
 }: {
   title: string
   note?: string
@@ -214,10 +231,13 @@ function SkillSection({
   collapsible?: boolean
   defaultCollapsed?: boolean
   manageLocked?: boolean
+  lockedActiveIds?: Set<string>
 }) {
   const [collapsed, setCollapsed] = useState(collapsible && defaultCollapsed)
   const t = useT()
-  const enabledCount = skills.filter((skill) => !disabledSkillIds.includes(skill.id)).length
+  const enabledCount = skills.filter((skill) =>
+    manageLocked ? Boolean(lockedActiveIds?.has(skill.id)) : !disabledSkillIds.includes(skill.id),
+  ).length
   return (
     <section className="space-y-2.5">
       <div
@@ -248,7 +268,11 @@ function SkillSection({
               key={skill.id}
               skill={skill}
               index={index}
-              enabled={manageLocked ? true : !disabledSkillIds.includes(skill.id)}
+              enabled={
+                manageLocked
+                  ? Boolean(lockedActiveIds?.has(skill.id))
+                  : !disabledSkillIds.includes(skill.id)
+              }
               onToggleEnabled={onToggleEnabled}
               onPreview={onPreview}
               onDelete={onDelete}
@@ -310,7 +334,7 @@ function SkillUrlImport({ onInstalled }: { onInstalled: () => void }) {
   )
 }
 
-export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
+export function SkillCenter({ onSkillsChanged, projectCwd }: SkillCenterProps) {
   const t = useT()
   const [settings, setSettings] = useState<Settings | null>(null)
   const [skills, setSkills] = useState<SkillMeta[]>([])
@@ -325,6 +349,7 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
   const [cliSelected, setCliSelected] = useState<Set<string>>(new Set())
   const [cliImporting, setCliImporting] = useState(false)
   const [cliImportDone, setCliImportDone] = useState('')
+  const [enabledPluginSkillIds, setEnabledPluginSkillIds] = useState<Set<string>>(() => new Set())
 
   const settingsRef = useRef<Settings | null>(null)
   const saveTimer = useRef<number | null>(null)
@@ -336,10 +361,25 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
     setSkillsLoading(true)
     setSkillError('')
     try {
-      const result = await api.chatSkillsList(scanPaths ?? settingsRef.current?.chatTools?.skillScanPaths)
+      if (isTauriRuntime()) {
+        try {
+          const plugins = await api.pluginsListCached()
+          const ids = new Set<string>()
+          for (const plugin of plugins) {
+            if (!plugin.enabled) continue
+            for (const skillId of plugin.skillIds ?? []) ids.add(skillId)
+          }
+          setEnabledPluginSkillIds(ids)
+        } catch {
+          /* 插件列表失败不挡技能列表 */
+        }
+      }
+      const result = await api.chatSkillsList(
+        scanPaths ?? settingsRef.current?.chatTools?.skillScanPaths,
+        projectCwd || undefined,
+      )
       if (result.success) {
         setSkills(result.skills)
-        if (result.error) setSkillError(result.error)
       } else {
         setSkillError(result.error || t.chatSkillListLoadFailed)
       }
@@ -348,7 +388,7 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
     } finally {
       setSkillsLoading(false)
     }
-  }, [t])
+  }, [projectCwd, t])
 
   useEffect(() => {
     let cancelled = false
@@ -428,7 +468,7 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
   const handlePreviewSkill = useCallback(async (skillId: string) => {
     setSkillError('')
     try {
-      const result = await api.chatSkillsRead(skillId)
+      const result = await api.chatSkillsRead(skillId, projectCwd || undefined)
       if (result.success && result.skill) {
         setSelectedSkillPreview(result.skill)
       } else {
@@ -437,7 +477,7 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
     } catch (err) {
       setSkillError(err instanceof Error ? err.message : String(err))
     }
-  }, [t])
+  }, [projectCwd, t])
 
   const handleImportSkill = useCallback(async () => {
     try {
@@ -599,11 +639,23 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
     () => skills.filter((skill) => isPluginSkill(skill) && skillMatches(skill, normalizedQuery)),
     [skills, normalizedQuery],
   )
-  const userSkills = useMemo(
+  const projectSkills = useMemo(
+    () => skills.filter((skill) => isProjectSkill(skill) && skillMatches(skill, normalizedQuery)),
+    [skills, normalizedQuery],
+  )
+  const globalSkills = useMemo(
+    () => skills.filter((skill) => isGlobalAgentsSkill(skill) && skillMatches(skill, normalizedQuery)),
+    [skills, normalizedQuery],
+  )
+  const personalSkills = useMemo(
     () =>
       skills.filter(
         (skill) =>
-          !isBuiltinSkill(skill) && !isPluginSkill(skill) && skillMatches(skill, normalizedQuery),
+          !isBuiltinSkill(skill)
+          && !isPluginSkill(skill)
+          && !isProjectSkill(skill)
+          && !isGlobalAgentsSkill(skill)
+          && skillMatches(skill, normalizedQuery),
       ),
     [skills, normalizedQuery],
   )
@@ -898,21 +950,51 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
           <div className="mt-6 space-y-5">
             {skillsLoading && skills.length === 0 ? (
               <div className="grid min-h-[220px] place-items-center text-[13px] text-neutral-400">{t.chatSkillLoading}</div>
-            ) : skills.length === 0 ? (
-              <div className="grid min-h-[220px] place-items-center rounded-md border border-dashed border-neutral-200 px-6 text-center text-[13px] text-neutral-400 dark:border-neutral-800">
-                {t.chatSkillEmpty}
-              </div>
             ) : (
               <>
+                {(projectSkills.length > 0 || Boolean(projectCwd)) && (
+                  <SkillSection
+                    title={t.chatSkillSectionProject}
+                    note={t.chatSkillProjectNote}
+                    emptyText={normalizedQuery ? t.chatSkillNoMatchingSkills : t.chatSkillNoProjectSkills}
+                    skills={projectSkills}
+                    disabledSkillIds={disabledSkillIds}
+                    onToggleEnabled={handleToggleSkillEnabled}
+                    onPreview={handlePreviewSkill}
+                  />
+                )}
                 <SkillSection
                   title={t.chatSkillSectionWorkspacePersonal}
+                  note={t.chatSkillPersonalNote}
                   emptyText={normalizedQuery ? t.chatSkillNoMatchingSkills : t.chatSkillNoImportedSkills}
-                  skills={userSkills}
+                  skills={personalSkills}
                   disabledSkillIds={disabledSkillIds}
                   onToggleEnabled={handleToggleSkillEnabled}
                   onPreview={handlePreviewSkill}
                   onDelete={handleDeleteSkill}
                 />
+                <SkillSection
+                  title={t.chatSkillSectionPlugin}
+                  note={t.chatSkillPluginNote}
+                  emptyText={normalizedQuery ? t.chatSkillNoMatchingPlugin : t.chatSkillNoPluginSkills}
+                  skills={pluginSkills}
+                  disabledSkillIds={disabledSkillIds}
+                  onToggleEnabled={handleToggleSkillEnabled}
+                  onPreview={handlePreviewSkill}
+                  manageLocked
+                  lockedActiveIds={enabledPluginSkillIds}
+                />
+                {(globalSkills.length > 0 || normalizedQuery) && (
+                  <SkillSection
+                    title={t.chatSkillSectionGlobal}
+                    note={t.chatSkillGlobalNote}
+                    emptyText={t.chatSkillNoMatchingSkills}
+                    skills={globalSkills}
+                    disabledSkillIds={disabledSkillIds}
+                    onToggleEnabled={handleToggleSkillEnabled}
+                    onPreview={handlePreviewSkill}
+                  />
+                )}
                 <SkillSection
                   title={t.chatSkillSectionBuiltin}
                   note={t.chatSkillBuiltinNote}
@@ -924,19 +1006,6 @@ export function SkillCenter({ onSkillsChanged }: SkillCenterProps) {
                   collapsible
                   defaultCollapsed
                 />
-                {/* 插件技能：无插件且未搜索时整段隐藏，避免空框霸占版面 */}
-                {(pluginSkills.length > 0 || normalizedQuery) && (
-                  <SkillSection
-                    title={t.chatSkillSectionPlugin}
-                    note={t.chatSkillPluginNote}
-                    emptyText={t.chatSkillNoMatchingPlugin}
-                    skills={pluginSkills}
-                    disabledSkillIds={disabledSkillIds}
-                    onToggleEnabled={handleToggleSkillEnabled}
-                    onPreview={handlePreviewSkill}
-                    manageLocked
-                  />
-                )}
               </>
             )}
           </div>

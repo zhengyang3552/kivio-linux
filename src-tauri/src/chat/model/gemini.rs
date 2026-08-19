@@ -759,7 +759,9 @@ pub fn gemini_function_declarations(tools: &[ModelTool]) -> Vec<Value> {
 }
 
 /// Gemini 只收 OpenAPI 子集：剥 JSON Schema 专有键（`$schema`/`additionalProperties`/
-/// `$defs` 等），nullable `anyOf` 折成非空分支。递归处理 properties/items。
+/// `$defs` 等），nullable `anyOf` 折成非空分支。递归处理 properties/items/组合子。
+/// `required` 只允许出现在 `type: object` 上，否则 Gemini 400
+///（`required: only allowed for OBJECT type`，issue #33）。
 fn normalize_gemini_schema(schema: Value) -> Value {
     match schema {
         Value::Object(mut map) => {
@@ -813,6 +815,23 @@ fn normalize_gemini_schema(schema: Value) -> Value {
             }
             if let Some(items) = map.get("items").cloned() {
                 map.insert("items".into(), normalize_gemini_schema(items));
+            }
+            // 留下的 typed anyOf/oneOf/allOf 也要递归，否则分支里的非 object
+            // `required` 会原样透传给 Gemini。
+            for key in ["anyOf", "oneOf", "allOf"] {
+                if let Some(branches) = map.get(key).and_then(|v| v.as_array()).cloned() {
+                    let normalized: Vec<Value> =
+                        branches.into_iter().map(normalize_gemini_schema).collect();
+                    map.insert(key.into(), Value::Array(normalized));
+                }
+            }
+            // 有 properties 却没写 type 的 MCP schema：补成 object，required 才合法。
+            if map.contains_key("properties") && map.get("type").is_none() {
+                map.insert("type".into(), Value::String("object".into()));
+            }
+            let is_object = map.get("type").and_then(|v| v.as_str()) == Some("object");
+            if !is_object {
+                map.remove("required");
             }
             Value::Object(map)
         }
@@ -902,9 +921,13 @@ fn web_search_from_gemini_value(value: &Value) -> Option<BuiltinWebSearch> {
             }
         }
     }
+    // 块下标 → citations 下标（groundingSupports.groundingChunkIndices 引的是
+    // groundingChunks 数组下标，非 web 块或重复 url 记 None）。
+    let mut chunk_to_citation: Vec<Option<usize>> = Vec::new();
     if let Some(chunks) = grounding.get("groundingChunks").and_then(Value::as_array) {
         for chunk in chunks {
             let Some(web) = chunk.get("web") else {
+                chunk_to_citation.push(None);
                 continue;
             };
             let Some(url) = web
@@ -913,9 +936,11 @@ fn web_search_from_gemini_value(value: &Value) -> Option<BuiltinWebSearch> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             else {
+                chunk_to_citation.push(None);
                 continue;
             };
             if result.citations.iter().any(|c| c.url == url) {
+                chunk_to_citation.push(None);
                 continue;
             }
             let title = web
@@ -928,7 +953,37 @@ fn web_search_from_gemini_value(value: &Value) -> Option<BuiltinWebSearch> {
             result.citations.push(WebCitation {
                 title,
                 url: url.to_string(),
+                ..Default::default()
             });
+            chunk_to_citation.push(Some(result.citations.len() - 1));
+        }
+    }
+    // groundingSupports[]:segment.text 是「答案正文里支持某来源」的片段，
+    // groundingChunkIndices 指向它支撑的块。把它映射成对应来源的 snippet（首个命中即止）。
+    if let Some(supports) = grounding.get("groundingSupports").and_then(Value::as_array) {
+        for support in supports {
+            let Some(text) = support
+                .get("segment")
+                .and_then(|segment| segment.get("text"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(indices) = support.get("groundingChunkIndices").and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for index in indices.iter().filter_map(Value::as_u64) {
+                let Some(Some(citation_index)) = chunk_to_citation.get(index as usize).copied()
+                else {
+                    continue;
+                };
+                if result.citations[citation_index].snippet.is_none() {
+                    result.citations[citation_index].snippet = Some(text.chars().take(400).collect());
+                }
+            }
         }
     }
     if result.is_empty() {
@@ -939,6 +994,8 @@ fn web_search_from_gemini_value(value: &Value) -> Option<BuiltinWebSearch> {
 }
 
 /// 把新解析出的内置搜索片段合并进累积值（流式逐段调用；去重按 url / query 文本）。
+/// 同一 url 的后到片段若带了 snippet/published_date 而累积值没有，则补全
+/// （groundingSupports 可能随后续流式段才到，而 chunk 首段就建立了引用）。
 fn merge_gemini_web_search(acc: &mut Option<BuiltinWebSearch>, next: Option<BuiltinWebSearch>) {
     let Some(next) = next else {
         return;
@@ -950,9 +1007,16 @@ fn merge_gemini_web_search(acc: &mut Option<BuiltinWebSearch>, next: Option<Buil
         }
     }
     for citation in next.citations {
-        if !target.citations.iter().any(|c| c.url == citation.url) {
-            target.citations.push(citation);
+        if let Some(existing) = target.citations.iter_mut().find(|c| c.url == citation.url) {
+            if existing.snippet.is_none() {
+                existing.snippet = citation.snippet;
+            }
+            if existing.published_date.is_none() {
+                existing.published_date = citation.published_date;
+            }
+            continue;
         }
+        target.citations.push(citation);
     }
 }
 
@@ -1284,7 +1348,8 @@ mod tests {
 
     #[test]
     fn web_search_parsed_from_grounding_metadata() {
-        // groundingMetadata.webSearchQueries → 查询；groundingChunks[].web → 来源（去重）。
+        // groundingMetadata.webSearchQueries → 查询；groundingChunks[].web → 来源（去重）；
+        // groundingSupports[].segment.text → 按 groundingChunkIndices 映射成对应来源的 snippet。
         let value = serde_json::json!({
             "candidates": [{
                 "content": { "parts": [{ "text": "见来源" }] },
@@ -1294,6 +1359,20 @@ mod tests {
                         { "web": { "uri": "https://a.com", "title": "A 站" } },
                         { "web": { "uri": "https://a.com", "title": "dup" } },
                         { "web": { "uri": "https://b.com" } }
+                    ],
+                    "groundingSupports": [
+                        {
+                            "segment": { "text": "长春今天晴。" },
+                            "groundingChunkIndices": [0, 5]
+                        },
+                        {
+                            "segment": { "text": "来源见气象台。" },
+                            "groundingChunkIndices": [2]
+                        },
+                        {
+                            "segment": { "text": "" },
+                            "groundingChunkIndices": [0]
+                        }
                     ]
                 }
             }]
@@ -1302,7 +1381,10 @@ mod tests {
         assert_eq!(parsed.queries, vec!["吉林 天气".to_string()]);
         assert_eq!(parsed.citations.len(), 2);
         assert_eq!(parsed.citations[0].url, "https://a.com");
+        assert_eq!(parsed.citations[0].snippet.as_deref(), Some("长春今天晴。"));
         assert_eq!(parsed.citations[1].title, "https://b.com");
+        assert_eq!(parsed.citations[1].snippet.as_deref(), Some("来源见气象台。"));
+        assert!(parsed.citations[0].published_date.is_none());
     }
 
     #[test]
@@ -1326,10 +1408,11 @@ mod tests {
                 citations: vec![WebCitation {
                     title: "A".into(),
                     url: "https://a.com".into(),
+                    ..Default::default()
                 }],
             }),
         );
-        // 第二段带重复 url + 重复 query + 新来源。
+        // 第二段带重复 url + 重复 query + 新来源；重复 url 带 snippet 应补全进首条。
         merge_gemini_web_search(
             &mut acc,
             Some(BuiltinWebSearch {
@@ -1338,10 +1421,13 @@ mod tests {
                     WebCitation {
                         title: "A-dup".into(),
                         url: "https://a.com".into(),
+                        snippet: Some("天气不错".into()),
+                        ..Default::default()
                     },
                     WebCitation {
                         title: "B".into(),
                         url: "https://b.com".into(),
+                        ..Default::default()
                     },
                 ],
             }),
@@ -1350,6 +1436,7 @@ mod tests {
         assert_eq!(merged.queries, vec!["q1".to_string(), "q2".to_string()]);
         assert_eq!(merged.citations.len(), 2);
         assert_eq!(merged.citations[0].url, "https://a.com");
+        assert_eq!(merged.citations[0].snippet.as_deref(), Some("天气不错"));
         assert_eq!(merged.citations[1].url, "https://b.com");
     }
 
@@ -1649,6 +1736,49 @@ mod tests {
         assert_eq!(branches.len(), 2);
         assert_eq!(branches[0]["type"], "string");
         assert_eq!(branches[1]["type"], "integer");
+    }
+
+    #[test]
+    fn normalize_strips_required_unless_type_object() {
+        // Gemini: `required` is only legal on OBJECT. MCP schemas often park it
+        // on string / untyped nodes (and inside typed anyOf branches).
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "required": ["query"]
+                },
+                "payload": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": { "id": { "type": "string" } },
+                            "required": ["id"]
+                        },
+                        { "type": "string", "required": ["id"] }
+                    ]
+                }
+            },
+            "required": ["query"]
+        });
+        let out = normalize_gemini_schema(schema);
+        assert!(out["properties"]["query"].get("required").is_none());
+        assert_eq!(out["required"], serde_json::json!(["query"]));
+        let branches = out["properties"]["payload"]["anyOf"].as_array().unwrap();
+        assert_eq!(branches[0]["required"], serde_json::json!(["id"]));
+        assert!(branches[1].get("required").is_none());
+    }
+
+    #[test]
+    fn normalize_infers_object_type_when_properties_present() {
+        let schema = serde_json::json!({
+            "properties": { "q": { "type": "string" } },
+            "required": ["q"]
+        });
+        let out = normalize_gemini_schema(schema);
+        assert_eq!(out["type"], "object");
+        assert_eq!(out["required"], serde_json::json!(["q"]));
     }
 
     fn image_request(model: &str) -> GenerateRequest {

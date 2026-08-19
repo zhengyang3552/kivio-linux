@@ -50,10 +50,12 @@ fn sanitize_python_input_name(path: &Path) -> String {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("input");
+    // Keep Unicode letters/digits so a host file like 销售报表.xlsx is still
+    // that name inside Pyodide (`KIVIO_INPUT_FILES`), not ________.xlsx.
     let sanitized = raw
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+            if ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
                 ch
             } else {
                 '_'
@@ -917,6 +919,36 @@ pub fn unavailable_mcp_servers_note(names: &[String]) -> Option<String> {
     ))
 }
 
+fn tinyfish_mcp_configured(settings: &crate::settings::Settings) -> bool {
+    let url = settings.lens.web_search.tinyfish_mcp_url.trim();
+    if url.is_empty() {
+        return false;
+    }
+    if settings
+        .lens
+        .web_search
+        .tinyfish_mcp_auth
+        .as_ref()
+        .is_some_and(|auth| !auth.access_token.trim().is_empty())
+    {
+        return true;
+    }
+    let normalized = url.trim_end_matches('/');
+    settings.chat_tools.servers.iter().any(|server| {
+        if server.url.trim().trim_end_matches('/') != normalized {
+            return false;
+        }
+        server
+            .headers
+            .get("Authorization")
+            .is_some_and(|value| !value.trim().is_empty())
+            || server
+                .auth
+                .as_ref()
+                .is_some_and(|auth| !auth.access_token.trim().is_empty())
+    })
+}
+
 pub(crate) fn web_search_configured(settings: &crate::settings::Settings) -> bool {
     match settings.lens.web_search.provider {
         WebSearchProvider::Tavily => !settings.lens.web_search.tavily_api_key.trim().is_empty(),
@@ -924,6 +956,13 @@ pub(crate) fn web_search_configured(settings: &crate::settings::Settings) -> boo
         WebSearchProvider::ExaMcp => !settings.lens.web_search.exa_mcp_url.trim().is_empty(),
         WebSearchProvider::Ollama => !settings.lens.web_search.ollama_api_key.trim().is_empty(),
         WebSearchProvider::Grok => !settings.lens.web_search.grok_api_key.trim().is_empty(),
+        WebSearchProvider::Brave => !settings.lens.web_search.brave_api_key.trim().is_empty(),
+        WebSearchProvider::Serper => !settings.lens.web_search.serper_api_key.trim().is_empty(),
+        WebSearchProvider::Bocha => !settings.lens.web_search.bocha_api_key.trim().is_empty(),
+        WebSearchProvider::Zhipu => !settings.lens.web_search.zhipu_api_key.trim().is_empty(),
+        WebSearchProvider::Tinyfish => !settings.lens.web_search.tinyfish_api_key.trim().is_empty(),
+        WebSearchProvider::TinyfishMcp => tinyfish_mcp_configured(settings),
+        WebSearchProvider::Searxng => !settings.lens.web_search.searxng_base_url.trim().is_empty(),
         WebSearchProvider::Unknown => false,
     }
 }
@@ -978,7 +1017,6 @@ async fn call_skill_tool(
     if let Some(err) = crate::settings::skill_global_unavailable_error(
         &settings.chat_tools,
         &record.meta.id,
-        &settings.email_accounts,
         crate::settings::obsidian_connector_configured(&settings.obsidian_vault_path),
         &skill_name,
     ) {
@@ -1376,6 +1414,11 @@ pub(super) async fn run_python_via_pyodide(
                         for exported in &exported_artifacts {
                             if let Some(artifact) = artifacts.get_mut(exported.artifact_index) {
                                 artifact.path = Some(exported.path.display().to_string());
+                                if let Some(name) =
+                                    exported.path.file_name().and_then(|value| value.to_str())
+                                {
+                                    artifact.name = name.to_string();
+                                }
                             }
                         }
                         let export_note =
@@ -1421,6 +1464,27 @@ pub(super) async fn run_python_via_pyodide(
 mod tests {
     use super::*;
     use crate::native_tools::ReadFileResult;
+    use std::path::Path;
+
+    #[test]
+    fn python_input_name_keeps_unicode_letters() {
+        assert_eq!(
+            sanitize_python_input_name(Path::new("销售报表.xlsx")),
+            "销售报表.xlsx"
+        );
+        assert_eq!(
+            sanitize_python_input_name(Path::new("/tmp/Q1 销售.csv")),
+            "Q1 销售.csv"
+        );
+        assert_eq!(
+            sanitize_python_input_name(Path::new("../secret?.png")),
+            "secret_.png"
+        );
+        assert_eq!(
+            sanitize_python_input_name(Path::new("chart.png")),
+            "chart.png"
+        );
+    }
 
     #[test]
     fn read_file_tool_result_preserves_structured_content() {

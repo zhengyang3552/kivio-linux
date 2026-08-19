@@ -1,4 +1,5 @@
-import { isValidElement, memo, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { Code2, ExternalLink, Eye, Loader2 } from 'lucide-react'
 import type { Components, UrlTransform } from 'streamdown'
 import { defaultRemarkPlugins, Streamdown } from 'streamdown'
@@ -13,11 +14,11 @@ import { MarkdownErrorBoundary } from './MarkdownErrorBoundary'
 import type { ChatToolArtifact } from './types'
 import { artifactDataUrl } from './artifacts'
 import { loadArtifactDataUrl } from './attachmentPreview'
-import type { KbHitView } from './knowledgeBaseHits'
-import { remarkCitations } from './citations'
+import { remarkCitations, type CitationView } from './citations'
+import { citationPopoverPosition, type CitationPopoverPosition } from './citationPopover'
+import { isWebCitation } from './webSearchCitations'
 import { ChatInlineImage } from './ChatInlineImage'
 import { MarkdownStreamingContext } from './markdownStreaming'
-import { getChatPerformanceFlags } from './chatPerformanceFlags'
 import { getSettledMarkdownCacheEntry } from './settledMarkdownCache'
 import { ChatHeavyIsland } from './ChatHeavyIsland'
 import { useConversationTransition } from './conversationTransitionStore'
@@ -32,8 +33,8 @@ interface ChatMarkdownProps {
   conversationId?: string | null
   onImageClick?: (src: string, alt: string, name?: string) => void
   variant?: 'default' | 'reasoning' | 'lens' | 'lens-muted'
-  /** 知识库引用：把答案里的 `[n]` 渲染成可点来源片段（n → 命中片段）。 */
-  citations?: Map<number, KbHitView>
+  /** 引用：把答案里的 `[n]` 渲染成可点来源片段（n → KB 命中片段或联网来源）。 */
+  citations?: Map<number, CitationView>
 }
 
 // 排版只走 Streamdown 默认样式；变体只改外壳字号/颜色。
@@ -853,31 +854,110 @@ function LinkAnchor({
   )
 }
 
-/** 知识库引用角标 `[n]`：点击弹出对应来源片段（文档名 · 标题 · 正文）。 */
-function CitationChip({ n, hit }: { n: number; hit?: KbHitView }) {
+/** 引用角标 `[n]`：点击弹出对应来源片段。KB 命中显示「文档 · 标题 · 正文」；
+ *  联网来源显示「标题 · 域名 · 日期 · 摘要」，标题可点直接在浏览器打开。 */
+function CitationChip({ n, hit }: { n: number; hit?: CitationView }) {
   const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLSpanElement>(null)
+  const [popoverPosition, setPopoverPosition] = useState<CitationPopoverPosition | null>(null)
+  const triggerRef = useRef<HTMLSpanElement>(null)
+  const popoverRef = useRef<HTMLSpanElement>(null)
+  const web = isWebCitation(hit) ? hit : null
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setPopoverPosition(null)
+      return
+    }
+
+    const place = () => {
+      const trigger = triggerRef.current
+      const popover = popoverRef.current
+      if (!trigger || !popover) return
+      setPopoverPosition(citationPopoverPosition(
+        trigger.getBoundingClientRect(),
+        popover.getBoundingClientRect(),
+        { width: window.innerWidth, height: window.innerHeight },
+      ))
+    }
+
+    place()
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => {
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place, true)
+    }
+  }, [open, hit])
+
   useEffect(() => {
     if (!open) return
     const onDown = (event: MouseEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) setOpen(false)
+      const target = event.target as Node
+      if (triggerRef.current?.contains(target) || popoverRef.current?.contains(target)) return
+      setOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false)
     }
     document.addEventListener('mousedown', onDown)
-    return () => document.removeEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
   }, [open])
+
   return (
-    <span ref={ref} className="relative inline-block align-baseline">
-      <button
-        type="button"
-        onClick={() => setOpen((value) => !value)}
-        className="mx-0.5 rounded bg-indigo-500/15 px-1 align-baseline text-[0.82em] font-medium text-indigo-500 transition hover:bg-indigo-500/25"
-        aria-label={`来源 ${n}`}
-      >
-        [{n}]
-      </button>
-      {open && (
-        <span className="absolute left-0 top-full z-30 mt-1 block w-80 max-w-[80vw] rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] p-2.5 text-left text-xs shadow-lg">
-          {hit ? (
+    <>
+      <span ref={triggerRef} className="inline-block align-baseline">
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          className="mx-0.5 rounded bg-indigo-500/15 px-1 align-baseline text-[0.82em] font-medium text-indigo-500 transition hover:bg-indigo-500/25"
+          aria-label={`来源 ${n}`}
+          aria-expanded={open}
+        >
+          [{n}]
+        </button>
+      </span>
+      {open && createPortal(
+        <span
+          ref={popoverRef}
+          role="dialog"
+          aria-label={`来源 ${n}`}
+          className="fixed z-[200] block max-h-[calc(100vh-1rem)] w-80 max-w-[calc(100vw-1rem)] overflow-auto rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] p-2.5 text-left text-xs shadow-lg"
+          style={{
+            left: popoverPosition?.left ?? 0,
+            top: popoverPosition?.top ?? 0,
+            visibility: popoverPosition ? 'visible' : 'hidden',
+          }}
+          data-tauri-drag-region="false"
+        >
+          {web ? (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  void api.openExternal(web.url).catch((err) => console.error('openExternal failed', err))
+                }}
+                className="mb-1 flex w-full items-center gap-1 font-medium text-neutral-700 hover:underline dark:text-neutral-200"
+                title={web.url}
+              >
+                <span className="shrink-0 rounded bg-indigo-500/15 px-1 text-indigo-500">[{n}]</span>
+                <span className="min-w-0 flex-1 truncate text-left">{web.title}</span>
+                <ExternalLink size={10.5} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
+              </button>
+              <span className="mb-1 block truncate text-[10.5px] text-neutral-400 dark:text-neutral-500">
+                {web.host}
+                {web.publishedDate ? ` · ${web.publishedDate}` : ''}
+              </span>
+              {web.snippet && (
+                <span className="custom-scrollbar block max-h-48 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-neutral-600 dark:text-neutral-300">
+                  {web.snippet}
+                </span>
+              )}
+            </>
+          ) : hit && !isWebCitation(hit) ? (
             <>
               <span className="mb-1 flex items-center gap-1 font-medium text-neutral-700 dark:text-neutral-200">
                 <span className="shrink-0 rounded bg-indigo-500/15 px-1 text-indigo-500">[{n}]</span>
@@ -893,9 +973,10 @@ function CitationChip({ n, hit }: { n: number; hit?: KbHitView }) {
           ) : (
             <span className="text-neutral-400">未找到对应来源片段</span>
           )}
-        </span>
+        </span>,
+        document.body,
       )}
-    </span>
+    </>
   )
 }
 
@@ -1102,7 +1183,6 @@ function ChatMarkdownComponent({
   citations,
 }: ChatMarkdownProps) {
   const streaming = useContext(MarkdownStreamingContext)
-  const flags = getChatPerformanceFlags()
   const remarkPlugins = useMemo<PluggableList>(() => {
     const plugins: PluggableList = [...streamdownRemarkPlugins]
     if (citations && citations.size > 0) {
@@ -1151,7 +1231,7 @@ function ChatMarkdownComponent({
           content={content}
           components={components}
           remarkPlugins={remarkPlugins}
-          useCache={flags.settledMarkdownCache && !streaming}
+          useCache={!streaming}
           streaming={streaming}
         />
       </MarkdownErrorBoundary>

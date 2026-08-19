@@ -153,7 +153,7 @@ import {
   restoreGroupArm,
   touchGroup,
 } from './groupStreamingStore'
-import { compareTimelineSegments, isExternalSubagentToolCall, isUserSteerToolCall, segmentStepNumber, segmentToolCallId } from './segments'
+import { compareTimelineSegments, isExternalSubagentToolCall, isUserFollowUpToolCall, isUserSteerToolCall, segmentStepNumber, segmentToolCallId } from './segments'
 import { latestCompactionBoundaryId, mergeCompactionContextState } from './compactionBoundary'
 import { applyLiveContextUsage } from './contextPanel'
 import { measureChatSurface, onChatPerfProfiler, useChatPerfLongTaskProbe, useChatPerfRenderProbe } from './chatPerformanceProbe'
@@ -1007,6 +1007,8 @@ type SendMessageOptions = {
 
 /** 稳定空数组：没有排队消息时不要每次渲染都造一个新引用。 */
 const NO_QUEUED_MESSAGES: QueuedMessage[] = []
+/** 轨迹未打开时不要把 displayMessages 灌进 Dock，避免流式每帧带动右侧栏。 */
+const NO_TRAJECTORY_MESSAGES: ChatMessage[] = []
 
 export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   useChatPerfRenderProbe('Chat', { view: hashPath() })
@@ -1802,13 +1804,14 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }
   }, [])
 
+  const skillProjectCwdRef = useRef('')
   const loadSkills = useCallback(async () => {
     if (!isTauriRuntime()) {
       setSkills([])
       return
     }
     try {
-      const result = await api.chatSkillsList()
+      const result = await api.chatSkillsList(undefined, skillProjectCwdRef.current || undefined)
       if (result.success) {
         setSkills(result.skills.map(normalizeSkill))
         if (result.error) {
@@ -2560,6 +2563,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         const steerId = (record.structuredContent as { steer_id?: unknown } | undefined)?.steer_id
         if (typeof steerId === 'string') {
           messageQueueRef.current.confirmSteered(payload.conversationId, steerId)
+        }
+      } else if (isUserFollowUpToolCall(record)) {
+        const followUpId = (record.structuredContent as { follow_up_id?: unknown } | undefined)?.follow_up_id
+        if (typeof followUpId === 'string') {
+          messageQueueRef.current.confirmFollowUp(payload.conversationId, followUpId)
         }
       }
       const index = snapshot.toolCalls.findIndex((item) => item.id === record.id)
@@ -3629,7 +3637,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const handleSendMessageRef = useRef(handleSendMessage)
   handleSendMessageRef.current = handleSendMessage
 
-  /** 设置 → 插件「让 AI 安装」：取规范 brief → 回聊天 → 新开对话并自动发送安装任务 */
+  /** 设置 → 插件「让 AI 代装」：取规范 brief → 回聊天 → 新开对话并自动发送安装任务 */
   const handleRequestPluginAiInstall = useCallback(async (pluginId: string) => {
     const startingConversationId = currentConversationIdRef.current
     const brief = await api.pluginsInstallBrief(pluginId)
@@ -3750,7 +3758,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   // 「立刻引导」能不能给入口，取决于这一轮由谁在跑：
   //   - 内置 agent 循环 → 能（轮首注入，见 chat/agent/steering.rs）；
   //   - 外部 CLI → 看它的协议支不支持（`supportsSteering`，后端 RuntimeAgentDef 是唯一真源）。
-  //     codex 有 `turn/steer`；claude 的 stream-json 输入是顺序处理的、ACP 只有 prompt/cancel。
+  //     codex 有 `turn/steer`；pi 有 RPC `steer`；dsh 有 bridge `session/steer`。
+  //     claude 的 stream-json 输入是顺序处理的、ACP 只有 prompt/cancel。
   //   - 多模型一问多答 → 一律不给：同会话 N 条并发 run，按 conversation 键的信箱定不到某条臂。
   const activeExternalAgentSupportsSteering = useMemo(() => {
     const agentId = activeAgentRuntime.externalAgentId
@@ -3758,15 +3767,28 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     const agent = detectedExternalAgents.find((item) => item.id === agentId)
     return Boolean(agent?.supportsSteering ?? agent?.supports_steering)
   }, [activeAgentRuntime.externalAgentId, detectedExternalAgents])
+  const activeExternalAgentSupportsFollowUp = useMemo(() => {
+    const agentId = activeAgentRuntime.externalAgentId
+    if (!agentId) return false
+    const agent = detectedExternalAgents.find((item) => item.id === agentId)
+    return Boolean(agent?.supportsFollowUp ?? agent?.supports_follow_up)
+  }, [activeAgentRuntime.externalAgentId, detectedExternalAgents])
   const canSteerCurrentConversation =
     (usesExternalRuntime ? activeExternalAgentSupportsSteering : true)
     && activeReplyModels.length < 2
+  // 自动 follow-up：内置循环终答后续跑；Pi / dsh 走原生下一轮。多模型一问多答同样不给。
+  const canFollowUpCurrentConversation =
+    (usesExternalRuntime ? activeExternalAgentSupportsFollowUp : true)
+    && activeReplyModels.length < 2
 
   const handleQueueMessage = useCallback((content: string, attachments: PendingAttachment[]) => {
-    const conversationId = currentConversationIdRef.current
-    if (!conversationId) return
-    messageQueueRef.current.enqueue(conversationId, content, attachments)
-  }, [])
+    const conversation = currentConversationRef.current
+    if (!conversation) return
+    const message = messageQueueRef.current.enqueue(conversation.id, content, attachments)
+    if (message && canFollowUpCurrentConversation) {
+      void messageQueueRef.current.followUp(conversation, message.id)
+    }
+  }, [canFollowUpCurrentConversation])
 
   const handleSteerQueuedMessage = useCallback((messageId: string) => {
     const conversationId = currentConversationIdRef.current
@@ -4477,7 +4499,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [treeExpanded, setTreeExpanded] = useState<string[]>([])
   const [dockReveal, setDockReveal] = useState<DockRevealRequest>(null)
   const [dockPreview, setDockPreview] = useState<DockPreviewRequest>(null)
-
+  const piNativeEnabled = usesExternalRuntime
+    && activeAgentRuntime.externalAgentId === 'pi'
+    && Boolean(currentConversation?.id)
+  const trajectoryLive = dockOpen && dockTab === 'trajectory'
   // 工作目录跟随当前会话 / 选中项目 / agent runtime 变化，由后端 dock_resolve_cwd 解析
   // （外部 agent 与内置 runtime 的实际写入目录不同，runtime 切换必须重解析）。
   useEffect(() => {
@@ -4500,6 +4525,12 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       cancelled = true
     }
   }, [currentConversation?.id, selectedProject?.id, activeAgentRuntime.kind])
+
+  useEffect(() => {
+    const prev = skillProjectCwdRef.current
+    skillProjectCwdRef.current = dockWorkdir
+    if (prev !== dockWorkdir) void loadSkills()
+  }, [dockWorkdir, loadSkills])
 
   // 文件树展开状态按 workdir 持久化，workdir 切换时重新载入。
   useEffect(() => {
@@ -4700,6 +4731,24 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     })
   }, [handleSelectConversation, runAfterLeavingSettings])
 
+  const handlePiConversationChanged = useCallback((
+    id: string,
+    conversation?: Conversation,
+    draft?: string,
+  ) => {
+    refreshSidebar()
+    if (conversation) {
+      currentConversationIdRef.current = id
+      applyConversation(conversation)
+      setChatView('conversation')
+      syncConversationRoute(id)
+    } else {
+      handleSidebarSelectConversation(id)
+    }
+    if (draft?.trim()) {
+      requestAnimationFrame(() => insertTextIntoComposer(draft))
+    }
+  }, [applyConversation, handleSidebarSelectConversation, refreshSidebar, syncConversationRoute])
   const handleSidebarNewConversation = useCallback(() => {
     runAfterLeavingSettings(() => void handleNewConversation())
   }, [handleNewConversation, runAfterLeavingSettings])
@@ -4756,7 +4805,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     openEmbeddedSettings('chat')
   }, [chatView, extensionsNavItem, handleSettingsClose, openEmbeddedSettings])
 
-  // 侧栏账户菜单：语言切换 / 检查更新。都是全局行为，所以留在 Chat 这层，
+  // 侧栏账户菜单：语言切换 / 检查更新 / 用量。都是全局行为，所以留在 Chat 这层，
   // 侧栏只负责触发（它拿不到 settings 也不该自己全量保存）。
   const handleSidebarSelectLang = useCallback((next: Lang) => {
     setUiLang(next)
@@ -4775,6 +4824,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const handleSidebarCheckUpdate = useCallback(() => {
     setExtensionsNavItem(null)
     openEmbeddedSettings('about')
+  }, [openEmbeddedSettings])
+
+  const handleSidebarOpenUsage = useCallback(() => {
+    setExtensionsNavItem(null)
+    openEmbeddedSettings('usage')
   }, [openEmbeddedSettings])
 
   const handleSidebarSearchOpenChange = useCallback((open: boolean) => {
@@ -5282,6 +5336,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           onOpenSettings={handleSidebarOpenSettings}
           onSelectLang={handleSidebarSelectLang}
           onCheckUpdate={handleSidebarCheckUpdate}
+          onOpenUsage={handleSidebarOpenUsage}
           settingsActive={settingsPanelActive}
           extensionsActive={extensionsActive}
           collapsed={sidebarCollapsed || settingsPanelActive}
@@ -5336,7 +5391,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           <div key="center" className={centerPageClass}>
             {centerPageTopStrip}
             <Suspense fallback={null}>
-              <SkillCenter onSkillsChanged={() => void loadSkills()} />
+              <SkillCenter
+                onSkillsChanged={() => void loadSkills()}
+                projectCwd={dockWorkdir || undefined}
+              />
             </Suspense>
           </div>
         ) : chatView === 'mcp' ? (
@@ -5419,6 +5477,9 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             workdir={dockWorkdir}
             lang={uiLang}
             conversationId={currentConversation?.id ?? null}
+            conversation={trajectoryLive ? currentConversation : null}
+            messages={trajectoryLive ? displayMessages : NO_TRAJECTORY_MESSAGES}
+            piNativeEnabled={trajectoryLive && piNativeEnabled}
             treeExpanded={treeExpanded}
             revealRequest={dockReveal}
             previewRequest={dockPreview}
@@ -5427,6 +5488,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onClose={handleCloseDock}
             onTreeExpandedChange={handleTreeExpandedChange}
             onInsertMention={handleInsertFileMention}
+            onPiConversationChanged={handlePiConversationChanged}
+            onFocusMessage={setFocusMessageId}
             onRevealInTree={handleDockRevealInTree}
           />
         )}

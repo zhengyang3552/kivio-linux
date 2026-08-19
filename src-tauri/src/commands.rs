@@ -141,8 +141,8 @@ pub(crate) fn set_translate_card_size(
         guard.clone()
     };
     persist_settings(&app, &snapshot)?;
-    // 通知可能开着的设置窗口同步草稿里的宽度，避免其随后 save_settings 用陈旧草稿覆盖掉这次拖拽。
-    let _ = tauri::Emitter::emit_to(&app, "settings", "translate-card-width", clamped);
+    // 通知可能开着的设置页同步草稿里的宽度，避免其随后 save_settings 用陈旧草稿覆盖掉这次拖拽。
+    let _ = tauri::Emitter::emit_to(&app, "chat", "translate-card-width", clamped);
     Ok(())
 }
 
@@ -201,16 +201,6 @@ async fn apply_settings(
         }
         restore_runtime_settings(app, state, &previous_settings);
         return Err(err);
-    }
-
-    let had_email = !previous_settings.email_accounts.is_empty();
-    let has_email = !sanitized.email_accounts.is_empty();
-    if has_email || had_email {
-        if let Err(err) =
-            crate::connectors::himalaya::sync_himalaya_config(&sanitized.email_accounts)
-        {
-            eprintln!("himalaya config sync: {err}");
-        }
     }
 
     if let Err(err) = setup_tray(app) {

@@ -81,11 +81,31 @@ pub const PI_AGENT_DEF: RuntimeAgentDef = RuntimeAgentDef {
     prompt_input_format: PromptInputFormat::Text,
     stream_format: StreamFormat::PiRpc,
     resumes_session_via_cli: true,
-    supports_native_image: false,
-    supports_steering: false,
-    image_mime_whitelist: &[],
+    supports_native_image: true,
+    supports_steering: true,
+    supports_follow_up: true,
+    image_mime_whitelist: &["image/jpeg", "image/png", "image/gif", "image/webp"],
     build_args: build_pi_args,
 };
+
+pub fn pi_args_fresh_session(args: &[String], session_id: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len() + 2);
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--session-id" {
+            skip_next = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out.push("--session-id".to_string());
+    out.push(session_id.to_string());
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -155,5 +175,35 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["--session-id", "sess-existing"]));
+    }
+
+    #[test]
+    fn pi_advertises_rpc_steering_and_native_images() {
+        assert!(PI_AGENT_DEF.supports_steering);
+        assert!(PI_AGENT_DEF.supports_follow_up);
+        assert!(PI_AGENT_DEF.supports_native_image);
+        assert_eq!(
+            PI_AGENT_DEF.image_mime_whitelist,
+            &["image/jpeg", "image/png", "image/gif", "image/webp"]
+        );
+    }
+
+    #[test]
+    fn pi_args_fresh_session_replaces_the_session_id_flag() {
+        let args = vec![
+            "--mode".to_string(),
+            "rpc".to_string(),
+            "--session-id".to_string(),
+            "dead".to_string(),
+        ];
+        assert_eq!(
+            pi_args_fresh_session(&args, "fresh"),
+            vec![
+                "--mode".to_string(),
+                "rpc".to_string(),
+                "--session-id".to_string(),
+                "fresh".to_string(),
+            ]
+        );
     }
 }

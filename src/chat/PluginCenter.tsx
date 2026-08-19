@@ -3,6 +3,7 @@ import {
   ExternalLink,
   FileSpreadsheet,
   Loader2,
+  Monitor,
   Puzzle,
   RefreshCw,
   Sparkles,
@@ -22,11 +23,6 @@ import { useT } from '../settings/i18n'
 interface PluginCenterProps {
   /** 让 Kivio AI 按规范文档安装：父级开新对话并发送 install brief */
   onRequestAiInstall?: (pluginId: string) => void | Promise<void>
-  /**
-   * `center`：整页中心（自带大标题）。
-   * `settings`：嵌在设置页内容区（标题由 SettingsShell pageMeta 提供）。
-   */
-  variant?: 'center' | 'settings'
 }
 
 type TabId = 'plaza' | 'installed'
@@ -35,6 +31,7 @@ function PluginCard({
   plugin,
   busy,
   installBusy,
+  onRunInstall,
   onAiInstall,
   onToggleEnabled,
   onUninstall,
@@ -42,17 +39,22 @@ function PluginCard({
   plugin: PluginStatus
   busy: boolean
   installBusy: boolean
+  onRunInstall: (id: string) => void
   onAiInstall: (id: string) => void
   onToggleEnabled: (id: string, enabled: boolean) => void
   onUninstall: (id: string) => void
 }) {
   const t = useT()
+  const canInstall = plugin.canInstall === true
+
   return (
     <article className="chat-motion-fade-up flex min-w-0 flex-col gap-3 rounded-xl border border-neutral-200 bg-white p-5 shadow-sm transition-[border-color,box-shadow] duration-[var(--kv-dur-fast)] hover:border-neutral-300 dark:border-neutral-800 dark:bg-neutral-950/40 dark:hover:border-neutral-700">
       <div className="flex min-w-0 items-start gap-3">
         <span className="grid size-9 shrink-0 place-items-center rounded-md border border-neutral-200 bg-neutral-50 text-neutral-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300">
           {plugin.id === 'officecli' ? (
             <FileSpreadsheet size={18} strokeWidth={1.75} />
+          ) : plugin.id === 'cua-driver' ? (
+            <Monitor size={18} strokeWidth={1.75} />
           ) : (
             <Terminal size={18} strokeWidth={1.75} />
           )}
@@ -117,7 +119,7 @@ function PluginCard({
                 {t.chatPluginSkillIdsWrap.replace('{names}', plugin.skillIds.join(', '))}
               </span>
             )}
-            {plugin.mcpServerId && plugin.mcpActive && (
+            {plugin.mcpServerId && (
               <span className="font-mono text-[11px] text-neutral-400">
                 {plugin.mcpServerId}
               </span>
@@ -158,9 +160,33 @@ function PluginCard({
         )}
       </div>
 
+      {!plugin.installed && !canInstall ? (
+        <p className="text-[12px] leading-relaxed text-neutral-400 dark:text-neutral-500">
+          {t.chatPluginInstallUnavailable}
+        </p>
+      ) : null}
+
       <div className="flex flex-wrap items-center gap-2">
         <Button
           size="sm"
+          disabled={!canInstall || installBusy || busy}
+          onClick={() => onRunInstall(plugin.id)}
+          title={t.chatPluginRunInstallTitle}
+        >
+          {installBusy ? <Loader2 size={14} className="animate-spin" /> : <Terminal size={14} />}
+          {installBusy
+            ? t.chatPluginInstalling
+            : plugin.installed
+              ? t.chatPluginRunReinstall
+              : t.chatPluginRunInstall}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => void api.openExternal(plugin.repo)}>
+          <ExternalLink size={14} />
+          GitHub
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
           disabled={installBusy || busy}
           onClick={() => onAiInstall(plugin.id)}
           title={t.chatPluginAiInstallTitle}
@@ -181,22 +207,7 @@ function PluginCard({
             {t.chatPluginUninstall}
           </Button>
         )}
-        <Button size="sm" variant="ghost" onClick={() => void api.openExternal(plugin.repo)}>
-          <ExternalLink size={14} />
-          GitHub
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => void api.openExternal(plugin.homepage)}>
-          {t.chatPluginHomepage}
-        </Button>
       </div>
-
-      {!plugin.installed && (
-        <p className="text-[12px] leading-relaxed text-neutral-400 dark:text-neutral-500">
-          {t.chatPluginInstallNoteLead}{' '}
-          <strong className="font-medium text-neutral-600 dark:text-neutral-300">Kivio AI</strong>{' '}
-          {t.chatPluginInstallNoteTail}
-        </p>
-      )}
       {plugin.installed && !plugin.enabled && (
         <p className="text-[12px] leading-relaxed text-neutral-400 dark:text-neutral-500">
           {t.chatPluginDetectedNotEnabledLead}
@@ -212,17 +223,16 @@ function PluginCard({
           {t.chatPluginEnabled}
           {plugin.skillActive ? t.chatPluginSkillReady : ''}
           {plugin.mcpActive ? t.chatPluginMcpWritten : plugin.hasMcp ? t.chatPluginMcpRegisterRetry : ''}
-          {t.chatPluginEnabledTail.replace('{binary}', plugin.binary)}
+          {t.chatPluginEnabledTail}
         </p>
       )}
     </article>
   )
 }
 
-/** 插件中心：检测状态 + 启用开关；安装交给 Kivio AI。 */
-export function PluginCenter({ onRequestAiInstall, variant = 'center' }: PluginCenterProps) {
+/** 插件中心：安装 / 启用开关控制 MCP / Skill。 */
+export function PluginCenter({ onRequestAiInstall }: PluginCenterProps) {
   const t = useT()
-  const inSettings = variant === 'settings'
   const [tab, setTab] = useState<TabId>('plaza')
   const [plugins, setPlugins] = useState<PluginStatus[]>([])
   const [loading, setLoading] = useState(true)
@@ -275,6 +285,26 @@ export function PluginCenter({ onRequestAiInstall, variant = 'center' }: PluginC
   const patchStatus = useCallback((status: PluginStatus) => {
     setPlugins((prev) => prev.map((p) => (p.id === status.id ? status : p)))
   }, [])
+
+  const handleRunInstall = useCallback(
+    async (id: string) => {
+      setInstallBusyId(id)
+      setError('')
+      setStatusMsg('')
+      try {
+        const result = await api.pluginsRunOfficialInstall(id)
+        await refresh()
+        setStatusMsg(result.message || '')
+      } catch (err) {
+        setStatusMsg('')
+        setError(err instanceof Error ? err.message : String(err))
+        await refresh()
+      } finally {
+        setInstallBusyId(null)
+      }
+    },
+    [refresh],
+  )
 
   const handleAiInstall = useCallback(
     async (id: string) => {
@@ -369,47 +399,16 @@ export function PluginCenter({ onRequestAiInstall, variant = 'center' }: PluginC
 
   const body = (
     <>
-      {!inSettings && (
-        <div className="border-b border-neutral-200 pb-5 dark:border-neutral-800">
-          <div className="flex min-w-0 items-center gap-2">
-            <h1 className="flex items-center gap-2.5 text-[28px] font-semibold tracking-normal text-neutral-950 dark:text-neutral-50">
-              <Puzzle size={24} className="text-neutral-500" />
-              {t.chatNavPlugins}
-            </h1>
-            <IconButton size="lg" label={t.chatPluginRefreshDetection} onClick={() => void refresh()} disabled={refreshing}>
-              <RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} />
-            </IconButton>
-          </div>
-          <p className="mt-3.5 max-w-2xl text-[14px] leading-relaxed text-neutral-500 dark:text-neutral-400">
-            {t.chatPluginIntroLead}{' '}
-            <strong className="font-medium text-neutral-700 dark:text-neutral-300">Kivio AI</strong>
-            {t.chatPluginIntroAiInstall}
-            <strong className="font-medium text-neutral-700 dark:text-neutral-300">{t.chatPluginReadmeFirst}</strong>
-            {t.chatPluginIntroReadmeTail}
-            <strong className="font-medium text-neutral-700 dark:text-neutral-300">{t.chatPluginEnable}</strong>
-            {t.chatPluginIntroTail}
-          </p>
-        </div>
-      )}
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <p className="max-w-2xl text-[13px] leading-relaxed text-neutral-500 dark:text-neutral-400">
+          {t.chatPluginIntro}
+        </p>
+        <IconButton size="md" label={t.chatPluginRefreshDetection} onClick={() => void refresh()} disabled={refreshing}>
+          <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
+        </IconButton>
+      </div>
 
-      {inSettings && (
-        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-          <p className="max-w-2xl text-[13px] leading-relaxed text-neutral-500 dark:text-neutral-400">
-            {t.chatPluginIntroLead}{' '}
-            <strong className="font-medium text-neutral-700 dark:text-neutral-300">Kivio AI</strong>
-            {t.chatPluginIntroAiInstall}
-            <strong className="font-medium text-neutral-700 dark:text-neutral-300">{t.chatPluginReadmeFirst}</strong>
-            {t.chatPluginIntroReadmeTail}
-            <strong className="font-medium text-neutral-700 dark:text-neutral-300">{t.chatPluginEnable}</strong>
-            {t.chatPluginIntroTail}
-          </p>
-          <IconButton size="md" label={t.chatPluginRefreshDetection} onClick={() => void refresh()} disabled={refreshing}>
-            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} />
-          </IconButton>
-        </div>
-      )}
-
-      <div className={`${inSettings ? 'mt-1' : 'mt-6'} flex flex-wrap items-center gap-3`}>
+      <div className="mt-1 flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-1 rounded-lg bg-neutral-100 p-0.5 dark:bg-neutral-800/80">
           {(
             [
@@ -461,7 +460,7 @@ export function PluginCenter({ onRequestAiInstall, variant = 'center' }: PluginC
           ))}
         </div>
       ) : filtered.length === 0 ? (
-        <div className={`${inSettings ? 'mt-10' : 'mt-16'} flex flex-col items-center justify-center text-center`}>
+        <div className="mt-10 flex flex-col items-center justify-center text-center">
           <div className="flex h-14 w-14 items-center justify-center rounded-md bg-neutral-100 text-neutral-400 dark:bg-neutral-800 dark:text-neutral-500">
             <Puzzle size={28} strokeWidth={1.5} />
           </div>
@@ -475,8 +474,9 @@ export function PluginCenter({ onRequestAiInstall, variant = 'center' }: PluginC
             <PluginCard
               key={plugin.id}
               plugin={plugin}
-              busy={busyId === plugin.id}
+              busy={busyId === plugin.id || installBusyId === plugin.id}
               installBusy={installBusyId === plugin.id}
+              onRunInstall={(id) => void handleRunInstall(id)}
               onAiInstall={(id) => void handleAiInstall(id)}
               onToggleEnabled={(id, enabled) => void handleToggle(id, enabled)}
               onUninstall={(id) => void handleUninstall(id)}
@@ -487,15 +487,5 @@ export function PluginCenter({ onRequestAiInstall, variant = 'center' }: PluginC
     </>
   )
 
-  if (inSettings) {
-    return <div className="min-w-0 text-neutral-900 dark:text-neutral-100">{body}</div>
-  }
-
-  return (
-    <div className="assistant-center-root flex h-full min-h-0 flex-col text-neutral-900 dark:text-neutral-100">
-      <main className="custom-scrollbar min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto w-full max-w-[1040px] px-9 pb-10 pt-7">{body}</div>
-      </main>
-    </div>
-  )
+  return <div className="min-w-0 text-neutral-900 dark:text-neutral-100">{body}</div>
 }

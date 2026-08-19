@@ -5,6 +5,14 @@ import { JsonRpcLineTransport } from '@deepseek-ai/dsh-sdk-protocol'
 class KivioHarnessSdkJsonRpcServer extends HarnessSdkJsonRpcServer {
   async initialize(params) {
     const result = await super.initialize(params)
+    // Session tools read header.cwd; sandbox-policy falls back to process.cwd()
+    // when a header has none. Align the process with initialize.cwd so this
+    // one-session process is actually rooted in the Kivio project directory.
+    try {
+      process.chdir(this.cwd)
+    } catch {
+      // header.cwd still drives tools even if chdir is refused.
+    }
     return {
       ...result,
       serverInfo: {
@@ -45,16 +53,18 @@ class KivioHarnessSdkJsonRpcServer extends HarnessSdkJsonRpcServer {
 
   async createFreshSession(sessionId) {
     const preset = this.agentPreset()
+    const cwd = this.cwd
     const record = {
       handle: await this.ctx.agents.create({
         sessionId,
-        meta: { cwd: this.cwd, agentPreset: preset },
+        meta: { cwd, agentPreset: preset },
         agentOptions: this.agentOptions(),
         setup: (agentCtx) => this.mountPreset(agentCtx, preset),
       }),
       resumed: false,
     }
     this.sessions.set(sessionId, record)
+    await this.attachToWorkspace(sessionId, cwd)
     return record
   }
 
@@ -69,7 +79,31 @@ class KivioHarnessSdkJsonRpcServer extends HarnessSdkJsonRpcServer {
     })
     const record = { handle, resumed: true }
     this.sessions.set(sessionId, record)
+    await this.attachToWorkspace(
+      sessionId,
+      handle.agent?.session?.header?.cwd || this.cwd,
+    )
     return record
+  }
+
+  /**
+   * Official web groups sessions by Host Workspace membership, not by
+   * session.header.cwd. `agents.create({ meta.cwd })` alone leaves the
+   * session in the ungrouped bucket ("其他项目" / 未分组). Mirror
+   * session.create: ensure the directory is a workspace, then attach.
+   *
+   * Per-conversation Kivio workbenches stay ungrouped so they do not
+   * flood the web sidebar with uuid folders.
+   */
+  async attachToWorkspace(sessionId, cwd) {
+    if (!shouldAttachWorkspace(cwd)) return
+    try {
+      const workspace = await this.ctx.workspaceRegistry.create(cwd)
+      await workspace.attachSession(sessionId)
+    } catch (error) {
+      // Grouping is best-effort; a failed attach must not drop the turn.
+      console.error('[kivio-dsh] workspace attach failed:', error)
+    }
   }
 
   agentPreset() {
@@ -105,9 +139,12 @@ class KivioHarnessSdkJsonRpcServer extends HarnessSdkJsonRpcServer {
     const sessionId = requireSessionId(params.sessionId)
     const record = this.sessions.get(sessionId)
     if (!record) throw new Error(`session "${sessionId}" is not open`)
-    record.handle.agent.cancel({ kind: 'user' })
-    await record.handle.agent.whenIdle()
-    return { sessionId, cancelled: true }
+    const agent = record.handle.agent
+    return withExclusiveAgentCall(agent, async () => {
+      agent.cancel({ kind: 'user' })
+      await agent.whenIdle()
+      return { sessionId, cancelled: true }
+    })
   }
 
   async command(params) {
@@ -213,7 +250,40 @@ class KivioHarnessSdkJsonRpcServer extends HarnessSdkJsonRpcServer {
 
   async prompt(params) {
     const contentBlocks = await materializeContentBlocks(this.ctx, params?.contentBlocks)
-    return super.prompt({ ...params, contentBlocks })
+    const patched = { ...params, contentBlocks }
+    if (typeof params?.sessionId !== 'string' || params.sessionId.trim() === '') {
+      return super.prompt(patched)
+    }
+    const record = await this.getOrCreateSession(params.sessionId)
+    return withExclusiveAgentCall(record.handle.agent, () => super.prompt(patched))
+  }
+
+  // Official SDK only exposes session/prompt → agent.followup() (next turn).
+  // dsh itself has agent.steer() (next-step inbox). Reuse prompt()'s
+  // UserMessage construction by routing followup to steer for this one call.
+  // @deepseek-ai/dsh-llm is a peer of the SDK server, not a kivio profile dep.
+  // prompt() and steer() share a per-agent queue so a concurrent prompt cannot
+  // run while followup is patched to steer.
+  async steer(params) {
+    const sessionId = requireSessionId(params.sessionId)
+    const contentBlocks = await materializeContentBlocks(this.ctx, params?.contentBlocks)
+    if (contentBlocks.length === 0) {
+      throw new TypeError('session/steer requires contentBlocks')
+    }
+    const record = await this.getOrCreateSession(sessionId)
+    if (this.ctx.agents.get(record.handle.agent.id) !== record.handle.agent) {
+      throw new Error(`session agent was disposed outside the server: ${sessionId}`)
+    }
+    const agent = record.handle.agent
+    return withExclusiveAgentCall(agent, async () => {
+      const enqueueFollowup = agent.followup.bind(agent)
+      agent.followup = agent.steer.bind(agent)
+      try {
+        return await super.prompt({ sessionId, contentBlocks })
+      } finally {
+        agent.followup = enqueueFollowup
+      }
+    })
   }
 
   async handleRequest(method, params) {
@@ -228,6 +298,8 @@ class KivioHarnessSdkJsonRpcServer extends HarnessSdkJsonRpcServer {
         return this.listCommands(params)
       case 'session/stop-job':
         return this.stopJob(params)
+      case 'session/steer':
+        return this.steer(params)
       default:
         return super.handleRequest(method, params)
     }
@@ -244,6 +316,27 @@ function requireSessionId(value) {
     throw new TypeError('sessionId must be a non-empty string')
   }
   return value.trim()
+}
+
+const agentCallTails = new WeakMap()
+
+function withExclusiveAgentCall(agent, fn) {
+  const prev = agentCallTails.get(agent) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  agentCallTails.set(
+    agent,
+    next.then(
+      () => undefined,
+      () => undefined,
+    ),
+  )
+  return next
+}
+
+function shouldAttachWorkspace(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return false
+  const normalized = cwd.replace(/\\/g, '/')
+  return !/(^|\/)chat-workspaces\//.test(normalized)
 }
 
 const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
@@ -292,7 +385,7 @@ async function materializeContentBlocks(ctx, blocks) {
 }
 
 export const name = 'kivio-dsh-jsonrpc-bridge'
-export const inject = ['agents', 'sessionPersistence', 'agentPresets', 'userQuestions', 'commands', 'attachments', 'jobs', 'subagents']
+export const inject = ['agents', 'sessionPersistence', 'agentPresets', 'userQuestions', 'commands', 'attachments', 'jobs', 'subagents', 'workspaceRegistry']
 export const Config = Schema.object({
   maxTokensAsSuccess: Schema.boolean().default(false),
 })

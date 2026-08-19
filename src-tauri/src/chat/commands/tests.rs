@@ -28,7 +28,9 @@ use super::messages::{
     content_from_segments, normalize_assistant_segments, reasoning_from_segments,
     reconcile_orphan_tool_segments, replace_final_text_segments_for_edit,
 };
-use super::mutations::{apply_regenerate_truncation, build_fork_messages};
+use super::mutations::{
+    apply_regenerate_truncation, build_fork_messages, build_fork_messages_before_anchor,
+};
 use super::reply_runtime::resolve_reply_arms;
 use super::sanitization::sanitize_image_payloads_for_model;
 use super::title::{build_title_summary_prompt, generate_title, sanitize_generated_title};
@@ -147,7 +149,6 @@ fn slash_trigger_rewrites_body_and_pins_skill() {
         &chat_tools,
         None,
         "/commit fix login",
-        &[],
         false,
     )
     .expect("slash trigger should match");
@@ -165,11 +166,11 @@ fn slash_trigger_ignores_non_slash_and_unknown() {
     let chat_tools = crate::settings::ChatToolsConfig::default();
 
     assert!(
-        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "commit fix", &[], false)
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "commit fix", false)
             .is_none()
     );
     assert!(
-        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/unknown x", &[], false)
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/unknown x", false)
             .is_none()
     );
 }
@@ -181,7 +182,7 @@ fn slash_trigger_skips_disabled_skill() {
     chat_tools.disabled_skill_ids = vec!["commit".to_string()];
 
     assert!(
-        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/commit fix", &[], false)
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/commit fix", false)
             .is_none()
     );
 }
@@ -2740,6 +2741,24 @@ fn build_fork_messages_keeps_prefix_including_anchor() {
     assert_eq!(ids, vec!["m0", "m1", "m2"]);
     // 源不变。
     assert_eq!(messages.len(), 4);
+}
+
+#[test]
+fn pi_fork_prefix_stops_before_the_selected_user_message() {
+    let messages = vec![
+        test_chat_message("m0", "user", "q1", 1),
+        test_chat_message("m1", "assistant", "a1", 2),
+        test_chat_message("m2", "user", "q2", 3),
+    ];
+    let forked = build_fork_messages_before_anchor(&messages, 2);
+    assert_eq!(
+        forked
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["m0", "m1"]
+    );
+    assert!(build_fork_messages_before_anchor(&messages, 0).is_empty());
 }
 
 #[test]

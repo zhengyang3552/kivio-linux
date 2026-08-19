@@ -44,8 +44,19 @@ import { ModelIcon } from './ModelIcon'
 import { ToolCallBlock } from './ToolCallBlock'
 import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
 import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ToolCallRecord } from './types'
-import { knowledgeSearchHits, type KbHitView } from './knowledgeBaseHits'
-import { compareTimelineSegments, groupTimelineSegments, isStandaloneToolCard, isUserSteerToolCall, segmentToolCallId, summarizeToolGroup, toolRecordId, userSteerText } from './segments'
+import { buildCitationMap, type CitationView } from './citations'
+import {
+  compareTimelineSegments,
+  groupTimelineSegments,
+  isStandaloneToolCard,
+  isUserFollowUpToolCall,
+  isUserSteerToolCall,
+  segmentToolCallId,
+  summarizeToolGroup,
+  toolRecordId,
+  userFollowUpText,
+  userSteerText,
+} from './segments'
 import type { TimelineGroupItem, ToolGroupIcon } from './segments'
 
 const DIRECT_IMAGE_GENERATION_PENDING = '[[KIVIO_DIRECT_IMAGE_GENERATION_PENDING]]'
@@ -379,7 +390,7 @@ function MissingToolSegment({ toolCallId }: { toolCallId: string }) {
  * 渲染成一条右对齐的小气泡，读起来就是「我在这里插了一句」，与时间线上下文的因果关系对得上。
  */
 function UserSteerSegment({ toolCall }: { toolCall: ToolCallRecord }) {
-  const text = userSteerText(toolCall)
+  const text = isUserFollowUpToolCall(toolCall) ? userFollowUpText(toolCall) : userSteerText(toolCall)
   if (!text.trim()) return null
   return (
     <div className="not-prose flex justify-end">
@@ -393,6 +404,10 @@ function UserSteerSegment({ toolCall }: { toolCall: ToolCallRecord }) {
       </div>
     </div>
   )
+}
+
+function isUserInjectedToolCall(toolCall: ToolCallRecord): boolean {
+  return isUserSteerToolCall(toolCall) || isUserFollowUpToolCall(toolCall)
 }
 
 function TimelineToolSegment({
@@ -411,7 +426,7 @@ function TimelineToolSegment({
   if (!toolCall) {
     return <MissingToolSegment toolCallId={toolCallId} />
   }
-  if (isUserSteerToolCall(toolCall)) {
+  if (isUserInjectedToolCall(toolCall)) {
     return <UserSteerSegment toolCall={toolCall} />
   }
   if (isArtifactPresentationToolCall(toolCall)) {
@@ -438,7 +453,7 @@ function TimelineTextSegment({
 }: {
   segment: ChatMessageSegment
   artifacts: ChatToolArtifact[]
-  citations?: Map<number, KbHitView>
+  citations?: Map<number, CitationView>
   conversationId?: string | null
 }) {
   const text = segmentText(segment).trim()
@@ -475,7 +490,7 @@ function TimelineSegmentNode({
   segmentCount: number
   toolCallById: ReadonlyMap<string, ToolCallRecord>
   artifacts: ChatToolArtifact[]
-  citations?: Map<number, KbHitView>
+  citations?: Map<number, CitationView>
   conversationId?: string | null
   reasoningStreaming: boolean
   reasoningDurationMs?: number | null
@@ -624,7 +639,7 @@ function TimelineGroupBlock({
   toolCalls: ToolCallRecord[]
   toolCallById: ReadonlyMap<string, ToolCallRecord>
   artifacts: ChatToolArtifact[]
-  citations?: Map<number, KbHitView>
+  citations?: Map<number, CitationView>
   conversationId?: string | null
   isLastGroup: boolean
   messageStreaming: boolean
@@ -726,18 +741,6 @@ function TimelineGroupBlock({
   )
 }
 
-/** 汇总本条消息所有 knowledge_search 命中，按 n 建索引，供答案里的 `[n]` 角标查源。
- *  多次检索 n 会重叠 —— 后写覆盖（罕见，且只影响弹窗预览内容）。 */
-function buildCitationMap(toolCalls: ToolCallRecord[]): Map<number, KbHitView> {
-  const map = new Map<number, KbHitView>()
-  for (const toolCall of toolCalls) {
-    for (const hit of knowledgeSearchHits(toolCall) ?? []) {
-      map.set(hit.n, hit)
-    }
-  }
-  return map
-}
-
 function TimelineSegments({
   segments,
   toolCalls,
@@ -824,7 +827,7 @@ function TimelineSegments({
           if (!toolCall) return null
           return (
             <div key={item.segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-              {isUserSteerToolCall(toolCall) ? (
+              {isUserInjectedToolCall(toolCall) ? (
                 <UserSteerSegment toolCall={toolCall} />
               ) : isArtifactPresentationToolCall(toolCall) ? (
                 <ArtifactPresentationBlock
@@ -862,7 +865,7 @@ function TimelineSegments({
       })}
       {orphanTools.map((toolCall, index) => (
         <div key={toolRecordId(toolCall) || `orphan-tool-${index}`} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-          {isUserSteerToolCall(toolCall) ? (
+          {isUserInjectedToolCall(toolCall) ? (
             <UserSteerSegment toolCall={toolCall} />
           ) : isArtifactPresentationToolCall(toolCall) ? (
             <ArtifactPresentationBlock
@@ -903,9 +906,9 @@ function MessageBubbleComponent({
   // 历史消息会被虚拟列表反复卸载/挂载；只让真正的流式预览播放进入动画，
   // 否则滚动时每个重新进入 DOM 的旧气泡都会淡入并上移，看起来像刷新且阻滞滚动。
   const playEntranceAnimation = messageStreaming
-  // 「这条可以改动吗」：门控重新生成 / 删除。`onUpdateMessage` 保留在判据里不是残留——
-  // MessageGroup 的**在飞列**正是靠不传它来一次关掉这些入口（见那里的 `!live ? … : undefined`），
-  // 去掉它会让还在生成的那一列冒出删除键。（编辑入口已按需求移除，改写消息不再有 UI。）
+  // 「这条是否已落盘并允许历史操作」：门控重新生成。`onUpdateMessage` / `onDeleteMessage`
+  // 在这里作为完整可变能力信号；MessageGroup 的在飞列不传它们，从而一次关掉这些入口。
+  // 编辑与删除入口已按需求移除，但底层能力仍保留。
   const canMutate = Boolean(onUpdateMessage && onDeleteMessage && onRegenerateMessage)
   const prepared = useMemo(() => {
     const attachments = message.attachments ?? []
@@ -1126,7 +1129,7 @@ function MessageBubbleComponent({
   const renderToolCall = (toolCall: ToolCallRecord, index: number) => {
     const key = toolCall.id || toolCall.call_id || toolCall.callId || index
     // 无时间线段的旧路径：插话卡照样不能退化成一张写着 user_steer 的工具卡。
-    if (isUserSteerToolCall(toolCall)) {
+    if (isUserInjectedToolCall(toolCall)) {
       return <UserSteerSegment key={key} toolCall={toolCall} />
     }
     if (isArtifactPresentationToolCall(toolCall)) {
@@ -1273,13 +1276,6 @@ function MessageBubbleComponent({
               onForkMessage
                 ? () => {
                     void onForkMessage(message.id)
-                  }
-                : undefined
-            }
-            onDelete={
-              canMutate
-                ? () => {
-                    void onDeleteMessage!(message.id)
                   }
                 : undefined
             }

@@ -54,7 +54,6 @@ pub struct AgentRunConfig<'a> {
     /// 会话级联网搜索有效模式（任务 07-23）。由 `effective_web_search_mode` 解析后传入。
     /// 决定本 run 是否暴露 `search_web`（ThirdParty）或请求内置搜索（Builtin，且模型支持）。
     pub web_search_mode: crate::chat::types::WebSearchMode,
-    pub stream_enabled: bool,
     pub max_output_tokens: u32,
     pub retry_attempts: usize,
     pub assistant_snapshot: Option<ChatAssistantSnapshot>,
@@ -67,6 +66,8 @@ pub struct AgentRunConfig<'a> {
     /// 锚点响应**之后**（不含响应本身，响应用 output 计入锚点）新增消息的字符估算，由 commands.rs
     /// 组装 runtime_messages 时算好。与 `initial_anchor_total_tokens` 配对：`effective = 锚点 + 该 trailing`。
     pub initial_anchor_trailing_estimate: usize,
+    /// 对话工作目录，用于扫描项目 `.kivio/skills` 与 `.agents/skills`。
+    pub skill_project_cwd: Option<std::path::PathBuf>,
 }
 
 impl AgentRunConfig<'_> {

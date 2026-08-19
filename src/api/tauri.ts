@@ -513,7 +513,7 @@ export type ExternalCliAgentConfig = {
   customModels?: Array<{ id: string; label: string }>
   /** 该 CLI 的第三方供应商（中转站）列表。 */
   providers?: ExternalCliProvider[]
-  /** 当前生效的供应商 id；空 = 用 CLI 自己的配置。 */
+  /** 当前默认供应商 id；Pi / OpenCode / dsh 的 providers 会全部并存。空 = 用 CLI 自己的默认配置。 */
   currentProvider?: string
 }
 
@@ -529,6 +529,8 @@ export type ExternalCliAgentConfig = {
 export type ExternalCliProvider = {
   id: string
   name: string
+  /** Disabled providers stay saved but are not materialized or injected. */
+  disabled?: boolean
   remark?: string
   env?: Array<{ key: string; value: string }>
   configToml?: string
@@ -1002,6 +1004,53 @@ export type KnowledgeBaseConfig = {
   minScore: number
 }
 
+export type WebSearchProviderId =
+  | 'tavily'
+  | 'exa'
+  | 'exa_mcp'
+  | 'ollama'
+  | 'grok'
+  | 'brave'
+  | 'serper'
+  | 'bocha'
+  | 'zhipu'
+  | 'tinyfish'
+  | 'tinyfish_mcp'
+  | 'searxng'
+
+export type WebSearchMcpAuth = NonNullable<ChatMcpServer['auth']>
+
+export type WebSearchConfig = {
+  enabled: boolean
+  provider: WebSearchProviderId
+  tavilyApiKey: string
+  tavilyBaseUrl?: string
+  exaApiKey: string
+  exaBaseUrl?: string
+  exaMcpUrl?: string
+  ollamaApiKey?: string
+  ollamaBaseUrl?: string
+  grokApiKey?: string
+  grokModel?: string
+  grokBaseUrl?: string
+  grokSystemPrompt?: string
+  braveApiKey?: string
+  braveBaseUrl?: string
+  serperApiKey?: string
+  serperBaseUrl?: string
+  bochaApiKey?: string
+  bochaBaseUrl?: string
+  zhipuApiKey?: string
+  zhipuBaseUrl?: string
+  tinyfishApiKey?: string
+  tinyfishBaseUrl?: string
+  tinyfishMcpUrl?: string
+  tinyfishMcpAuth?: WebSearchMcpAuth | null
+  searxngBaseUrl?: string
+  maxResults: number
+  searchDepth: 'ultra-fast' | 'fast' | 'basic' | 'advanced'
+}
+
 export type Settings = {
   hotkey: string
   chatHotkey: string
@@ -1095,23 +1144,7 @@ export type Settings = {
     /** 进入截图选择态时是否显示顶部提示（默认 true） */
     showCaptureHint?: boolean
     /** Lens 联网搜索配置 */
-    webSearch?: {
-      enabled: boolean
-      provider: 'tavily' | 'exa' | 'exa_mcp' | 'ollama' | 'grok'
-      tavilyApiKey: string
-      tavilyBaseUrl?: string
-      exaApiKey: string
-      exaBaseUrl?: string
-      exaMcpUrl?: string
-      ollamaApiKey?: string
-      ollamaBaseUrl?: string
-      grokApiKey?: string
-      grokModel?: string
-      grokBaseUrl?: string
-      grokSystemPrompt?: string
-      maxResults: number
-      searchDepth: 'ultra-fast' | 'fast' | 'basic' | 'advanced'
-    }
+    webSearch?: WebSearchConfig
   }
   settingsLanguage?: 'zh' | 'en'
   /** 首次使用引导：`pending` | `completed` | `skipped` */
@@ -1126,45 +1159,6 @@ export type Settings = {
   obsidianVaultPath?: string
   /** 收藏并置顶的模型键（"providerId:model"）；顺序即置顶顺序。chat 模型选择器用。 */
   favoriteModels?: string[]
-  /** Himalaya IMAP/SMTP 邮箱账户 */
-  emailAccounts?: EmailAccountConfig[]
-}
-
-export type EmailAccountConfig = {
-  id: string
-  email: string
-  displayName: string
-  password: string
-  imapHost: string
-  imapPort: number
-  imapEncryption: string
-  smtpHost: string
-  smtpPort: number
-  smtpEncryption: string
-  isDefault: boolean
-}
-
-export type EmailProviderPreset = {
-  id: string
-  label: string
-  imapHost: string
-  imapPort: number
-  imapEncryption: string
-  smtpHost: string
-  smtpPort: number
-  smtpEncryption: string
-}
-
-export type HimalayaStatus = {
-  installed: boolean
-  version: string | null
-  path: string | null
-}
-
-export type HimalayaInstallResult = {
-  ok: boolean
-  alreadyInstalled: boolean
-  message: string
 }
 
 /** 能力插件（领域 CLI 等）状态 —— 设置 → 插件 */
@@ -1196,6 +1190,8 @@ export type PluginStatus = {
   /** 启用后 MCP 是否已写入 settings 且 enabled */
   mcpActive: boolean
   mcpServerId: string | null
+  /** 当前系统是否可自动安装（安装命令不回传前端） */
+  canInstall?: boolean
 }
 
 export type PluginActionResult = {
@@ -1757,6 +1753,19 @@ export function normalizeSettings(settings: Settings): Settings {
         grokBaseUrl: current.lens?.webSearch?.grokBaseUrl ?? 'https://api.x.ai/v1',
         grokSystemPrompt: current.lens?.webSearch?.grokSystemPrompt
           ?? "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations.",
+        braveApiKey: current.lens?.webSearch?.braveApiKey ?? '',
+        braveBaseUrl: current.lens?.webSearch?.braveBaseUrl ?? 'https://api.search.brave.com',
+        serperApiKey: current.lens?.webSearch?.serperApiKey ?? '',
+        serperBaseUrl: current.lens?.webSearch?.serperBaseUrl ?? 'https://google.serper.dev',
+        bochaApiKey: current.lens?.webSearch?.bochaApiKey ?? '',
+        bochaBaseUrl: current.lens?.webSearch?.bochaBaseUrl ?? 'https://api.bochaai.com',
+        zhipuApiKey: current.lens?.webSearch?.zhipuApiKey ?? '',
+        zhipuBaseUrl: current.lens?.webSearch?.zhipuBaseUrl ?? 'https://open.bigmodel.cn/api/paas/v4',
+        tinyfishApiKey: current.lens?.webSearch?.tinyfishApiKey ?? '',
+        tinyfishBaseUrl: current.lens?.webSearch?.tinyfishBaseUrl ?? 'https://api.search.tinyfish.ai',
+        tinyfishMcpUrl: current.lens?.webSearch?.tinyfishMcpUrl ?? 'https://agent.tinyfish.ai/mcp',
+        tinyfishMcpAuth: current.lens?.webSearch?.tinyfishMcpAuth ?? null,
+        searxngBaseUrl: current.lens?.webSearch?.searxngBaseUrl ?? '',
         maxResults: current.lens?.webSearch?.maxResults ?? 5,
         searchDepth: current.lens?.webSearch?.searchDepth ?? 'basic',
       },
@@ -1768,7 +1777,6 @@ export function normalizeSettings(settings: Settings): Settings {
     imageArchivePath: current.imageArchivePath ?? '',
     obsidianVaultPath: current.obsidianVaultPath ?? '',
     favoriteModels: current.favoriteModels ?? [],
-    emailAccounts: current.emailAccounts ?? [],
   }
 }
 
@@ -1894,19 +1902,15 @@ export const api = {
   listObsidianVaults: () =>
     invoke<{ name: string; path: string }[]>('list_obsidian_vaults_cmd'),
 
-  listEmailProviderPresets: () =>
-    invoke<EmailProviderPreset[]>('list_email_provider_presets'),
-
-  himalayaStatus: () => invoke<HimalayaStatus>('himalaya_status_cmd'),
-
-  himalayaInstall: () => invoke<HimalayaInstallResult>('himalaya_install_cmd'),
-
   /** 能力插件列表（目录 + 安装/启用状态） */
   pluginsList: () => invoke<PluginStatus[]>('plugins_list'),
   // Cached (no-spawn) status for instant first paint; follow with pluginsList to refine.
   pluginsListCached: () => invoke<PluginStatus[]>('plugins_list_cached'),
-  /** 取「让 AI 安装」任务 brief（含标准化安装文档） */
+  /** 取可选「让 AI 代装」任务 brief（含标准化安装文档） */
   pluginsInstallBrief: (id: string) => invoke<PluginInstallBrief>('plugins_install_brief', { id }),
+  /** 运行当前系统对应的 GitHub README 安装命令 */
+  pluginsRunOfficialInstall: (id: string) =>
+    invoke<PluginActionResult>('plugins_run_official_install', { id }),
   pluginsSetEnabled: (id: string, enabled: boolean) =>
     invoke<PluginActionResult>('plugins_set_enabled', { id, enabled }),
   pluginsUninstall: (id: string) => invoke<PluginActionResult>('plugins_uninstall', { id }),
@@ -1928,9 +1932,6 @@ export const api = {
   notesOpenFolder: () => invoke<string>('notes_open_folder'),
   /** 笔记目录的绝对路径，用于订阅 workspace:activity 自动刷新。 */
   notesDirPath: () => invoke<string>('notes_dir_path'),
-
-  testHimalayaEmail: (account: EmailAccountConfig, existingAccounts?: EmailAccountConfig[]) =>
-    invoke<string>('test_himalaya_email_cmd', { account, existingAccounts }),
 
   // 窗口控制
   /** 给当前（chat）窗口上 Mica，返回材质是否真的生效。Win10 没有 Mica 时为 false —— 这条
@@ -1971,6 +1972,15 @@ export const api = {
   startDragging: async () => {
     const win = getCurrentWindow()
     await win.startDragging()
+  },
+
+  /** 把聊天窗口上次停留的路由交给 Rust 持久化（null = 清除）。 */
+  rememberChatLastRoute: async (route: string | null): Promise<void> => {
+    try {
+      await invoke('chat_remember_last_route', { route })
+    } catch {
+      // 路由持久化是尽力而为：失败只影响「重开回到哪条对话」，绝不打断交互。
+    }
   },
 
   // 事件监听
@@ -2209,22 +2219,20 @@ export const api = {
     invoke<McpServerStatus>('chat_mcp_server_status', { serverId }),
   chatMcpListToolDefs: (serverId: string) =>
     invoke<{ name: string; description: string }[]>('chat_mcp_list_tool_defs', { serverId }),
-  chatMcpReloadServer: (serverId: string) =>
-    invoke<void>('chat_mcp_reload_server', { serverId }),
   /** 后台预热 MCP 连接（fire-and-forget）：不传 = 全部启用的 server；结果走 onMcpServerState 推送。 */
   chatMcpWarmup: (serverIds?: string[]) => {
     if (!isTauriRuntime()) return Promise.resolve()
     return invoke<void>('chat_mcp_warmup', { serverIds })
   },
-  chatSkillsList: (skillScanPaths?: string[]) =>
+  chatSkillsList: (skillScanPaths?: string[], projectCwd?: string) =>
     invoke<{ success: boolean; skills: SkillMeta[]; warnings?: string[]; error?: string | null }>(
       'chat_skills_list',
-      { skillScanPaths },
+      { skillScanPaths, projectCwd },
     ),
-  chatSkillsRead: (skillId: string) =>
+  chatSkillsRead: (skillId: string, projectCwd?: string) =>
     invoke<{ success: boolean; skill?: SkillDetail | null; error?: string | null }>(
       'chat_skills_read',
-      { skillId },
+      { skillId, projectCwd },
     ),
   chatSkillsImport: (path: string) =>
     invoke<{ success: boolean; skill?: SkillMeta | null; error?: string | null }>(

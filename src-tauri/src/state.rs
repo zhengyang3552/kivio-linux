@@ -209,6 +209,8 @@ pub struct AppState {
     // ponytail: 无上限增长，每 (agent, cwd) 一项（会话×agent 级，量很小）；若日后 key 基数变大，
     // 改成带容量上限的 LRU 或探测完即移除空闲锁。
     pub model_probe_locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Pi tree panel lazy-connect single-flight, keyed by Kivio conversation id.
+    pub pi_session_control_locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Phase 2 持久会话注册表：conversation_id → 活会话（仅持有控制通道，不持有 Child）。
     /// 仅在 get/insert/remove 时短暂持锁，绝不跨 turn await 持锁。
     pub external_live_sessions:
@@ -224,6 +226,10 @@ pub struct AppState {
     /// 无法定向到具体某条臂，所以前端在 `reply_models ≥ 2` 时不给「立刻引导」入口。要支持就把键
     /// 换成 run_id，并让前端把当前 run_id 传进来。
     pub pending_chat_steering: Mutex<HashMap<String, Vec<crate::chat::agent::SteeringMessage>>>,
+    /// 运行中原生 follow-up 信箱：conversation_id → 待在终答后续跑的用户消息。
+    /// 不在轮首注入（那是 `pending_chat_steering`）。仅内存、不持久化。
+    /// 同样按 conversation_id 建键，前端在 `reply_models ≥ 2` 时不给自动 follow-up。
+    pub pending_chat_follow_up: Mutex<HashMap<String, Vec<crate::chat::agent::SteeringMessage>>>,
     /// Lens 启动前抓到的选中文本：放在这里等前端 enterSelect 来取走。
     /// 取一次清一次（take 语义）。无选中 / 取过 / translate 模式 = None。
     pub pending_selection: Mutex<Option<String>>,
@@ -404,9 +410,11 @@ impl AppState {
             external_detected_agents_cache: Mutex::new(HashMap::new()),
             availability_probe_lock: tokio::sync::Mutex::new(()),
             model_probe_locks: Mutex::new(HashMap::new()),
+            pi_session_control_locks: Mutex::new(HashMap::new()),
             external_live_sessions: Mutex::new(HashMap::new()),
             pending_chat_external_sends: Mutex::new(Vec::new()),
             pending_chat_steering: Mutex::new(HashMap::new()),
+            pending_chat_follow_up: Mutex::new(HashMap::new()),
             pending_selection: Mutex::new(None),
             lens_freeze_frame_image_id: Mutex::new(None),
             lens_pending_reset: Mutex::new(None),
@@ -692,6 +700,49 @@ impl AppState {
             .remove(conversation_id);
     }
 
+    /// 用户在运行中排 follow-up：放进终答后续跑的信箱。没有活跃 run 则 false。
+    pub fn push_chat_follow_up(
+        &self,
+        conversation_id: &str,
+        message: crate::chat::agent::SteeringMessage,
+    ) -> bool {
+        if self
+            .chat_active_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation_id)
+            .map(|active| active.is_empty())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.pending_chat_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push(message);
+        true
+    }
+
+    pub fn take_chat_follow_up(
+        &self,
+        conversation_id: &str,
+    ) -> Vec<crate::chat::agent::SteeringMessage> {
+        self.pending_chat_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(conversation_id)
+            .unwrap_or_default()
+    }
+
+    pub fn clear_chat_follow_up(&self, conversation_id: &str) {
+        self.pending_chat_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(conversation_id);
+    }
+
     /// 对话被删除时清理其按 conversation_id 累积的运行态痕迹：活跃 generation 集合、
     /// 会话级工具同意标记、按工具名的「总是允许」集合。三者都严格按 conversation_id 取键，对话删除后再不会被
     /// 引用，是最无歧义的有界清理点（不影响其它活跃对话）。generation 号本身来自进程级
@@ -710,6 +761,7 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(conv, _)| conv != conversation_id);
         self.clear_chat_steering(conversation_id);
+        self.clear_chat_follow_up(conversation_id);
     }
 
     /// 尝试占用某个对话的某条 run 回复槽位。同会话允许多条 run 并存（多模型一问多答）；
@@ -963,6 +1015,20 @@ impl AppState {
             .clone()
     }
 
+    pub fn pi_session_control_lock_for(
+        &self,
+        conversation_id: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .pi_session_control_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Phase 2: return the control channel of a reusable live session for this conversation
     /// (same agent + cwd + launch configuration, actor still alive). Removes a stale/mismatched
     /// entry as a side effect.
@@ -1010,6 +1076,21 @@ impl AppState {
         })
     }
 
+    /// 控制面操作只在会话空闲时独占 busy 标志；不能覆盖正在生成的 guard。
+    pub fn try_mark_external_live_session_busy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<crate::external_agents::session::live::TurnBusyGuard, String> {
+        let map = self
+            .external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = map
+            .get(conversation_id)
+            .ok_or_else(|| "external live session is unavailable".to_string())?;
+        crate::external_agents::session::live::TurnBusyGuard::try_new(session.busy.clone())
+            .ok_or_else(|| "Pi session is busy; wait for the current run to finish".to_string())
+    }
     /// 取出该会话常驻 CLI 的控制通道（若有）。给「运行中插话」用：外部 CLI 那条路不走
     /// `pending_chat_steering` 信箱（那是内置 agent 循环的轮首注入），而是把命令直接送进
     /// 会话 actor，由各协议自己决定能不能注入。不存在常驻会话 = 这条对话没在跑 CLI。
@@ -1022,6 +1103,41 @@ impl AppState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(conversation_id)
+            .map(|session| session.control.clone())
+    }
+
+    /// 取出宣称 follow-up 能力的常驻会话控制通道，以及该 CLI 的图片 MIME 白名单。
+    /// 没有常驻会话、或该协议不支持 follow-up，都回 `None`（前端按普通轮末发送）。
+    pub fn external_follow_up_live_session(
+        &self,
+        conversation_id: &str,
+    ) -> Option<(
+        tokio::sync::mpsc::Sender<crate::external_agents::session::live::SessionCommand>,
+        &'static [&'static str],
+    )> {
+        let map = self
+            .external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = map.get(conversation_id)?;
+        let def = crate::external_agents::registry::get_agent_def(&session.agent_id)?;
+        if !def.supports_follow_up {
+            return None;
+        }
+        Some((session.control.clone(), def.image_mime_whitelist))
+    }
+
+    /// 取出 Pi 常驻会话控制通道（session tree / fork / switch）。
+    pub fn external_pi_live_session_control(
+        &self,
+        conversation_id: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::external_agents::session::live::SessionCommand>>
+    {
+        self.external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation_id)
+            .filter(|session| session.agent_id == "pi")
             .map(|session| session.control.clone())
     }
 
@@ -1062,6 +1178,25 @@ impl AppState {
             .remove(conversation_id);
     }
 
+    pub fn move_external_live_session(
+        &self,
+        source_conversation_id: &str,
+        destination_conversation_id: &str,
+    ) -> Result<(), String> {
+        let mut map = self
+            .external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.contains_key(destination_conversation_id) {
+            return Err("destination conversation already has a live session".to_string());
+        }
+        let mut session = map
+            .remove(source_conversation_id)
+            .ok_or_else(|| "source live session disappeared".to_string())?;
+        session.last_activity = Instant::now();
+        map.insert(destination_conversation_id.to_string(), session);
+        Ok(())
+    }
     /// Reclaim every idle/dead live session (e.g. from a periodic sweeper). Returns how many
     /// were dropped. Dropping each entry closes its actor + child process.
     pub fn sweep_idle_external_live_sessions(&self, idle_ttl: Duration) -> usize {

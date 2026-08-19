@@ -44,7 +44,7 @@ pub fn load_session(app: &AppHandle, conversation_id: &str) -> Option<ExternalAg
 pub fn save_session(app: &AppHandle, session: &ExternalAgentSession) -> Result<(), String> {
     let path = session_path(app, &session.conversation_id)?;
     let raw = serde_json::to_string_pretty(session).map_err(|e| e.to_string())?;
-    fs::write(path, raw).map_err(|e| e.to_string())
+    crate::chat::storage::atomic_write(&path, &raw, "external agent session")
 }
 
 pub fn stable_prompt_hash(instructions: &str) -> String {
@@ -152,11 +152,26 @@ pub fn replace_stored_session_id(
     let _ = save_session(app, &stored);
 }
 
+pub fn update_stored_session_id(
+    app: &AppHandle,
+    conversation_id: &str,
+    agent_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let Some(mut stored) = load_session(app, conversation_id).filter(|s| s.agent_id == agent_id)
+    else {
+        return Ok(());
+    };
+    stored.session_id = session_id.to_string();
+    save_session(app, &stored)
+}
+
 pub fn persist_delivered_session(
     app: &AppHandle,
     conversation_id: &str,
     agent_id: &str,
     resume_ctx: &AgentResumeContext,
+    actual_session_id: Option<&str>,
     instructions: &str,
     is_slash: bool,
 ) -> Result<(), String> {
@@ -168,28 +183,30 @@ pub fn persist_delivered_session(
         return Ok(());
     }
     if !resume_ctx.is_resuming {
-        if let Some(session_id) = resume_ctx.new_session_id.as_ref() {
+        if let Some(session_id) = actual_session_id.or(resume_ctx.new_session_id.as_deref()) {
             save_session(
                 app,
                 &ExternalAgentSession {
                     conversation_id: conversation_id.to_string(),
                     agent_id: agent_id.to_string(),
-                    session_id: session_id.clone(),
+                    session_id: session_id.to_string(),
                     stable_prompt_hash: Some(stable_prompt_hash(instructions)),
                     model: resume_ctx.delivered_model.clone(),
                 },
             )?;
         }
     } else if let Some(mut stored) = load_session(app, conversation_id) {
-        // 记录随「系统提示变了」或「模型换了」任一变化而更新。以前只看提示哈希——换模型走的是
-        // 另一条（丢弃会话）分支，所以看不看模型无所谓；现在换模型也 resume，只看哈希会让存下
-        // 的模型一直停在第一次那个值上。
+        // 记录随系统提示、模型或 live actor 实际使用的原生会话 id 变化而更新。
         let next_hash = stable_prompt_hash(instructions);
         let hash_changed = stored.stable_prompt_hash.as_deref() != Some(next_hash.as_str());
         let model_changed = stored.model != resume_ctx.delivered_model;
-        if hash_changed || model_changed {
+        let session_changed = actual_session_id.is_some_and(|id| stored.session_id != id);
+        if hash_changed || model_changed || session_changed {
             stored.stable_prompt_hash = Some(next_hash);
             stored.model = resume_ctx.delivered_model.clone();
+            if let Some(session_id) = actual_session_id {
+                stored.session_id = session_id.to_string();
+            }
             save_session(app, &stored)?;
         }
     }
@@ -233,6 +250,9 @@ pub struct LiveSessionHandle {
     pub protocol: String,
     /// Native thread id (codex) / session id (ACP / claude)。
     pub native_id: String,
+    /// Pi RPC reports the active JSONL file path; older handles and other protocols leave it blank.
+    #[serde(default)]
+    pub native_path: Option<String>,
     pub cwd: String,
 }
 
@@ -245,6 +265,41 @@ pub fn load_live_handle(app: &AppHandle, conversation_id: &str) -> Option<LiveSe
     serde_json::from_str(&raw).ok()
 }
 
+pub fn find_live_binding_by_native_path(
+    app: &AppHandle,
+    native_path: &std::path::Path,
+) -> Option<(String, LiveSessionHandle)> {
+    let target = std::fs::canonicalize(native_path).unwrap_or_else(|_| native_path.to_path_buf());
+    let entries = std::fs::read_dir(sessions_dir(app).ok()?).ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let Some(conversation_id) = file_name
+            .strip_prefix("live-")
+            .and_then(|value| value.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(handle) = serde_json::from_str::<LiveSessionHandle>(&raw) else {
+            continue;
+        };
+        let Some(path) = handle.native_path.as_deref() else {
+            continue;
+        };
+        let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+        let matches = if cfg!(target_os = "windows") {
+            candidate.to_string_lossy().eq_ignore_ascii_case(&target.to_string_lossy())
+        } else {
+            candidate == target
+        };
+        if matches {
+            return Some((conversation_id.to_string(), handle));
+        }
+    }
+    None
+}
 pub fn save_live_handle(
     app: &AppHandle,
     conversation_id: &str,
@@ -252,7 +307,7 @@ pub fn save_live_handle(
 ) -> Result<(), String> {
     let path = live_handle_path(app, conversation_id)?;
     let raw = serde_json::to_string_pretty(handle).map_err(|e| e.to_string())?;
-    fs::write(path, raw).map_err(|e| e.to_string())
+    crate::chat::storage::atomic_write(&path, &raw, "external live session handle")
 }
 
 pub fn clear_live_handle(app: &AppHandle, conversation_id: &str) {

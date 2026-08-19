@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  Blocks,
+  BookOpen,
   ChevronDown,
   ChevronRight,
   Download,
@@ -31,6 +33,8 @@ import { Button, IconButton } from '../components/Button'
 import { dshNativeDetailToProvider } from './cliNativeProviderConfigs'
 import { CliProviderModal } from './CliProviderModal'
 import { DshPluginsSettings } from './DshPluginsSettings'
+import { PiExtensionsSettings } from './PiExtensionsSettings'
+import { PiSkillsSettings } from './PiSkillsSettings'
 import { CcSwitchImportModal } from './CcSwitchImportModal'
 import type {
   ExternalCliAgentConfig,
@@ -88,24 +92,66 @@ function Row({
   )
 }
 
-/** 比较 CLI 常见的数字版本号；缺段按 0 处理，解析失败时交回后端结果兜底。 */
-function isVersionNewer(localVersion: string, latestVersion: string): boolean | null {
-  const parse = (value: string) => {
-    const match = value.match(/\d+(?:\.\d+){2,}/)?.[0]
-    if (!match) return null
-    const parts = match.split('.').map(Number)
-    return parts.every(Number.isSafeInteger) ? parts : null
-  }
-  const local = parse(localVersion)
-  const latest = parse(latestVersion)
-  if (!local || !latest) return null
+type ParsedCliVersion = {
+  core: number[]
+  pre: Array<number | string> | null
+}
+
+/** 抓 `x.y.z` 以及可选 `-rc.7`；解析失败时交回后端结果兜底。 */
+function parseCliVersion(value: string): ParsedCliVersion | null {
+  const match = value.match(/v?(\d+(?:\.\d+){2,})(?:-([0-9A-Za-z.-]+))?/)
+  if (!match) return null
+  const core = match[1].split('.').map(Number)
+  if (!core.every(Number.isSafeInteger)) return null
+  const pre = match[2]
+    ? match[2].replace(/[.-]+$/, '').split('.').map((ident) => (
+      /^\d+$/.test(ident) ? Number(ident) : ident
+    ))
+    : null
+  return { core, pre }
+}
+
+function compareCore(local: number[], latest: number[]): number {
   const length = Math.max(local.length, latest.length)
   for (let index = 0; index < length; index += 1) {
     const currentPart = local[index] ?? 0
     const latestPart = latest[index] ?? 0
-    if (latestPart !== currentPart) return latestPart > currentPart
+    if (currentPart !== latestPart) return currentPart < latestPart ? -1 : 1
   }
-  return false
+  return 0
+}
+
+function comparePreIdent(local: number | string, latest: number | string): number {
+  const localNum = typeof local === 'number'
+  const latestNum = typeof latest === 'number'
+  if (localNum && latestNum) return local === latest ? 0 : local < latest ? -1 : 1
+  if (localNum) return -1
+  if (latestNum) return 1
+  return local === latest ? 0 : String(local) < String(latest) ? -1 : 1
+}
+
+function comparePrerelease(
+  local: Array<number | string> | null,
+  latest: Array<number | string> | null,
+): number {
+  if (local == null) return latest == null ? 0 : 1
+  if (latest == null) return -1
+  const length = Math.min(local.length, latest.length)
+  for (let index = 0; index < length; index += 1) {
+    const order = comparePreIdent(local[index], latest[index])
+    if (order !== 0) return order
+  }
+  return local.length - latest.length
+}
+
+/** 比较 CLI 版本号（含 prerelease）；缺段按 0 处理，解析失败时交回后端结果兜底。 */
+function isVersionNewer(localVersion: string, latestVersion: string): boolean | null {
+  const local = parseCliVersion(localVersion)
+  const latest = parseCliVersion(latestVersion)
+  if (!local || !latest) return null
+  const core = compareCore(local.core, latest.core)
+  if (core !== 0) return core < 0
+  return comparePrerelease(local.pre, latest.pre) < 0
 }
 
 interface ExternalAgentsSettingsProps {
@@ -121,6 +167,8 @@ export function ExternalAgentsSettings({ lang, settings, updateChat }: ExternalA
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [query, setQuery] = useState('')
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
+  const [showPiExtensions, setShowPiExtensions] = useState(false)
+  const [showPiSkills, setShowPiSkills] = useState(false)
 
   const overrides = useMemo(
     () => settings.chat?.externalCliAgents ?? {},
@@ -193,6 +241,14 @@ export function ExternalAgentsSettings({ lang, settings, updateChat }: ExternalA
     },
     [settings.chat?.externalCliAgents, updateChat],
   )
+
+  if (showPiExtensions) {
+    return <PiExtensionsSettings lang={lang} onBack={() => setShowPiExtensions(false)} />
+  }
+
+  if (showPiSkills) {
+    return <PiSkillsSettings lang={lang} onBack={() => setShowPiSkills(false)} />
+  }
 
   return (
     <div className="kv-providers-root">
@@ -279,6 +335,8 @@ export function ExternalAgentsSettings({ lang, settings, updateChat }: ExternalA
               config={overrides[selected.id] ?? EMPTY_CONFIG}
               onPatch={(patch) => patchOverride(selected.id, patch)}
               reloadAgents={loadAgents}
+              onOpenPiExtensions={() => setShowPiExtensions(true)}
+              onOpenPiSkills={() => setShowPiSkills(true)}
             />
           ) : (
             <p className="kv-row-desc py-8 text-center">
@@ -297,12 +355,16 @@ function AgentDetail({
   config,
   onPatch,
   reloadAgents,
+  onOpenPiExtensions,
+  onOpenPiSkills,
 }: {
   agent: DetectedExternalAgent
   lang: Lang
   config: ExternalCliAgentConfig
   onPatch: (patch: Partial<ExternalCliAgentConfig>) => void
   reloadAgents: (force?: boolean) => Promise<void>
+  onOpenPiExtensions: () => void
+  onOpenPiSkills: () => void
 }) {
   const t = i18n[lang]
   const disabled = config.disabled ?? agent.disabled ?? false
@@ -312,7 +374,9 @@ function AgentDetail({
 
   const [probedModels, setProbedModels] = useState<DetectedExternalAgent['models']>([])
   const [showPlugins, setShowPlugins] = useState(false)
-  useEffect(() => setShowPlugins(false), [agent.id])
+  useEffect(() => {
+    setShowPlugins(false)
+  }, [agent.id])
   useEffect(() => {
     if (!agent.available) {
       setProbedModels([])
@@ -463,6 +527,48 @@ function AgentDetail({
           </span>
           <span className="kv-subpage-entry-go">
             {lang === 'zh' ? '配置' : 'Edit'}
+            <ChevronRight size={14} aria-hidden="true" />
+          </span>
+        </button>
+      )}
+
+      {agent.id === 'pi' && agent.available && (
+        <button
+          type="button"
+          onClick={onOpenPiExtensions}
+          className="kv-cli-card kv-pi-extensions-entry"
+          data-tauri-drag-region="false"
+        >
+          <span className="kv-pi-extensions-entry-icon" aria-hidden="true">
+            <Blocks size={16} />
+          </span>
+          <span className="kv-row-text">
+            <span className="kv-row-label">{t.externalAgentsPiExtensions}</span>
+            <span className="kv-row-desc">{t.externalAgentsPiExtensionsHint}</span>
+          </span>
+          <span className="kv-subpage-entry-go">
+            {lang === 'zh' ? '管理' : 'Manage'}
+            <ChevronRight size={14} aria-hidden="true" />
+          </span>
+        </button>
+      )}
+
+      {agent.id === 'pi' && agent.available && (
+        <button
+          type="button"
+          onClick={onOpenPiSkills}
+          className="kv-cli-card kv-pi-skills-entry"
+          data-tauri-drag-region="false"
+        >
+          <span className="kv-pi-skills-entry-icon" aria-hidden="true">
+            <BookOpen size={16} />
+          </span>
+          <span className="kv-row-text">
+            <span className="kv-row-label">{t.externalAgentsPiSkills}</span>
+            <span className="kv-row-desc">{t.externalAgentsPiSkillsHint}</span>
+          </span>
+          <span className="kv-subpage-entry-go">
+            {lang === 'zh' ? '管理' : 'Manage'}
             <ChevronRight size={14} aria-hidden="true" />
           </span>
         </button>
@@ -670,6 +776,7 @@ function NativeProviderRow({
   lang,
   provider,
   current,
+  coexisting,
   onUseCliConfig,
   onEdit,
   onDelete,
@@ -677,6 +784,7 @@ function NativeProviderRow({
   lang: Lang
   provider: NativeProviderSummary
   current: string
+  coexisting: boolean
   onUseCliConfig: () => void
   onEdit?: () => void
   onDelete?: () => void
@@ -700,7 +808,24 @@ function NativeProviderRow({
         <p className="kv-row-desc truncate">{subtitle}</p>
       </div>
       <div className="kv-row-control">
-        {inUse ? (
+        {coexisting ? (
+          <>
+            <span className={`kv-tag ${inUse ? 'ok' : ''}`}>
+              {inUse
+                ? t.externalAgentsProviderDefault
+                : provider.isDefault
+                  ? t.externalAgentsNativeProviderDefault
+                  : official
+                    ? t.externalAgentsDshOfficialProvider
+                    : t.externalAgentsNativeProviderBadge}
+            </span>
+            {current && provider.isDefault && (
+              <Button size="sm" onClick={onUseCliConfig}>
+                {t.externalAgentsProviderSetDefault}
+              </Button>
+            )}
+          </>
+        ) : inUse ? (
           <span className="kv-tag ok">{t.externalAgentsProviderInUse}</span>
         ) : current && provider.isDefault ? (
           <Button size="sm" onClick={onUseCliConfig}>
@@ -799,25 +924,39 @@ function ProviderSection({
   const hideGenericLocal = agentId === 'dsh'
 
   const save = (provider: ExternalCliProvider) => {
-    const exists = providers.some((p) => p.id === provider.id)
-    const adoptInUse = agentId === 'dsh'
-      && !current
-      && !exists
-      && Boolean(provider.nativeProviderId)
-      && nativeProviders.some((native) => native.id === provider.nativeProviderId && native.isDefault)
+    const existing = providers.find((item) => item.id === provider.id)
+    const saved = {
+      ...provider,
+      disabled: provider.disabled ?? existing?.disabled ?? false,
+    }
+    const adoptInUse =
+      agentId === 'dsh' &&
+      !current &&
+      !existing &&
+      !saved.disabled &&
+      Boolean(saved.nativeProviderId) &&
+      nativeProviders.some((native) => native.id === saved.nativeProviderId && native.isDefault)
     onPatch({
-      providers: exists
-        ? providers.map((p) => (p.id === provider.id ? provider : p))
-        : [...providers, provider],
-      ...(adoptInUse ? { currentProvider: provider.id } : {}),
+      providers: existing
+        ? providers.map((item) => (item.id === saved.id ? saved : item))
+        : [...providers, saved],
+      ...(adoptInUse ? { currentProvider: saved.id } : {}),
     })
     setEditing(undefined)
   }
 
+  const setProviderEnabled = (provider: ExternalCliProvider, enabled: boolean) => {
+    onPatch({
+      providers: providers.map((item) =>
+        item.id === provider.id ? { ...item, disabled: !enabled } : item,
+      ),
+      ...(!enabled && current === provider.id ? { currentProvider: '' } : {}),
+    })
+  }
   const remove = (provider: ExternalCliProvider) => {
     const deletesNativeFile = Boolean(
-      provider.nativeProviderId
-      && nativeProviders.some((native) => native.id === provider.nativeProviderId),
+      provider.nativeProviderId &&
+      nativeProviders.some((native) => native.id === provider.nativeProviderId),
     )
     const confirmText = deletesNativeFile
       ? t.externalAgentsDshNativeDeleteConfirm
@@ -834,7 +973,8 @@ function ProviderSection({
       provider.name,
     )
     if (agentId === 'dsh' && provider.nativeProviderId) {
-      void chatApi.dshNativeProviderDelete(provider.nativeProviderId)
+      void chatApi
+        .dshNativeProviderDelete(provider.nativeProviderId)
         .then(() => reloadAgents(true))
         .catch(() => {})
     }
@@ -850,7 +990,8 @@ function ProviderSection({
   }
 
   const removeNative = async (native: NativeProviderSummary) => {
-    if (!window.confirm(t.externalAgentsDshNativeDeleteConfirm.replace('{name}', native.name))) return
+    if (!window.confirm(t.externalAgentsDshNativeDeleteConfirm.replace('{name}', native.name)))
+      return
     try {
       await chatApi.dshNativeProviderDelete(native.id)
     } catch (err) {
@@ -877,6 +1018,7 @@ function ProviderSection({
     // 保留 cc-switch 的原 id：同一条再导一次是更新，不会堆出重复项。
     const merged = [...providers]
     for (const item of items) {
+      const idx = merged.findIndex((provider) => provider.id === item.id)
       const next: ExternalCliProvider = {
         id: item.id,
         name: item.name,
@@ -884,8 +1026,8 @@ function ProviderSection({
         env: item.env,
         configToml: item.configToml,
         authJson: item.authJson,
+        disabled: idx >= 0 ? merged[idx].disabled : false,
       }
-      const idx = merged.findIndex((p) => p.id === item.id)
       if (idx >= 0) merged[idx] = next
       else merged.push(next)
     }
@@ -893,8 +1035,10 @@ function ProviderSection({
     setImporting(false)
   }
 
-  // opencode / pi / grok / kimi 写原生配置；dsh 写 Kivio 私有 profile；claude / codex 用 Kivio 私有文件。
-  const nativeOnDisk = agentId === 'opencode' || agentId === 'pi' || agentId === 'grok' || agentId === 'kimi'
+  // Pi / OpenCode 的全部供应商写进原生配置，dsh 的全部供应商挂进 Kivio profile；currentProvider 只选默认项。
+  const providersCoexist = agentId === 'pi' || agentId === 'opencode' || agentId === 'dsh'
+  const nativeOnDisk =
+    agentId === 'opencode' || agentId === 'pi' || agentId === 'grok' || agentId === 'kimi'
   const envOnly = agentId !== 'claude' && agentId !== 'codex' && agentId !== 'dsh' && !nativeOnDisk
 
   return (
@@ -928,31 +1072,43 @@ function ProviderSection({
                 </div>
                 <div className="kv-row-control">
                   {!current ? (
-                    <span className="kv-tag ok">{t.externalAgentsProviderInUse}</span>
+                    <span className="kv-tag ok">
+                      {providersCoexist
+                        ? t.externalAgentsProviderDefault
+                        : t.externalAgentsProviderInUse}
+                    </span>
                   ) : (
                     <Button size="sm" onClick={() => onPatch({ currentProvider: '' })}>
-                      {t.externalAgentsProviderActivate}
+                      {providersCoexist
+                        ? t.externalAgentsProviderSetDefault
+                        : t.externalAgentsProviderActivate}
                     </Button>
                   )}
                   <span className="kv-cli-provider-spacer" />
                 </div>
               </div>
             )}
-            {hideGenericLocal && listedNatives.map((provider) => (
-              <NativeProviderRow
-                key={`native-${provider.id}`}
-                lang={lang}
-                provider={provider}
-                current={current}
-                onUseCliConfig={() => onPatch({ currentProvider: '' })}
-                onEdit={provider.id === DSH_OFFICIAL_PROVIDER_ID
-                  ? undefined
-                  : () => void editNative(provider)}
-                onDelete={provider.id === DSH_OFFICIAL_PROVIDER_ID
-                  ? undefined
-                  : () => void removeNative(provider)}
-              />
-            ))}
+            {hideGenericLocal &&
+              listedNatives.map((provider) => (
+                <NativeProviderRow
+                  key={`native-${provider.id}`}
+                  lang={lang}
+                  provider={provider}
+                  current={current}
+                  coexisting={providersCoexist}
+                  onUseCliConfig={() => onPatch({ currentProvider: '' })}
+                  onEdit={
+                    provider.id === DSH_OFFICIAL_PROVIDER_ID
+                      ? undefined
+                      : () => void editNative(provider)
+                  }
+                  onDelete={
+                    provider.id === DSH_OFFICIAL_PROVIDER_ID
+                      ? undefined
+                      : () => void removeNative(provider)
+                  }
+                />
+              ))}
             {providers.map((provider) => (
               <div className="kv-row kv-cli-provider" key={provider.id}>
                 <span className="kv-cli-monogram">{monogram(provider.name)}</span>
@@ -961,40 +1117,74 @@ function ProviderSection({
                   <p className="kv-row-desc truncate">{providerSubtitle(provider)}</p>
                 </div>
                 <div className="kv-row-control">
-                  {current === provider.id ? (
+                  {providersCoexist ? (
+                    <>
+                      <span
+                        className={`kv-tag ${!provider.disabled && current === provider.id ? 'ok' : ''}`}
+                      >
+                        {provider.disabled
+                          ? t.externalAgentsDisabledGroup
+                          : current === provider.id
+                            ? t.externalAgentsProviderDefault
+                            : t.externalAgentsProviderCoexisting}
+                      </span>
+                      {!provider.disabled && current !== provider.id && (
+                        <Button size="sm" onClick={() => onPatch({ currentProvider: provider.id })}>
+                          {t.externalAgentsProviderSetDefault}
+                        </Button>
+                      )}
+                      <Toggle
+                        checked={!provider.disabled}
+                        onChange={(enabled) => setProviderEnabled(provider, enabled)}
+                        ariaLabel={`${provider.name} ${t.externalAgentsEnable}`}
+                      />
+                    </>
+                  ) : current === provider.id ? (
                     <span className="kv-tag ok">{t.externalAgentsProviderInUse}</span>
                   ) : (
                     <Button size="sm" onClick={() => onPatch({ currentProvider: provider.id })}>
                       {t.externalAgentsProviderActivate}
                     </Button>
                   )}
-                  <IconButton size="sm" label={t.externalAgentsProviderEdit} onClick={() => setEditing(provider)}>
+                  <IconButton
+                    size="sm"
+                    label={t.externalAgentsProviderEdit}
+                    onClick={() => setEditing(provider)}
+                  >
                     <Pencil size={13} />
                   </IconButton>
-                  <IconButton size="sm" label={t.externalAgentsRemove} onClick={() => remove(provider)}>
+                  <IconButton
+                    size="sm"
+                    label={t.externalAgentsRemove}
+                    onClick={() => remove(provider)}
+                  >
                     <Trash2 size={13} />
                   </IconButton>
                 </div>
               </div>
             ))}
-            {!hideGenericLocal && listedNatives.map((provider) => (
-              <NativeProviderRow
-                key={`native-${provider.id}`}
-                lang={lang}
-                provider={provider}
-                current={current}
-                onUseCliConfig={() => onPatch({ currentProvider: '' })}
-              />
-            ))}
+            {!hideGenericLocal &&
+              listedNatives.map((provider) => (
+                <NativeProviderRow
+                  key={`native-${provider.id}`}
+                  lang={lang}
+                  provider={provider}
+                  current={current}
+                  coexisting={providersCoexist}
+                  onUseCliConfig={() => onPatch({ currentProvider: '' })}
+                />
+              ))}
           </>
         )}
       </div>
       <p className="kv-row-desc mt-2">
-        {nativeOnDisk
-          ? t.externalAgentsNativeScope
-          : envOnly
-            ? t.externalAgentsProviderEnvOnly
-            : t.externalAgentsProviderScope}
+        {providersCoexist
+          ? t.externalAgentsProviderCoexistScope
+          : nativeOnDisk
+            ? t.externalAgentsNativeScope
+            : envOnly
+              ? t.externalAgentsProviderEnvOnly
+              : t.externalAgentsProviderScope}
       </p>
 
       {editing !== undefined && (

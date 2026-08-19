@@ -4,9 +4,8 @@
 //   - 'token'：用户粘贴 PAT/API key → headers.Authorization = 'Bearer <token>'（Phase A 已支持）。
 //   - 'oauth'：OAuth 2.1 + PKCE 授权（Phase B 实现；Phase A 卡片连接按钮禁用）。
 //   - 'vault'：本地笔记库路径（Obsidian）；写入 settings，注入系统提示，不走 MCP。
-//   - 'email'：IMAP/SMTP 邮箱（Himalaya CLI）；写入 settings + config.toml，配合 himalaya skill。
 
-export type ConnectorAuthKind = 'oauth' | 'token' | 'vault' | 'email'
+export type ConnectorAuthKind = 'oauth' | 'token' | 'vault'
 
 export type ConnectorCatalogEntry = {
   id: string
@@ -57,31 +56,6 @@ export const CONNECTOR_CATALOG: ConnectorCatalogEntry[] = [
     website: 'https://obsidian.md',
     support: 'https://help.obsidian.md',
     developer: 'Obsidian',
-  },
-  {
-    id: 'email',
-    name: 'Email',
-    description: {
-      zh: '通过 Himalaya CLI 连接 IMAP/SMTP 邮箱，agent 激活 himalaya skill 后用 bash 读写邮件。',
-      en: 'Connect IMAP/SMTP mail via the Himalaya CLI; the agent uses the himalaya skill and bash to read and send mail.',
-    },
-    iconKey: 'email',
-    authKind: 'email',
-    overview: {
-      zh: [
-        '填写邮箱、密码与 IMAP/SMTP 服务器（支持 Gmail / Outlook 等预设）。',
-        '需先在连接器中手动安装 Himalaya，再添加邮箱；保存后写入设置并同步 ~/.config/himalaya/config.toml。',
-        'Agent 激活 himalaya skill 后通过 bash 读写邮件。',
-      ],
-      en: [
-        'Enter email, password, and IMAP/SMTP servers (Gmail / Outlook presets supported).',
-        'Install Himalaya manually in the connector first, then add mailboxes; saved to settings and synced to ~/.config/himalaya/config.toml.',
-        'The agent uses the himalaya skill + bash to read and send mail.',
-      ],
-    },
-    website: 'https://github.com/pimalaya/himalaya',
-    support: 'https://pimalaya.org/himalaya/',
-    developer: 'Pimalaya',
   },
   {
     id: 'notion',
@@ -250,3 +224,29 @@ export const CONNECTOR_CATALOG: ConnectorCatalogEntry[] = [
     developer: 'Composio',
   },
 ]
+
+/** 插件 MCP（`plugin-<id>` / `connectorId: plugin:<id>`）。
+ *  连接器页排除；MCP 已安装列表与普通服务器一起展示，带「插件」标记，只读。 */
+export function isPluginManagedServer(server: {
+  id: string
+  connectorId?: string | null
+}): boolean {
+  return server.id.startsWith('plugin-') || (server.connectorId?.startsWith('plugin:') ?? false)
+}
+
+/** MCP 页保存时钉住插件条目：开关 / 删除 / 改命令只走「扩展 → 插件」。 */
+export function preservePluginManagedServers<T extends { id: string; connectorId?: string | null }>(
+  previous: T[],
+  next: T[],
+): T[] {
+  const locked = new Map(
+    previous.filter(isPluginManagedServer).map((server) => [server.id, server] as const),
+  )
+  if (locked.size === 0) return next
+  const out = next.map((server) => locked.get(server.id) ?? server)
+  const present = new Set(out.map((server) => server.id))
+  for (const [id, server] of locked) {
+    if (!present.has(id)) out.push(server)
+  }
+  return out
+}

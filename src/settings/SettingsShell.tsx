@@ -84,7 +84,7 @@ export interface SettingsShellProps {
   initialTab?: SettingsTab
   /** embedded 单页模式：隐藏左侧设置导航，只显示 initialTab 对应页（如从扩展点「知识库」进入） */
   hideNav?: boolean
-  /** 插件页「让 AI 安装」：由 Chat 宿主开新对话并发送 install brief */
+  /** 插件页「让 AI 代装」：由 Chat 宿主开新对话并发送 install brief */
   onRequestPluginAiInstall?: (pluginId: string) => void | Promise<void>
 }
 
@@ -271,7 +271,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   // 更新检查状态：'idle' / 'checking' / 'up-to-date' / 'available' / 'check-failed'
   const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'up-to-date' | 'available' | 'check-failed'>('idle')
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  // 下载/安装两段式状态机:idle → downloading(进度条) → downloaded(显示安装按钮) → 用户点击 → 应用退出
+  // 下载后立刻静默安装:idle → downloading → (downloaded 一闪) → installer 拉起并退出
+  // 安装失败才停在 downloaded / failed，让用户点「安装并重启」或重试。
   // failed 时显示错误 + 重试 + 跳 GitHub 兜底
   const [downloadState, setDownloadState] = useState<'idle' | 'downloading' | 'downloaded' | 'failed'>('idle')
   const [downloadPercent, setDownloadPercent] = useState(0)
@@ -563,7 +564,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     }
   }, [updateInfo])
 
-  /** 下载新版安装包到 temp dir,期间监听 update-download-progress 事件刷新进度条 */
+  /** 下载安装包后立刻静默安装并退出。Windows 走 NSIS `/S /UPDATE /R`，装完会自己拉起。 */
   const handleDownloadAndInstall = useCallback(async () => {
     if (!updateInfo?.version) return
     setDownloadState('downloading')
@@ -577,8 +578,9 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       const path = await api.downloadUpdate(updateInfo.version)
       setDownloadedPath(path)
       setDownloadState('downloaded')
+      await api.installUpdate(path)
     } catch (err) {
-      console.error('Download update failed:', err)
+      console.error('Download or install update failed:', err)
       setDownloadError(typeof err === 'string' ? err : (err instanceof Error ? err.message : String(err)))
       setDownloadState('failed')
     } finally {
@@ -586,7 +588,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     }
   }, [updateInfo])
 
-  /** 启动 installer 并退出当前应用。Rust 端会在 macOS 上 cp 新 .app + open,在 Windows spawn NSIS exe */
+  /** 已下载的安装包再装一次（下载成功但拉起 installer 失败时用）。 */
   const handleInstall = useCallback(async () => {
     if (!downloadedPath) return
     try {
@@ -1765,8 +1767,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     plugins: {
       title: t.tabPlugins,
       subtitle: lang === 'zh'
-        ? '检测本机能力插件（如 officecli）；启用后自动注入 Skill / MCP。'
-        : 'Detect local capability plugins (e.g. officecli); enable to inject Skills / MCP.',
+        ? '检测本机能力插件（OfficeCLI / Cua Driver / ego lite）；启用后自动注入 Skill / MCP。'
+        : 'Detect local capability plugins (OfficeCLI / Cua Driver / ego lite); enable to inject Skills / MCP.',
     },
     webSearch: {
       title: t.tabWebSearch,
@@ -2103,8 +2105,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 updateChatTools={updateChatTools}
                 obsidianVaultPath={settings?.obsidianVaultPath ?? ''}
                 onObsidianVaultPathChange={(path) => updateSettings({ obsidianVaultPath: path })}
-                emailAccounts={settings?.emailAccounts ?? []}
-                onEmailAccountsChange={(accounts) => updateSettings({ emailAccounts: accounts })}
                 lang={lang}
                 testServer={async (server) => {
                   try {
@@ -2124,7 +2124,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
             {/* ===== 插件标签页（原扩展 → 插件） ===== */}
             {activeTab === 'plugins' && (
               <PluginCenter
-                variant="settings"
                 onRequestAiInstall={onRequestPluginAiInstall}
               />
             )}
