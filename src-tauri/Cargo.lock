@@ -3242,6 +3242,7 @@ dependencies = [
  "objc_exception",
  "ort",
  "pdf-extract",
+ "percent-encoding",
  "portable-pty",
  "rand 0.8.5",
  "regex",
@@ -3275,6 +3276,7 @@ dependencies = [
  "window-vibrancy 0.8.0",
  "windows 0.61.3",
  "xcap",
+ "zbus",
  "zip",
 ]
 

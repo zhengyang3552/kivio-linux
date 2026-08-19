@@ -274,31 +274,48 @@ export function PermissionsGroup({
   permissionsLoading,
   onOpenPermissionSettings,
   onRefreshPermissions,
+  onRequestScreenCapture,
+  requestingScreenCapture,
 }: {
   t: I18n
   permissionStatus: PermissionStatus
   permissionsLoading: boolean
   onOpenPermissionSettings: (target: 'accessibility' | 'screen-recording') => void
   onRefreshPermissions: () => void
+  /** Linux Wayland：点击「授权屏幕捕获」 */
+  onRequestScreenCapture?: () => void
+  requestingScreenCapture?: boolean
 }) {
+  const isLinux = permissionStatus.platform === 'linux'
   return (
     <SettingsGroup title={t.permissions}>
+      {!isLinux && (
+        <PermissionItem
+          label={t.accessibilityPermission}
+          granted={permissionStatus.accessibility}
+          grantedText={t.permissionGranted}
+          missingText={t.permissionMissing}
+          actionLabel={t.openSystemSettings}
+          onOpen={() => onOpenPermissionSettings('accessibility')}
+        />
+      )}
       <PermissionItem
-        label={t.accessibilityPermission}
-        granted={permissionStatus.accessibility}
-        grantedText={t.permissionGranted}
-        missingText={t.permissionMissing}
-        actionLabel={t.openSystemSettings}
-        onOpen={() => onOpenPermissionSettings('accessibility')}
-      />
-      <PermissionItem
-        label={t.screenRecordingPermission}
+        label={isLinux ? t.screenCapturePermission : t.screenRecordingPermission}
         granted={permissionStatus.screenRecording}
         grantedText={t.permissionGranted}
         missingText={t.permissionMissing}
-        actionLabel={t.openSystemSettings}
-        onOpen={() => onOpenPermissionSettings('screen-recording')}
+        actionLabel={isLinux
+          ? (requestingScreenCapture ? t.grantingScreenCapture : t.grantScreenCapture)
+          : t.openSystemSettings}
+        onOpen={isLinux
+          ? () => { if (!requestingScreenCapture) onRequestScreenCapture?.() }
+          : () => onOpenPermissionSettings('screen-recording')}
       />
+      {isLinux && (
+        <div className="px-4 pb-2 text-[11px] leading-relaxed text-gray-400 dark:text-gray-500">
+          {t.screenCaptureHint}
+        </div>
+      )}
       <div className="flex justify-end py-2">
         <Button
           size="sm"

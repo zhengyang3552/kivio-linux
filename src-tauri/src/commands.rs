@@ -1020,13 +1020,50 @@ pub(crate) fn get_permission_status() -> serde_json::Value {
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        // Wayland 下截图走门户，需要单独授权；X11 会话用门户截图通常无需权限，默认按已授权处理
+        let wayland = crate::linux_portal::is_wayland_session();
+        let screen_capture = if wayland {
+            crate::linux_portal::screenshot_permission_granted()
+        } else {
+            true
+        };
+        return serde_json::json!({
+          "platform": "linux",
+          "wayland": wayland,
+          "accessibility": true,
+          "screenRecording": screen_capture,
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         serde_json::json!({
           "platform": "other",
           "accessibility": true,
           "screenRecording": true,
         })
+    }
+}
+
+/// Linux Wayland：请求屏幕捕获权限（触发门户授权弹窗，必要时回退为直接写入权限存储）。
+/// async + spawn_blocking：内部同步等待门户线程，最长要等用户操作系统授权弹窗，不能占用主线程。
+/// X11 / 其他平台无需授权，直接返回成功。
+#[tauri::command]
+pub(crate) async fn request_linux_screen_capture_permission() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let result = tauri::async_runtime::spawn_blocking(|| {
+            crate::linux_portal::request_screenshot_permission()
+        })
+        .await
+        .map_err(|e| format!("permission task join failed: {e}"))?;
+        result.map(|_| serde_json::json!({ "success": true }))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(serde_json::json!({ "success": true }))
     }
 }
 

@@ -126,6 +126,12 @@ pub(crate) fn active_overlay_window(app: &AppHandle) -> Option<WebviewWindow> {
 }
 
 fn register_lens_escape_shortcut(app: &AppHandle) {
+    // Wayland 下 lens overlay 窗口会获得键盘焦点，webview 自带的 Esc 处理可用；
+    // 且门户无法合理捕获裸 Esc（会拦截系统级按键），故不注册全局守卫。
+    #[cfg(target_os = "linux")]
+    if crate::linux_portal::is_wayland_session() {
+        return;
+    }
     let shortcuts = app.global_shortcut();
     if shortcuts.is_registered(LENS_ESCAPE_SHORTCUT) {
         return;
@@ -168,7 +174,7 @@ pub(crate) fn lens_set_escape_guard(app: AppHandle, active: bool) {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn insert_temp_explain_image(app: &AppHandle, path: PathBuf) -> String {
     let image_id = Uuid::new_v4().to_string();
     let state = app.state::<AppState>();
@@ -743,12 +749,30 @@ pub(crate) async fn lens_capture_region(
             // 冻结帧缺失/过期（会话内二次截图、开屏抓帧失败）→ 现场截屏兜底。
             // Windows xcap 不能像 macOS SCK 那样按 PID 排除自身，必须先藏浮窗
             // （等 DWM 合成一帧生效）再截，否则会把 lens 遮罩/对话框截进图里。
-            #[cfg(target_os = "windows")]
-            let overlay = active_overlay_window(&app);
-            #[cfg(target_os = "windows")]
+            // Wayland 门户截图同样是整屏抓取，需要先隐藏 overlay。
+            let needs_hide: bool = {
+                #[cfg(target_os = "windows")]
+                {
+                    true
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    crate::linux_portal::is_wayland_session()
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                {
+                    false
+                }
+            };
+            let overlay = if needs_hide {
+                active_overlay_window(&app)
+            } else {
+                None
+            };
             if let Some(w) = overlay.as_ref() {
                 let _ = w.hide();
-                std::thread::sleep(std::time::Duration::from_millis(60));
+                let hide_wait_ms: u64 = if cfg!(target_os = "windows") { 60 } else { 120 };
+                std::thread::sleep(std::time::Duration::from_millis(hide_wait_ms));
             }
             let live = capture_region_image(
                 absolute_x,
@@ -760,7 +784,6 @@ pub(crate) async fn lens_capture_region(
                 scale_factor,
                 exclude_self_pid,
             );
-            #[cfg(target_os = "windows")]
             if let Some(w) = overlay.as_ref() {
                 let _ = w.show();
                 let _ = w.set_focus();
@@ -2292,8 +2315,10 @@ pub(crate) fn lens_take_reset_payload(state: State<'_, AppState>) -> Option<Stri
 /// 冻结帧：进入选择态前抓取当前显示器整帧，之后的区域截图从该帧裁剪（双端常开，无开关）。
 /// - Windows：规避浏览器视频在透明置顶 WebView2 下变黑。
 /// - macOS：SCK 捕获时排除自身 PID（webview 此刻虽未显示，防御复用窗口的边缘态）。
+/// - Linux Wayland：门户截图无法排除自身窗口，必须在 overlay 显示前抓帧，
+///   否则会把 lens 自己截进图里。
 /// 捕获失败静默降级：返回 None，前端照常走实时透明覆盖 + 现场截图路径。
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn prepare_freeze_frame(app: &AppHandle, frame: Option<LensFrame>) -> Option<String> {
     let frame = frame?;
     let width = frame.width.round().max(1.0) as u32;
@@ -2336,7 +2361,7 @@ fn prepare_freeze_frame(app: &AppHandle, frame: Option<LensFrame>) -> Option<Str
     Some(image_id)
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn prepare_freeze_frame(_app: &AppHandle, _frame: Option<LensFrame>) -> Option<String> {
     None
 }
@@ -2734,8 +2759,74 @@ fn capture_region_image(
     )
 }
 
+/// Linux 平台：区域截图。
+/// Wayland / X11 统一走 xdg-desktop-portal 的 Screenshot 接口：先整屏截图，
+/// 再按绝对坐标裁剪。不直接用 xcap：xcap 在 Linux 会引入 pipewire / xcb /
+/// wayland 等 C 系统库构建依赖，会推高 CI 门槛；而门户路径纯 D-Bus，
+/// GNOME/KDE 均实现，且能正确遵守 Wayland 的安全策略。
+#[cfg(target_os = "linux")]
+fn capture_region_image(
+    absolute_x: i32,
+    absolute_y: i32,
+    _x: i32,
+    _y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    _exclude_self_pid: Option<i32>,
+) -> Result<PathBuf, String> {
+    capture_region_image_portal(absolute_x, absolute_y, width, height, scale_factor)
+}
+
+#[cfg(target_os = "linux")]
+fn capture_region_image_portal(
+    absolute_x: i32,
+    absolute_y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+) -> Result<PathBuf, String> {
+    let screen_png = crate::linux_portal::capture_full_screen()?;
+    let opened = image::open(&screen_png);
+    // 门户把整屏截图存在用户图片目录（如 ~/图片/Screenshot-*.png），用完即删
+    let _ = std::fs::remove_file(&screen_png);
+    let img = opened.map_err(|e| format!("failed to read portal screenshot: {e}"))?;
+
+    let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let img_w = img.width() as i64;
+    let img_h = img.height() as i64;
+    // 门户整屏图为物理像素，绝对坐标是逻辑像素，按 webview 的 scaleFactor 换算。
+    // 限制：多显示器且主屏不在原点时，门户图像左上角对应的全局坐标未知，
+    // 此处按非负裁剪（单显示器 / 主屏在原点的常见布局下正确）。
+    let mut rx = (f64::from(absolute_x) * scale).round() as i64;
+    let mut ry = (f64::from(absolute_y) * scale).round() as i64;
+    if rx < 0 {
+        rx = 0;
+    }
+    if ry < 0 {
+        ry = 0;
+    }
+    if rx >= img_w || ry >= img_h {
+        return Err("capture region is outside the portal screenshot".to_string());
+    }
+    let rw = ((width as f64) * scale).round().max(1.0) as i64;
+    let rh = ((height as f64) * scale).round().max(1.0) as i64;
+    let rw = rw.min(img_w - rx).max(1) as u32;
+    let rh = rh.min(img_h - ry).max(1) as u32;
+    let cropped = image::imageops::crop_imm(&img, rx as u32, ry as u32, rw, rh).to_image();
+    let temp_path = std::env::temp_dir().join(format!("screenshot-{}.png", Uuid::new_v4()));
+    cropped
+        .save(&temp_path)
+        .map_err(|e| format!("failed to save cropped capture: {e}"))?;
+    Ok(temp_path)
+}
+
 /// 其他平台：占位
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn capture_region_image(
     _absolute_x: i32,
     _absolute_y: i32,

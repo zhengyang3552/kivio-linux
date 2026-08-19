@@ -256,6 +256,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const [systemFonts, setSystemFonts] = useState<string[]>([])
   const [permissionStatus, setPermissionStatus] = useState<PermissionStatus | null>(null)
   const [permissionsLoading, setPermissionsLoading] = useState(false)
+  const [requestingScreenCapture, setRequestingScreenCapture] = useState(false)
   const [fetchingProviderId, setFetchingProviderId] = useState<string | null>(null)
   const [modelPickerProviderId, setModelPickerProviderId] = useState<string | null>(null)
   const [drawerModel, setDrawerModel] = useState<{ providerId: string; model: string } | null>(null)
@@ -484,6 +485,24 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       setPermissionsLoading(false)
     }
   }, [])
+
+  /**
+   * Linux Wayland：请求屏幕捕获权限（触发门户授权弹窗，必要时回退为直接写入权限存储）。
+   * 请保持 Kivio 窗口聚焦，否则系统弹窗可能无法弹出（后端会回退到直接写入）。
+   */
+  const handleRequestScreenCapture = useCallback(async () => {
+    if (requestingScreenCapture) return
+    setRequestingScreenCapture(true)
+    try {
+      await api.requestLinuxScreenCapturePermission()
+    } catch (err) {
+      console.error('Failed to request screen capture permission:', err)
+      window.alert(err instanceof Error ? err.message : String(err))
+    } finally {
+      setRequestingScreenCapture(false)
+      refreshPermissions()
+    }
+  }, [requestingScreenCapture, refreshPermissions])
 
   useEffect(() => {
     refreshPermissions()
@@ -1948,13 +1967,15 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                   </FieldBlock>
                 </SettingsGroup>
 
-                {permissionStatus?.platform === 'macos' && (
+                {(permissionStatus?.platform === 'macos' || permissionStatus?.platform === 'linux') && (
                   <PermissionsGroup
                     t={t}
                     permissionStatus={permissionStatus}
                     permissionsLoading={permissionsLoading}
                     onOpenPermissionSettings={handleOpenPermissionSettings}
                     onRefreshPermissions={refreshPermissions}
+                    onRequestScreenCapture={handleRequestScreenCapture}
+                    requestingScreenCapture={requestingScreenCapture}
                   />
                 )}
               </>

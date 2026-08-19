@@ -13,6 +13,8 @@ pub mod fonts;
 pub mod inpainting;
 pub mod lens;
 pub mod lens_commands;
+#[cfg(target_os = "linux")]
+pub mod linux_portal;
 #[cfg(target_os = "macos")]
 pub mod macos_ocr;
 pub mod mcp;
@@ -493,6 +495,7 @@ pub fn run() {
             commands::test_provider_connection,
             commands::test_web_search,
             commands::get_permission_status,
+            commands::request_linux_screen_capture_permission,
             commands::open_permission_settings,
             lens_commands::lens_list_windows,
             lens_commands::lens_capture_window,

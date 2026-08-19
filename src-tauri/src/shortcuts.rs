@@ -542,6 +542,12 @@ fn classify_hotkey_error(scope: HotkeyScope, hotkey: String, raw: String) -> Hot
 /// JSON 序列化后由前端按界面语言渲染。
 pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
     let settings = app.state::<AppState>().settings_read().clone();
+    // Wayland 会话下 tauri-plugin-global-shortcut 依赖的 X11 抓键机制不生效，
+    // 改走 xdg-desktop-portal 的 GlobalShortcuts 后端。
+    #[cfg(target_os = "linux")]
+    if crate::linux_portal::is_wayland_session() {
+        return register_hotkeys_portal(app, &settings);
+    }
     let shortcut_manager = app.global_shortcut();
     shortcut_manager
         .unregister_all()
@@ -823,6 +829,258 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
         // 序列化失败几乎不可能(字段都是 String/枚举),fallback 给一个最小可读消息
         Err(serde_json::to_string(&errors)
             .unwrap_or_else(|_| "Hotkey registration failed".to_string()))
+    }
+}
+
+/// Wayland 会话：通过 xdg-desktop-portal GlobalShortcuts 注册全局热键。
+/// 启用条件与重复检查逻辑和上面的插件版一致，触发行为见 [`dispatch_linux_hotkey`]。
+/// 注意：首次注册时桌面环境（如 GNOME）会弹出快捷键确认窗口，用户确认后持久化，
+/// 之后每次启动静默重绑。
+#[cfg(target_os = "linux")]
+fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    use crate::linux_portal::{LinuxHotkeyAction, PortalShortcutEntry};
+
+    let mut errors: Vec<HotkeyError> = Vec::new();
+    let mut registered = HashSet::new();
+    let mut entries: Vec<PortalShortcutEntry> = Vec::new();
+    let mut entry_scopes: Vec<HotkeyScope> = Vec::new();
+    let mut entry_hotkeys: Vec<String> = Vec::new();
+
+    let mut add_entry = |scope: HotkeyScope,
+                         hotkey: &str,
+                         id: &'static str,
+                         description: &'static str,
+                         action: LinuxHotkeyAction| {
+        let hotkey_key = hotkey.to_lowercase();
+        if !registered.insert(hotkey_key) {
+            errors.push(HotkeyError {
+                kind: HotkeyErrorKind::Duplicate,
+                scope,
+                hotkey: hotkey.to_string(),
+                raw: None,
+            });
+            return;
+        }
+        match crate::linux_portal::tauri_hotkey_to_portal_trigger(hotkey) {
+            Some(trigger) => {
+                entries.push(PortalShortcutEntry {
+                    id,
+                    trigger,
+                    description,
+                    action,
+                });
+                entry_scopes.push(scope);
+                entry_hotkeys.push(hotkey.to_string());
+            }
+            None => errors.push(HotkeyError {
+                kind: HotkeyErrorKind::Other,
+                scope,
+                hotkey: hotkey.to_string(),
+                raw: Some("无法解析为 Wayland 门户快捷键格式".to_string()),
+            }),
+        }
+    };
+
+    let translator_hotkey = settings.hotkey.trim().to_string();
+    if !translator_hotkey.is_empty() {
+        add_entry(
+            HotkeyScope::Translator,
+            &translator_hotkey,
+            "kivio-translator",
+            "输入翻译",
+            LinuxHotkeyAction::Translator,
+        );
+    }
+
+    let chat_hotkey = settings.chat_hotkey.trim().to_string();
+    if !chat_hotkey.is_empty() {
+        add_entry(
+            HotkeyScope::Chat,
+            &chat_hotkey,
+            "kivio-chat",
+            "聊天窗口",
+            LinuxHotkeyAction::Chat,
+        );
+    }
+
+    let close_chat_hotkey = settings.close_chat_hotkey.trim().to_string();
+    if !close_chat_hotkey.is_empty() {
+        add_entry(
+            HotkeyScope::CloseChat,
+            &close_chat_hotkey,
+            "kivio-close-chat",
+            "关闭聊天",
+            LinuxHotkeyAction::CloseChat,
+        );
+    }
+
+    if settings.screenshot_translation.enabled {
+        let hotkey = settings.screenshot_translation.hotkey.trim().to_string();
+        if !hotkey.is_empty() {
+            add_entry(
+                HotkeyScope::Screenshot,
+                &hotkey,
+                "kivio-screenshot-translate",
+                "截图翻译",
+                LinuxHotkeyAction::ScreenshotTranslate,
+            );
+        }
+
+        let text_hotkey = settings
+            .screenshot_translation
+            .text_hotkey
+            .trim()
+            .to_string();
+        if !text_hotkey.is_empty() {
+            add_entry(
+                HotkeyScope::ScreenshotText,
+                &text_hotkey,
+                "kivio-screenshot-translate-text",
+                "截图翻译选中文本",
+                LinuxHotkeyAction::ScreenshotTranslateText,
+            );
+        }
+
+        if settings.screenshot_translation.replace_enabled {
+            let replace_hotkey = settings
+                .screenshot_translation
+                .replace_hotkey
+                .trim()
+                .to_string();
+            if !replace_hotkey.is_empty() {
+                add_entry(
+                    HotkeyScope::ScreenshotReplace,
+                    &replace_hotkey,
+                    "kivio-screenshot-replace",
+                    "截图替换翻译",
+                    LinuxHotkeyAction::ScreenshotReplace,
+                );
+            }
+        }
+    }
+
+    if settings.screenshot_annotate.enabled {
+        let hotkey = settings.screenshot_annotate.hotkey.trim().to_string();
+        if !hotkey.is_empty() {
+            add_entry(
+                HotkeyScope::ScreenshotAnnotate,
+                &hotkey,
+                "kivio-screenshot-annotate",
+                "截图标注",
+                LinuxHotkeyAction::ScreenshotAnnotate,
+            );
+        }
+    }
+
+    if settings.lens.enabled {
+        let hotkey = settings.lens.hotkey.trim().to_string();
+        if !hotkey.is_empty() {
+            add_entry(
+                HotkeyScope::Lens,
+                &hotkey,
+                "kivio-lens",
+                "Lens 取词",
+                LinuxHotkeyAction::Lens,
+            );
+        }
+    }
+
+    if let Err(err) = crate::linux_portal::register_shortcuts(app.clone(), entries) {
+        // 门户级失败（无 xdg-desktop-portal / D-Bus 不可用等）：所有条目统一报错
+        for (idx, scope) in entry_scopes.iter().enumerate() {
+            errors.push(HotkeyError {
+                kind: HotkeyErrorKind::Other,
+                scope: *scope,
+                hotkey: entry_hotkeys.get(idx).cloned().unwrap_or_default(),
+                raw: Some(err.clone()),
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(serde_json::to_string(&errors)
+            .unwrap_or_else(|_| "Hotkey registration failed".to_string()))
+    }
+}
+
+/// Wayland 门户热键触发分发：行为与插件版 on_shortcut 回调完全对齐。
+/// 从门户监听线程调用，因此涉及 UI 的操作沿用既有的 spawn / 线程安全入口。
+#[cfg(target_os = "linux")]
+pub(crate) fn dispatch_linux_hotkey(
+    app: &AppHandle,
+    action: crate::linux_portal::LinuxHotkeyAction,
+) {
+    use crate::linux_portal::LinuxHotkeyAction;
+    match action {
+        LinuxHotkeyAction::Translator => toggle_main_window(app),
+        LinuxHotkeyAction::Chat => {
+            if let Err(err) = open_chat_window(app) {
+                eprintln!("Chat hotkey trigger error: {err}");
+            }
+        }
+        LinuxHotkeyAction::CloseChat => close_chat_window(app),
+        LinuxHotkeyAction::ScreenshotTranslate => {
+            if lens_is_active(app) {
+                let _ = request_lens_close(app);
+            } else {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = lens_request_translate(handle) {
+                        eprintln!("Screenshot translation trigger error: {err}");
+                    }
+                });
+            }
+        }
+        LinuxHotkeyAction::ScreenshotTranslateText => {
+            if lens_is_active(app) {
+                let _ = request_lens_close(app);
+            } else {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = lens_request_translate_text(handle) {
+                        eprintln!("Selected text screenshot translation trigger error: {err}");
+                    }
+                });
+            }
+        }
+        LinuxHotkeyAction::ScreenshotReplace => {
+            if lens_is_active(app) {
+                let _ = request_lens_close(app);
+            } else {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = lens_request_replace(handle) {
+                        eprintln!("Replace translation trigger error: {err}");
+                    }
+                });
+            }
+        }
+        LinuxHotkeyAction::ScreenshotAnnotate => {
+            if lens_is_active(app) {
+                let _ = request_lens_close(app);
+            } else {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = lens_request_screenshot(handle) {
+                        eprintln!("Screenshot annotate trigger error: {err}");
+                    }
+                });
+            }
+        }
+        LinuxHotkeyAction::Lens => {
+            if lens_is_active(app) {
+                let _ = request_lens_close(app);
+            } else {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = lens_request(handle) {
+                        eprintln!("Lens trigger error: {err}");
+                    }
+                });
+            }
+        }
     }
 }
 

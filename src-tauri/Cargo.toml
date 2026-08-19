@@ -128,6 +128,14 @@ screencapturekit = { version = "1.5", features = ["macos_14_0"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux 平台特有依赖：
+# - zbus：Wayland/X11 全局热键与截图都走 xdg-desktop-portal D-Bus 接口（linux_portal.rs），
+#   纯 Rust 实现，不引入 libpipewire / libxcb 等 C 构建依赖（CI 无需额外系统包）。
+# - percent-encoding：解码门户截图返回的 file:// URI。
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+percent-encoding = "2"
+
 # Windows 平台特有依赖（屏幕截图、选中文本捕获）
 [target.'cfg(target_os = "windows")'.dependencies]
 xcap = "0.8"

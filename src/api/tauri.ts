@@ -1798,11 +1798,13 @@ export type DefaultPromptTemplates = {
   chatRuntimePrompt?: string
 }
 
-// macOS 权限状态
+// 权限状态（macOS 辅助功能/屏幕录制；Linux Wayland 屏幕捕获）
 export type PermissionStatus = {
-  platform: 'macos' | 'other'
+  platform: 'macos' | 'linux' | 'other'
   accessibility: boolean
   screenRecording: boolean
+  /** Linux：是否 Wayland 会话（仅 Wayland 需要屏幕捕获授权） */
+  wayland?: boolean
 }
 
 // 事件取消监听函数类型
@@ -1874,6 +1876,9 @@ export const api = {
   getPermissionStatus: () => invoke<PermissionStatus>('get_permission_status'),
   openPermissionSettings: (kind: 'accessibility' | 'screen-recording') =>
     invoke<void>('open_permission_settings', { kind }),
+  // Linux Wayland：请求屏幕捕获权限（触发门户授权弹窗 / 写入权限存储）
+  requestLinuxScreenCapturePermission: () =>
+    invoke<{ success: boolean }>('request_linux_screen_capture_permission'),
 
   // 应用信息
   getAppVersion: () => getVersion(),
