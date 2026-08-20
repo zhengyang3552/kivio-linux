@@ -22,7 +22,7 @@ use futures::StreamExt;
 use tauri::AppHandle;
 use zbus::fdo::DBusProxy;
 use zbus::message::Type as MsgType;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
 const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
@@ -367,7 +367,7 @@ async fn create_shortcut_session(
         .await
         .map_err(|e| format!("D-Bus session bus unavailable: {e}"))?;
     // 先创建消息流再订阅匹配规则，避免遗漏信号
-    let stream = MessageStream::from(&conn);
+    let mut stream = MessageStream::from(&conn);
     let dbus_proxy = DBusProxy::new(&conn)
         .await
         .map_err(|e| format!("DBus proxy init failed: {e}"))?;
@@ -405,10 +405,22 @@ async fn create_shortcut_session(
         )
         .await
         .map_err(|e| format!("GlobalShortcuts.CreateSession failed: {e}"))?;
-    let session_handle: OwnedObjectPath = reply
+    // 注意：CreateSession 的方法返回值只是 Request 对象路径；真正的会话句柄
+    // session_handle 在该 Request 的 Response 信号 results 里（类型 o）。
+    let request_path: OwnedObjectPath = reply
         .body()
         .deserialize()
         .map_err(|e| format!("CreateSession reply parse failed: {e}"))?;
+    let (resp, results) =
+        await_request_response(&mut stream, request_path.as_str(), Duration::from_secs(30)).await?;
+    if resp != 0 {
+        return Err(format!("CreateSession rejected by portal (resp={resp})"));
+    }
+    let session_handle: OwnedObjectPath = results
+        .get("session_handle")
+        .and_then(|value| <&ObjectPath>::try_from(value).ok())
+        .map(|path| OwnedObjectPath::from(path.to_owned()))
+        .ok_or_else(|| "CreateSession response missing session_handle".to_string())?;
 
     let actions = entries
         .iter()
