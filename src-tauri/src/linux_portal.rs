@@ -258,7 +258,7 @@ fn normalize_trigger(trigger: &str) -> (BTreeSet<&'static str>, String) {
     let mut mods: BTreeSet<&'static str> = BTreeSet::new();
     let mut key = String::new();
     // 返回 true 表示识别为修饰键
-    let mut absorb = |tok: &str, mods: &mut BTreeSet<&'static str>, key: &mut String| {
+    let absorb = |tok: &str, mods: &mut BTreeSet<&'static str>, key: &mut String| {
         let canon = match tok.to_ascii_lowercase().as_str() {
             "ctrl" | "control" | "primary" => "ctrl",
             "shift" => "shift",

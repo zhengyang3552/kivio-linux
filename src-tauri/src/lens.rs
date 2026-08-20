@@ -292,7 +292,7 @@ fn list_windows_x11() -> Result<Vec<WindowInfo>, String> {
         if geom.width < 16 || geom.height < 16 {
             continue;
         }
-        let Ok(tr_cookie) = conn.translate_coordinates(window, 0, 0, root) else {
+        let Ok(tr_cookie) = conn.translate_coordinates(window, root, 0, 0) else {
             continue;
         };
         let Ok(tr) = tr_cookie.reply() else {
