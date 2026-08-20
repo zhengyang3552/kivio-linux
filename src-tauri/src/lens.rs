@@ -228,7 +228,7 @@ fn list_windows_x11() -> Result<Vec<WindowInfo>, String> {
 
     // 读 atom 数组属性（32 位值）
     let atom_list_prop = |window: u32, atom: u32| -> Vec<u32> {
-        conn.get_property(false, window, atom, AtomEnum::ATOM.into(), 0, 64)
+        conn.get_property(false, window, atom, AtomEnum::ATOM, 0, 64)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
             .and_then(|reply| reply.value32().map(|values| values.collect()))
@@ -256,7 +256,7 @@ fn list_windows_x11() -> Result<Vec<WindowInfo>, String> {
     };
 
     let list_reply = conn
-        .get_property(false, root, net_client_list, AtomEnum::ATOM.into(), 0, 4096)
+        .get_property(false, root, net_client_list, AtomEnum::ATOM, 0, 4096)
         .map_err(|e| e.to_string())?
         .reply()
         .map_err(|e| e.to_string())?;
@@ -303,7 +303,7 @@ fn list_windows_x11() -> Result<Vec<WindowInfo>, String> {
 
         // 排除本应用自身浮窗，避免 Lens 遮罩窗口出现在待选列表里
         let class_raw = conn
-            .get_property(false, window, wm_class, AtomEnum::STRING.into(), 0, 512)
+            .get_property(false, window, wm_class, AtomEnum::STRING, 0, 512)
             .ok()
             .and_then(|cookie| cookie.reply().ok())
             .map(|reply| reply.value)
