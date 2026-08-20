@@ -471,6 +471,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
+            commands::set_hotkeys_suspended,
+            commands::list_gnome_system_shortcuts,
             windows::chat_window_apply_mica,
             windows::chat_window_set_opaque,
             windows::chat_traffic_light_center_y,

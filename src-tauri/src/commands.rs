@@ -45,6 +45,29 @@ pub(crate) fn apply_launch_at_startup(app: &AppHandle, enabled: bool) -> Result<
     Ok(())
 }
 
+/// 设置页录制快捷键期间的全局暂停开关：暂停后所有全局热键动作不再派发，
+/// 避免录制时按下已注册组合触发翻译/聊天等窗口。
+#[tauri::command]
+pub(crate) fn set_hotkeys_suspended(state: State<AppState>, suspended: bool) {
+    state
+        .hotkeys_suspended
+        .store(suspended, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// GNOME 系统快捷键列表（Linux）；其他平台返回空。
+/// 供设置页把“系统占用”计入快捷键冲突检查。
+#[tauri::command]
+pub(crate) fn list_gnome_system_shortcuts() -> Vec<crate::linux_portal::SystemShortcutInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_portal::list_system_shortcuts()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
 /// 获取当前应用设置
 #[tauri::command]
 pub(crate) fn get_settings(state: State<AppState>) -> Settings {

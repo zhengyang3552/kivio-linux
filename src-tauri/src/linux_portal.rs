@@ -55,8 +55,8 @@ pub struct PortalShortcutEntry {
     pub id: &'static str,
     /// 门户 trigger 字符串，如 "CTRL+SHIFT+A"。
     pub trigger: String,
-    /// 展示在桌面环境快捷键设置里的描述。
-    pub description: &'static str,
+    /// 展示在桌面环境快捷键设置里的描述（与软件设置页 i18n 文案一致）。
+    pub description: String,
     pub action: LinuxHotkeyAction,
     /// 前端错误展示用的 scope 名（与 shortcuts.rs HotkeyScope 的 snake_case 序列化一致）。
     pub scope_name: &'static str,
@@ -196,6 +196,108 @@ fn run_dconf(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn run_gsettings(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("gsettings")
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// GNOME 系统快捷键条目（用于设置页冲突检查）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemShortcutInfo {
+    /// GTK 加速器格式，如 "<Control><Alt>t"。
+    pub accelerator: String,
+    /// 可读名称：自定义快捷键用用户起的名字，内置快捷键用 key 名。
+    pub label: String,
+}
+
+/// 把 `gsettings get` 的单引号值去引号。
+fn gsettings_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))?;
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() || trimmed == "disabled" {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// 解析 gsettings 输出里的路径数组，如 ['/a/', '/b/']。
+fn gsettings_path_list(raw: &str) -> Vec<String> {
+    raw.split('\'')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "[" && *s != "]" && *s != ",")
+        .map(|s| s.trim_end_matches('/').to_string())
+        .collect()
+}
+
+/// 枚举 GNOME 系统快捷键（内置 media-keys / wm / shell / mutter + 用户自定义快捷键），
+/// 供设置页把“系统占用”计入冲突检查。非 GNOME 桌面返回空列表。
+pub fn list_system_shortcuts() -> Vec<SystemShortcutInfo> {
+    let mut out: Vec<SystemShortcutInfo> = Vec::new();
+    for schema in [
+        "org.gnome.settings-daemon.plugins.media-keys",
+        "org.gnome.desktop.wm.keybindings",
+        "org.gnome.shell.keybindings",
+        "org.gnome.mutter.keybindings",
+    ] {
+        let Some(lines) = run_gsettings(&["list-recursively", schema]) else {
+            continue;
+        };
+        for line in lines.lines() {
+            let mut parts = line.splitn(3, ' ');
+            let (_schema, key, value) = (parts.next(), parts.next(), parts.next());
+            let (Some(key), Some(value)) = (key, value) else {
+                continue;
+            };
+            let Some(accel) = gsettings_value(value) else {
+                continue;
+            };
+            if accel.starts_with('<') {
+                out.push(SystemShortcutInfo {
+                    accelerator: accel,
+                    label: key.to_string(),
+                });
+            }
+        }
+    }
+    // 用户自定义快捷键：binding + 用户起的名字
+    if let Some(raw) = run_gsettings(&[
+        "get",
+        "org.gnome.settings-daemon.plugins.media-keys",
+        "custom-keybindings",
+    ]) {
+        for path in gsettings_path_list(&raw) {
+            let schema_path =
+                format!("org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{path}");
+            let name = run_gsettings(&["get", &schema_path, "name"]).unwrap_or_default();
+            let binding = run_gsettings(&["get", &schema_path, "binding"]).unwrap_or_default();
+            let Some(accel) = gsettings_value(&binding) else {
+                continue;
+            };
+            if !accel.starts_with('<') {
+                continue;
+            }
+            let label = gsettings_value(&name)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "自定义快捷键".to_string());
+            out.push(SystemShortcutInfo {
+                accelerator: accel,
+                label,
+            });
+        }
+    }
+    out
+}
+
 /// 找到存放本应用快捷键的 dconf 组（组名即桌面环境解析出的 app id，
 /// 如 kivio-desktop），返回（键路径，存储文本）。
 fn read_gnome_shortcuts_group() -> Option<(String, String)> {
@@ -260,10 +362,11 @@ fn normalize_trigger(trigger: &str) -> (BTreeSet<&'static str>, String) {
     // 返回 true 表示识别为修饰键
     let absorb = |tok: &str, mods: &mut BTreeSet<&'static str>, key: &mut String| {
         let canon = match tok.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" | "primary" => "ctrl",
+            "ctrl" | "control" | "primary" | "commandorcontrol" | "cmdorctrl" | "command"
+            | "cmd" => "ctrl",
             "shift" => "shift",
-            "alt" | "mod1" => "alt",
-            "super" | "logo" | "meta" | "mod4" => "super",
+            "alt" | "option" | "mod1" => "alt",
+            "super" | "logo" | "meta" | "mod4" | "win" | "windows" | "mod" => "super",
             "num" | "mod2" => "num",
             _ => {
                 if !tok.is_empty() {

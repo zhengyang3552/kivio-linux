@@ -126,6 +126,9 @@ pub struct AppState {
     pub explain_images: Mutex<HashMap<String, PathBuf>>,
     pub current_explain_image_id: Mutex<Option<String>>,
     pub lens_busy: AtomicBool,
+    /// 设置页录制快捷键期间为 true：全局快捷键动作一律不派发，
+    /// 避免录制时按下已注册组合触发翻译/聊天等窗口。
+    pub hotkeys_suspended: AtomicBool,
     /// Lens 会话代号：每次 `lens_request_internal` 成功开启一个新浮窗会话就 +1。
     /// 强制关闭 watchdog（`schedule_forced_lens_close`）用它判断"宽限期内是否已开了新会话"，
     /// 避免迟到的 watchdog 误杀用户刚刚重新打开的浮窗。
@@ -387,6 +390,7 @@ impl AppState {
             explain_images: Mutex::new(HashMap::new()),
             current_explain_image_id: Mutex::new(None),
             lens_busy: AtomicBool::new(false),
+            hotkeys_suspended: AtomicBool::new(false),
             lens_open_seq: AtomicU64::new(0),
             lens_opened_at: Mutex::new(None),
             prev_frontmost_pid_lens: AtomicI32::new(0),

@@ -1883,6 +1883,8 @@ export const api = {
   // 应用信息
   getAppVersion: () => getVersion(),
   openSettingsWindow: () => invoke<void>('open_settings_window'),
+  setHotkeysSuspended: (suspended: boolean) => invoke<void>('set_hotkeys_suspended', { suspended }),
+  listGnomeSystemShortcuts: () => invoke<{ accelerator: string; label: string }[]>('list_gnome_system_shortcuts'),
   closeTranslatorWindow: () => invoke<void>('close_translator_window'),
 
   // 文本翻译
