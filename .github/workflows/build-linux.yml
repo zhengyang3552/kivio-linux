@@ -20,6 +20,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -36,8 +37,13 @@ jobs:
 
       - name: Install Tauri system dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev >/dev/null
+          # 防 apt 静默挂死:保留完整日志;等锁最多 120s(超时报错而不是无限等);
+          # 关交互提示;停掉后台 unattended-upgrades 防抢锁
+          APT="sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get"
+          sudo systemctl stop unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+          $APT update
+          $APT install -y -o DPkg::Lock::Timeout=120 \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Resolve version
         id: ver
