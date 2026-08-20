@@ -1619,6 +1619,14 @@ export default function Lens() {
     setDragging(false)
     if (hovered) {
       await handleCaptureWindow(hovered)
+    } else if (windows.length === 0) {
+      // Wayland 拿不到窗口列表：点击退化为整屏截图（复用区域截图流程，走冻结帧）
+      await handleCaptureRegion({
+        x: 0,
+        y: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      })
     }
   }
 

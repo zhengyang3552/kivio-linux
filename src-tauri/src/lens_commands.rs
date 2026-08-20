@@ -503,8 +503,18 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
 
     // 必须在 ensure_lens_window/show/set_focus 之前抓取。创建隐藏 webview 在 macOS 上也可能
     // 改变当前 focused UI element，导致 Cmd+C/AXSelectedText 读到 Lens 自己而不是前台 App。
-    let pending_selection = if mode == "chat" || mode == "translateText" {
+    let pending_selection = if mode == "chat" {
         capture_active_selection()
+    } else if mode == "translateText" {
+        // Linux：无全局选区读取 API，读剪贴板文本（用户先 Ctrl+C 复制选中文本）
+        #[cfg(target_os = "linux")]
+        {
+            crate::shortcuts::linux_read_clipboard_selection()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            capture_active_selection()
+        }
     } else {
         None
     };

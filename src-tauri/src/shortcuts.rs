@@ -383,6 +383,37 @@ fn wait_for_copy_shortcut_modifiers_to_clear(timeout: Duration) {
     std::thread::sleep(timeout.min(Duration::from_millis(120)));
 }
 
+/// Linux：Wayland/X11 都没有"未复制的选中文本"读取 API（AX 不可用、
+/// 模拟 Ctrl+C 在 Linux 下不可靠），退化为直接读剪贴板文本——
+/// 用户先 Ctrl+C 复制选中文本，再按"选中文本快捷键"即可翻译。
+/// 供 lens translateText 模式使用；chat 模式不读剪贴板，避免误带历史复制内容。
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_read_clipboard_selection() -> Option<String> {
+    // arboard：Wayland 走 data-control 协议，X11 走 x11rb
+    if let Ok(mut cb) = Clipboard::new() {
+        if let Ok(text) = cb.get_text() {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    // 兜底：xclip 读 X11 剪贴板（XWayland 会话下也能用）
+    let output = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard", "-o"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// 在前一个 App 仍持焦点时把选中文本读出来，失败时才模拟 Cmd+C/Ctrl+C 兜底。
 /// 失败/Accessibility 权限缺失/剪贴板为非文本格式 → 一律静默降级返回 None。
 /// 调用方负责确保此函数在 Lens 窗口 show() 之前执行。
@@ -897,14 +928,14 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                          id: &'static str,
                          action: LinuxHotkeyAction| {
         let (desc_zh, desc_en): (&str, &str) = match scope {
-            HotkeyScope::Translator => ("翻译", "translator"),
-            HotkeyScope::Chat => ("Kivio Agent", "Kivio Agent"),
-            HotkeyScope::CloseChat => ("关闭 Kivio Agent", "close Kivio Agent"),
-            HotkeyScope::Screenshot => ("快速翻译", "quick translation"),
-            HotkeyScope::ScreenshotText => ("选中文本快速翻译", "selected text quick translation"),
-            HotkeyScope::ScreenshotReplace => ("替换翻译", "replace translation"),
+            HotkeyScope::Translator => ("输入翻译", "Input Translation"),
+            HotkeyScope::Chat => ("打开 Kivio Agent", "Open Kivio Agent"),
+            HotkeyScope::CloseChat => ("关闭 Kivio Agent", "Close Kivio Agent"),
+            HotkeyScope::Screenshot => ("截图快捷键", "Screenshot hotkey"),
+            HotkeyScope::ScreenshotText => ("选中文本快捷键", "Selected text hotkey"),
+            HotkeyScope::ScreenshotReplace => ("替换翻译快捷键", "Replace translation hotkey"),
             HotkeyScope::ScreenshotAnnotate => ("截图标注", "Screenshot annotate"),
-            HotkeyScope::Lens => ("Lens", "lens"),
+            HotkeyScope::Lens => ("Lens", "Lens"),
         };
         let description = if is_en { desc_en } else { desc_zh };
         let hotkey_key = hotkey.to_lowercase();

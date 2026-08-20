@@ -316,10 +316,16 @@ fn read_gnome_shortcuts_group() -> Option<(String, String)> {
     None
 }
 
-/// 解析 `dconf read` 输出为 id → 已存 trigger 列表。
-/// 示例：`[('kivio-chat', {'description': <'聊天窗口'>, 'shortcuts': <['CTRL+SHIFT+k']>})]`
-fn parse_stored_triggers(dump: &str) -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+/// dconf 里已存的一条快捷键条目。
+struct StoredShortcut {
+    triggers: Vec<String>,
+    description: Option<String>,
+}
+
+/// 解析 `dconf read` 输出为 id → 已存条目（trigger 列表 + description）。
+/// 示例：`[('kivio-chat', {'description': <'打开 Kivio Agent'>, 'shortcuts': <['<Shift><Control>k']>})]`
+fn parse_stored_triggers(dump: &str) -> HashMap<String, StoredShortcut> {
+    let mut out: HashMap<String, StoredShortcut> = HashMap::new();
     let Ok(entry_re) = regex::Regex::new(r"\('([^']*)',\s*\{[^}]*\}") else {
         return out;
     };
@@ -327,6 +333,9 @@ fn parse_stored_triggers(dump: &str) -> HashMap<String, Vec<String>> {
         return out;
     };
     let Ok(string_re) = regex::Regex::new(r"'([^']*)'") else {
+        return out;
+    };
+    let Ok(desc_re) = regex::Regex::new(r"'description':\s*<'([^']*)'>") else {
         return out;
     };
     for caps in entry_re.captures_iter(dump) {
@@ -348,7 +357,11 @@ fn parse_stored_triggers(dump: &str) -> HashMap<String, Vec<String>> {
                     .collect()
             })
             .unwrap_or_default();
-        out.insert(id, triggers);
+        let description = desc_re
+            .captures(entry_text)
+            .map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .flatten();
+        out.insert(id, StoredShortcut { triggers, description });
     }
     out
 }
@@ -398,11 +411,18 @@ pub fn reset_stale_gnome_shortcut_entries(entries: &[PortalShortcutEntry]) {
         return;
     };
     let stored = parse_stored_triggers(&dump);
-    // 已存条目的 trigger 与本次请求不一致 → 必须先清掉，GNOME 才会应用新值
+    // 已存条目的 trigger / description 与本次请求不一致 → 必须先清掉，GNOME 才会应用新值
     let mut stale = entries.iter().any(|entry| {
         let expected = normalize_trigger(&entry.trigger);
         match stored.get(entry.id) {
-            Some(triggers) => !triggers.iter().any(|t| normalize_trigger(t) == expected),
+            Some(item) => {
+                let trigger_ok = item
+                    .triggers
+                    .iter()
+                    .any(|t| normalize_trigger(t) == expected);
+                let desc_ok = item.description.as_deref() == Some(entry.description.as_str());
+                !trigger_ok || !desc_ok
+            }
             // 从未存储过的条目 GNOME 会当新快捷键处理，无需清理
             None => false,
         }
@@ -433,7 +453,9 @@ pub fn verify_gnome_shortcut_bindings(entries: &[PortalShortcutEntry]) -> Vec<St
         .filter(|entry| {
             let expected = normalize_trigger(&entry.trigger);
             match stored.get(entry.id) {
-                Some(triggers) => !triggers.iter().any(|t| normalize_trigger(t) == expected),
+                Some(item) => {
+                    !item.triggers.iter().any(|t| normalize_trigger(t) == expected)
+                }
                 None => true,
             }
         })
