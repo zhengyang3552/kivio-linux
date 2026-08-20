@@ -381,11 +381,9 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     settingsRef.current = settings
   }, [settings])
 
-  // 客户端热键冲突检测:在保存前发现"两个启用功能用了同一个组合"。
-  // OS 层面的冲突(Spotlight 占用 Cmd+Space 等)仍需保存后从后端拿到结果。
-  // 返回每个 scope 对应的"和谁冲突"——前端各 HotkeyInput 拿到对应 scope 的伙伴名后,
-  // 用 hotkeyScope* 模板自己拼本地化字符串。
-  const hotkeyConflicts = useMemo<Partial<Record<HotkeyScopeKey, HotkeyScopeKey>>>(() => {
+  // 客户端热键冲突检测:在保存前发现"两个启用功能用了同一个组合"，
+  // 以及与应用内/系统（GNOME）快捷键的冲突。返回每个 scope 对应的冲突对象。
+  const hotkeyConflicts = useMemo<Partial<Record<HotkeyScopeKey, HotkeyConflict>>>(() => {
     if (!settings) return {}
     const slots: Array<{ scope: HotkeyScopeKey; hotkey: string; enabled: boolean }> = [
       { scope: 'main', hotkey: settings.hotkey || '', enabled: !!(settings.hotkey || '').trim() },
