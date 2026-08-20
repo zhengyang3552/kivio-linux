@@ -97,9 +97,11 @@ pub fn app_id_candidates() -> Vec<String> {
     ids
 }
 
-/// 把 Tauri/global-hotkey 风格的热键字符串转成门户 trigger（如 "Ctrl+Shift+F10"）。
+/// 把 Tauri/global-hotkey 风格的热键字符串转成门户 trigger（如 "CTRL+SHIFT+F10"）。
 /// 解析失败（没有普通键）返回 None。
 pub fn tauri_hotkey_to_portal_trigger(hotkey: &str) -> Option<String> {
+    // GNOME 实现（xdg-desktop-portal-gnome portal_trigger_to_settings）按 "+" 拆分后
+    // 用 strcmp 精确匹配大写修饰键：CTRL/SHIFT/ALT/NUM/LOGO，其余原样透传。
     let mut modifiers: Vec<&'static str> = Vec::new();
     let mut key: Option<String> = None;
     for raw_part in hotkey.trim().split('+') {
@@ -109,23 +111,24 @@ pub fn tauri_hotkey_to_portal_trigger(hotkey: &str) -> Option<String> {
         }
         match part.to_ascii_lowercase().as_str() {
             "commandorcontrol" | "cmdorctrl" | "command" | "cmd" | "control" | "ctrl" => {
-                if !modifiers.contains(&"Ctrl") {
-                    modifiers.push("Ctrl");
+                if !modifiers.contains(&"CTRL") {
+                    modifiers.push("CTRL");
                 }
             }
             "alt" | "option" => {
-                if !modifiers.contains(&"Alt") {
-                    modifiers.push("Alt");
+                if !modifiers.contains(&"ALT") {
+                    modifiers.push("ALT");
                 }
             }
             "shift" => {
-                if !modifiers.contains(&"Shift") {
-                    modifiers.push("Shift");
+                if !modifiers.contains(&"SHIFT") {
+                    modifiers.push("SHIFT");
                 }
             }
+            // GNOME 映射表里 Super 对应 LOGO；写 SUPER 不在表内会被当普通键透传
             "super" | "meta" | "win" | "windows" | "mod" => {
-                if !modifiers.contains(&"Super") {
-                    modifiers.push("Super");
+                if !modifiers.contains(&"LOGO") {
+                    modifiers.push("LOGO");
                 }
             }
             _ => {
@@ -159,7 +162,7 @@ fn normalize_portal_key(part: &str) -> String {
         "down" => "Down".to_string(),
         "left" => "Left".to_string(),
         "right" => "Right".to_string(),
-        single if single.len() == 1 => single.to_ascii_uppercase(),
+        single if single.len() == 1 => single.to_ascii_lowercase(),
         other => other.to_string(), // F1..F35、Print 等原样透传
     }
 }
@@ -446,8 +449,10 @@ async fn bind_shortcuts(
         .iter()
         .map(|entry| {
             let mut options: HashMap<String, Value<'static>> = HashMap::new();
+            // 注意：xdg-desktop-portal 1.21 核心会按白名单过滤快捷键条目选项，
+            // 白名单里是 preferred_trigger（下划线）；连字符写法会被静默丢弃。
             options.insert(
-                "preferred-trigger".to_string(),
+                "preferred_trigger".to_string(),
                 Value::new(entry.trigger.clone()),
             );
             options.insert(
