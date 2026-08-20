@@ -675,42 +675,10 @@ pub(crate) fn lens_list_windows() -> Vec<lens::WindowInfo> {
     lens::list_windows()
 }
 
-/// 整窗截图（macOS）：用 `screencapture -l <id>` 按 window id 截，不会截到 lens webview，
-/// 所以无需 hide lens（避免 hide/show 那 ~250ms 的视觉闪烁）。
-#[tauri::command]
-pub(crate) async fn lens_capture_window(
-    app: AppHandle,
-    window_id: u32,
-) -> Result<serde_json::Value, String> {
-    let result = lens::capture_window(window_id);
-    let _ = app; // 保留参数避免破坏现有调用签名
-
-    match result {
-        Ok(path) => {
-            let image_id = Uuid::new_v4().to_string();
-            let state = app.state::<AppState>();
-
-            // 自动归档（在 insert 前直接用 path，避免二次加锁）
-            archive_captured_image(&app, &path, &image_id);
-
-            {
-                let mut map = state.images_lock();
-                map.insert(image_id.clone(), path);
-            }
-            {
-                let mut current = state.current_id_lock();
-                *current = Some(image_id.clone());
-            }
-            Ok(serde_json::json!({ "success": true, "imageId": image_id }))
-        }
-        Err(err) => Ok(serde_json::json!({ "success": false, "error": err })),
-    }
-}
-
-/// 区域截图：复用 capture_region_image 路径，注册 image_id 返回。
-#[tauri::command]
-pub(crate) async fn lens_capture_region(
-    app: AppHandle,
+/// 区域截图核心：先尝试从冻结帧裁剪，失败则现场截图兜底（必要时短暂隐藏浮窗）。
+/// lens_capture_region 与 Linux 整窗截图共用。
+fn capture_region_core(
+    app: &AppHandle,
     absolute_x: i32,
     absolute_y: i32,
     x: i32,
@@ -718,12 +686,12 @@ pub(crate) async fn lens_capture_region(
     width: u32,
     height: u32,
     scale_factor: f64,
-    freeze_frame_image_id: Option<String>,
-) -> Result<serde_json::Value, String> {
+    freeze_frame_image_id: Option<&str>,
+) -> Result<PathBuf, String> {
     // SCK 路径：把自己 PID 传给 capture_region_image，SCK 在 GPU compositor 排除 lens webview，
     // 不再需要 hide webview + sleep 60ms 等 NSWindow.orderOut 生效（旧 `screencapture -R` 会截到全屏透明 lens 自己）。
     // Windows 版 capture_region_image 忽略 exclude_self_pid 参数。
-    let _ = active_overlay_window(&app); // 仍引用以保证当前浮窗 webview 存活
+    let _ = active_overlay_window(app); // 仍引用以保证当前浮窗 webview 存活
     let exclude_self_pid: Option<i32> = {
         #[cfg(target_os = "macos")]
         {
@@ -735,9 +703,9 @@ pub(crate) async fn lens_capture_region(
         }
     };
 
-    let result = match capture_region_from_freeze_frame(
-        &app,
-        freeze_frame_image_id.as_deref(),
+    match capture_region_from_freeze_frame(
+        app,
+        freeze_frame_image_id,
         x,
         y,
         width,
@@ -765,7 +733,7 @@ pub(crate) async fn lens_capture_region(
                 }
             };
             let overlay = if needs_hide {
-                active_overlay_window(&app)
+                active_overlay_window(app)
             } else {
                 None
             };
@@ -790,14 +758,22 @@ pub(crate) async fn lens_capture_region(
             }
             live
         }
-    };
+    }
+}
+
+/// 把截图结果注册为 image_id（归档 + 状态表 + current id + 冻结帧清理）。
+fn register_captured_image(
+    app: &AppHandle,
+    result: Result<PathBuf, String>,
+    freeze_frame_image_id: Option<&str>,
+) -> serde_json::Value {
     match result {
         Ok(path) => {
             let image_id = Uuid::new_v4().to_string();
             let state = app.state::<AppState>();
 
             // 自动归档（在 insert 前直接用 path，避免二次加锁）
-            archive_captured_image(&app, &path, &image_id);
+            archive_captured_image(app, &path, &image_id);
 
             {
                 let mut map = state.images_lock();
@@ -807,13 +783,92 @@ pub(crate) async fn lens_capture_region(
                 let mut current = state.current_id_lock();
                 *current = Some(image_id.clone());
             }
-            if let Some(freeze_id) = freeze_frame_image_id.as_deref() {
-                cleanup_lens_freeze_frame_if_current(&app, freeze_id);
+            if let Some(freeze_id) = freeze_frame_image_id {
+                cleanup_lens_freeze_frame_if_current(app, freeze_id);
             }
-            Ok(serde_json::json!({ "success": true, "imageId": image_id }))
+            serde_json::json!({ "success": true, "imageId": image_id })
         }
-        Err(err) => Ok(serde_json::json!({ "success": false, "error": err })),
+        Err(err) => serde_json::json!({ "success": false, "error": err }),
     }
+}
+
+/// 整窗截图：
+/// - macOS：用 `screencapture -l <id>` 按 window id 截，不会截到 lens webview，
+///   所以无需 hide lens（避免 hide/show 那 ~250ms 的视觉闪烁）。
+/// - Linux：无法按 window id 抓帧，前端把窗口几何传过来，复用区域截图路径
+///   （冻结帧裁剪/门户现场截图）。Wayland 会话拿不到窗口列表，前端不会走到这里。
+#[tauri::command]
+pub(crate) async fn lens_capture_window(
+    app: AppHandle,
+    window_id: u32,
+    absolute_x: Option<i32>,
+    absolute_y: Option<i32>,
+    x: Option<i32>,
+    y: Option<i32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    scale_factor: Option<f64>,
+    freeze_frame_image_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let freeze_id = freeze_frame_image_id.as_deref();
+    #[cfg(target_os = "linux")]
+    let result = match (absolute_x, absolute_y, x, y, width, height) {
+        (Some(absolute_x), Some(absolute_y), Some(x), Some(y), Some(width), Some(height)) => {
+            let scale_factor = scale_factor
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .unwrap_or(1.0);
+            capture_region_core(
+                &app,
+                absolute_x,
+                absolute_y,
+                x,
+                y,
+                width,
+                height,
+                scale_factor,
+                freeze_id,
+            )
+        }
+        _ => lens::capture_window(window_id),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = {
+        let _ = (absolute_x, absolute_y, x, y, width, height, scale_factor);
+        lens::capture_window(window_id)
+    };
+
+    Ok(register_captured_image(&app, result, freeze_id))
+}
+
+/// 区域截图：复用 capture_region_image 路径，注册 image_id 返回。
+#[tauri::command]
+pub(crate) async fn lens_capture_region(
+    app: AppHandle,
+    absolute_x: i32,
+    absolute_y: i32,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    freeze_frame_image_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let result = capture_region_core(
+        &app,
+        absolute_x,
+        absolute_y,
+        x,
+        y,
+        width,
+        height,
+        scale_factor,
+        freeze_frame_image_id.as_deref(),
+    );
+    Ok(register_captured_image(
+        &app,
+        result,
+        freeze_frame_image_id.as_deref(),
+    ))
 }
 
 /// 多轮提问：调用 vision API 流式发出 lens-stream 事件。

@@ -1090,8 +1090,9 @@ export default function Lens() {
   const captureHintText = useMemo(() => {
     if (dragging) return t.lensSelectHintDrag
     if (hovered) return t.lensSelectHintHover.replace('{app}', hovered.owner)
-    return t.lensSelectHintIdle
-  }, [dragging, hovered, t])
+    // Wayland 下拿不到窗口列表：退化为仅提示拖动选区，避免“点击窗口”承诺落空
+    return windows.length > 0 ? t.lensSelectHintIdle : t.lensSelectHintIdleNoWindow
+  }, [dragging, hovered, windows, t])
 
   const handleMouseDown = (e: React.MouseEvent) => {
     if (stage !== 'select') return
@@ -1476,7 +1477,18 @@ export default function Lens() {
     // capturingRef 全程 true，避免 macOS screencapture 短暂让 lens webview 失焦时触发 blur handler 误关
     capturingRef.current = true
     try {
-      const result = await api.lensCaptureWindow(info.id)
+      // 带上窗口几何：macOS 按 window id 抓帧会忽略它们；
+      // Linux X11 下后端靠这些坐标从冻结帧/门户截图里裁剪整窗。
+      const result = await api.lensCaptureWindow(info.id, {
+        absoluteX: Math.round(info.x),
+        absoluteY: Math.round(info.y),
+        x: Math.round(info.x - winOrigin.x),
+        y: Math.round(info.y - winOrigin.y),
+        width: Math.round(info.width),
+        height: Math.round(info.height),
+        scaleFactor: window.devicePixelRatio || 1,
+        freezeFrameImageId: freezeFrameImageId || undefined,
+      })
       if (captureOpenSeq !== lensOpenSeqRef.current) return
       if (!result.success || !result.imageId) {
         console.error('lensCaptureWindow failed:', result.error)

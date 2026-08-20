@@ -177,7 +177,171 @@ fn read_dict_subdict(
     Some(unsafe { CFDictionary::wrap_under_get_rule(r) })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub fn list_windows() -> Vec<WindowInfo> {
+    // Wayland 合成器不对外提供窗口列表，只能返回空（前端退化为拖动选区）；
+    // X11 会话走 XCB 枚举。
+    if crate::linux_portal::is_wayland_session() {
+        return Vec::new();
+    }
+    list_windows_x11().unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn list_windows_x11() -> Result<Vec<WindowInfo>, String> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, MapState};
+    use x11rb::rust_connection::RustConnection;
+
+    let (conn, screen_idx) =
+        RustConnection::connect(None).map_err(|e| format!("无法连接 X server: {e}"))?;
+    let root = conn.setup().roots[screen_idx].root;
+
+    let intern = |name: &str| -> Result<u32, String> {
+        let reply = conn
+            .intern_atom(false, name.as_bytes())
+            .map_err(|e| e.to_string())?
+            .reply()
+            .map_err(|e| e.to_string())?;
+        Ok(reply.atom)
+    };
+
+    let net_client_list = intern("_NET_CLIENT_LIST")?;
+    let net_wm_name = intern("_NET_WM_NAME")?;
+    let utf8_string = intern("UTF8_STRING")?;
+    let wm_name = intern("WM_NAME")?;
+    let wm_class = intern("WM_CLASS")?;
+    let net_wm_state = intern("_NET_WM_STATE")?;
+    let net_wm_state_hidden = intern("_NET_WM_STATE_HIDDEN")?;
+    let net_wm_window_type = intern("_NET_WM_WINDOW_TYPE")?;
+    let skip_types: Vec<u32> = [
+        "_NET_WM_WINDOW_TYPE_DOCK",
+        "_NET_WM_WINDOW_TYPE_DESKTOP",
+        "_NET_WM_WINDOW_TYPE_PANEL",
+        "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+        "_NET_WM_WINDOW_TYPE_SPLASH",
+        "_NET_WM_WINDOW_TYPE_COMBO",
+    ]
+    .iter()
+    .map(|name| intern(name))
+    .collect::<Result<Vec<_>, _>>()?;
+
+    // 读 atom 数组属性（32 位值）
+    let atom_list_prop = |window: u32, atom: u32| -> Vec<u32> {
+        conn.get_property(false, window, atom, AtomEnum::ATOM.into(), 0, 64)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .and_then(|reply| reply.value32().map(|values| values.collect()))
+            .unwrap_or_default()
+    };
+    // 读文本属性（UTF8_STRING / STRING）
+    let text_prop = |window: u32, atom: u32, prop_type: u32| -> Option<String> {
+        let reply = conn
+            .get_property(false, window, atom, prop_type, 0, 1024)
+            .ok()?
+            .reply()
+            .ok()?;
+        if reply.value.is_empty() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&reply.value)
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    };
+
+    let list_reply = conn
+        .get_property(false, root, net_client_list, AtomEnum::ATOM.into(), 0, 4096)
+        .map_err(|e| e.to_string())?
+        .reply()
+        .map_err(|e| e.to_string())?;
+    let Some(window_ids) = list_reply.value32() else {
+        return Ok(Vec::new());
+    };
+
+    let mut windows: Vec<WindowInfo> = Vec::new();
+    for window in window_ids {
+        // 窗口可能中途被销毁：逐项失败都跳过
+        let Ok(attrs_cookie) = conn.get_window_attributes(window) else {
+            continue;
+        };
+        let Ok(attrs) = attrs_cookie.reply() else {
+            continue;
+        };
+        if attrs.map_state != MapState::VIEWABLE {
+            continue;
+        }
+        if atom_list_prop(window, net_wm_state).contains(&net_wm_state_hidden) {
+            continue; // 最小化
+        }
+        let types = atom_list_prop(window, net_wm_window_type);
+        if types.iter().any(|t| skip_types.contains(t)) {
+            continue; // 任务栏/桌面/通知类窗口不作为截图目标
+        }
+        let Ok(geom_cookie) = conn.get_geometry(window) else {
+            continue;
+        };
+        let Ok(geom) = geom_cookie.reply() else {
+            continue;
+        };
+        if geom.width < 16 || geom.height < 16 {
+            continue;
+        }
+        let Ok(tr_cookie) = conn.translate_coordinates(window, 0, 0, root) else {
+            continue;
+        };
+        let Ok(tr) = tr_cookie.reply() else {
+            continue;
+        };
+        let x = i32::from(tr.dst_x);
+        let y = i32::from(tr.dst_y);
+
+        // 排除本应用自身浮窗，避免 Lens 遮罩窗口出现在待选列表里
+        let class_raw = conn
+            .get_property(false, window, wm_class, AtomEnum::STRING.into(), 0, 512)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.value)
+            .unwrap_or_default();
+        let class_text = String::from_utf8_lossy(&class_raw);
+        if class_text.to_ascii_lowercase().contains("kivio") {
+            continue;
+        }
+        // WM_CLASS = "instance\0class\0"，习惯用 class 作为应用名
+        let class_parts: Vec<&str> = class_text.split('\0').filter(|s| !s.is_empty()).collect();
+        let owner = class_parts
+            .get(1)
+            .or_else(|| class_parts.first())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        let title = text_prop(window, net_wm_name, utf8_string)
+            .or_else(|| text_prop(window, wm_name, AtomEnum::STRING.into()))
+            .unwrap_or_default();
+
+        windows.push(WindowInfo {
+            id: window,
+            owner: if owner.is_empty() {
+                title.clone()
+            } else {
+                owner
+            },
+            title,
+            x: f64::from(x),
+            y: f64::from(y),
+            width: f64::from(geom.width),
+            height: f64::from(geom.height),
+        });
+    }
+    Ok(windows)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn list_windows() -> Vec<WindowInfo> {
     Vec::new()
 }

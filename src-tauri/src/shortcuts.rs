@@ -863,11 +863,23 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
         }
         match crate::linux_portal::tauri_hotkey_to_portal_trigger(hotkey) {
             Some(trigger) => {
+                let scope_name = match scope {
+                    HotkeyScope::Translator => "translator",
+                    HotkeyScope::Chat => "chat",
+                    HotkeyScope::CloseChat => "close_chat",
+                    HotkeyScope::Screenshot => "screenshot",
+                    HotkeyScope::ScreenshotText => "screenshot_text",
+                    HotkeyScope::ScreenshotReplace => "screenshot_replace",
+                    HotkeyScope::ScreenshotAnnotate => "screenshot_annotate",
+                    HotkeyScope::Lens => "lens",
+                };
                 entries.push(PortalShortcutEntry {
                     id,
                     trigger,
                     description,
                     action,
+                    scope_name,
+                    source_hotkey: hotkey.to_string(),
                 });
                 entry_scopes.push(scope);
                 entry_hotkeys.push(hotkey.to_string());
