@@ -22,7 +22,7 @@ use futures::StreamExt;
 use tauri::AppHandle;
 use zbus::fdo::DBusProxy;
 use zbus::message::Type as MsgType;
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
 const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
@@ -406,7 +406,8 @@ async fn create_shortcut_session(
         .await
         .map_err(|e| format!("GlobalShortcuts.CreateSession failed: {e}"))?;
     // 注意：CreateSession 的方法返回值只是 Request 对象路径；真正的会话句柄
-    // session_handle 在该 Request 的 Response 信号 results 里（类型 o）。
+    // session_handle 在该 Request 的 Response 信号 results 里。
+    // xdg-desktop-portal 1.21 以字符串（签名 s）返回，而非对象路径。
     let request_path: OwnedObjectPath = reply
         .body()
         .deserialize()
@@ -416,11 +417,13 @@ async fn create_shortcut_session(
     if resp != 0 {
         return Err(format!("CreateSession rejected by portal (resp={resp})"));
     }
-    let session_handle: OwnedObjectPath = results
+    let session_handle_str = results
         .get("session_handle")
-        .and_then(|value| <&ObjectPath>::try_from(value).ok())
-        .map(|path| OwnedObjectPath::from(path.to_owned()))
+        .and_then(|value| <&str>::try_from(value).ok())
+        .map(|value| value.to_string())
         .ok_or_else(|| "CreateSession response missing session_handle".to_string())?;
+    let session_handle = OwnedObjectPath::try_from(session_handle_str)
+        .map_err(|e| format!("CreateSession returned invalid session_handle: {e}"))?;
 
     let actions = entries
         .iter()
