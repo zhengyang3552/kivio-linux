@@ -384,25 +384,35 @@ fn wait_for_copy_shortcut_modifiers_to_clear(timeout: Duration) {
 }
 
 /// Linux：Wayland/X11 都没有"未复制的选中文本"读取 API（AX 不可用、
-/// 模拟 Ctrl+C 在 Linux 下不可靠），退化为直接读剪贴板文本——
-/// 用户先 Ctrl+C 复制选中文本，再按"选中文本快捷键"即可翻译。
-/// 供 lens translateText 模式使用；chat 模式不读剪贴板，避免误带历史复制内容。
+/// 模拟 Ctrl+C 在 Linux 下不可靠），改读系统选择：
+/// 1. PRIMARY selection（X11/XWayland 下"选中即复制"，即中键粘贴的数据源）——
+///    用户选中文本后直接按快捷键即可，无需手动 Ctrl+C；
+/// 2. 剪贴板 CLIPBOARD（arboard data-control；XWayland 由 mutter 同步）——
+///    用户先 Ctrl+C 复制过也能用。
+/// 供 lens translateText 模式使用；chat 模式不读，避免误带历史复制内容。
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_read_clipboard_selection() -> Option<String> {
-    // arboard：Wayland 走 data-control 协议，X11 走 x11rb
-    if let Ok(mut cb) = Clipboard::new() {
-        if let Ok(text) = cb.get_text() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
+    // PRIMARY：选中即复制（中键粘贴的数据源），语义与"选中文本"一致
+    if let Some(text) = read_xclip_selection("primary") {
+        return Some(text);
     }
-    // 兜底：xclip 读 X11 剪贴板（XWayland 会话下也能用）
-    let output = std::process::Command::new("xclip")
-        .args(["-selection", "clipboard", "-o"])
-        .output()
+    // CLIPBOARD：arboard（Wayland data-control / X11），带超时防挂起
+    if let Some(text) = clipboard_text_with_timeout(Duration::from_millis(800)) {
+        return Some(text);
+    }
+    // CLIPBOARD 兜底：xclip（XWayland 会话下 mutter 会把 Wayland 剪贴板同步过来）
+    read_xclip_selection("clipboard")
+}
+
+#[cfg(target_os = "linux")]
+fn read_xclip_selection(selection: &str) -> Option<String> {
+    let child = std::process::Command::new("xclip")
+        .args(["-selection", selection, "-o"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
+    let output = wait_child_with_timeout(child, Duration::from_millis(800))?;
     if !output.status.success() {
         return None;
     }
@@ -411,6 +421,48 @@ pub(crate) fn linux_read_clipboard_selection() -> Option<String> {
         None
     } else {
         Some(text)
+    }
+}
+
+/// 等待子进程结束；超时则 kill（防御 xclip 在 selection owner 响应慢时挂起）。
+#[cfg(target_os = "linux")]
+fn wait_child_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 带超时读剪贴板：arboard 在 Wayland 下若 data-control owner 不响应可能阻塞。
+#[cfg(target_os = "linux")]
+fn clipboard_text_with_timeout(timeout: Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Clipboard::new()
+            .ok()
+            .and_then(|mut cb| cb.get_text().ok());
+        let _ = tx.send(result);
+    });
+    let text = rx.recv_timeout(timeout).ok().flatten()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
