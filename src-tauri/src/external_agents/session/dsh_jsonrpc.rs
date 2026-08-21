@@ -532,8 +532,7 @@ impl DshJsonRpcSession {
                     } else {
                         let rpc_id = self.next_id;
                         self.next_id += 1;
-                        let display_text = if text.trim().is_empty() && !images.is_empty()
-                        {
+                        let display_text = if text.trim().is_empty() && !images.is_empty() {
                             format!("附带图片（{}）", images.len())
                         } else {
                             text.clone()
@@ -558,9 +557,6 @@ impl DshJsonRpcSession {
                 }
                 Ok(SessionCommand::RunTurn { done, .. }) => {
                     let _ = done.send(Err("session busy".to_string()));
-                }
-                Ok(SessionCommand::PiSession { reply, .. }) => {
-                    let _ = reply.send(Err("Pi session commands are unsupported".to_string()));
                 }
                 Ok(SessionCommand::StopTask { task_id }) => {
                     self.send_stop_task(&task_id).await;
@@ -656,11 +652,7 @@ impl DshJsonRpcSession {
                             };
                             let _ = events.send(event).await;
                         }
-                        if deferred_idle
-                            && started
-                            && terminal.is_some()
-                            && cancel_id.is_none()
-                        {
+                        if deferred_idle && started && terminal.is_some() && cancel_id.is_none() {
                             match dsh_idle_action(
                                 pending_steers.is_empty(),
                                 turns_ended,
@@ -994,12 +986,9 @@ pub fn spawn_dsh_session_actor_with_sink(
             let cmd = match step {
                 ActorStep::IdleDecision(decision) => {
                     if let Some(decision) = decision {
-                        if let Err(err) = settle_session_ask(
-                            &mut session.stdin,
-                            &mut idle_pending_asks,
-                            decision,
-                        )
-                        .await
+                        if let Err(err) =
+                            settle_session_ask(&mut session.stdin, &mut idle_pending_asks, decision)
+                                .await
                         {
                             eprintln!("[external-agent] dsh idle session/ask settle failed: {err}");
                         }
@@ -1078,6 +1067,7 @@ pub fn spawn_dsh_session_actor_with_sink(
                     events,
                     done,
                     mut approvals,
+                    extra_writable_roots: _,
                 } => {
                     let result = session
                         .run_turn(
@@ -1101,9 +1091,6 @@ pub fn spawn_dsh_session_actor_with_sink(
                 SessionCommand::Steer { accepted, .. } => {
                     // 空闲时没有在飞轮次：引导和 follow-up 都拒，前端按普通新轮发出。
                     let _ = accepted.send(false);
-                }
-                SessionCommand::PiSession { reply, .. } => {
-                    let _ = reply.send(Err("Pi session commands are unsupported".to_string()));
                 }
                 SessionCommand::Cancel => {}
                 SessionCommand::StopTask { task_id } => {
@@ -1879,12 +1866,12 @@ fn map_session_event(
                 .map(|max| format!("/{max}"))
                 .unwrap_or_default();
             sink(UnifiedAgentEvent::StatusNote {
-                text: format!("上游重试 {retry}{of_max}"),
+                text: format!("retry {retry}{of_max}"),
             });
         }
         "llm/retry-started" => {
             sink(UnifiedAgentEvent::StatusNote {
-                text: "正在重试模型调用…".to_string(),
+                text: "retry".to_string(),
             });
         }
         "user/message" => {
@@ -3037,11 +3024,11 @@ mod tests {
         ]);
         assert!(matches!(
             &events[0],
-            UnifiedAgentEvent::StatusNote { text } if text == "上游重试 2/5"
+            UnifiedAgentEvent::StatusNote { text } if text == "retry 2/5"
         ));
         assert!(matches!(
             &events[1],
-            UnifiedAgentEvent::StatusNote { text } if text == "正在重试模型调用…"
+            UnifiedAgentEvent::StatusNote { text } if text == "retry"
         ));
     }
 

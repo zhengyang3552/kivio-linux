@@ -767,8 +767,10 @@ pub struct ExternalCliAgentConfig {
 }
 
 /// 一个第三方供应商（中转站）。**各 CLI 用到的字段不同**：
-/// - claude / gemini / 其余 env 系：只用 `env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` …）
-/// - codex：只用 `config_toml` / `auth_json`，物化成一个私有 `CODEX_HOME`
+/// - claude / gemini / 其余 env 系：只用 `env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` …）；
+///   claude 聊天选模按 cc-switch 写入 `~/.claude/settings.json` 的 `model` / `env.ANTHROPIC_MODEL`
+/// - codex：只用 `config_toml` / `auth_json`，物化成一个私有 `CODEX_HOME`；聊天选模写入
+///   `~/.codex/config.toml` 顶层 `model`（文件已存在时）以及 CLI 正在读的那份
 /// - grok：只用 `config_toml`，把其中的 `[models]` / `[model.*]` 合并进 `~/.grok/config.toml`
 /// - opencode / pi：用 `config_json` / `auth_json` / `default_model` 合并进 CLI 原生全局配置
 /// - dsh：用 `config_json` 在 Kivio 私有 profile 中挂载 `llm-pi-ai`，Key 通过 `env` 注入
@@ -1036,8 +1038,6 @@ pub struct ChatNativeToolsConfig {
     pub edit_file: bool,
     #[serde(default)]
     pub run_command: bool,
-    #[serde(default)]
-    pub run_python: bool,
     #[serde(default = "default_true")]
     pub knowledge_search: bool,
     /// Default root for ordinary (non-project) conversation workbenches.
@@ -1059,7 +1059,6 @@ impl ChatNativeToolsConfig {
             || self.write_file
             || self.edit_file
             || self.run_command
-            || self.run_python
             || self.knowledge_search
     }
 }
@@ -1080,7 +1079,6 @@ impl Default for ChatNativeToolsConfig {
             write_file: true,
             edit_file: true,
             run_command: true,
-            run_python: true,
             knowledge_search: true,
             working_directory: default_chat_working_directory(),
             workspace_roots: Vec::new(),
@@ -2374,7 +2372,6 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         native.write_file = true;
         native.edit_file = true;
         native.run_command = true;
-        native.run_python = true;
         native.web_fetch = true;
         native.web_search = true;
         if settings.chat_tools.approval_policy == LEGACY_DEFAULT_APPROVAL_POLICY {

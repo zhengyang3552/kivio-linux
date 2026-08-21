@@ -76,29 +76,6 @@ pub enum MessageInjectionKind {
     FollowUp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PiSessionRequest {
-    GetTree,
-    GetEntries { since: Option<String> },
-    GetForkMessages,
-    Fork { entry_id: String },
-    Clone,
-    Switch { session_path: String },
-}
-
-impl PiSessionRequest {
-    pub fn changes_session(&self) -> bool {
-        matches!(self, Self::Fork { .. } | Self::Clone | Self::Switch { .. })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PiSessionRpcResult {
-    pub data: serde_json::Value,
-    /// Mutations are followed by `get_state`; this is Pi's authoritative new identity.
-    pub state: Option<serde_json::Value>,
-}
-
 /// A command sent to a live session's actor task.
 pub enum SessionCommand {
     /// Run one turn: write the prompt, stream `UnifiedAgentEvent`s into `events`, and report the
@@ -109,6 +86,9 @@ pub enum SessionCommand {
         reasoning: Option<String>,
         /// 本轮用户消息的原生图片块（ACP → image content block；Codex → localImage 临时文件）。空=无图。
         images: Vec<crate::external_agents::attachments::ImageBlock>,
+        /// Codex `workspace-write` 默认锁在 cwd：附件目录 / 临时图片必须作为
+        /// `sandboxPolicy.writableRoots` 下发，否则 CLI 读不到。其它协议忽略。
+        extra_writable_roots: Vec<String>,
         events: mpsc::Sender<UnifiedAgentEvent>,
         done: oneshot::Sender<Result<(), String>>,
         /// 本轮的权限审批通道。`None` = 宿主不接权限询问（未启用 / 协议不支持）⇒ 会话对
@@ -132,11 +112,6 @@ pub enum SessionCommand {
         images: Vec<crate::external_agents::attachments::ImageBlock>,
         kind: MessageInjectionKind,
         accepted: oneshot::Sender<bool>,
-    },
-    /// Pi session tree/query/mutation RPC. The Pi actor is the sole stdin/stdout owner.
-    PiSession {
-        request: PiSessionRequest,
-        reply: oneshot::Sender<Result<PiSessionRpcResult, String>>,
     },
     /// 停止 CLI 侧的一个后台任务（Background tasks 面板的停止按钮）。
     ///

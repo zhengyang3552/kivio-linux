@@ -46,7 +46,7 @@ import { ModelSelector } from './ModelSelector'
 import { ThinkingLevelSelector } from './ThinkingLevelSelector'
 import { ExternalModelSelector, RuntimePicker } from './RuntimePicker'
 import { PermissionPicker } from './PermissionPicker'
-import { deriveDshPresetModes, derivePermissionModes, useDetectedExternalAgents } from './permissionModes'
+import { deriveDshPresetModes, derivePermissionModes, useDetectedExternalAgents, useDshCustomPresets } from './permissionModes'
 import { BackgroundJobsIndicator } from './BackgroundJobsIndicator'
 import { ContextIndicator } from './ContextIndicator'
 import { isExecutableAgentPlanText } from './agentPlan'
@@ -1007,8 +1007,6 @@ type SendMessageOptions = {
 
 /** 稳定空数组：没有排队消息时不要每次渲染都造一个新引用。 */
 const NO_QUEUED_MESSAGES: QueuedMessage[] = []
-/** 轨迹未打开时不要把 displayMessages 灌进 Dock，避免流式每帧带动右侧栏。 */
-const NO_TRAJECTORY_MESSAGES: ChatMessage[] = []
 
 export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   useChatPerfRenderProbe('Chat', { view: hashPath() })
@@ -1511,9 +1509,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }),
     [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode],
   )
+  const dshCustomPresets = useDshCustomPresets(activeAgentRuntime)
   const composerPresets = useMemo(
-    () => deriveDshPresetModes(activeAgentRuntime),
-    [activeAgentRuntime],
+    () => deriveDshPresetModes(activeAgentRuntime, dshCustomPresets),
+    [activeAgentRuntime, dshCustomPresets],
   )
   const currentConversationIsBlank = isPlainBlankConversation(currentConversation)
   const activeProviderId = currentConversation && !currentConversationIsBlank
@@ -2801,53 +2800,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       console.error('Failed to synchronize chat protocol state:', error)
     })
   }, [currentConversation?.id])
-
-  useEffect(() => {
-    let cancelled = false
-    let unlisten: (() => void) | undefined
-    let clientPromise: Promise<typeof import('./pyodideClient')> | null = null
-
-    const setupListener = async () => {
-      unlisten = await api.onChatRunPython((payload) => {
-        if (cancelled) return
-        void (async () => {
-          try {
-            clientPromise ??= import('./pyodideClient')
-            const { runPythonInSandbox } = await clientPromise
-            const outcome = await runPythonInSandbox(payload.code, payload.timeoutMs, payload.files)
-            await api.chatPythonComplete(
-              payload.runId,
-              outcome.content,
-              outcome.isError,
-              outcome.artifacts,
-            )
-          } catch (err) {
-            const message = err instanceof Error
-              ? err.message || err.stack || err.name
-              : String(err)
-            await api.chatPythonComplete(
-              payload.runId,
-              `Python 沙盒调用失败：${message || 'Unknown error'}。不要使用 run_command/pip 安装或修改本机 Python 环境来绕过沙盒；请直接基于已有数据回答，除非用户明确要求修改本机环境。`,
-              true,
-              [],
-            )
-          }
-        })()
-      })
-      if (cancelled) {
-        unlisten()
-      }
-    }
-
-    setupListener()
-    return () => {
-      cancelled = true
-      unlisten?.()
-      void clientPromise
-        ?.then(({ disposePythonSandbox }) => disposePythonSandbox())
-        .catch(() => {})
-    }
-  }, [])
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversation?.id ?? null
@@ -4498,10 +4450,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [treeExpanded, setTreeExpanded] = useState<string[]>([])
   const [dockReveal, setDockReveal] = useState<DockRevealRequest>(null)
   const [dockPreview, setDockPreview] = useState<DockPreviewRequest>(null)
-  const piNativeEnabled = usesExternalRuntime
-    && activeAgentRuntime.externalAgentId === 'pi'
-    && Boolean(currentConversation?.id)
-  const trajectoryLive = dockOpen && dockTab === 'trajectory'
   // 工作目录跟随当前会话 / 选中项目 / agent runtime 变化，由后端 dock_resolve_cwd 解析
   // （外部 agent 与内置 runtime 的实际写入目录不同，runtime 切换必须重解析）。
   useEffect(() => {
@@ -4730,24 +4678,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     })
   }, [handleSelectConversation, runAfterLeavingSettings])
 
-  const handlePiConversationChanged = useCallback((
-    id: string,
-    conversation?: Conversation,
-    draft?: string,
-  ) => {
-    refreshSidebar()
-    if (conversation) {
-      currentConversationIdRef.current = id
-      applyConversation(conversation)
-      setChatView('conversation')
-      syncConversationRoute(id)
-    } else {
-      handleSidebarSelectConversation(id)
-    }
-    if (draft?.trim()) {
-      requestAnimationFrame(() => insertTextIntoComposer(draft))
-    }
-  }, [applyConversation, handleSidebarSelectConversation, refreshSidebar, syncConversationRoute])
   const handleSidebarNewConversation = useCallback(() => {
     runAfterLeavingSettings(() => void handleNewConversation())
   }, [handleNewConversation, runAfterLeavingSettings])
@@ -4804,7 +4734,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     openEmbeddedSettings('chat')
   }, [chatView, extensionsNavItem, handleSettingsClose, openEmbeddedSettings])
 
-  // 侧栏账户菜单：语言切换 / 检查更新 / 用量。都是全局行为，所以留在 Chat 这层，
+  // 侧栏账户菜单：语言切换 / 用量。都是全局行为，所以留在 Chat 这层，
   // 侧栏只负责触发（它拿不到 settings 也不该自己全量保存）。
   const handleSidebarSelectLang = useCallback((next: Lang) => {
     setUiLang(next)
@@ -4817,13 +4747,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       }
     })()
   }, [])
-
-  // 检查更新：设置「关于」页已有完整流程（检查中 / 有新版 / 已最新 + 下载入口），
-  // 这里只负责把用户送过去，不重造一套。
-  const handleSidebarCheckUpdate = useCallback(() => {
-    setExtensionsNavItem(null)
-    openEmbeddedSettings('about')
-  }, [openEmbeddedSettings])
 
   const handleSidebarOpenUsage = useCallback(() => {
     setExtensionsNavItem(null)
@@ -5334,7 +5257,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           onOpenExtensionsItem={handleSidebarOpenExtensionsItem}
           onOpenSettings={handleSidebarOpenSettings}
           onSelectLang={handleSidebarSelectLang}
-          onCheckUpdate={handleSidebarCheckUpdate}
           onOpenUsage={handleSidebarOpenUsage}
           settingsActive={settingsPanelActive}
           extensionsActive={extensionsActive}
@@ -5476,9 +5398,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             workdir={dockWorkdir}
             lang={uiLang}
             conversationId={currentConversation?.id ?? null}
-            conversation={trajectoryLive ? currentConversation : null}
-            messages={trajectoryLive ? displayMessages : NO_TRAJECTORY_MESSAGES}
-            piNativeEnabled={trajectoryLive && piNativeEnabled}
             treeExpanded={treeExpanded}
             revealRequest={dockReveal}
             previewRequest={dockPreview}
@@ -5487,8 +5406,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onClose={handleCloseDock}
             onTreeExpandedChange={handleTreeExpandedChange}
             onInsertMention={handleInsertFileMention}
-            onPiConversationChanged={handlePiConversationChanged}
-            onFocusMessage={setFocusMessageId}
             onRevealInTree={handleDockRevealInTree}
           />
         )}

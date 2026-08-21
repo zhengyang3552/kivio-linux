@@ -22,12 +22,6 @@ import type {
 } from './types'
 import type { ThinkingLevel, WebSearchMode, ModelRef } from './types'
 import type { CliImportResult, ImportableCliSession } from './types'
-import type {
-  PiForkMessage,
-  PiSessionMutationResult,
-  PiSessionTreeSnapshot,
-  PiSessionSwitchResult,
-} from './piSessionTree'
 
 export type { DetectedExternalAgent, AgentRuntimeConfig }
 
@@ -117,6 +111,13 @@ export interface DshNativeProviderDetail {
   apiKeyEnv: string
   models: DshNativeProviderModel[]
   defaultModel: string
+}
+
+/** `$DSH_HOME/.agent-presets` 里用户自己写的 Agent preset（不含官方四档）。 */
+export interface DshAgentPresetOption {
+  id: string
+  label: string
+  description?: string | null
 }
 
 /** PI 全局 Package 与 ~/.pi/agent/extensions 的结构化清单。 */
@@ -1635,29 +1636,6 @@ export const chatApi = {
     })
   },
 
-  async piSessionTree(conversationId: string): Promise<PiSessionTreeSnapshot> {
-    if (!isTauriRuntime()) return { tree: [], leafId: null, sessionId: '', sessionFile: null }
-    return invoke<PiSessionTreeSnapshot>('chat_pi_session_tree', { conversationId })
-  },
-
-  async piForkMessages(conversationId: string): Promise<PiForkMessage[]> {
-    if (!isTauriRuntime()) return []
-    const result = await invoke<{ messages?: PiForkMessage[] }>('chat_pi_fork_messages', { conversationId })
-    return result.messages ?? []
-  },
-
-  async piSessionFork(conversationId: string, entryId: string): Promise<PiSessionMutationResult> {
-    return invoke<PiSessionMutationResult>('chat_pi_session_fork', { conversationId, entryId })
-  },
-
-  async piSessionClone(conversationId: string): Promise<PiSessionMutationResult> {
-    return invoke<PiSessionMutationResult>('chat_pi_session_clone', { conversationId })
-  },
-
-  async piSessionSwitch(conversationId: string, sessionPath: string): Promise<PiSessionSwitchResult> {
-    return invoke<PiSessionSwitchResult>('chat_pi_session_switch', { conversationId, sessionPath })
-  },
-
   // 删除对话。返回未能清理的副产物说明（工作区被占用等）——对话本身一定已经删掉了，
   // 后端只有在「对话文件 / 索引」这两步失败时才抛错。
   async deleteConversation(conversationId: string): Promise<string[]> {
@@ -2099,6 +2077,12 @@ export const chatApi = {
   async dshNativeProviderDelete(id: string): Promise<void> {
     if (!isTauriRuntime()) return
     await invoke('chat_dsh_native_provider_delete', { id })
+  },
+
+  async listDshAgentPresets(): Promise<DshAgentPresetOption[]> {
+    if (!isTauriRuntime()) return []
+    const list = await invoke<DshAgentPresetOption[]>('chat_dsh_list_agent_presets')
+    return Array.isArray(list) ? list : []
   },
 
   /**
