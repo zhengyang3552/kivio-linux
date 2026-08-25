@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { SettingRow, HotkeyInput, SettingsGroup } from '../components'
 import { Button } from '../../components/Button'
 import type { I18n } from '../i18n'
-import type { HotkeyScopeKey } from '../SettingsShell'
+import type { HotkeyConflict, HotkeyScopeKey } from '../SettingsShell'
 import type { Settings as SettingsData } from '../../api/tauri'
 import { DEFAULT_HOTKEYS } from '../hotkeyDefaults'
 import { formatHotkey, getPlatform } from '../utils'
@@ -13,8 +13,8 @@ interface HotkeysTabProps {
   recordingTarget: HotkeyScopeKey | null
   onToggleRecording: (target: HotkeyScopeKey) => void
   conflictMessageFor: (scope: HotkeyScopeKey) => string | undefined
-  /** scope → 与之冲突的另一 scope（SettingsShell 客户端冲突检测结果） */
-  hotkeyConflicts: Partial<Record<HotkeyScopeKey, HotkeyScopeKey>>
+  /** scope → 与之冲突的另一 scope / 系统快捷键（SettingsShell 客户端冲突检测结果） */
+  hotkeyConflicts: Partial<Record<HotkeyScopeKey, HotkeyConflict>>
   onUpdateSettings: (updates: Partial<SettingsData>) => void
   onUpdateScreenshotTranslation: (updates: Partial<SettingsData['screenshotTranslation']>) => void
   onUpdateScreenshotAnnotate: (updates: Partial<NonNullable<SettingsData['screenshotAnnotate']>>) => void
@@ -110,8 +110,17 @@ export function HotkeysTab({
     const seen = new Set<string>()
     const lines: string[] = []
     for (const scope of ALL_SCOPES) {
-      const partner = hotkeyConflicts[scope]
-      if (!partner) continue
+      const conflict = hotkeyConflicts[scope]
+      if (!conflict) continue
+      if (conflict.kind === 'system') {
+        lines.push(
+          t.hotkeyConflictWithSystem
+            .replace('{label}', conflict.label)
+            .replace('{accelerator}', conflict.accelerator),
+        )
+        continue
+      }
+      const partner = conflict.partner
       const pairKey = [scope, partner].sort().join('|')
       if (seen.has(pairKey)) continue
       seen.add(pairKey)

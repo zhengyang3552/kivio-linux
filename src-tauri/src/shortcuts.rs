@@ -383,6 +383,89 @@ fn wait_for_copy_shortcut_modifiers_to_clear(timeout: Duration) {
     std::thread::sleep(timeout.min(Duration::from_millis(120)));
 }
 
+/// Linux：Wayland/X11 都没有"未复制的选中文本"读取 API（AX 不可用、
+/// 模拟 Ctrl+C 在 Linux 下不可靠），改读系统选择：
+/// 1. PRIMARY selection（X11/XWayland 下"选中即复制"，即中键粘贴的数据源）——
+///    用户选中文本后直接按快捷键即可，无需手动 Ctrl+C；
+/// 2. 剪贴板 CLIPBOARD（arboard data-control；XWayland 由 mutter 同步）——
+///    用户先 Ctrl+C 复制过也能用。
+/// 供 lens translateText 模式使用；chat 模式不读，避免误带历史复制内容。
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_read_clipboard_selection() -> Option<String> {
+    // PRIMARY：选中即复制（中键粘贴的数据源），语义与"选中文本"一致
+    if let Some(text) = read_xclip_selection("primary") {
+        return Some(text);
+    }
+    // CLIPBOARD：arboard（Wayland data-control / X11），带超时防挂起
+    if let Some(text) = clipboard_text_with_timeout(Duration::from_millis(800)) {
+        return Some(text);
+    }
+    // CLIPBOARD 兜底：xclip（XWayland 会话下 mutter 会把 Wayland 剪贴板同步过来）
+    read_xclip_selection("clipboard")
+}
+
+#[cfg(target_os = "linux")]
+fn read_xclip_selection(selection: &str) -> Option<String> {
+    let child = std::process::Command::new("xclip")
+        .args(["-selection", selection, "-o"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let output = wait_child_with_timeout(child, Duration::from_millis(800))?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// 等待子进程结束；超时则 kill（防御 xclip 在 selection owner 响应慢时挂起）。
+#[cfg(target_os = "linux")]
+fn wait_child_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 带超时读剪贴板：arboard 在 Wayland 下若 data-control owner 不响应可能阻塞。
+#[cfg(target_os = "linux")]
+fn clipboard_text_with_timeout(timeout: Duration) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Clipboard::new()
+            .ok()
+            .and_then(|mut cb| cb.get_text().ok());
+        let _ = tx.send(result);
+    });
+    let text = rx.recv_timeout(timeout).ok().flatten()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// 在前一个 App 仍持焦点时把选中文本读出来，失败时才模拟 Cmd+C/Ctrl+C 兜底。
 /// 失败/Accessibility 权限缺失/剪贴板为非文本格式 → 一律静默降级返回 None。
 /// 调用方负责确保此函数在 Lens 窗口 show() 之前执行。
@@ -567,7 +650,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
             });
         } else if let Err(err) =
             shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                if event.state == ShortcutState::Pressed {
+                if event.state == ShortcutState::Pressed
+                    && !app
+                        .state::<AppState>()
+                        .hotkeys_suspended
+                        .load(Ordering::Relaxed)
+                {
                     toggle_main_window(app);
                 }
             })
@@ -592,7 +680,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
             });
         } else if let Err(err) =
             shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                if event.state == ShortcutState::Pressed {
+                if event.state == ShortcutState::Pressed
+                    && !app
+                        .state::<AppState>()
+                        .hotkeys_suspended
+                        .load(Ordering::Relaxed)
+                {
                     if let Err(err) = open_chat_window(app) {
                         eprintln!("Chat hotkey trigger error: {err}");
                     }
@@ -619,7 +712,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
             });
         } else if let Err(err) =
             shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                if event.state == ShortcutState::Pressed {
+                if event.state == ShortcutState::Pressed
+                    && !app
+                        .state::<AppState>()
+                        .hotkeys_suspended
+                        .load(Ordering::Relaxed)
+                {
                     close_chat_window(app);
                 }
             })
@@ -645,7 +743,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
                 });
             } else if let Err(err) =
                 shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
+                    if event.state == ShortcutState::Pressed
+                        && !app
+                            .state::<AppState>()
+                            .hotkeys_suspended
+                            .load(Ordering::Relaxed)
+                    {
                         // 切换行为：Lens 可见时关闭，不可见时打开截图翻译
                         if lens_is_active(app) {
                             let _ = request_lens_close(app);
@@ -684,7 +787,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
                 });
             } else if let Err(err) =
                 shortcut_manager.on_shortcut(text_hotkey.as_str(), move |app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
+                    if event.state == ShortcutState::Pressed
+                        && !app
+                            .state::<AppState>()
+                            .hotkeys_suspended
+                            .load(Ordering::Relaxed)
+                    {
                         if lens_is_active(app) {
                             let _ = request_lens_close(app);
                         } else {
@@ -726,7 +834,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
                 } else if let Err(err) = shortcut_manager.on_shortcut(
                     replace_hotkey.as_str(),
                     move |app, _shortcut, event| {
-                        if event.state == ShortcutState::Pressed {
+                        if event.state == ShortcutState::Pressed
+                            && !app
+                                .state::<AppState>()
+                                .hotkeys_suspended
+                                .load(Ordering::Relaxed)
+                        {
                             if lens_is_active(app) {
                                 let _ = request_lens_close(app);
                             } else {
@@ -763,7 +876,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
                 });
             } else if let Err(err) =
                 shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
+                    if event.state == ShortcutState::Pressed
+                        && !app
+                            .state::<AppState>()
+                            .hotkeys_suspended
+                            .load(Ordering::Relaxed)
+                    {
                         if lens_is_active(app) {
                             let _ = request_lens_close(app);
                         } else {
@@ -799,7 +917,12 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
                 });
             } else if let Err(err) =
                 shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
+                    if event.state == ShortcutState::Pressed
+                        && !app
+                            .state::<AppState>()
+                            .hotkeys_suspended
+                            .load(Ordering::Relaxed)
+                    {
                         // 切换行为：Lens 可见时关闭，不可见时打开
                         if lens_is_active(app) {
                             let _ = request_lens_close(app);
@@ -846,11 +969,27 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
     let mut entry_scopes: Vec<HotkeyScope> = Vec::new();
     let mut entry_hotkeys: Vec<String> = Vec::new();
 
+    // GNOME 里展示的快捷键描述与软件设置页 i18n 文案保持一致（zh/en 按设置语言）。
+    let is_en = settings
+        .settings_language
+        .as_deref()
+        .map(|l| l.eq_ignore_ascii_case("en") || l.starts_with("en"))
+        .unwrap_or(false);
     let mut add_entry = |scope: HotkeyScope,
                          hotkey: &str,
                          id: &'static str,
-                         description: &'static str,
                          action: LinuxHotkeyAction| {
+        let (desc_zh, desc_en): (&str, &str) = match scope {
+            HotkeyScope::Translator => ("输入翻译", "Input Translation"),
+            HotkeyScope::Chat => ("打开 Kivio Agent", "Open Kivio Agent"),
+            HotkeyScope::CloseChat => ("关闭 Kivio Agent", "Close Kivio Agent"),
+            HotkeyScope::Screenshot => ("截图快捷键", "Screenshot hotkey"),
+            HotkeyScope::ScreenshotText => ("选中文本快捷键", "Selected text hotkey"),
+            HotkeyScope::ScreenshotReplace => ("替换翻译快捷键", "Replace translation hotkey"),
+            HotkeyScope::ScreenshotAnnotate => ("截图标注", "Screenshot annotate"),
+            HotkeyScope::Lens => ("Lens", "Lens"),
+        };
+        let description = if is_en { desc_en } else { desc_zh };
         let hotkey_key = hotkey.to_lowercase();
         if !registered.insert(hotkey_key) {
             errors.push(HotkeyError {
@@ -863,11 +1002,23 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
         }
         match crate::linux_portal::tauri_hotkey_to_portal_trigger(hotkey) {
             Some(trigger) => {
+                let scope_name = match scope {
+                    HotkeyScope::Translator => "translator",
+                    HotkeyScope::Chat => "chat",
+                    HotkeyScope::CloseChat => "close_chat",
+                    HotkeyScope::Screenshot => "screenshot",
+                    HotkeyScope::ScreenshotText => "screenshot_text",
+                    HotkeyScope::ScreenshotReplace => "screenshot_replace",
+                    HotkeyScope::ScreenshotAnnotate => "screenshot_annotate",
+                    HotkeyScope::Lens => "lens",
+                };
                 entries.push(PortalShortcutEntry {
                     id,
                     trigger,
-                    description,
+                    description: description.to_string(),
                     action,
+                    scope_name,
+                    source_hotkey: hotkey.to_string(),
                 });
                 entry_scopes.push(scope);
                 entry_hotkeys.push(hotkey.to_string());
@@ -887,7 +1038,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
             HotkeyScope::Translator,
             &translator_hotkey,
             "kivio-translator",
-            "输入翻译",
             LinuxHotkeyAction::Translator,
         );
     }
@@ -898,7 +1048,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
             HotkeyScope::Chat,
             &chat_hotkey,
             "kivio-chat",
-            "聊天窗口",
             LinuxHotkeyAction::Chat,
         );
     }
@@ -909,7 +1058,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
             HotkeyScope::CloseChat,
             &close_chat_hotkey,
             "kivio-close-chat",
-            "关闭聊天",
             LinuxHotkeyAction::CloseChat,
         );
     }
@@ -921,7 +1069,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                 HotkeyScope::Screenshot,
                 &hotkey,
                 "kivio-screenshot-translate",
-                "截图翻译",
                 LinuxHotkeyAction::ScreenshotTranslate,
             );
         }
@@ -936,7 +1083,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                 HotkeyScope::ScreenshotText,
                 &text_hotkey,
                 "kivio-screenshot-translate-text",
-                "截图翻译选中文本",
                 LinuxHotkeyAction::ScreenshotTranslateText,
             );
         }
@@ -952,7 +1098,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                     HotkeyScope::ScreenshotReplace,
                     &replace_hotkey,
                     "kivio-screenshot-replace",
-                    "截图替换翻译",
                     LinuxHotkeyAction::ScreenshotReplace,
                 );
             }
@@ -966,7 +1111,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                 HotkeyScope::ScreenshotAnnotate,
                 &hotkey,
                 "kivio-screenshot-annotate",
-                "截图标注",
                 LinuxHotkeyAction::ScreenshotAnnotate,
             );
         }
@@ -979,7 +1123,6 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                 HotkeyScope::Lens,
                 &hotkey,
                 "kivio-lens",
-                "Lens 取词",
                 LinuxHotkeyAction::Lens,
             );
         }
@@ -1012,6 +1155,14 @@ pub(crate) fn dispatch_linux_hotkey(
     app: &AppHandle,
     action: crate::linux_portal::LinuxHotkeyAction,
 ) {
+    // 设置页录制快捷键期间不派发任何热键动作
+    if app
+        .state::<AppState>()
+        .hotkeys_suspended
+        .load(Ordering::Relaxed)
+    {
+        return;
+    }
     use crate::linux_portal::LinuxHotkeyAction;
     match action {
         LinuxHotkeyAction::Translator => toggle_main_window(app),

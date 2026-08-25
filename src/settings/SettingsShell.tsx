@@ -106,6 +106,39 @@ export type HotkeyScopeKey =
   | 'screenshotAnnotate'
   | 'lens'
 
+/** 快捷键冲突：应用内重复 或 与系统（GNOME）快捷键冲突 */
+export type HotkeyConflict =
+  | { kind: 'app'; partner: HotkeyScopeKey }
+  | { kind: 'system'; label: string; accelerator: string }
+
+/**
+ * 把快捷键统一成「排序后的修饰键集合|键」以便跨格式比较：
+ * Tauri 格式（CommandOrControl+Alt+T）、GTK 格式（<Control><Alt>t）、
+ * GNOME 规范化顺序（<Alt><Control>t）都视为相等。与后端 normalize_trigger 保持一致。
+ */
+const normalizeHotkeyForCompare = (trigger: string): string => {
+  const mods = new Set<string>()
+  let key = ''
+  const absorb = (tok: string) => {
+    const low = tok.toLowerCase()
+    const canon =
+      { ctrl: 'ctrl', control: 'ctrl', primary: 'ctrl', commandorcontrol: 'ctrl', cmdorctrl: 'ctrl', command: 'ctrl', cmd: 'ctrl', shift: 'shift', alt: 'alt', option: 'alt', mod1: 'alt', super: 'super', logo: 'super', meta: 'super', mod4: 'super', win: 'super', windows: 'super', mod: 'super', num: 'num', mod2: 'num' }[low]
+    if (canon) mods.add(canon)
+    else if (tok) key = low
+  }
+  let rest = trigger.trim()
+  for (;;) {
+    const s = rest.indexOf('<')
+    if (s < 0) break
+    const e = rest.indexOf('>', s)
+    if (e < 0) break
+    absorb(rest.slice(s + 1, e))
+    rest = rest.slice(e + 1)
+  }
+  for (const part of rest.split('+')) absorb(part.trim())
+  return [...mods].sort().join(',') + '|' + key
+}
+
 function defaultChatConfig(): NonNullable<SettingsData['chat']> {
   return {
     streamEnabled: true,
@@ -254,6 +287,31 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const [saveWarning, setSaveWarning] = useState('')
   const [confirmDeleteProviderId, setConfirmDeleteProviderId] = useState<string | null>(null)
   const [recordingTarget, setRecordingTarget] = useState<HotkeyScopeKey | null>(null)
+  // GNOME 系统快捷键（用于冲突检查；非 Linux 为空）
+  const [systemShortcuts, setSystemShortcuts] = useState<{ accelerator: string; label: string }[]>([])
+
+  // 加载系统快捷键：把“系统占用”计入冲突检查
+  useEffect(() => {
+    let active = true
+    void api
+      .listGnomeSystemShortcuts()
+      .then((list) => {
+        if (active) setSystemShortcuts(list)
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+    }
+  }, [])
+
+  // 录制快捷键期间暂停全局热键派发：避免按下已注册组合触发翻译/聊天等窗口
+  useEffect(() => {
+    if (!recordingTarget) return
+    void api.setHotkeysSuspended(true)
+    return () => {
+      void api.setHotkeysSuspended(false)
+    }
+  }, [recordingTarget])
   const [defaultPrompts, setDefaultPrompts] = useState<DefaultPromptTemplates | null>(null)
   const [retryAttemptsInput, setRetryAttemptsInput] = useState('')
   const [uiFontPxInput, setUiFontPxInput] = useState('')
@@ -345,11 +403,9 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     })
   }, [])
 
-  // 客户端热键冲突检测:在保存前发现"两个启用功能用了同一个组合"。
-  // OS 层面的冲突(Spotlight 占用 Cmd+Space 等)仍需保存后从后端拿到结果。
-  // 返回每个 scope 对应的"和谁冲突"——前端各 HotkeyInput 拿到对应 scope 的伙伴名后,
-  // 用 hotkeyScope* 模板自己拼本地化字符串。
-  const hotkeyConflicts = useMemo<Partial<Record<HotkeyScopeKey, HotkeyScopeKey>>>(() => {
+  // 客户端热键冲突检测:在保存前发现"两个启用功能用了同一个组合"，
+  // 以及与应用内/系统（GNOME）快捷键的冲突。返回每个 scope 对应的冲突对象。
+  const hotkeyConflicts = useMemo<Partial<Record<HotkeyScopeKey, HotkeyConflict>>>(() => {
     if (!settings) return {}
     const slots: Array<{ scope: HotkeyScopeKey; hotkey: string; enabled: boolean }> = [
       { scope: 'main', hotkey: settings.hotkey || '', enabled: !!(settings.hotkey || '').trim() },
@@ -386,16 +442,27 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       list.push(s.scope)
       groups.set(key, list)
     }
-    const out: Partial<Record<HotkeyScopeKey, HotkeyScopeKey>> = {}
+    const out: Partial<Record<HotkeyScopeKey, HotkeyConflict>> = {}
     for (const list of groups.values()) {
       if (list.length < 2) continue
       for (const scope of list) {
         const partner = list.find(other => other !== scope)
-        if (partner) out[scope] = partner
+        if (partner) out[scope] = { kind: 'app', partner }
       }
     }
+    // 系统快捷键占用：同一组合被 GNOME（media-keys / wm / shell / mutter / 自定义）占用
+    const systemByNorm = new Map<string, { label: string; accelerator: string }>()
+    for (const s of systemShortcuts) {
+      const norm = normalizeHotkeyForCompare(s.accelerator)
+      if (!systemByNorm.has(norm)) systemByNorm.set(norm, s)
+    }
+    for (const s of slots) {
+      if (!s.enabled || !s.hotkey.trim()) continue
+      const sys = systemByNorm.get(normalizeHotkeyForCompare(s.hotkey))
+      if (sys && !out[s.scope]) out[s.scope] = { kind: 'system', label: sys.label, accelerator: sys.accelerator }
+    }
     return out
-  }, [settings])
+  }, [settings, systemShortcuts])
 
   const SCOPE_I18N_KEY: Record<HotkeyScopeKey, 'hotkeyScopeTranslator' | 'hotkeyScopeChat' | 'hotkeyScopeCloseChat' | 'hotkeyScopeScreenshot' | 'hotkeyScopeScreenshotText' | 'hotkeyScopeScreenshotReplace' | 'annotateHotkeyLabel' | 'hotkeyScopeLens'> = {
     main: 'hotkeyScopeTranslator',
@@ -408,9 +475,14 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     lens: 'hotkeyScopeLens',
   }
   const conflictMessageFor = (scope: HotkeyScopeKey): string | undefined => {
-    const partner = hotkeyConflicts[scope]
-    if (!partner) return undefined
-    return t.hotkeyConflictWith.replace('{partner}', t[SCOPE_I18N_KEY[partner]])
+    const conflict = hotkeyConflicts[scope]
+    if (!conflict) return undefined
+    if (conflict.kind === 'app') {
+      return t.hotkeyConflictWith.replace('{partner}', t[SCOPE_I18N_KEY[conflict.partner]])
+    }
+    return t.hotkeyConflictWithSystem
+      .replace('{label}', conflict.label)
+      .replace('{accelerator}', conflict.accelerator)
   }
 
   // 初始化：加载设置、版本号、默认提示词

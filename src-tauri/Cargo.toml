@@ -135,6 +135,9 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
 percent-encoding = "2"
+# X11 会话下的窗口枚举（Lens 整窗截图）；Wayland 会话不会连接 X server。
+# 选 x11rb 是因为它已在依赖图中（global-hotkey 用），不新增 C 系统库依赖。
+x11rb = "0.13"
 
 # Windows 平台特有依赖（屏幕截图、选中文本捕获）
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -13,7 +13,7 @@
 //! 本模块内部维护一个专用线程（自带 tokio runtime）承载所有 D-Bus 异步操作，
 //! 对外暴露同步阻塞 API，方便热键注册 / 截图等既有同步调用点直接使用。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
@@ -53,11 +53,15 @@ pub enum LinuxHotkeyAction {
 pub struct PortalShortcutEntry {
     /// 稳定的快捷键 id（GNOME 按 app + id 持久化，改名会导致旧绑定残留）。
     pub id: &'static str,
-    /// 门户 trigger 字符串，如 "Ctrl+Shift+A"。
+    /// 门户 trigger 字符串，如 "CTRL+SHIFT+A"。
     pub trigger: String,
-    /// 展示在桌面环境快捷键设置里的描述。
-    pub description: &'static str,
+    /// 展示在桌面环境快捷键设置里的描述（与软件设置页 i18n 文案一致）。
+    pub description: String,
     pub action: LinuxHotkeyAction,
+    /// 前端错误展示用的 scope 名（与 shortcuts.rs HotkeyScope 的 snake_case 序列化一致）。
+    pub scope_name: &'static str,
+    /// 用户设置里的原始热键字符串（仅用于错误提示）。
+    pub source_hotkey: String,
 }
 
 /// 当前是否为 Wayland 会话。
@@ -97,9 +101,11 @@ pub fn app_id_candidates() -> Vec<String> {
     ids
 }
 
-/// 把 Tauri/global-hotkey 风格的热键字符串转成门户 trigger（如 "Ctrl+Shift+F10"）。
+/// 把 Tauri/global-hotkey 风格的热键字符串转成门户 trigger（如 "CTRL+SHIFT+F10"）。
 /// 解析失败（没有普通键）返回 None。
 pub fn tauri_hotkey_to_portal_trigger(hotkey: &str) -> Option<String> {
+    // GNOME 实现（xdg-desktop-portal-gnome portal_trigger_to_settings）按 "+" 拆分后
+    // 用 strcmp 精确匹配大写修饰键：CTRL/SHIFT/ALT/NUM/LOGO，其余原样透传。
     let mut modifiers: Vec<&'static str> = Vec::new();
     let mut key: Option<String> = None;
     for raw_part in hotkey.trim().split('+') {
@@ -109,23 +115,24 @@ pub fn tauri_hotkey_to_portal_trigger(hotkey: &str) -> Option<String> {
         }
         match part.to_ascii_lowercase().as_str() {
             "commandorcontrol" | "cmdorctrl" | "command" | "cmd" | "control" | "ctrl" => {
-                if !modifiers.contains(&"Ctrl") {
-                    modifiers.push("Ctrl");
+                if !modifiers.contains(&"CTRL") {
+                    modifiers.push("CTRL");
                 }
             }
             "alt" | "option" => {
-                if !modifiers.contains(&"Alt") {
-                    modifiers.push("Alt");
+                if !modifiers.contains(&"ALT") {
+                    modifiers.push("ALT");
                 }
             }
             "shift" => {
-                if !modifiers.contains(&"Shift") {
-                    modifiers.push("Shift");
+                if !modifiers.contains(&"SHIFT") {
+                    modifiers.push("SHIFT");
                 }
             }
+            // GNOME 映射表里 Super 对应 LOGO；写 SUPER 不在表内会被当普通键透传
             "super" | "meta" | "win" | "windows" | "mod" => {
-                if !modifiers.contains(&"Super") {
-                    modifiers.push("Super");
+                if !modifiers.contains(&"LOGO") {
+                    modifiers.push("LOGO");
                 }
             }
             _ => {
@@ -159,8 +166,312 @@ fn normalize_portal_key(part: &str) -> String {
         "down" => "Down".to_string(),
         "left" => "Left".to_string(),
         "right" => "Right".to_string(),
-        single if single.len() == 1 => single.to_ascii_uppercase(),
+        single if single.len() == 1 => single.to_ascii_lowercase(),
         other => other.to_string(), // F1..F35、Print 等原样透传
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GNOME dconf 集成：过期条目清理 + 绑定后冲突校验
+// ---------------------------------------------------------------------------
+//
+// GNOME 的 GlobalShortcuts provider（gnome-control-center）处理 BindShortcuts 时，
+// 对已存在于 dconf 的条目会原样保留、忽略新的 preferred_trigger（见其
+// app_shortcuts_to_settings_variant），导致热键修改永远写不进去。因此：
+// - 绑定前：把与期望值不一致的已存条目 reset 掉，让 GNOME 按新值重建；
+// - 绑定后：读回 dconf 与请求值比对，不一致的条目（冲突被桌面环境拒绝/改写）
+//   通过 hotkey-warning 事件告知前端。
+// 依赖 `dconf` CLI（GNOME 桌面标配）；缺失时静默降级，不影响绑定流程。
+
+const GNOME_SHORTCUTS_BASE: &str = "/org/gnome/settings-daemon/global-shortcuts/";
+
+fn run_dconf(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("dconf")
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_gsettings(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("gsettings")
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// GNOME 系统快捷键条目（用于设置页冲突检查）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemShortcutInfo {
+    /// GTK 加速器格式，如 "<Control><Alt>t"。
+    pub accelerator: String,
+    /// 可读名称：自定义快捷键用用户起的名字，内置快捷键用 key 名。
+    pub label: String,
+}
+
+/// 把 `gsettings get` 的单引号值去引号。
+fn gsettings_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let trimmed = trimmed
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))?;
+    let trimmed = trimmed.trim();
+    if trimmed.is_empty() || trimmed == "disabled" {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// 解析 gsettings 输出里的路径数组，如 ['/a/', '/b/']。
+fn gsettings_path_list(raw: &str) -> Vec<String> {
+    raw.split('\'')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "[" && *s != "]" && *s != ",")
+        .map(|s| s.trim_end_matches('/').to_string())
+        .collect()
+}
+
+/// 枚举 GNOME 系统快捷键（内置 media-keys / wm / shell / mutter + 用户自定义快捷键），
+/// 供设置页把“系统占用”计入冲突检查。非 GNOME 桌面返回空列表。
+pub fn list_system_shortcuts() -> Vec<SystemShortcutInfo> {
+    let mut out: Vec<SystemShortcutInfo> = Vec::new();
+    for schema in [
+        "org.gnome.settings-daemon.plugins.media-keys",
+        "org.gnome.desktop.wm.keybindings",
+        "org.gnome.shell.keybindings",
+        "org.gnome.mutter.keybindings",
+    ] {
+        let Some(lines) = run_gsettings(&["list-recursively", schema]) else {
+            continue;
+        };
+        for line in lines.lines() {
+            let mut parts = line.splitn(3, ' ');
+            let (_schema, key, value) = (parts.next(), parts.next(), parts.next());
+            let (Some(key), Some(value)) = (key, value) else {
+                continue;
+            };
+            let Some(accel) = gsettings_value(value) else {
+                continue;
+            };
+            if accel.starts_with('<') {
+                out.push(SystemShortcutInfo {
+                    accelerator: accel,
+                    label: key.to_string(),
+                });
+            }
+        }
+    }
+    // 用户自定义快捷键：binding + 用户起的名字
+    if let Some(raw) = run_gsettings(&[
+        "get",
+        "org.gnome.settings-daemon.plugins.media-keys",
+        "custom-keybindings",
+    ]) {
+        for path in gsettings_path_list(&raw) {
+            let schema_path =
+                format!("org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:{path}");
+            let name = run_gsettings(&["get", &schema_path, "name"]).unwrap_or_default();
+            let binding = run_gsettings(&["get", &schema_path, "binding"]).unwrap_or_default();
+            let Some(accel) = gsettings_value(&binding) else {
+                continue;
+            };
+            if !accel.starts_with('<') {
+                continue;
+            }
+            let label = gsettings_value(&name)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "自定义快捷键".to_string());
+            out.push(SystemShortcutInfo {
+                accelerator: accel,
+                label,
+            });
+        }
+    }
+    out
+}
+
+/// 找到存放本应用快捷键的 dconf 组（组名即桌面环境解析出的 app id，
+/// 如 kivio-desktop），返回（键路径，存储文本）。
+fn read_gnome_shortcuts_group() -> Option<(String, String)> {
+    let listing = run_dconf(&["list", GNOME_SHORTCUTS_BASE])?;
+    for line in listing.lines() {
+        let group = line.trim().trim_end_matches('/');
+        if group.is_empty() {
+            continue;
+        }
+        let key = format!("{GNOME_SHORTCUTS_BASE}{group}/shortcuts");
+        let dump = run_dconf(&["read", &key]).unwrap_or_default();
+        if dump.contains("kivio-") {
+            return Some((key, dump));
+        }
+    }
+    None
+}
+
+/// dconf 里已存的一条快捷键条目。
+struct StoredShortcut {
+    triggers: Vec<String>,
+    description: Option<String>,
+}
+
+/// 解析 `dconf read` 输出为 id → 已存条目（trigger 列表 + description）。
+/// 示例：`[('kivio-chat', {'description': <'打开 Kivio Agent'>, 'shortcuts': <['<Shift><Control>k']>})]`
+fn parse_stored_triggers(dump: &str) -> HashMap<String, StoredShortcut> {
+    let mut out: HashMap<String, StoredShortcut> = HashMap::new();
+    let Ok(entry_re) = regex::Regex::new(r"\('([^']*)',\s*\{[^}]*\}") else {
+        return out;
+    };
+    let Ok(shortcuts_re) = regex::Regex::new(r"'shortcuts':\s*<\[([^\]]*)\]>") else {
+        return out;
+    };
+    let Ok(string_re) = regex::Regex::new(r"'([^']*)'") else {
+        return out;
+    };
+    let Ok(desc_re) = regex::Regex::new(r"'description':\s*<'([^']*)'>") else {
+        return out;
+    };
+    for caps in entry_re.captures_iter(dump) {
+        let id = caps
+            .get(1)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let entry_text = caps.get(0).map(|m| m.as_str()).unwrap_or_default();
+        let triggers: Vec<String> = shortcuts_re
+            .captures(entry_text)
+            .map(|c| c.get(1).map(|m| m.as_str()).unwrap_or_default().to_string())
+            .map(|inner| {
+                string_re
+                    .captures_iter(&inner)
+                    .filter_map(|s| s.get(1).map(|m| m.as_str().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let description = desc_re
+            .captures(entry_text)
+            .map(|c| c.get(1).map(|m| m.as_str().to_string()))
+            .flatten();
+        out.insert(id, StoredShortcut { triggers, description });
+    }
+    out
+}
+
+/// 把 trigger 归一化成（修饰键集合，键），用于跨格式比较：
+/// 门户格式 "CTRL+ALT+t"、GNOME 存储格式 "<ctrl><alt>t"（含 GTK 规范化后的
+/// 不同修饰键顺序，如 "<alt><ctrl>t"）都视为相等。
+fn normalize_trigger(trigger: &str) -> (BTreeSet<&'static str>, String) {
+    let mut mods: BTreeSet<&'static str> = BTreeSet::new();
+    let mut key = String::new();
+    // 返回 true 表示识别为修饰键
+    let absorb = |tok: &str, mods: &mut BTreeSet<&'static str>, key: &mut String| {
+        let canon = match tok.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "primary" | "commandorcontrol" | "cmdorctrl" | "command"
+            | "cmd" => "ctrl",
+            "shift" => "shift",
+            "alt" | "option" | "mod1" => "alt",
+            "super" | "logo" | "meta" | "mod4" | "win" | "windows" | "mod" => "super",
+            "num" | "mod2" => "num",
+            _ => {
+                if !tok.is_empty() {
+                    *key = tok.to_ascii_lowercase();
+                }
+                return;
+            }
+        };
+        mods.insert(canon);
+    };
+    let mut rest = trigger.trim();
+    while let Some(start) = rest.find('<') {
+        let Some(end_rel) = rest[start..].find('>') else {
+            break;
+        };
+        absorb(&rest[start + 1..start + end_rel], &mut mods, &mut key);
+        rest = &rest[start + end_rel + 1..];
+    }
+    for part in rest.split('+') {
+        absorb(part.trim(), &mut mods, &mut key);
+    }
+    (mods, key)
+}
+
+/// BindShortcuts 之前：清理 dconf 中与期望值不一致的已存条目。
+/// 不清理的话 GNOME 会保留旧绑定，热键修改永远不生效。
+pub fn reset_stale_gnome_shortcut_entries(entries: &[PortalShortcutEntry]) {
+    let Some((key, dump)) = read_gnome_shortcuts_group() else {
+        return;
+    };
+    let stored = parse_stored_triggers(&dump);
+    // 已存条目的 trigger / description 与本次请求不一致 → 必须先清掉，GNOME 才会应用新值
+    let mut stale = entries.iter().any(|entry| {
+        let expected = normalize_trigger(&entry.trigger);
+        match stored.get(entry.id) {
+            Some(item) => {
+                let trigger_ok = item
+                    .triggers
+                    .iter()
+                    .any(|t| normalize_trigger(t) == expected);
+                let desc_ok = item.description.as_deref() == Some(entry.description.as_str());
+                !trigger_ok || !desc_ok
+            }
+            // 从未存储过的条目 GNOME 会当新快捷键处理，无需清理
+            None => false,
+        }
+    });
+    // 之前绑过、本次不再请求的残留条目（如已关闭的功能）也清掉
+    if !stale {
+        stale = stored
+            .keys()
+            .any(|id| id.starts_with("kivio-") && !entries.iter().any(|e| e.id == *id));
+    }
+    if !stale {
+        return;
+    }
+    if run_dconf(&["reset", &key]).is_some() {
+        eprintln!("[linux-portal] reset stale GNOME shortcut entries at {key}");
+    }
+}
+
+/// BindShortcuts 成功后：比对 dconf 实际存储的 trigger 与请求值，
+/// 返回不一致的快捷键 id（被桌面环境拒绝/冲突未生效）。
+pub fn verify_gnome_shortcut_bindings(entries: &[PortalShortcutEntry]) -> Vec<String> {
+    let Some((_key, dump)) = read_gnome_shortcuts_group() else {
+        return Vec::new();
+    };
+    let stored = parse_stored_triggers(&dump);
+    entries
+        .iter()
+        .filter(|entry| {
+            let expected = normalize_trigger(&entry.trigger);
+            match stored.get(entry.id) {
+                Some(item) => {
+                    !item.triggers.iter().any(|t| normalize_trigger(t) == expected)
+                }
+                None => true,
+            }
+        })
+        .map(|entry| entry.id.to_string())
+        .collect()
+}
+
+/// 以 hotkey-warning 事件推送未生效的热键（与 register_hotkeys 的错误 JSON 同格式，
+/// 复用设置页已有的 formatHotkeyError 展示逻辑）。
+fn emit_hotkey_warnings(app: &AppHandle, errors: Vec<serde_json::Value>) {
+    if errors.is_empty() {
+        return;
+    }
+    if let Ok(payload) = serde_json::to_string(&errors) {
+        eprintln!("[linux-portal] hotkey warnings: {payload}");
+        let _ = tauri::Emitter::emit(app, "hotkey-warning", payload);
     }
 }
 
@@ -353,9 +664,44 @@ async fn shortcut_session_task(
         }
     };
     let mut session = session;
+    // GNOME 会原样保留已配置的条目、忽略新的 preferred_trigger：
+    // 先清掉与期望值不一致的已存条目，否则热键修改永远写不进 dconf。
+    reset_stale_gnome_shortcut_entries(&entries);
     if let Err(err) = bind_shortcuts(&mut session, &entries).await {
         eprintln!("[linux-portal] BindShortcuts failed: {err}");
+        // 用户取消确认窗口 / 门户拒绝：全部条目视为未注册，推 warning
+        let warnings: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "kind": "other",
+                    "scope": entry.scope_name,
+                    "hotkey": entry.source_hotkey,
+                    "raw": format!("BindShortcuts failed: {err}"),
+                })
+            })
+            .collect();
+        emit_hotkey_warnings(&app, warnings);
         return;
+    }
+    // 绑定成功后校验 dconf 实际存储值，与请求不一致的（冲突/被桌面环境改写）推 warning。
+    // 稍等 dconf-service 落盘，避免读到旧值。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mismatched = verify_gnome_shortcut_bindings(&entries);
+    if !mismatched.is_empty() {
+        let warnings: Vec<serde_json::Value> = entries
+            .iter()
+            .filter(|entry| mismatched.iter().any(|id| id == entry.id))
+            .map(|entry| {
+                serde_json::json!({
+                    "kind": "conflict",
+                    "scope": entry.scope_name,
+                    "hotkey": entry.source_hotkey,
+                    "raw": "与桌面环境已用快捷键冲突，未按请求值生效",
+                })
+            })
+            .collect();
+        emit_hotkey_warnings(&app, warnings);
     }
     run_shortcut_event_loop(&app, &mut session).await;
 }
@@ -367,7 +713,7 @@ async fn create_shortcut_session(
         .await
         .map_err(|e| format!("D-Bus session bus unavailable: {e}"))?;
     // 先创建消息流再订阅匹配规则，避免遗漏信号
-    let stream = MessageStream::from(&conn);
+    let mut stream = MessageStream::from(&conn);
     let dbus_proxy = DBusProxy::new(&conn)
         .await
         .map_err(|e| format!("DBus proxy init failed: {e}"))?;
@@ -405,10 +751,25 @@ async fn create_shortcut_session(
         )
         .await
         .map_err(|e| format!("GlobalShortcuts.CreateSession failed: {e}"))?;
-    let session_handle: OwnedObjectPath = reply
+    // 注意：CreateSession 的方法返回值只是 Request 对象路径；真正的会话句柄
+    // session_handle 在该 Request 的 Response 信号 results 里。
+    // xdg-desktop-portal 1.21 以字符串（签名 s）返回，而非对象路径。
+    let request_path: OwnedObjectPath = reply
         .body()
         .deserialize()
         .map_err(|e| format!("CreateSession reply parse failed: {e}"))?;
+    let (resp, results) =
+        await_request_response(&mut stream, request_path.as_str(), Duration::from_secs(30)).await?;
+    if resp != 0 {
+        return Err(format!("CreateSession rejected by portal (resp={resp})"));
+    }
+    let session_handle_str = results
+        .get("session_handle")
+        .and_then(|value| <&str>::try_from(value).ok())
+        .map(|value| value.to_string())
+        .ok_or_else(|| "CreateSession response missing session_handle".to_string())?;
+    let session_handle = OwnedObjectPath::try_from(session_handle_str)
+        .map_err(|e| format!("CreateSession returned invalid session_handle: {e}"))?;
 
     let actions = entries
         .iter()
@@ -431,8 +792,10 @@ async fn bind_shortcuts(
         .iter()
         .map(|entry| {
             let mut options: HashMap<String, Value<'static>> = HashMap::new();
+            // 注意：xdg-desktop-portal 1.21 核心会按白名单过滤快捷键条目选项，
+            // 白名单里是 preferred_trigger（下划线）；连字符写法会被静默丢弃。
             options.insert(
-                "preferred-trigger".to_string(),
+                "preferred_trigger".to_string(),
                 Value::new(entry.trigger.clone()),
             );
             options.insert(

@@ -1902,6 +1902,8 @@ export const api = {
   // 应用信息
   getAppVersion: () => getVersion(),
   openSettingsWindow: () => invoke<void>('open_settings_window'),
+  setHotkeysSuspended: (suspended: boolean) => invoke<void>('set_hotkeys_suspended', { suspended }),
+  listGnomeSystemShortcuts: () => invoke<{ accelerator: string; label: string }[]>('list_gnome_system_shortcuts'),
   closeTranslatorWindow: () => invoke<void>('close_translator_window'),
 
   // 文本翻译
@@ -2334,8 +2336,30 @@ export const api = {
   onLensCloseRequest: (listener: () => void) =>
     on('lens-close-request', () => listener()),
   lensListWindows: () => invoke<LensWindowInfo[]>('lens_list_windows'),
-  lensCaptureWindow: (windowId: number) =>
-    invoke<{ success: boolean; imageId?: string; error?: string }>('lens_capture_window', { windowId }),
+  lensCaptureWindow: (
+    windowId: number,
+    geometry?: {
+      absoluteX: number
+      absoluteY: number
+      x: number
+      y: number
+      width: number
+      height: number
+      scaleFactor: number
+      freezeFrameImageId?: string
+    },
+  ) =>
+    invoke<{ success: boolean; imageId?: string; error?: string }>('lens_capture_window', {
+      windowId,
+      absoluteX: geometry?.absoluteX,
+      absoluteY: geometry?.absoluteY,
+      x: geometry?.x,
+      y: geometry?.y,
+      width: geometry?.width,
+      height: geometry?.height,
+      scaleFactor: geometry?.scaleFactor,
+      freezeFrameImageId: geometry?.freezeFrameImageId,
+    }),
   lensCaptureRegion: (params: {
     absoluteX: number
     absoluteY: number
