@@ -9,6 +9,7 @@ import type { I18n } from '../settings/i18n'
 import type { Lang } from '../settings/i18n'
 import { PROVIDER_PRESETS, type ProviderPreset } from '../settings/providerPresets'
 import { isProviderEnabled } from '../settings/utils'
+import { ProviderIcon } from '../chat/ModelIcon'
 
 type ProviderSetupPanelProps = {
   t: I18n
@@ -91,7 +92,7 @@ function freshPresetProvider(preset: ProviderPreset, id: string): ModelProvider 
     availableModels: [],
     enabledModels: [],
     enabled: true,
-    apiFormat: 'openai_chat',
+    apiFormat: preset.apiFormat ?? 'openai_chat',
   }
 }
 
@@ -109,16 +110,6 @@ function maybeAutoBindDefaults(settings: Settings, provider: ModelProvider): Set
       providerId: provider.id,
       model: primaryModel,
     }
-  }
-
-  const chatEmpty = !next.defaultModels.chat.providerId.trim() || !next.defaultModels.chat.model.trim()
-  if (chatEmpty) {
-    next.defaultModels = {
-      ...next.defaultModels,
-      chat: { providerId: provider.id, model: primaryModel },
-    }
-    next.chatProviderId = provider.id
-    next.chatModel = primaryModel
   }
 
   const lensEmpty = !next.lens?.providerId?.trim() || !next.lens?.model?.trim()
@@ -340,6 +331,7 @@ export function ProviderSetupPanel({ t, lang, settings, onChange }: ProviderSetu
               onClick={() => selectProvider(item.id)}
               data-tauri-drag-region="false"
             >
+              <ProviderIcon name={item.name} baseUrl={item.baseUrl} size={14} />
               {item.name.trim() || item.id}
             </button>
           ))}
@@ -351,7 +343,7 @@ export function ProviderSetupPanel({ t, lang, settings, onChange }: ProviderSetu
               onClick={() => handleAddPreset(preset)}
               data-tauri-drag-region="false"
             >
-              <Plus size={12} />
+              <ProviderIcon name={preset.name} baseUrl={preset.baseUrl} size={14} />
               {preset.name}
             </button>
           ))}
@@ -515,27 +507,6 @@ export function ProviderSetupPanel({ t, lang, settings, onChange }: ProviderSetu
                 }}
               />
               <p className="onboarding-field-hint">{t.onboardingProviderLensHint}</p>
-            </div>
-            <div className="onboarding-default-cell">
-              <span className="onboarding-field-label">{t.onboardingProviderChatModel}</span>
-              <ModelPairSelect
-                providerId={settings.defaultModels.chat.providerId}
-                model={settings.defaultModels.chat.model}
-                providers={settings.providers}
-                className="w-full"
-                onChange={(providerId, model) => {
-                  onChange({
-                    ...settings,
-                    defaultModels: {
-                      ...settings.defaultModels,
-                      chat: { providerId, model },
-                    },
-                    chatProviderId: providerId,
-                    chatModel: model,
-                  })
-                }}
-              />
-              <p className="onboarding-field-hint">{t.onboardingProviderChatHint}</p>
             </div>
           </div>
         </div>

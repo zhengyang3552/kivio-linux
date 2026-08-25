@@ -292,8 +292,8 @@ pub enum UnifiedAgentEvent {
         /// 压缩耗时，仅用于诊断日志。
         duration_ms: Option<u64>,
     },
-    /// 生成过程的瞬态状态一行字（当前唯一来源：claude 的 `system/api_retry`——上游
-    /// 429/overloaded 时 CLI 在静默重试）。挂到前端的流状态行，不进消息正文。
+    /// 生成过程的瞬态状态一行字（claude `api_retry`、codex `Reconnecting... N/M`、
+    /// grok `retry_state`、dsh `llm/retry-started`）。挂到前端的流状态行，不进消息正文。
     StatusNote {
         text: String,
     },
@@ -325,11 +325,14 @@ pub enum UnifiedAgentEvent {
     TodoWrite {
         todos: Value,
     },
-    /// dsh 后台子代理（另一个 `sessionId`）的嵌套进度。
+    /// 子代理嵌套进度。
     ///
     /// 不能走 `TextDelta` / `ToolUse`：那些会进父气泡。前端已有
     /// `subagent_updated` → `structuredContent.subagentProgress`。
-    /// `task_id` 是子会话 id，对应派出回执 / `subagent.started` 的 `childSessionId`。
+    ///
+    /// `task_id` 的含义因 CLI 而异：dsh 是子会话 id（派出回执 /
+    /// `subagent.started` 的 `childSessionId`）；claude 是派出它的那次
+    /// Task/Agent `tool_use` id（`parent_tool_use_id`）。
     SubagentProgress {
         task_id: String,
         status: String,

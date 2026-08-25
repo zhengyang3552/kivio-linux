@@ -9,9 +9,16 @@
 //!    文件通常已被 cc-switch 写满了 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`，
 //!    于是「在 Kivio 里选了供应商却还是走老中转站」。所以额外物化一份只含 `{"env": …}`
 //!    的文件用 `--settings` 传进去，并把本供应商**没设的路由键补成空串**显式压掉。
+//!    聊天里选的模型按 cc-switch live 口径写入 `~/.claude/settings.json`：顶层 `model` +
+//!    `env.ANTHROPIC_MODEL`（能认出档位时再写对应 `ANTHROPIC_DEFAULT_*_MODEL`）。凭证 /
+//!    路由键仍不改用户文件。
 //! 3. **codex 的私有 `CODEX_HOME`** —— codex 的 base_url 只能来自 `config.toml`，没有
 //!    环境变量通道。物化一个私有 home（config.toml + auth.json）后注入 `CODEX_HOME`，
-//!    用户自己的 `~/.codex` 一个字节不动。
+//!    用户自己的 `~/.codex` 凭证与供应商表不动。聊天里选的模型按 cc-switch live 口径写入
+//!    `~/.codex/config.toml` 顶层 `model`（文件已存在时），并同步 CLI 正在读的那份
+//!    （挂了中转 = 私有 home）。**会话 jsonl** 仍接到用户 `~/.codex/sessions`，这样
+//!    Codex CLI / TUI 的 `/resume` 能看见 Kivio 里聊过的原生会话。WSL 二进制在没有
+//!    私有 home 时直接把 `CODEX_HOME` 指到 Windows 的 `~/.codex`。
 //! 4. **opencode / pi 的原生配置** —— 字段级合并 Kivio 管理的 provider、凭据与默认模型；
 //!    其他 provider 和顶层设置原样保留。切回「CLI 自身配置」时恢复 Kivio 接管前的默认模型。
 //! 5. **grok 的 `~/.grok/config.toml`** —— 与 cc-switch 一样落盘（Grok 没有 env 通道，
@@ -88,6 +95,11 @@ pub const CLAUDE_ROUTING_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_MODEL",
+    // 2.1.236：新会话默认模型（`/model` 仍覆盖并持久化）。不列入路由键的话，
+    // 切供应商时会留下上一套的默认模型。
+    // **不要**放进 `CLAUDE_CHAT_MODEL_ENV_KEYS`：那一轮会从 overlay / live
+    // settings 把空串盖回去，路由空值等于没写。
+    "ANTHROPIC_DEFAULT_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "ANTHROPIC_DEFAULT_FABLE_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
@@ -99,6 +111,18 @@ pub const CLAUDE_ROUTING_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
+];
+
+/// 聊天选模相关的 env 键：供应商没给值时，从已有 overlay / live settings 补回来。
+///
+/// `ANTHROPIC_DEFAULT_MODEL` 不在这里：它是新会话默认，不是当前聊天选中的模型。
+/// 放进来会把路由键刚补的空串盖掉，切供应商后 Auto 仍走上一套中转的默认模型。
+const CLAUDE_CHAT_MODEL_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 ];
 
 fn profiles_dir() -> Option<PathBuf> {
@@ -186,6 +210,38 @@ fn sanitize_segment(id: &str) -> Option<String> {
 
 fn codex_home_for(provider_id: &str) -> Option<PathBuf> {
     Some(profiles_dir()?.join(format!("codex-{}", sanitize_segment(provider_id)?)))
+}
+
+/// Codex CLI / TUI 读的那份用户 home（`~/.codex`）。Kivio 进程在 Windows 上时就是
+/// `%USERPROFILE%\.codex`，与用户在终端里跑 `codex` 看到的是同一处。
+pub fn native_codex_home() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|base| base.home_dir().join(".codex"))
+}
+
+/// WSL 里的 Codex 若继承 Windows 环境、自己却把会话写到 Linux `~/.codex`，
+/// TUI 在 Windows 上看不见。没有私有供应商 home 时，把 `CODEX_HOME` 指到用户那份。
+///
+/// 返回的是 **host 路径**；注入子进程时由 `spawn::apply_env_for_cli` 再翻成 `/mnt/...`。
+pub fn wsl_shared_codex_home(cli_bin: &Path) -> Option<PathBuf> {
+    if !crate::external_agents::wsl::is_wsl_target(cli_bin) {
+        return None;
+    }
+    native_codex_home()
+}
+
+/// 中转私有 home 的 `sessions/` 接到用户 `~/.codex/sessions`。保存供应商时物化一次，
+/// 拉起 Codex 时再补一次，这样升级前已经写在私有目录里的 rollout 也会露给 TUI。
+pub fn ensure_private_codex_sessions_shared() {
+    let Some(home) = provider_env("codex").get("CODEX_HOME").cloned() else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    if !is_kivio_private_codex_home(&home) {
+        return;
+    }
+    if let Err(err) = share_codex_sessions_with_user_home(&home) {
+        eprintln!("[external-agent] Codex 会话目录未能接到用户 ~/.codex：{err}");
+    }
 }
 
 fn claude_settings_path_for(provider_id: &str) -> Option<PathBuf> {
@@ -300,8 +356,22 @@ pub fn materialize(agent_id: &str) -> Result<(), String> {
 }
 
 fn materialize_claude(provider: &ExternalCliProvider) -> Result<(), String> {
+    let _guard = NATIVE_CONFIG_LOCK
+        .lock()
+        .map_err(|_| "原生 CLI 配置写锁已损坏".to_string())?;
     let path = claude_settings_path_for(&provider.id)
         .ok_or_else(|| format!("供应商 id 不能作为文件名：{}", provider.id))?;
+    materialize_claude_to(&path, provider)
+}
+
+fn provider_sets_env(provider: &ExternalCliProvider, key: &str) -> bool {
+    provider
+        .env
+        .iter()
+        .any(|pair| pair.key == key && !pair.value.trim().is_empty())
+}
+
+fn materialize_claude_to(path: &Path, provider: &ExternalCliProvider) -> Result<(), String> {
     let mut env: serde_json::Map<String, serde_json::Value> = provider
         .env
         .iter()
@@ -318,21 +388,56 @@ fn materialize_claude(provider: &ExternalCliProvider) -> Result<(), String> {
         env.entry((*key).to_string())
             .or_insert_with(|| serde_json::Value::String(String::new()));
     }
-    let body = serde_json::json!({ "env": env });
+    let live = claude_native_settings_path();
+    let previous_model = read_json_string_field(path, "model").or_else(|| {
+        live.as_ref()
+            .filter(|candidate| *candidate != path)
+            .and_then(|candidate| read_json_string_field(candidate, "model"))
+    });
+    for key in CLAUDE_CHAT_MODEL_ENV_KEYS {
+        if provider_sets_env(provider, key) {
+            continue;
+        }
+        let previous = read_json_env_string(path, key).or_else(|| {
+            live.as_ref()
+                .filter(|candidate| *candidate != path)
+                .and_then(|candidate| read_json_env_string(candidate, key))
+        });
+        if let Some(value) = previous {
+            env.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    let previous_env_model = env
+        .get("ANTHROPIC_MODEL")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let mut body = serde_json::json!({ "env": env });
+    // 聊天选模写在顶层 `model` / `env.ANTHROPIC_MODEL`；重物化 env 时不要把它抹掉。
+    if let Some(model) = previous_model.or(previous_env_model) {
+        if let Some(root) = body.as_object_mut() {
+            root.insert("model".to_string(), serde_json::Value::String(model));
+        }
+    }
     write_private(
-        &path,
+        path,
         &serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?,
     )
 }
 
 fn materialize_codex(provider: &ExternalCliProvider) -> Result<(), String> {
+    let _guard = NATIVE_CONFIG_LOCK
+        .lock()
+        .map_err(|_| "原生 CLI 配置写锁已损坏".to_string())?;
     let home = codex_home_for(&provider.id)
         .ok_or_else(|| format!("供应商 id 不能作为目录名：{}", provider.id))?;
     // 写之前先验一遍：坏 TOML 会让 codex 整个起不来，报的错还跟供应商八竿子打不着。
     toml::from_str::<toml::Value>(&provider.config_toml)
         .map_err(|e| format!("config.toml 解析失败：{e}"))?;
     std::fs::create_dir_all(&home).map_err(|e| format!("创建 {} 失败：{e}", home.display()))?;
-    write_private(&home.join("config.toml"), &provider.config_toml)?;
+    let config_path = home.join("config.toml");
+    write_codex_config_preserving_chat_model(&config_path, &provider.config_toml)?;
     let auth = provider.auth_json.trim();
     if auth.is_empty() {
         let _ = std::fs::remove_file(home.join("auth.json"));
@@ -341,7 +446,439 @@ fn materialize_codex(provider: &ExternalCliProvider) -> Result<(), String> {
             .map_err(|e| format!("auth.json 解析失败：{e}"))?;
         write_private(&home.join("auth.json"), auth)?;
     }
+    if let Err(err) = share_codex_sessions_with_user_home(&home) {
+        eprintln!("[external-agent] Codex 会话目录未能接到用户 ~/.codex：{err}");
+    }
     Ok(())
+}
+
+/// 私有 `CODEX_HOME` 只承载中转 config/auth；把 `sessions/` 接到用户 `~/.codex/sessions`，
+/// 这样 Codex CLI / TUI 默认扫描的目录里能看到 Kivio 写下的 rollout。
+fn share_codex_sessions_with_user_home(private_home: &Path) -> Result<(), String> {
+    let Some(user_sessions) = native_codex_home().map(|home| home.join("sessions")) else {
+        return Ok(());
+    };
+    share_codex_sessions_dir(private_home, &user_sessions)
+}
+
+fn is_kivio_private_codex_home(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("codex-")
+        && path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("external-cli-providers")
+}
+
+fn share_codex_sessions_dir(private_home: &Path, user_sessions: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(user_sessions)
+        .map_err(|e| format!("创建 {} 失败：{e}", user_sessions.display()))?;
+    std::fs::create_dir_all(private_home)
+        .map_err(|e| format!("创建 {} 失败：{e}", private_home.display()))?;
+    let private_sessions = private_home.join("sessions");
+    if paths_point_to_same_dir(&private_sessions, user_sessions) {
+        return Ok(());
+    }
+    if is_reparse_point(&private_sessions) {
+        unlink_directory_link(&private_sessions);
+    } else if private_sessions.is_dir() {
+        merge_dir_contents(&private_sessions, user_sessions)?;
+        let _ = std::fs::remove_dir_all(&private_sessions);
+    } else if private_sessions.exists() {
+        let _ = std::fs::remove_file(&private_sessions);
+    }
+    create_directory_link(&private_sessions, user_sessions)
+}
+
+fn paths_point_to_same_dir(left: &Path, right: &Path) -> bool {
+    let Ok(left) = std::fs::canonicalize(left) else {
+        return false;
+    };
+    let Ok(right) = std::fs::canonicalize(right) else {
+        return false;
+    };
+    left == right
+}
+
+fn is_reparse_point(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+fn unlink_directory_link(path: &Path) {
+    if !is_reparse_point(path) {
+        return;
+    }
+    let _ = std::fs::remove_dir(path);
+    let _ = std::fs::remove_file(path);
+}
+
+fn merge_dir_contents(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("创建 {} 失败：{e}", to.display()))?;
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let dest = to.join(entry.file_name());
+        if src.is_dir() {
+            merge_dir_contents(&src, &dest)?;
+        } else if !dest.exists() {
+            std::fs::rename(&src, &dest)
+                .or_else(|_| std::fs::copy(&src, &dest).map(|_| ()))
+                .map_err(|e| format!("迁移 {} 失败：{e}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn create_directory_link(link: &Path, target: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use crate::proc::NoConsoleWindow;
+        // mklink 是 cmd 内建；整条命令塞进一个 `/C` 参数会被 Rust 再包一层引号，
+        // 路径末尾的 `\` 会把收尾引号吃掉（「文件名、目录名或卷标语法不正确」）。
+        let output = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .no_console_window()
+            .output()
+            .map_err(|e| format!("创建会话目录联接失败：{e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return Ok(());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "创建会话目录联接失败（{} → {}）：{}{}",
+            link.display(),
+            target.display(),
+            stdout.trim(),
+            stderr.trim()
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(target, link)
+            .map_err(|e| format!("创建会话目录符号链接失败：{e}"))
+    }
+}
+
+/// 整份覆盖 `config.toml` 之后，把聊天里选过的顶层 `model` / `model_reasoning_effort` 写回去。
+fn write_codex_config_preserving_chat_model(path: &Path, config_toml: &str) -> Result<(), String> {
+    let previous = if path.is_file() {
+        std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?
+    } else {
+        String::new()
+    };
+    let previous_model = read_toml_toplevel_string(&previous, "model");
+    let previous_effort = read_toml_toplevel_string(&previous, "model_reasoning_effort");
+    write_private(path, config_toml)?;
+    if let Some(model) = previous_model {
+        upsert_toml_toplevel_string_file(path, "model", &model)?;
+    }
+    if let Some(effort) = previous_effort {
+        upsert_toml_toplevel_string_file(path, "model_reasoning_effort", &effort)?;
+    }
+    Ok(())
+}
+
+/// 把 Kivio 聊天里选的模型写进 Claude / Codex 的 **cc-switch live 文件**。
+///
+/// Auto / 空 / `default` 不写：沿用文件里已有的默认。其它 CLI 无操作。
+/// 失败由调用方记日志，不阻断换模型。
+pub fn persist_selected_model(
+    agent_id: &str,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+) -> Result<(), String> {
+    let Some(model) = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default")
+    else {
+        return Ok(());
+    };
+    match agent_id {
+        "claude" => {
+            let Some(wire) =
+                crate::external_agents::session::claude_init::claude_wire_model(Some(model))
+            else {
+                return Ok(());
+            };
+            persist_claude_model(&wire)
+        }
+        "codex" => persist_codex_model(model, reasoning),
+        _ => Ok(()),
+    }
+}
+
+fn persist_claude_model(model: &str) -> Result<(), String> {
+    let _guard = NATIVE_CONFIG_LOCK
+        .lock()
+        .map_err(|_| "原生 CLI 配置写锁已损坏".to_string())?;
+    if let Some(path) = claude_native_settings_path() {
+        upsert_claude_live_model(&path, model)?;
+    }
+    if let Some(path) = claude_settings_override("claude") {
+        upsert_claude_live_model(&path, model)?;
+    }
+    Ok(())
+}
+
+fn persist_codex_model(model: &str, reasoning: Option<&str>) -> Result<(), String> {
+    let _guard = NATIVE_CONFIG_LOCK
+        .lock()
+        .map_err(|_| "原生 CLI 配置写锁已损坏".to_string())?;
+    let reasoning = reasoning
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "default");
+    // 只改已有文件：不要新建一份只有 `model =` 的残缺 ~/.codex/config.toml。
+    for path in existing_unique_files(
+        [codex_effective_config_path(), codex_native_config_path()]
+            .into_iter()
+            .flatten(),
+    ) {
+        upsert_toml_toplevel_string_file(&path, "model", model)?;
+        if let Some(effort) = reasoning {
+            upsert_toml_toplevel_string_file(&path, "model_reasoning_effort", effort)?;
+        }
+    }
+    Ok(())
+}
+
+/// cc-switch `get_claude_settings_path`：已有 `settings.json` 用它，否则兼容旧 `claude.json`。
+fn claude_native_settings_path() -> Option<PathBuf> {
+    let dir = nonempty_env_path("CLAUDE_CONFIG_DIR")
+        .or_else(|| directories::BaseDirs::new().map(|base| base.home_dir().join(".claude")))?;
+    let settings = dir.join("settings.json");
+    if settings.is_file() {
+        return Some(settings);
+    }
+    let legacy = dir.join("claude.json");
+    if legacy.is_file() {
+        return Some(legacy);
+    }
+    Some(settings)
+}
+
+fn codex_native_config_path() -> Option<PathBuf> {
+    native_codex_home().map(|home| home.join("config.toml"))
+}
+
+fn codex_effective_config_path() -> Option<PathBuf> {
+    if let Some(home) = provider_env("codex").get("CODEX_HOME") {
+        return Some(PathBuf::from(home).join("config.toml"));
+    }
+    codex_native_config_path()
+}
+
+fn read_json_string_field(path: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn read_json_env_string(path: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("env")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|env| env.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// cc-switch 写进 Claude live `settings.json` 的模型字段：顶层 `model` + `env.ANTHROPIC_MODEL`，
+/// 能认出 opus/sonnet/haiku/fable 时再写对应 `ANTHROPIC_DEFAULT_*_MODEL`。其它键原样保留。
+fn upsert_claude_live_model(path: &Path, model: &str) -> Result<(), String> {
+    let mut root = if path.is_file() {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        if text.trim().is_empty() {
+            serde_json::Map::new()
+        } else {
+            parse_object_text(&text, &format!("{}", path.display()))?
+        }
+    } else {
+        serde_json::Map::new()
+    };
+    let already = root.get("model").and_then(serde_json::Value::as_str) == Some(model)
+        && root
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|env| env.get("ANTHROPIC_MODEL"))
+            .and_then(serde_json::Value::as_str)
+            == Some(model);
+    let family_ok = match claude_default_env_key(model) {
+        None => true,
+        Some(key) => {
+            root.get("env")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|env| env.get(key))
+                .and_then(serde_json::Value::as_str)
+                == Some(model)
+        }
+    };
+    if already && family_ok {
+        return Ok(());
+    }
+    let env = root
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(env) = env.as_object_mut() else {
+        return Err(format!("{} 的 env 不是对象", path.display()));
+    };
+    env.insert(
+        "ANTHROPIC_MODEL".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    if let Some(key) = claude_default_env_key(model) {
+        env.insert(
+            key.to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+    }
+    root.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.to_string()),
+    );
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| e.to_string())?
+        + "\n";
+    write_private_atomic(path, &rendered)
+}
+
+fn claude_default_env_key(model: &str) -> Option<&'static str> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.contains("fable") {
+        Some("ANTHROPIC_DEFAULT_FABLE_MODEL")
+    } else if normalized.contains("haiku") {
+        Some("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+    } else if normalized.contains("sonnet") {
+        Some("ANTHROPIC_DEFAULT_SONNET_MODEL")
+    } else if normalized.contains("opus") {
+        Some("ANTHROPIC_DEFAULT_OPUS_MODEL")
+    } else {
+        None
+    }
+}
+
+fn upsert_toml_toplevel_string_file(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    let existing = if path.is_file() {
+        std::fs::read_to_string(path).map_err(|e| format!("读取 {} 失败：{e}", path.display()))?
+    } else {
+        String::new()
+    };
+    let next = upsert_toml_toplevel_string(&existing, key, value);
+    if next == existing {
+        return Ok(());
+    }
+    write_private_atomic(path, &next)
+}
+
+/// 替换或插入顶层 `key = "value"`，第一个 `[section]` 之前。其它行原样保留。
+fn upsert_toml_toplevel_string(text: &str, key: &str, value: &str) -> String {
+    let quoted = serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""));
+    let replacement = format!("{key} = {quoted}");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut section_at = lines.len();
+    let mut replaced = false;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            section_at = index;
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((found_key, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if found_key.trim() != key {
+            continue;
+        }
+        lines[index] = replacement.clone();
+        replaced = true;
+        break;
+    }
+    if !replaced {
+        lines.insert(section_at, replacement);
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn read_toml_toplevel_string(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((found_key, raw)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if found_key.trim() != key {
+            continue;
+        }
+        let raw = raw.trim();
+        if let Ok(value) = serde_json::from_str::<String>(raw) {
+            return Some(value).filter(|value| !value.is_empty());
+        }
+        let unquoted = raw.trim_matches('"').trim_matches('\'').trim();
+        if unquoted.is_empty() {
+            return None;
+        }
+        return Some(unquoted.to_string());
+    }
+    None
+}
+
+fn existing_unique_files(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in candidates {
+        if path.is_file() && !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 /// Grok 原生配置路径：`$GROK_HOME/config.toml`，否则 `~/.grok/config.toml`。
@@ -1470,6 +2007,9 @@ pub fn cleanup(
         }
         "codex" => {
             if let Some(home) = codex_home_for(provider_id) {
+                // `sessions/` 可能是接到用户 ~/.codex/sessions 的 junction；必须先拆掉
+                // 联接再删私有 home，否则 remove_dir_all 可能顺着联接把用户会话清掉。
+                unlink_directory_link(&home.join("sessions"));
                 let _ = std::fs::remove_dir_all(home);
             }
         }
@@ -2789,5 +3329,254 @@ max_context_size = 200000
         assert!(openai.get("models").and_then(Value::as_array).unwrap()[0]
             .get("compat")
             .is_none());
+    }
+
+    #[test]
+    fn claude_live_model_matches_cc_switch_env_fields() {
+        let root = temp_root("claude-model");
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"effortLevel":"high","env":{"ANTHROPIC_BASE_URL":"https://x"}}"#,
+        )
+        .unwrap();
+        upsert_claude_live_model(&path, "claude-sonnet-5").unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["model"], "claude-sonnet-5");
+        assert_eq!(value["effortLevel"], "high");
+        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://x");
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5");
+        assert_eq!(
+            value["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "claude-sonnet-5"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_live_model_skips_family_env_for_unrecognized_ids() {
+        let root = temp_root("claude-model-freeform");
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, r#"{"env":{}}"#).unwrap();
+        upsert_claude_live_model(&path, "glm-5.2").unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["model"], "glm-5.2");
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "glm-5.2");
+        assert!(value["env"].get("ANTHROPIC_DEFAULT_SONNET_MODEL").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_materialize_keeps_chat_model_and_provider_family_maps() {
+        let root = temp_root("claude-overlay");
+        let path = root.join("claude-relay.json");
+        std::fs::create_dir_all(&root).unwrap();
+        upsert_claude_live_model(&path, "claude-sonnet-5").unwrap();
+        let provider = ExternalCliProvider {
+            id: "relay".to_string(),
+            env: vec![
+                crate::settings::CliEnvVar {
+                    key: "ANTHROPIC_BASE_URL".to_string(),
+                    value: "https://relay.example".to_string(),
+                },
+                crate::settings::CliEnvVar {
+                    key: "ANTHROPIC_DEFAULT_SONNET_MODEL".to_string(),
+                    value: "glm-5.2".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        materialize_claude_to(&path, &provider).unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["model"], "claude-sonnet-5");
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5");
+        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://relay.example");
+        assert_eq!(value["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "glm-5.2");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_materialize_blanks_stale_default_model_instead_of_preserving_it() {
+        let root = temp_root("claude-default-model");
+        let path = root.join("claude-relay.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_DEFAULT_MODEL":"old-relay-opus","ANTHROPIC_MODEL":"claude-sonnet-5"}}"#,
+        )
+        .unwrap();
+        let provider = ExternalCliProvider {
+            id: "relay".to_string(),
+            env: vec![crate::settings::CliEnvVar {
+                key: "ANTHROPIC_BASE_URL".to_string(),
+                value: "https://relay.example".to_string(),
+            }],
+            ..Default::default()
+        };
+        materialize_claude_to(&path, &provider).unwrap();
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "claude-sonnet-5");
+        assert_eq!(
+            value["env"]["ANTHROPIC_DEFAULT_MODEL"], "",
+            "切供应商后新会话默认模型不该从旧 overlay 填回来：{value}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn codex_model_upsert_keeps_provider_tables() {
+        let original =
+            "approval_policy = \"on-request\"\n\n[model_providers.relay]\nname = \"relay\"\n";
+        let next = upsert_toml_toplevel_string(original, "model", "gpt-5.5");
+        assert!(next.contains("model = \"gpt-5.5\""));
+        assert!(next.contains("approval_policy = \"on-request\""));
+        assert!(next.contains("[model_providers.relay]"));
+        assert!(
+            next.find("model = \"gpt-5.5\"").unwrap()
+                < next.find("[model_providers.relay]").unwrap()
+        );
+        let replaced = upsert_toml_toplevel_string(&next, "model", "gpt-5.4");
+        assert!(replaced.contains("model = \"gpt-5.4\""));
+        assert!(!replaced.contains("model = \"gpt-5.5\""));
+        assert_eq!(
+            read_toml_toplevel_string(&replaced, "model").as_deref(),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn codex_rematerialize_keeps_chat_selected_model() {
+        let root = temp_root("codex-preserve-model");
+        let path = root.join("config.toml");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &path,
+            "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"high\"\n\n[model_providers.relay]\nname = \"relay\"\n",
+        )
+        .unwrap();
+        write_codex_config_preserving_chat_model(
+            &path,
+            "model = \"gpt-5\"\n\n[model_providers.relay]\nname = \"relay\"\nbase_url = \"https://x\"\n",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("model = \"gpt-5.5\""));
+        assert!(text.contains("model_reasoning_effort = \"high\""));
+        assert!(text.contains("base_url = \"https://x\""));
+        assert!(!text.contains("model = \"gpt-5\"\n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_unique_files_skips_missing_and_dedups() {
+        let root = temp_root("codex-existing-files");
+        let present = root.join("config.toml");
+        let missing = root.join("missing.toml");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&present, "model = \"gpt-5\"\n").unwrap();
+        let paths = existing_unique_files([present.clone(), present.clone(), missing]);
+        assert_eq!(paths, vec![present]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persist_selected_model_skips_auto_and_other_clis() {
+        persist_selected_model("claude", Some("default"), None).unwrap();
+        persist_selected_model("claude", Some(""), None).unwrap();
+        persist_selected_model("claude", None, None).unwrap();
+        persist_selected_model("pi", Some("gpt-test"), None).unwrap();
+    }
+
+    #[test]
+    fn native_codex_home_is_user_dot_codex() {
+        let home = native_codex_home().expect("home dir");
+        assert_eq!(
+            home.file_name().and_then(|name| name.to_str()),
+            Some(".codex")
+        );
+    }
+
+    #[test]
+    fn wsl_shared_codex_home_is_host_path_only_for_wsl_codex() {
+        let wsl = PathBuf::from(r"\\wsl$\Ubuntu\usr\bin\codex");
+        let win = PathBuf::from(r"C:\codex.exe");
+        assert!(wsl_shared_codex_home(&win).is_none());
+        let home = wsl_shared_codex_home(&wsl).expect("wsl shares the host Codex home");
+        assert_eq!(
+            home.file_name().and_then(|name| name.to_str()),
+            Some(".codex")
+        );
+        assert!(!home
+            .to_string_lossy()
+            .replace('\\', "/")
+            .starts_with("/mnt/"));
+    }
+
+    #[test]
+    fn kivio_private_codex_home_is_the_materialized_dir() {
+        // Join so macOS CI Path semantics match Windows (`\` is not a separator on Unix).
+        let private = Path::new("com.zmair.kivio")
+            .join("external-cli-providers")
+            .join("codex-relay");
+        assert!(is_kivio_private_codex_home(&private));
+        assert!(!is_kivio_private_codex_home(Path::new(".codex")));
+        assert!(!is_kivio_private_codex_home(
+            &Path::new("external-cli-providers").join("other")
+        ));
+    }
+
+    #[test]
+    fn share_codex_sessions_dir_migrates_private_rollouts_then_links() {
+        let root = temp_root("codex-share-sessions");
+        let private_home = root.join("external-cli-providers").join("codex-relay");
+        let user_sessions = root.join("user-codex").join("sessions");
+        let nested = private_home
+            .join("sessions")
+            .join("2026")
+            .join("08")
+            .join("24");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("rollout-kivio.jsonl"), "kivio\n").unwrap();
+        std::fs::create_dir_all(user_sessions.join("2026")).unwrap();
+        std::fs::write(user_sessions.join("2026").join("keep-me.jsonl"), "tui\n").unwrap();
+
+        share_codex_sessions_dir(&private_home, &user_sessions).unwrap();
+        share_codex_sessions_dir(&private_home, &user_sessions).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(
+                user_sessions
+                    .join("2026")
+                    .join("08")
+                    .join("24")
+                    .join("rollout-kivio.jsonl")
+            )
+            .unwrap(),
+            "kivio\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user_sessions.join("2026").join("keep-me.jsonl")).unwrap(),
+            "tui\n"
+        );
+        assert!(paths_point_to_same_dir(
+            &private_home.join("sessions"),
+            &user_sessions
+        ));
+        std::fs::write(
+            private_home.join("sessions").join("via-link.jsonl"),
+            "linked\n",
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(user_sessions.join("via-link.jsonl")).unwrap(),
+            "linked\n"
+        );
+
+        unlink_directory_link(&private_home.join("sessions"));
+        std::fs::write(user_sessions.join("still-there.jsonl"), "ok\n").unwrap();
+        assert!(user_sessions.join("still-there.jsonl").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

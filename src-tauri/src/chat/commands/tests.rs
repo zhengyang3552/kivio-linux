@@ -16,9 +16,9 @@ use crate::skills;
 
 use super::catalog::{assistant_from_builder_args, strip_transcripts_for_frontend};
 use super::context::{
-    build_chat_api_messages, count_tokens_in_value, estimate_image_tokens_for_dimensions,
-    group_answer_excluded_from_context, mark_summary_stale_if_needed, resolve_usage_anchor,
-    should_auto_compress_context,
+    apply_context_clear, build_chat_api_messages, count_tokens_in_value,
+    estimate_image_tokens_for_dimensions, group_answer_excluded_from_context,
+    mark_summary_stale_if_needed, resolve_usage_anchor, should_auto_compress_context,
 };
 use super::interaction::{
     approve_agent_plan_for_execution, format_tool_approval_summary, stream_delta_event_kinds,
@@ -29,7 +29,8 @@ use super::messages::{
     reconcile_orphan_tool_segments, replace_final_text_segments_for_edit,
 };
 use super::mutations::{
-    apply_regenerate_truncation, build_fork_messages, build_fork_messages_before_anchor,
+    apply_regenerate_truncation, apply_reply_with_model_result, build_fork_messages,
+    build_fork_messages_before_anchor, prepare_reply_with_model,
 };
 use super::reply_runtime::resolve_reply_arms;
 use super::sanitization::sanitize_image_payloads_for_model;
@@ -62,13 +63,22 @@ fn resolve_thinking_maps_levels_and_defaults_to_high() {
 
 #[test]
 fn resolve_thinking_drops_level_for_models_without_effort_knob() {
-    // 模型库里 `reasoningEfforts: []` = 没有 effort 旋钮。Claude 4.5 及更早不认
-    // `output_config.effort`（传了 400），这里就得把等级抹成 None，适配器自然不发。
-    for model in ["claude-sonnet-4.5", "claude-opus-4", "claude-haiku-4.5"] {
+    // 模型库里 `reasoningEfforts: []` = 没有思考深度旋钮。
+    assert_eq!(
+        resolve_thinking(Some("high"), true, None, "claude-3.5-haiku"),
+        (true, None)
+    );
+    // Claude 4：UI 档位会下发（适配器再映射成 budget_tokens / adaptive+effort）。
+    for model in [
+        "claude-opus-4",
+        "claude-sonnet-4",
+        "claude-opus-4.5",
+        "claude-sonnet-4.5",
+    ] {
         assert_eq!(
             resolve_thinking(Some("high"), true, None, model),
-            (true, None),
-            "{model} 不该带 effort"
+            (true, Some("high".to_string())),
+            "{model}"
         );
     }
     // 4.6+ 反过来必须带上。
@@ -144,14 +154,9 @@ fn slash_trigger_rewrites_body_and_pins_skill() {
     let registry = slash_skill_registry(slash_skill_record("commit", "Commit", vec!["/commit"]));
     let chat_tools = crate::settings::ChatToolsConfig::default();
 
-    let (skill_id, rewritten) = try_apply_skill_slash_trigger(
-        &registry,
-        &chat_tools,
-        None,
-        "/commit fix login",
-        false,
-    )
-    .expect("slash trigger should match");
+    let (skill_id, rewritten) =
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/commit fix login", false)
+            .expect("slash trigger should match");
 
     assert_eq!(skill_id, "commit");
     assert!(rewritten.starts_with("[Skill: Commit]\n\n"));
@@ -166,12 +171,10 @@ fn slash_trigger_ignores_non_slash_and_unknown() {
     let chat_tools = crate::settings::ChatToolsConfig::default();
 
     assert!(
-        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "commit fix", false)
-            .is_none()
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "commit fix", false).is_none()
     );
     assert!(
-        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/unknown x", false)
-            .is_none()
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/unknown x", false).is_none()
     );
 }
 
@@ -182,8 +185,7 @@ fn slash_trigger_skips_disabled_skill() {
     chat_tools.disabled_skill_ids = vec!["commit".to_string()];
 
     assert!(
-        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/commit fix", false)
-            .is_none()
+        try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/commit fix", false).is_none()
     );
 }
 
@@ -293,7 +295,6 @@ fn agent_plan_tool_filter_keeps_only_read_only_and_agent_state_tools() {
         crate::mcp::types::native_read_file_tool(),
         crate::mcp::types::native_write_file_tool(),
         crate::mcp::types::native_run_command_tool(),
-        crate::mcp::types::native_run_python_tool(),
         crate::mcp::types::native_memory_read_tool(),
         crate::mcp::types::native_memory_modify_tool(),
         crate::mcp::types::mixer_generate_image_tool(),
@@ -322,13 +323,11 @@ fn agent_plan_tool_filter_keeps_only_read_only_and_agent_state_tools() {
     assert!(names.contains(&"mcp__docs__search".to_string()));
     assert!(!names.contains(&"write".to_string()));
     assert!(!names.contains(&"bash".to_string()));
-    assert!(!names.contains(&"run_python".to_string()));
     assert!(!names.contains(&"memory_modify".to_string()));
     assert!(!names.contains(&"mixer_generate_image".to_string()));
     assert!(!names.contains(&"mcp__fs__write".to_string()));
     assert!(blocked_names.contains(&"write".to_string()));
     assert!(blocked_names.contains(&"bash".to_string()));
-    assert!(blocked_names.contains(&"run_python".to_string()));
     assert!(blocked_names.contains(&"memory_modify".to_string()));
     assert!(blocked_names.contains(&"mixer_generate_image".to_string()));
     assert!(blocked_names.contains(&"mcp__fs__write".to_string()));
@@ -654,6 +653,58 @@ fn format_tool_approval_summary_highlights_run_command() {
 }
 
 #[test]
+fn tool_approval_does_not_fail_closed_after_sixty_seconds() {
+    let src = include_str!("interaction.rs");
+    let start = src
+        .find("pub(crate) async fn request_tool_approval_outcome")
+        .expect("request_tool_approval_outcome");
+    let rest = &src[start..];
+    let end = rest
+        .find("pub(crate) fn withdraw_tool_confirm")
+        .expect("withdraw_tool_confirm");
+    let body = &rest[..end];
+    assert!(
+        !body.contains("from_secs(60)"),
+        "a 60s wall-clock deny is what Codex reports as Rejected(\"rejected by user\")"
+    );
+    assert!(
+        body.contains("result = rx => result"),
+        "tool approval must wait on the user oneshot until cancel"
+    );
+}
+
+#[test]
+fn format_tool_approval_summary_shows_workspace_permission_grant() {
+    let record = ToolCallRecord {
+        id: "call_1".to_string(),
+        name: "request_permissions".to_string(),
+        source: "external_cli".to_string(),
+        server_id: None,
+        arguments: r#"{"reason":"Select a workspace root","cwd":"/work","permissions":{"fileSystem":{"write":["/work"]},"network":{"enabled":true}}}"#.to_string(),
+        status: ToolCallStatus::Pending,
+        result_preview: None,
+        error: None,
+        duration_ms: None,
+        started_at: None,
+        completed_at: None,
+        round: 1,
+        sensitive: true,
+        artifacts: Vec::new(),
+        trace_id: None,
+        span_id: None,
+        structured_content: None,
+    };
+
+    let summary = format_tool_approval_summary(&record);
+    assert_eq!(summary.target.as_deref(), Some("/work"));
+    assert!(summary.detail.contains("Select a workspace root"));
+    assert!(summary.detail.contains("Working directory: /work"));
+    assert!(summary.detail.contains("Write: /work"));
+    assert!(summary.detail.contains("Network access"));
+    assert!(!summary.detail.contains("Raw arguments"));
+}
+
+#[test]
 fn format_tool_approval_summary_highlights_file_path() {
     let record = ToolCallRecord {
         id: "call_1".to_string(),
@@ -719,15 +770,15 @@ fn assistant_model_messages_marks_failed_tool_results_as_error() {
                 "id": "call_error",
                 "type": "function",
                 "function": {
-                    "name": "run_python",
-                    "arguments": "{\"code\":\"print(1/0)\"}"
+                    "name": "bash",
+                    "arguments": "{\"command\":\"echo 1\"}"
                 }
             }]
         }),
         serde_json::json!({
             "role": "tool",
             "tool_call_id": "call_error",
-            "content": "Python 执行失败：ZeroDivisionError: division by zero"
+            "content": "command failed: exit 1"
         }),
         serde_json::json!({
             "role": "assistant",
@@ -736,13 +787,13 @@ fn assistant_model_messages_marks_failed_tool_results_as_error() {
     ];
     let tool_calls = vec![ToolCallRecord {
         id: "call_error".to_string(),
-        name: "run_python".to_string(),
+        name: "bash".to_string(),
         source: "native".to_string(),
         server_id: None,
-        arguments: "{\"code\":\"print(1/0)\"}".to_string(),
+        arguments: "{\"command\":\"echo 1\"}".to_string(),
         status: ToolCallStatus::Error,
         result_preview: None,
-        error: Some("Python 执行失败：ZeroDivisionError: division by zero".to_string()),
+        error: Some("command failed: exit 1".to_string()),
         duration_ms: Some(31),
         started_at: Some(1),
         completed_at: Some(2),
@@ -777,7 +828,7 @@ fn test_tool_record(id: &str, source: &str, round: u32, status: ToolCallStatus) 
         name: if source == "mixer" {
             "mixer_vision".to_string()
         } else {
-            "run_python".to_string()
+            "run_command".to_string()
         },
         source: source.to_string(),
         server_id: None,
@@ -827,7 +878,7 @@ fn reconcile_orphan_tool_segments_synthesizes_cancelled_record_with_recovered_me
         "tool_calls": [{
             "id": "fc_call_function_4agzr50pp9go_1",
             "type": "function",
-            "function": { "name": "run_python", "arguments": "{\"code\":\"1\"}" }
+            "function": { "name": "bash", "arguments": "{\"command\":\"echo 1\"}" }
         }]
     })];
 
@@ -843,11 +894,8 @@ fn reconcile_orphan_tool_segments_synthesizes_cancelled_record_with_recovered_me
         .find(|r| r.id == "fc_call_function_4agzr50pp9go_1")
         .expect("synthesized record present");
     assert!(matches!(synthesized.status, ToolCallStatus::Cancelled));
-    assert_eq!(
-        synthesized.name, "run_python",
-        "name recovered from api_messages"
-    );
-    assert_eq!(synthesized.arguments, "{\"code\":\"1\"}");
+    assert_eq!(synthesized.name, "bash", "name recovered from api_messages");
+    assert_eq!(synthesized.arguments, "{\"command\":\"echo 1\"}");
     assert_eq!(synthesized.round, 2);
     assert!(synthesized.error.is_some());
 }
@@ -1861,6 +1909,70 @@ fn build_chat_api_messages_injects_summary_and_skips_old_raw_messages() {
 }
 
 #[test]
+fn build_chat_api_messages_skips_cleared_messages_without_summary() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary = None;
+    apply_context_clear(&mut conversation).expect("clear");
+    let messages = build_chat_api_messages(None, "system", &conversation, None, None, &[])
+        .expect("messages should build");
+    let serialized = serde_json::to_string(&messages).expect("messages serialize");
+
+    assert_eq!(
+        messages.len(),
+        1,
+        "only the system prompt remains after a tail clear"
+    );
+    assert!(!serialized.contains("Previous conversation summary"));
+    assert!(!serialized.contains("old user content"));
+    assert!(!serialized.contains("recent assistant content"));
+}
+
+#[test]
+fn build_chat_api_messages_ignores_summary_covered_by_clear() {
+    let mut conversation = test_conversation_with_summary(false);
+    apply_context_clear(&mut conversation).expect("clear drops the live summary");
+    assert!(conversation.context_state.summary.is_none());
+    let messages = build_chat_api_messages(None, "system", &conversation, None, None, &[])
+        .expect("messages should build");
+    let serialized = serde_json::to_string(&messages).expect("messages serialize");
+    assert!(!serialized.contains("Previous conversation summary"));
+    assert!(!serialized.contains("summary of older messages"));
+    assert!(!serialized.contains("recent user content"));
+}
+
+#[test]
+fn apply_context_clear_rejects_external_runtime() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.agent_runtime.kind = crate::chat::AgentRuntimeKind::External;
+    conversation.agent_runtime.external_agent_id = Some("claude".to_string());
+    let err = apply_context_clear(&mut conversation).expect_err("external");
+    assert!(err.contains("Kivio Agent"));
+}
+
+#[test]
+fn apply_context_clear_is_idempotent_at_the_tail() {
+    let mut conversation = test_conversation_with_summary(false);
+    apply_context_clear(&mut conversation).expect("first clear");
+    let err = apply_context_clear(&mut conversation).expect_err("already clear");
+    assert!(err.contains("空上下文"));
+}
+
+#[test]
+fn rewind_past_clear_restores_live_context() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary = None;
+    apply_context_clear(&mut conversation).expect("clear");
+    conversation.messages.truncate(2);
+    mark_summary_stale_if_needed(&mut conversation, 0);
+    assert!(conversation.context_state.clear_boundaries.is_empty());
+    let messages = build_chat_api_messages(None, "system", &conversation, None, None, &[])
+        .expect("messages should build");
+    let serialized = serde_json::to_string(&messages).expect("messages serialize");
+    assert!(serialized.contains("old user content"));
+    assert!(serialized.contains("old assistant content"));
+}
+
+#[test]
 fn stale_summary_is_ignored_by_message_builder() {
     let conversation = test_conversation_with_summary(true);
     let messages = build_chat_api_messages(None, "system", &conversation, None, None, &[])
@@ -2004,6 +2116,85 @@ fn regenerate_truncation_rejects_bad_edit_targets() {
     apply_regenerate_truncation(&mut plain, 3, None).unwrap();
     assert_eq!(plain.messages.len(), 3);
     assert_eq!(plain.messages.last().unwrap().id, "msg_user_2");
+}
+
+#[test]
+fn prepare_reply_with_model_tags_last_turn_and_rejects_duplicates() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary = None;
+    let prep = prepare_reply_with_model(
+        &conversation,
+        "msg_assistant_2",
+        "other-provider",
+        "other-model",
+        Some("grp_preferred"),
+    )
+    .expect("prep");
+    assert_eq!(prep.group_id, "grp_preferred");
+    assert_eq!(prep.sibling_ids, vec!["msg_assistant_2"]);
+    assert_eq!(prep.arm_index, 1);
+    assert_eq!(prep.user_index, 2);
+
+    let err = prepare_reply_with_model(&conversation, "msg_assistant_2", "provider", "model", None)
+        .expect_err("session model already answered");
+    assert!(err.contains("已经回答"));
+
+    let err = prepare_reply_with_model(
+        &conversation,
+        "msg_assistant_1",
+        "other-provider",
+        "other-model",
+        None,
+    )
+    .expect_err("not last turn");
+    assert!(err.contains("最后一轮"));
+
+    conversation.agent_runtime.kind = crate::chat::AgentRuntimeKind::External;
+    conversation.agent_runtime.external_agent_id = Some("claude".to_string());
+    let err = prepare_reply_with_model(
+        &conversation,
+        "msg_assistant_2",
+        "other-provider",
+        "other-model",
+        None,
+    )
+    .expect_err("external");
+    assert!(err.contains("Kivio Agent"));
+}
+
+#[test]
+fn apply_reply_with_model_result_groups_existing_answer() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary = None;
+    let prep = prepare_reply_with_model(
+        &conversation,
+        "msg_assistant_2",
+        "other-provider",
+        "other-model",
+        Some("grp_new"),
+    )
+    .unwrap();
+    let mut extra = test_chat_message("msg_assistant_3", "assistant", "from other model", 5);
+    extra.group_id = Some("grp_new".to_string());
+    extra.provider_id = Some("other-provider".to_string());
+    extra.model = Some("other-model".to_string());
+    apply_reply_with_model_result(&mut conversation, &prep, extra);
+    assert_eq!(
+        conversation.messages[3].group_id.as_deref(),
+        Some("grp_new")
+    );
+    assert_eq!(
+        conversation.messages[3].provider_id.as_deref(),
+        Some("provider")
+    );
+    assert_eq!(conversation.messages[4].id, "msg_assistant_3");
+    assert_eq!(
+        conversation
+            .group_selections
+            .get("grp_new")
+            .map(String::as_str),
+        Some("msg_assistant_3")
+    );
 }
 
 #[test]

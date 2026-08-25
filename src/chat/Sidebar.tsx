@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { save } from '@tauri-apps/plugin-dialog'
 import {
@@ -34,6 +34,7 @@ import { useInsertionReorder } from '../utils/insertionReorder'
 import { applyConversationPins, withPinAt, type ConversationPin } from './conversationPins'
 import { ChatTitlebarActions } from './ChatTitlebarActions'
 import { chatTitlebarMacInsetClass, isMac, usesNativeTitlebar } from './platform'
+import { clampSidebarWidth, SIDEBAR_DEFAULT_WIDTH } from './persistence'
 import { useChatPerfRenderProbe } from './chatPerformanceProbe'
 import type { ConversationMenuAnchor } from './ConversationContextMenu'
 import type { ChatUserProfile } from './types'
@@ -206,12 +207,14 @@ export interface SidebarProps {
   onOpenSettings: () => void
   onOpenExtensionsItem: (item: ExtensionsNavItem) => void
   onSelectLang: (lang: Lang) => void
-  onCheckUpdate: () => void
   onOpenUsage: () => void
   settingsActive?: boolean
   extensionsActive?: ExtensionsNavItem | null
   collapsed: boolean
   onToggleCollapsed: () => void
+  /** 展开态宽度。拖拽过程只写 CSS 变量，松手才回传。 */
+  width?: number
+  onWidthChange?: (width: number) => void
   refreshKey: number
   profileRefreshKey?: number
   searchOpen: boolean
@@ -224,7 +227,6 @@ function SidebarUserFooter({
   settingsActive,
   onOpenSettings,
   onSelectLang,
-  onCheckUpdate,
   onOpenUsage,
 }: {
   profile: ChatUserProfile
@@ -232,7 +234,6 @@ function SidebarUserFooter({
   settingsActive: boolean
   onOpenSettings: () => void
   onSelectLang: (lang: Lang) => void
-  onCheckUpdate: () => void
   onOpenUsage: () => void
 }) {
   const [menuRect, setMenuRect] = useState<{ left: number; top: number; width: number } | null>(null)
@@ -294,7 +295,6 @@ function SidebarUserFooter({
           triggerRect={menuRect}
           lang={lang}
           onSelectLang={onSelectLang}
-          onCheckUpdate={onCheckUpdate}
           onOpenUsage={onOpenUsage}
           onClose={() => setMenuRect(null)}
         />
@@ -326,7 +326,7 @@ function NavRow({ icon, label, onClick, disabled, active, iconMotion }: NavRowPr
       }`}
     >
       <span
-        className={`flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out will-change-transform group-hover:text-neutral-800 group-active:scale-90 dark:text-neutral-400 dark:group-hover:text-neutral-200 ${iconMotion ?? ''}`}
+        className={`flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 group-active:scale-90 dark:text-neutral-400 dark:group-hover:text-neutral-200 ${iconMotion ?? ''}`}
       >
         {icon}
       </span>
@@ -363,7 +363,7 @@ function ExtensionsNav({
         }`}
         aria-expanded={expanded}
       >
-        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out will-change-transform group-hover:text-neutral-800 group-active:scale-90 group-hover:rotate-3 group-hover:scale-110 dark:text-neutral-400 dark:group-hover:text-neutral-200">
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 group-active:scale-90 group-hover:rotate-3 group-hover:scale-110 dark:text-neutral-400 dark:group-hover:text-neutral-200">
           <LayoutGrid size={17} strokeWidth={1.75} />
         </span>
         <span className="min-w-0 flex-1 truncate">{t.chatNavExtensions}</span>
@@ -575,6 +575,22 @@ function SearchDialog({
   )
 }
 
+function applySidebarWidthCss(aside: HTMLElement | null, nextWidth: number) {
+  const px = `${nextWidth}px`
+  aside?.style.setProperty('--chat-sidebar-width', px)
+  const shell = aside?.closest('.chat-window-shell')
+  if (shell instanceof HTMLElement) {
+    shell.style.setProperty('--chat-sidebar-width', px)
+  }
+}
+
+function setSidebarResizing(aside: HTMLElement | null, resizing: boolean) {
+  const shell = aside?.closest('.chat-window-shell')
+  if (shell instanceof HTMLElement) {
+    shell.classList.toggle('is-sidebar-resizing', resizing)
+  }
+}
+
 export const Sidebar = memo(function Sidebar({
   lang,
   currentConversationId,
@@ -592,12 +608,13 @@ export const Sidebar = memo(function Sidebar({
   onOpenSettings,
   onOpenExtensionsItem,
   onSelectLang,
-  onCheckUpdate,
   onOpenUsage,
   settingsActive = false,
   extensionsActive = null,
   collapsed,
   onToggleCollapsed,
+  width = SIDEBAR_DEFAULT_WIDTH,
+  onWidthChange,
   refreshKey,
   profileRefreshKey = 0,
   searchOpen,
@@ -605,12 +622,55 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
   const t = i18n[lang]
   const asideRef = useRef<HTMLElement>(null)
+  const dragStateRef = useRef<{ startX: number; startWidth: number; width: number; raf: number } | null>(null)
   // 折叠后侧栏仍挂载（用于滑出动画），用 inert 让其退出 tab 序 / 不可点击 / 不进 a11y 树。
   // useLayoutEffect：在绘制前与 JSX 里的 aria-hidden 原子地一起生效，避免短暂可聚焦窗口。
   useLayoutEffect(() => {
     const el = asideRef.current
     if (el) el.inert = collapsed
   }, [collapsed])
+  useLayoutEffect(() => {
+    applySidebarWidthCss(asideRef.current, width)
+  }, [width])
+  const handleResizeStart = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      const aside = asideRef.current
+      const measured = aside?.getBoundingClientRect().width ?? 0
+      const startWidth = measured > 0 ? measured : width
+      dragStateRef.current = { startX: event.clientX, startWidth, width: startWidth, raf: 0 }
+      setSidebarResizing(aside, true)
+
+      const onMove = (moveEvent: PointerEvent) => {
+        const state = dragStateRef.current
+        if (!state) return
+        const nextWidth = clampSidebarWidth(state.startWidth + (moveEvent.clientX - state.startX), window.innerWidth)
+        state.width = nextWidth
+        if (!state.raf) {
+          state.raf = window.requestAnimationFrame(() => {
+            state.raf = 0
+            applySidebarWidthCss(asideRef.current, state.width)
+          })
+        }
+      }
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove)
+        window.removeEventListener('pointerup', onUp)
+        const state = dragStateRef.current
+        dragStateRef.current = null
+        setSidebarResizing(asideRef.current, false)
+        if (!state) return
+        if (state.raf) window.cancelAnimationFrame(state.raf)
+        applySidebarWidthCss(asideRef.current, state.width)
+        if (state.width !== Math.round(startWidth)) onWidthChange?.(state.width)
+      }
+      window.addEventListener('pointermove', onMove)
+      window.addEventListener('pointerup', onUp)
+    },
+    [onWidthChange, width],
+  )
   const [conversations, setConversations] = useState<ConversationListItem[]>([])
   const [projects, setProjects] = useState<ChatProject[]>([])
   const [sets, setSets] = useState<ChatSet[]>([])
@@ -618,6 +678,11 @@ export const Sidebar = memo(function Sidebar({
   const [conversationPins, setConversationPins] = useState<Record<string, ConversationPin[]>>({})
   // 置顶手势的进行中覆盖：生成中乐观行 / 列表 refetch 都不得把刚点的 PIN 冲掉。
   const [pinOverrides, setPinOverrides] = useState<Record<string, boolean>>({})
+  /** 归档已乐观摘掉、但 persist/refetch 尚未落地：挡住过期 list 把条目写回来（其余行会跟着上下抽）。 */
+  const [suppressedConversationIds, setSuppressedConversationIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  )
+  const [titleGeneratingIds, setTitleGeneratingIds] = useState<Set<string>>(() => new Set())
   const [assistants, setAssistants] = useState<ChatAssistant[]>([])
   const [searchQuery, setSearchQuery] = useState('')
   // 后端全量索引搜索结果（覆盖所有对话，不止已加载的前 80）；空查询/非 Tauri 时为空，回退客户端过滤。
@@ -742,6 +807,40 @@ export const Sidebar = memo(function Sidebar({
     }
   }
 
+  const handleRegenerateConversationTitle = async (id: string) => {
+    setTitleGeneratingIds((previous) => {
+      if (previous.has(id)) return previous
+      const next = new Set(previous)
+      next.add(id)
+      return next
+    })
+    try {
+      const updated = await chatApi.regenerateConversationTitle(id)
+      setTitleGeneratingIds((previous) => {
+        if (!previous.has(id)) return previous
+        const next = new Set(previous)
+        next.delete(id)
+        return next
+      })
+      setConversations((items) =>
+        items.map((item) => (item.id === id ? { ...item, title: updated.title } : item)),
+      )
+      await loadSidebarData({ silent: true })
+    } catch (err) {
+      console.error('Failed to regenerate conversation title:', err)
+      window.alert(
+        t.chatRegenerateTitleFailed + (err instanceof Error ? err.message : String(err)),
+      )
+    } finally {
+      setTitleGeneratingIds((previous) => {
+        if (!previous.has(id)) return previous
+        const next = new Set(previous)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
   const handleTogglePinConversation = async (id: string, pinned: boolean) => {
     // 乐观更新：侧栏立刻重排，避免等磁盘写回才跳动。
     setPinOverrides((previous) => (previous[id] === pinned ? previous : { ...previous, [id]: pinned }))
@@ -766,6 +865,12 @@ export const Sidebar = memo(function Sidebar({
 
   /** 归档：侧栏「最近」不再显示；只在对话库「归档」书架可见。 */
   const handleArchiveConversation = async (id: string) => {
+    setSuppressedConversationIds((prev) => {
+      if (prev.has(id)) return prev
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
     // 1) 立刻从侧栏真实列表摘掉
     setConversations((items) => items.filter((item) => item.id !== id))
     // 2) 清父组件乐观条目 / in-flight，否则 visibleConversations 会因「真实列表没有」又把乐观项并回来
@@ -780,6 +885,13 @@ export const Sidebar = memo(function Sidebar({
     } catch (err) {
       console.error('Failed to archive conversation:', err)
       await loadSidebarData({ silent: true })
+    } finally {
+      setSuppressedConversationIds((prev) => {
+        if (!prev.has(id)) return prev
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
     }
   }
 
@@ -1000,11 +1112,13 @@ export const Sidebar = memo(function Sidebar({
 
   const visibleConversations = useMemo(() => {
     // 侧栏永不展示已归档（后端 list 也会滤；这里再兜一层防脏数据/旧索引）
-    const active = conversations.filter((item) => !item.archived)
+    const active = conversations.filter(
+      (item) => !item.archived && !suppressedConversationIds.has(item.id),
+    )
     if (optimisticConversations.length === 0) return applyPinOverrides(active, pinOverrides)
     const realById = new Map(active.map((item) => [item.id, item]))
     const visibleOptimisticConversations = optimisticConversations.filter((item) => {
-      if (item.archived) return false
+      if (item.archived || suppressedConversationIds.has(item.id)) return false
       const real = realById.get(item.id)
       // 真实列表里没有 → 保留。新会话从创建到首次 refetch 之间只存在于乐观列表；run 刚结束
       // 的那次 commit 里 generating 已清、refetch 还没落地，此刻若按 generating 判丢弃，
@@ -1025,7 +1139,7 @@ export const Sidebar = memo(function Sidebar({
       ...visibleOptimisticConversations,
       ...active.filter((item) => !optimisticIds.has(item.id)),
     ], pinOverrides)
-  }, [conversations, generatingConversationIds, optimisticConversations, pinOverrides])
+  }, [conversations, generatingConversationIds, optimisticConversations, pinOverrides, suppressedConversationIds])
 
   const normalizedSearchQuery = searchQuery.trim().toLowerCase()
 
@@ -1231,11 +1345,18 @@ export const Sidebar = memo(function Sidebar({
     <>
       <aside
         ref={asideRef}
-        className={`chat-sidebar-shell flex w-[240px] shrink-0 flex-col overflow-hidden${
+        className={`chat-sidebar-shell relative flex shrink-0 flex-col overflow-hidden${
           collapsed ? ' is-collapsed' : ''
         }${settingsActive ? ' is-settings-cover' : ''}`}
         aria-hidden={collapsed}
       >
+        {!collapsed && (
+          <div
+            className="chat-sidebar-resize"
+            data-tauri-drag-region="false"
+            onPointerDown={handleResizeStart}
+          />
+        )}
         {/* 侧栏内顶栏行只在 macOS 存在：那两枚按钮要贴着系统交通灯排。
             Windows / Linux 已把它们常驻到全宽标题栏带（见 ChatTitlebar），此处渲染会重复。 */}
         {usesNativeTitlebar && (
@@ -1513,6 +1634,7 @@ export const Sidebar = memo(function Sidebar({
                           reorder={conversationReorderFor(project.id)}
                           currentConversationId={currentConversationId}
                           generatingConversationIds={generatingConversationIds}
+                          titleGeneratingConversationIds={titleGeneratingIds}
                           projects={projects}
                           sets={sets}
                           lang={lang}
@@ -1523,6 +1645,7 @@ export const Sidebar = memo(function Sidebar({
                             onSelectConversation(id, conversation, { project, set: null })
                           }}
                           onRenameConversation={handleRenameConversation}
+                          onRegenerateConversationTitle={handleRegenerateConversationTitle}
                           onTogglePinConversation={handleTogglePinConversation}
                           onArchiveConversation={handleArchiveConversation}
                           onExportConversation={handleExportConversation}
@@ -1662,6 +1785,7 @@ export const Sidebar = memo(function Sidebar({
                               reorder={conversationReorderFor(set.id)}
                               currentConversationId={currentConversationId}
                               generatingConversationIds={generatingConversationIds}
+                              titleGeneratingConversationIds={titleGeneratingIds}
                               projects={projects}
                               sets={sets}
                               lang={lang}
@@ -1672,6 +1796,7 @@ export const Sidebar = memo(function Sidebar({
                                 onSelectConversation(id, conversation, { project: null, set })
                               }}
                               onRenameConversation={handleRenameConversation}
+                              onRegenerateConversationTitle={handleRegenerateConversationTitle}
                               onTogglePinConversation={handleTogglePinConversation}
                               onArchiveConversation={handleArchiveConversation}
                               onExportConversation={handleExportConversation}
@@ -1725,6 +1850,7 @@ export const Sidebar = memo(function Sidebar({
                       conversations={recentConversations}
                       currentConversationId={currentConversationId}
                       generatingConversationIds={generatingConversationIds}
+                      titleGeneratingConversationIds={titleGeneratingIds}
                       projects={projects}
                       sets={sets}
                       lang={lang}
@@ -1735,6 +1861,7 @@ export const Sidebar = memo(function Sidebar({
                         onSelectConversation(id, conversation, { project: null, set: null })
                       }}
                       onRenameConversation={handleRenameConversation}
+                      onRegenerateConversationTitle={handleRegenerateConversationTitle}
                       onTogglePinConversation={handleTogglePinConversation}
                       onArchiveConversation={handleArchiveConversation}
                       onExportConversation={handleExportConversation}
@@ -1757,7 +1884,6 @@ export const Sidebar = memo(function Sidebar({
         settingsActive={settingsActive}
         onOpenSettings={onOpenSettings}
         onSelectLang={onSelectLang}
-        onCheckUpdate={onCheckUpdate}
         onOpenUsage={onOpenUsage}
       />
 

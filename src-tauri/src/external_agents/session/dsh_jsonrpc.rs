@@ -4,14 +4,15 @@
 //! `dsh --profile kivio`（profile 由 `dsh_profile.rs` 维护），再驱动
 //! Kivio 自带的 resumable JSON-RPC bridge（profile 由 `dsh_profile.rs` 维护）。
 //!
-//! # 线协议（0.1.0-rc.6 实测）
+//! # 线协议（0.1.0-rc.6 实测；rc.8 斜杠命令补了 `images`）
 //!
 //! 客户端请求：
 //! - `initialize { cwd, provider, model, maxTokens? }`
 //! - `session/open { sessionId, resume }`
 //! - `session/prompt { sessionId, contentBlocks }`（官方：`agent.followup()`，下一轮 FIFO；
 //!    用户本轮 `RunTurn` 与运行中 follow-up 都走它）
-//! - `session/command { sessionId, line }`（bridge：`ctx.commands.execute`，不进模型）
+//! - `session/command { sessionId, line, images? }`（bridge：`ctx.commands.execute`，
+//!    不进模型；rc.8 起 `images` 是 `EncodedImageAttachment[]`，给 `/goal` `/plan` 带图）
 //! - `session/commands { sessionId }`（bridge：`ctx.commands.list`，斜杠菜单发现）
 //! - `session/stop-job { sessionId, jobId }`（bridge：`ctx.jobs.kill`，子代理走 `subagents.interrupt`）
 //! - `session/steer { sessionId, contentBlocks }`（bridge：`agent.steer()`，当前轮 next-step）
@@ -244,6 +245,7 @@ impl DshJsonRpcSession {
         {
             return Err("missing credential".to_string());
         }
+        crate::external_agents::dsh_plugins::heal_credentials_store()?;
         crate::external_agents::dsh_profile::ensure_profile_ready(resolved_bin, reasoning, preset)
             .await?;
 
@@ -262,7 +264,16 @@ impl DshJsonRpcSession {
             .env(
                 "DSH_AGENT_PRESET",
                 crate::external_agents::dsh_profile::normalize_agent_preset(preset),
-            )
+            );
+        if crate::external_agents::wsl::is_wsl_target(resolved_bin) {
+            if let Some(home) = crate::external_agents::dsh_profile::dsh_home() {
+                command.env(
+                    "DSH_HOME",
+                    crate::external_agents::wsl::path_for_cli(resolved_bin, &home),
+                );
+            }
+        }
+        command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -296,8 +307,9 @@ impl DshJsonRpcSession {
 
         let mut next_rpc_id: u64 = 1;
         let handshake = async {
+            let init_cwd = crate::external_agents::wsl::path_for_cli(resolved_bin, cwd);
             let init_params = json!({
-                "cwd": cwd.to_string_lossy(),
+                "cwd": init_cwd.to_string_lossy(),
                 "provider": route.provider,
                 "model": route.model,
             });
@@ -532,8 +544,7 @@ impl DshJsonRpcSession {
                     } else {
                         let rpc_id = self.next_id;
                         self.next_id += 1;
-                        let display_text = if text.trim().is_empty() && !images.is_empty()
-                        {
+                        let display_text = if text.trim().is_empty() && !images.is_empty() {
                             format!("附带图片（{}）", images.len())
                         } else {
                             text.clone()
@@ -558,9 +569,6 @@ impl DshJsonRpcSession {
                 }
                 Ok(SessionCommand::RunTurn { done, .. }) => {
                     let _ = done.send(Err("session busy".to_string()));
-                }
-                Ok(SessionCommand::PiSession { reply, .. }) => {
-                    let _ = reply.send(Err("Pi session commands are unsupported".to_string()));
                 }
                 Ok(SessionCommand::StopTask { task_id }) => {
                     self.send_stop_task(&task_id).await;
@@ -656,11 +664,7 @@ impl DshJsonRpcSession {
                             };
                             let _ = events.send(event).await;
                         }
-                        if deferred_idle
-                            && started
-                            && terminal.is_some()
-                            && cancel_id.is_none()
-                        {
+                        if deferred_idle && started && terminal.is_some() && cancel_id.is_none() {
                             match dsh_idle_action(
                                 pending_steers.is_empty(),
                                 turns_ended,
@@ -994,12 +998,9 @@ pub fn spawn_dsh_session_actor_with_sink(
             let cmd = match step {
                 ActorStep::IdleDecision(decision) => {
                     if let Some(decision) = decision {
-                        if let Err(err) = settle_session_ask(
-                            &mut session.stdin,
-                            &mut idle_pending_asks,
-                            decision,
-                        )
-                        .await
+                        if let Err(err) =
+                            settle_session_ask(&mut session.stdin, &mut idle_pending_asks, decision)
+                                .await
                         {
                             eprintln!("[external-agent] dsh idle session/ask settle failed: {err}");
                         }
@@ -1078,6 +1079,7 @@ pub fn spawn_dsh_session_actor_with_sink(
                     events,
                     done,
                     mut approvals,
+                    extra_writable_roots: _,
                 } => {
                     let result = session
                         .run_turn(
@@ -1101,9 +1103,6 @@ pub fn spawn_dsh_session_actor_with_sink(
                 SessionCommand::Steer { accepted, .. } => {
                     // 空闲时没有在飞轮次：引导和 follow-up 都拒，前端按普通新轮发出。
                     let _ = accepted.send(false);
-                }
-                SessionCommand::PiSession { reply, .. } => {
-                    let _ = reply.send(Err("Pi session commands are unsupported".to_string()));
                 }
                 SessionCommand::Cancel => {}
                 SessionCommand::StopTask { task_id } => {
@@ -1680,6 +1679,32 @@ fn prompt_content_blocks(
     content_blocks
 }
 
+/// rc.8 `CommandRuntime.execute` 的 `EncodedImageAttachment[]`：`mediaType` + base64 `data`。
+fn encoded_command_images(
+    images: &[crate::external_agents::attachments::ImageBlock],
+) -> Vec<Value> {
+    images
+        .iter()
+        .map(|image| {
+            let media_type = if image.mime == "image/jpg" {
+                "image/jpeg"
+            } else {
+                image.mime.as_str()
+            };
+            let name = image
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("image");
+            json!({
+                "mediaType": media_type,
+                "data": image.data_base64,
+                "name": name,
+            })
+        })
+        .collect()
+}
+
 fn steer_rpc(
     session_id: &str,
     text: &str,
@@ -1702,6 +1727,7 @@ fn turn_rpc(
             json!({
                 "sessionId": session_id,
                 "line": prompt.trim(),
+                "images": encoded_command_images(images),
             }),
         )
     } else {
@@ -1879,12 +1905,12 @@ fn map_session_event(
                 .map(|max| format!("/{max}"))
                 .unwrap_or_default();
             sink(UnifiedAgentEvent::StatusNote {
-                text: format!("上游重试 {retry}{of_max}"),
+                text: format!("retry {retry}{of_max}"),
             });
         }
         "llm/retry-started" => {
             sink(UnifiedAgentEvent::StatusNote {
-                text: "正在重试模型调用…".to_string(),
+                text: "retry".to_string(),
             });
         }
         "user/message" => {
@@ -3037,11 +3063,11 @@ mod tests {
         ]);
         assert!(matches!(
             &events[0],
-            UnifiedAgentEvent::StatusNote { text } if text == "上游重试 2/5"
+            UnifiedAgentEvent::StatusNote { text } if text == "retry 2/5"
         ));
         assert!(matches!(
             &events[1],
-            UnifiedAgentEvent::StatusNote { text } if text == "正在重试模型调用…"
+            UnifiedAgentEvent::StatusNote { text } if text == "retry"
         ));
     }
 
@@ -3363,6 +3389,7 @@ mod tests {
         assert_eq!(method, "session/command");
         assert_eq!(params["sessionId"], "kivio-1");
         assert_eq!(params["line"], "/compact");
+        assert_eq!(params["images"].as_array().map(Vec::len), Some(0));
         let (method, params) = turn_rpc("kivio-1", "hello", &[]);
         assert_eq!(method, "session/prompt");
         assert_eq!(params["contentBlocks"][0]["text"], "hello");
@@ -3388,6 +3415,22 @@ mod tests {
             Some("No compactable history")
         );
         assert!(command_result_error(&json!({ "kind": "success", "text": "ok" })).is_none());
+    }
+
+    #[test]
+    fn slash_turns_forward_encoded_command_images() {
+        let image = crate::external_agents::attachments::ImageBlock {
+            data_base64: "Zm9v".to_string(),
+            mime: "image/jpg".to_string(),
+            path: PathBuf::from("shot.jpg"),
+        };
+        let (method, params) = turn_rpc("kivio-1", "/goal rebuild the cathedral", &[image]);
+        assert_eq!(method, "session/command");
+        assert_eq!(params["line"], "/goal rebuild the cathedral");
+        assert_eq!(params["images"][0]["data"], "Zm9v");
+        assert_eq!(params["images"][0]["mediaType"], "image/jpeg");
+        assert_eq!(params["images"][0]["name"], "shot.jpg");
+        assert!(params["contentBlocks"].is_null());
     }
 
     #[test]

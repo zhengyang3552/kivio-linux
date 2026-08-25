@@ -322,28 +322,6 @@
       ],
       "type": "string"
     },
-    "ChatPythonInputFile": {
-      "additionalProperties": false,
-      "properties": {
-        "dataBase64": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "sizeBytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "name",
-        "dataBase64",
-        "sizeBytes"
-      ],
-      "type": "object"
-    },
     "ChatRunEventEnvelope": {
       "oneOf": [
         {
@@ -1187,7 +1165,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "生成过程的**瞬态状态一行字**（当前唯一来源：claude 上游重试 `api_retry`）。\n挂在流状态行（StreamStatusLine）上而不是消息正文——正文一恢复流动前端就清掉。\n`note: None` = 显式清除。",
+          "description": "生成过程的**瞬态状态一行字**（claude `api_retry`、codex 重连进度等）。\n挂在流状态行（StreamStatusLine）上而不是消息正文——正文一恢复流动前端就清掉。\n`note: None` = 显式清除。",
           "properties": {
             "baseRevision": {
               "format": "uint64",
@@ -1416,58 +1394,6 @@
         }
       ]
     },
-    "ChatRunPythonPayload": {
-      "additionalProperties": false,
-      "properties": {
-        "code": {
-          "type": "string"
-        },
-        "files": {
-          "items": {
-            "$ref": "#/$defs/ChatPythonInputFile"
-          },
-          "type": "array"
-        },
-        "parentConversationId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "parentMessageId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "parentRunId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "protocolVersion": {
-          "const": 1,
-          "type": "integer"
-        },
-        "runId": {
-          "type": "string"
-        },
-        "timeoutMs": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "protocolVersion",
-        "runId",
-        "code",
-        "timeoutMs",
-        "files"
-      ],
-      "type": "object"
-    },
     "ChatRunRecoveryMetadata": {
       "additionalProperties": false,
       "properties": {
@@ -1545,12 +1471,6 @@
         "pendingInteractions": {
           "items": {
             "$ref": "#/$defs/ChatPendingInteractionSnapshot"
-          },
-          "type": "array"
-        },
-        "pendingPythonRequests": {
-          "items": {
-            "$ref": "#/$defs/ChatRunPythonPayload"
           },
           "type": "array"
         },
@@ -1653,7 +1573,6 @@
         "tools",
         "subagents",
         "pendingInteractions",
-        "pendingPythonRequests",
         "warnings"
       ],
       "type": "object"

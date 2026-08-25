@@ -47,8 +47,20 @@ body {
      Windows Mica / macOS Menu 会从卡片缝和半透明侧栏里消失。 */
   background-color: transparent;
   background: transparent;
+}
+
+/* macOS Retina 上灰度抗锯齿比默认亚像素更干净。不要套到 Windows：
+   WebView2/DirectWrite 的 antialiased 会关掉 ClearType，Win10 小字发虚。 */
+html.macos,
+html.macos body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+html.windows,
+html.windows body {
+  -webkit-font-smoothing: auto;
+  text-rendering: auto;
 }
 
 :root {
@@ -237,19 +249,6 @@ body {
     0 0 0 0.5px rgba(255, 255, 255, 0.08),
     0 4px 16px -8px rgba(0, 0, 0, 0.58),
     0 20px 52px -22px rgba(0, 0, 0, 0.82);
-}
-
-@keyframes reasoning-tail-pulse {
-  from {
-    opacity: 0.72;
-  }
-  to {
-    opacity: 1;
-  }
-}
-
-.reasoning-stream-tail {
-  animation: reasoning-tail-pulse 0.22s ease-out;
 }
 
 /* 思考过程「生成中」标签：柔和呼吸亮度。
@@ -710,6 +709,9 @@ body {
 .chat-scroll-viewport {
   overflow-anchor: none;
 }
+.kv-sidebar-groups {
+  overflow-anchor: none;
+}
 .chat-scroll-viewport.is-navigator-locking {
   /* 锁定期再挡一层，避免系统/插件改滚动节奏 */
   overscroll-behavior: contain;
@@ -763,12 +765,57 @@ body {
 }
 
 .chat-sidebar-shell {
+  width: var(--chat-sidebar-width, 240px);
   margin: var(--chat-card-top) 8px 8px;
   /* 折叠时只做透明度动画。不要 transition margin-left：它会让 flex 主区在每一帧改变宽度，
      长聊天里的 Markdown / 代码块随之连续重排，侧栏动画会把聊天区一起拖卡。布局位置一次切换，
-     由外壳 overflow:hidden 裁掉滑出的卡片。 */
+     由外壳 overflow:hidden 裁掉滑出的卡片。也不要 transition width：拖拽调宽走 rAF 直写变量。 */
   transition:
     opacity var(--kv-dur-normal) var(--kv-ease-out);
+}
+
+/* 右缘拖拽手柄：6px 命中区，hover / 拖动时才露出细线，避免常驻一条分割线。 */
+.chat-sidebar-resize {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  width: 6px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.chat-sidebar-resize::after {
+  content: '';
+  position: absolute;
+  top: 16%;
+  right: 0;
+  bottom: 16%;
+  width: 2px;
+  border-radius: 1px;
+  background: transparent;
+  transition: background-color var(--kv-dur-instant) linear;
+}
+
+.chat-sidebar-resize:hover::after,
+.chat-window-shell.is-sidebar-resizing .chat-sidebar-resize::after {
+  background: rgba(24, 24, 27, 0.22);
+}
+
+.dark .chat-sidebar-resize:hover::after,
+.dark .chat-window-shell.is-sidebar-resizing .chat-sidebar-resize::after {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.chat-window-shell.is-sidebar-resizing,
+.chat-window-shell.is-sidebar-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.chat-window-shell.is-sidebar-resizing .chat-titlebar-strip-nav {
+  transition: none;
 }
 
 /* 侧栏顶栏：只上移那俩图标，卡片本身仍四周 margin:8 悬浮。
@@ -789,16 +836,16 @@ body {
 }
 
 .chat-sidebar-shell.is-collapsed {
-  /* -240 而非 -(240+8)：卡片 border box 落在 [-240, 0] 已完全出屏，同时布局推进
-     = -240 + 240 + margin-right 8 = 8，把那 8px 留给主区卡片当左缝。 */
-  margin-left: -240px;
+  /* 负 margin 等于侧栏宽、不加那 8px：卡片 border box 完全出屏，同时布局推进
+     = -W + W + margin-right 8 = 8，把那 8px 留给主区卡片当左缝。 */
+  margin-left: calc(-1 * var(--chat-sidebar-width, 240px));
   opacity: 0;
   pointer-events: none;
 }
 
 /* 设置页齐边铺满：不再需要会话浮卡那 8px 左缝，否则会在导航栏左边露一条
    透底（Mica/透明外壳下直接看到桌面）。收成 0 布局占位：
-   -240 + 240 + 0 = 0（普通折叠是 -240 + 240 + 8 = 8）。 */
+   -W + W + 0 = 0（普通折叠是 -W + W + 8 = 8）。 */
 .chat-sidebar-shell.is-collapsed.is-settings-cover {
   margin-right: 0;
 }
@@ -1556,10 +1603,20 @@ button.chat-composer-status-item:hover {
   }
 }
 
-/* 侧栏会话行尾：慢波 与 pin/归档 互斥替换。
+/* 侧栏会话行尾：短龄 / 慢波 / pin+归档 互斥替换。
+   平时显示 2m/13h；悬停或焦点让给按钮；生成中优先慢波（悬停同样让给按钮）。
+   已置顶时针常驻左侧，短龄叠在右侧归档位上，悬停换成归档。
    慢波保持 .chat-gen-wave 原始 14×11 尺寸 + absolute right-1（与 4a68189 一致），
    绝不要 width/height:auto 去铺满槽——那会把竖线拉高，动画就不是原来那个了。
    互斥用 visibility（unlayered），避免 Tailwind group-hover 盖不过 unlayered 样式。 */
+.kv-conv-age {
+  visibility: visible;
+}
+.kv-conv-row:hover .kv-conv-age,
+.kv-conv-row:focus-within .kv-conv-age,
+.kv-conv-trailing[data-busy] > .kv-conv-age {
+  visibility: hidden;
+}
 .kv-conv-trailing[data-busy] > .kv-conv-wave {
   visibility: visible;
 }
@@ -1573,6 +1630,26 @@ button.chat-composer-status-item:hover {
 .kv-conv-row:hover .kv-conv-trailing[data-busy] > .kv-conv-actions,
 .kv-conv-row:focus-within .kv-conv-trailing[data-busy] > .kv-conv-actions {
   visibility: visible;
+}
+
+/* 侧栏归档退场：高度收到 0，下面的行跟着滑上来，而不是瞬间塌洞抽一下。
+   1fr→0fr 与 .chat-motion-reveal 同一套；wrap 无 position，不改 .kv-conv-row 的 offsetParent。 */
+.kv-conv-exit {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows var(--kv-dur-fast) var(--kv-ease-standard),
+    opacity var(--kv-dur-fast) var(--kv-ease-out);
+}
+.kv-conv-exit.is-exiting {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+}
+.kv-conv-exit > * {
+  min-height: 0;
+  overflow: hidden;
 }
 
 
@@ -2257,7 +2334,9 @@ button.chat-composer-status-item:hover {
 /* 页内 tab 内容切换（中心页 已安装/市场/…、侧栏 最近/集/项目）：
    比整页 view-in 轻一档的 6px 上浮，快进快停；包裹节点需 key={tab} 以便每次切换重播。 */
 .chat-motion-tab-in {
-  animation: chat-motion-tab-in 200ms var(--kv-ease-standard) both;
+  /* backwards：播完卸掉 transform，避免 fill-mode:both 把 translateY(0) 留在层上，
+     子节点增删时整列合成层闪一下（侧栏归档最明显）。 */
+  animation: chat-motion-tab-in 200ms var(--kv-ease-standard) backwards;
 }
 
 @keyframes chat-motion-tab-in {
@@ -2376,6 +2455,15 @@ button.chat-composer-status-item:hover {
 
 .chat-compaction-divider-arrow {
   color: rgba(120, 120, 120, 0.72);
+}
+
+.chat-context-clear-badge {
+  border: 1px solid rgba(120, 120, 120, 0.28);
+  border-radius: 999px;
+  padding: 2px 10px;
+  line-height: 1.4;
+  color: var(--color-neutral-500, #737373);
+  background: var(--bg-primary, transparent);
 }
 
 .chat-compaction-progress {
@@ -2594,6 +2682,11 @@ button.chat-composer-status-item:hover {
   .chat-motion-tool-shimmer {
     animation: none;
     color: inherit;
+  }
+
+  .kv-stream-logo {
+    animation: none;
+    opacity: 1;
   }
 
   .subagent-sparkle.is-running::before {
@@ -2995,48 +3088,6 @@ button.chat-composer-status-item:hover {
   position: relative;
 }
 
-.settings-embedded .kv-provider-list-presets {
-  flex-shrink: 0;
-  margin-top: auto;
-  padding: 10px 0 8px;
-  border-top: 1px solid var(--divider);
-}
-
-.settings-embedded .kv-provider-list-section-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-  padding: 0 2px;
-}
-
-.settings-embedded .kv-provider-list-preset-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.settings-embedded .kv-provider-preset-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-input-subtle);
-  font-family: inherit;
-  font-size: 12px;
-  color: var(--text);
-  cursor: default;
-  text-align: left;
-}
-
-.settings-embedded .kv-provider-preset-btn:hover {
-  background: var(--bg-hover);
-  border-color: var(--border-strong, var(--border));
-}
-
 .settings-embedded .kv-provider-add {
   margin-bottom: 6px;
   flex-shrink: 0;
@@ -3128,6 +3179,51 @@ button.chat-composer-status-item:hover {
   color: var(--text-muted);
 }
 
+.kv-provider-header .kv-provider-preset-entry {
+  margin: 2px 0 10px;
+}
+.kv-provider-preset-entry .kv-subpage-entry-hint {
+  padding-left: 0;
+}
+
+.kv-provider-preset-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+  cursor: pointer;
+  font-family: inherit;
+}
+.kv-provider-preset-row:hover {
+  background: var(--bg-hover);
+}
+.kv-provider-preset-row-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.kv-provider-preset-row-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.kv-provider-preset-row-url {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @container settings-shell (max-width: 820px) {
   .settings-embedded-nav {
     width: 52px;
@@ -3174,11 +3270,6 @@ button.chat-composer-status-item:hover {
     max-width: none;
     min-height: 0;
     flex-direction: column;
-  }
-
-  .settings-embedded .kv-provider-list-presets,
-  .kv-provider-list-presets {
-    margin-top: 0;
   }
 
   .settings-embedded .kv-provider-list-items,
@@ -3262,10 +3353,10 @@ button.chat-composer-status-item:hover {
   );
 }
 
-/* 侧栏收起时顶栏行回到主区。收起态主区卡片左缘也在 x=8（`.is-collapsed` 用 -240px 而非
-   -248px，刻意把那 8px 留成左缝），与展开态侧栏卡片的左缘同位；灯 x 也按「卡片内」算过
+/* 侧栏收起时顶栏行回到主区。收起态主区卡片左缘也在 x=8（`.is-collapsed` 用 -W 而非
+   -(W+8)，刻意把那 8px 留成左缝），与展开态侧栏卡片的左缘同位；灯 x 也按「卡片内」算过
    （windows.rs 里 x = 14 + 8）。所以两态用同一个 92px，收起态不再额外 +8 ——
-   多补的话图标就比展开态右移 8px（历史回归：-248 → -240 时这里没跟着减）。 */
+   多补的话图标就比展开态右移 8px（历史回归：-248 → -W 时这里没跟着减）。 */
 .chat-titlebar-row--collapsed-mac {
   padding-left: 92px;
 }
@@ -3345,8 +3436,8 @@ button.chat-composer-status-item:hover {
 
 /* 带内导航区（侧栏开合 + 新建）。侧栏展开时撑到侧栏那一列的宽度，
    把业务控件推到主区卡片左缘 —— 否则控件压在侧栏卡片上方，读作错位。
-   宽度 = 主区卡片左缘 256（侧栏 margin 8 + w-[240px] + margin 8）− 带自身 padding-left 8 = 248，
-   与 `.chat-sidebar-shell` 的 w-[240px] + margin:8 同步（改一处必改另一处）。
+   宽度 = 主区卡片左缘（侧栏 margin 8 + 宽 + margin 8）− 带自身 padding-left 8
+        = var(--chat-sidebar-width) + 8，与 `.chat-sidebar-shell` 同步。
    用 min-width 而非 width 做过渡：width 的收起态是 auto（按钮自然宽），auto 不可插值、
    动画会直接跳；min-width 两端都是具体值，且 max(内容宽, min-width) 天然贴合按钮宽度，
    不必把「两枚 28px 钮 + 2px 间距」这种数字硬编码进来。
@@ -3361,7 +3452,7 @@ button.chat-composer-status-item:hover {
 }
 
 .chat-titlebar-strip-nav--reserve {
-  min-width: 248px;
+  min-width: calc(var(--chat-sidebar-width, 240px) + 8px);
 }
 
 /* 设置页：带浮起、不占行高，让 200/52px 灰导航栏自己从 y=0 画起（见 ChatTitlebar 注释）。
@@ -3506,8 +3597,6 @@ button.chat-composer-status-item:hover {
   font-family: var(--font-sans);
   font-size: 13px;
   line-height: 1.4;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
 }
 
 /* 主题色令牌不在此重复定义：--theme-surface* 是自定义属性，会从 :root 继承进本作用域，
@@ -4501,42 +4590,6 @@ input[type="password"]::-ms-clear {
   margin-bottom: 4px;
   position: relative;
 }
-.kv-provider-list-presets {
-  flex-shrink: 0;
-  margin-top: auto;
-  padding: 8px 0 6px;
-  border-top: 1px solid var(--divider);
-}
-.kv-provider-list-section-label {
-  font-size: 10.5px;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-  padding: 0 2px;
-}
-.kv-provider-list-preset-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.kv-provider-preset-btn {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  width: 100%;
-  padding: 5px 7px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-input-subtle);
-  font-family: inherit;
-  font-size: 11.5px;
-  color: var(--text);
-  cursor: default;
-  text-align: left;
-}
-.kv-provider-preset-btn:hover {
-  background: var(--bg-hover);
-}
 .kv-provider-add {
   margin-bottom: 4px;
   flex-shrink: 0;
@@ -4695,6 +4748,18 @@ input[type="password"]::-ms-clear {
 .kv-provider-dot.warn { background: var(--warn); }
 .kv-provider-dot.err { background: var(--danger); }
 .kv-provider-dot.off { background: var(--text-tertiary); opacity: 0.45; }
+.kv-cli-updating-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  border: 1.5px solid var(--text-faint);
+  border-top-color: var(--text);
+  animation: kv-cli-spin 0.7s linear infinite;
+}
+@keyframes kv-cli-spin {
+  to { transform: rotate(360deg); }
+}
 .kv-provider-add {
   font-size: 11.5px;
   color: var(--text-muted);
@@ -6225,6 +6290,37 @@ input[type="password"]::-ms-clear {
   max-height: min(80vh, 560px);
 }
 
+.kv-modal.kv-provider-preset-picker {
+  max-width: 440px;
+  padding: 14px 16px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(80vh, 560px);
+}
+.kv-provider-preset-picker-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.kv-provider-preset-picker-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.kv-provider-preset-picker-body {
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 -4px;
+  padding-right: 2px;
+}
+
 /* 连接器详情弹层 */
 .kv-modal.kv-connector-detail {
   max-width: 640px;
@@ -7449,6 +7545,9 @@ input[type="password"]::-ms-clear {
 }
 
 .onboarding-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   min-height: 32px;
   padding: 0 13px;
   border-radius: 999px;
@@ -7541,7 +7640,7 @@ input[type="password"]::-ms-clear {
 
 .onboarding-defaults-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -7709,10 +7808,9 @@ input[type="password"]::-ms-clear {
 }
 .kv-quote-chip-remove:hover { color: var(--text); background: var(--bg-hover); }
 
-/* ---- 生成中状态行的动效 logo（GRD-02 · 横向扫光）。
-   点阵：等距方格 step=3 / r=1.05（点间隙清晰）；--dx 是点相对 Logo 中心的
-   横向归一化位置。通过错峰让一条亮波左右往返扫过 Logo，不让整块点阵一起闪烁。
-   颜色与动画只在这里。 ---- */
+/* ---- 生成中状态行的 logo。
+   点阵只是静态形状。动效是整颗 SVG 一段呼吸，不要给 128 个圆各自挂
+   animation：WebView2 会按元素提合成层，思考一轮 GPU 进程就能到 20%+。 ---- */
 .kv-stream-logo {
   display: block;
   overflow: visible;
@@ -7720,7 +7818,8 @@ input[type="password"]::-ms-clear {
   width: var(--kv-stream-logo-size, 28px);
   height: var(--kv-stream-logo-size, 28px);
   --k: 1; /* 时长倍率：越小越快 */
-  --dot: #1d6bf0; /* 唯一颜色 */
+  --dot: #1d6bf0;
+  animation: kv-stream-logo-pulse calc(1.6s * var(--k)) ease-in-out infinite;
 }
 
 .chat-conversation-loading {
@@ -7735,23 +7834,14 @@ input[type="password"]::-ms-clear {
   --k: 0.68;
 }
 .kv-stream-logo circle {
-  transform-box: fill-box;
-  transform-origin: 50% 50%;
   fill: var(--dot);
 }
-.kv-stream-logo .dt {
-  animation: kv-stream-sweep calc(1.55s * var(--k)) cubic-bezier(0.4, 0, 0.3, 1) infinite alternate;
-  /* 左侧点（--dx 更小）先进入高亮，随后向右传播；alternate 让下一半周期反向传播。 */
-  animation-delay: calc((1 - var(--dx)) * -0.18s * var(--k));
-}
-@keyframes kv-stream-sweep {
-  0% { fill-opacity: 0.28; transform: scale(0.72); }
-  24% { fill-opacity: 0.34; transform: scale(0.78); }
-  50% { fill-opacity: 1; transform: scale(1.24); }
-  76%, 100% { fill-opacity: 0.28; transform: scale(0.72); }
+@keyframes kv-stream-logo-pulse {
+  0%, 100% { opacity: 0.42; }
+  50% { opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .kv-stream-logo circle { animation: none; transform: none; fill-opacity: 1; }
+  .kv-stream-logo { animation: none; opacity: 1; }
 }
 /* 闲置常驻态：动画停、点阵满亮（与 reduced-motion 同形）。 */
-.kv-stream-status-idle .kv-stream-logo .dt { animation: none; transform: none; fill-opacity: 1; }
+.kv-stream-status-idle .kv-stream-logo { animation: none; opacity: 1; }

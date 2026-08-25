@@ -5,10 +5,6 @@ export type JsonValue = unknown
 
 export type ChatProtocolScope = "run" | "conversation";
 
-export type ChatPythonInputFile = { name: string, dataBase64: string, sizeBytes: number, };
-
-export type ChatRunPythonPayload = { protocolVersion: typeof CHAT_PROTOCOL_VERSION, runId: string, parentConversationId: string | null, parentRunId: string | null, parentMessageId: string | null, code: string, timeoutMs: number, files: Array<ChatPythonInputFile>, };
-
 export type ChatSegmentKind = "text" | "reasoning" | "tool";
 
 export type ChatSegmentPhase = "auxiliary" | "plain" | "tool_loop" | "synthesis";
@@ -37,13 +33,15 @@ export type ChatPlanStatePayload = { mode: ChatPlanMode, status: ChatPlanStatus,
 
 export type ChatCompactionBoundaryPayload = { id: string, sourceUntilMessageId: string, displayAfterMessageId: string | null, tokenEstimateBefore: number, tokenEstimateAfter: number, summaryContent: string, trigger: string, createdAt: number, };
 
+export type ChatContextClearBoundaryPayload = { id: string, sourceUntilMessageId: string, createdAt: number, };
+
 export type ChatContextUsageSegmentPayload = { id: string, label: string, estimatedTokens: number, color: string | null, };
 
 export type ChatFileLedgerPayload = { readFiles: Array<string>, modifiedFiles: Array<string>, omittedCount: number, };
 
 export type ChatContextSummaryPayload = { id: string, content: string, sourceMessageIds: Array<string>, sourceUntilMessageId: string, tokenEstimateBefore: number, tokenEstimateAfter: number, createdAt: number, providerId: string, model: string, stale: boolean, fileLedger: ChatFileLedgerPayload | null, };
 
-export type ChatContextStatePayload = { estimatedInputTokens: number, contextWindowTokens: number | null, contextWindowEstimated: boolean, usageRatio: number | null, status: string, segments: Array<ChatContextUsageSegmentPayload>, lastMeasuredAt: number, lastCompressedAt: number | null, compressedMessageCount: number, compressionCount: number, summary: ChatContextSummaryPayload | null, compactionBoundaries: Array<ChatCompactionBoundaryPayload>, warning: string | null, contextSource: string | null, tokenCountSource: string | null, sessionInputTokens: number | null, sessionOutputTokens: number | null, externalAgentId: string | null, externalModel: string | null, };
+export type ChatContextStatePayload = { estimatedInputTokens: number, contextWindowTokens: number | null, contextWindowEstimated: boolean, usageRatio: number | null, status: string, segments: Array<ChatContextUsageSegmentPayload>, lastMeasuredAt: number, lastCompressedAt: number | null, compressedMessageCount: number, compressionCount: number, summary: ChatContextSummaryPayload | null, compactionBoundaries: Array<ChatCompactionBoundaryPayload>, clearBoundaries: Array<ChatContextClearBoundaryPayload>, warning: string | null, contextSource: string | null, tokenCountSource: string | null, sessionInputTokens: number | null, sessionOutputTokens: number | null, externalAgentId: string | null, externalModel: string | null, };
 
 export type ChatAskUserOptionPayload = { id: string, label: string, description: string | null, };
 
@@ -73,7 +71,7 @@ export type ChatWarningSnapshot = { "type": "hook_failed", hookName: string, eve
 
 export type ChatTerminalSnapshot = { "type": "run_completed", full: string, conversationRevision: number, } | { "type": "run_failed", error: string, full: string, conversationRevision: number, } | { "type": "run_cancelled", full: string, conversationRevision: number, };
 
-export type ChatRunSnapshot = { protocolVersion: typeof CHAT_PROTOCOL_VERSION, conversationId: string, runId: string, messageId: string, lastSeq: number, baseRevision: number, recovery: ChatRunRecoveryMetadata | null, status: ChatRunStatus, content: string, reasoning: string, segments: Array<ChatSegmentPayload>, tools: Array<ChatToolPayload>, contextUsage: ChatContextUsagePayload | null, subagents: Array<ChatSubagentSnapshot>, compaction: ChatCompactionSnapshot | null, todoState: ChatTodoStatePayload | null, planState: ChatPlanStatePayload | null, pendingInteractions: Array<ChatPendingInteractionSnapshot>, pendingPythonRequests: Array<ChatRunPythonPayload>, warnings: Array<ChatWarningSnapshot>, 
+export type ChatRunSnapshot = { protocolVersion: typeof CHAT_PROTOCOL_VERSION, conversationId: string, runId: string, messageId: string, lastSeq: number, baseRevision: number, recovery: ChatRunRecoveryMetadata | null, status: ChatRunStatus, content: string, reasoning: string, segments: Array<ChatSegmentPayload>, tools: Array<ChatToolPayload>, contextUsage: ChatContextUsagePayload | null, subagents: Array<ChatSubagentSnapshot>, compaction: ChatCompactionSnapshot | null, todoState: ChatTodoStatePayload | null, planState: ChatPlanStatePayload | null, pendingInteractions: Array<ChatPendingInteractionSnapshot>, warnings: Array<ChatWarningSnapshot>, 
 /**
  * 流状态行上的瞬态一行字（上游重试等）。见 `ChatRunEvent::StatusNoteUpdated`。
  */

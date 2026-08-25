@@ -411,15 +411,18 @@ export function SkillCenter({ onSkillsChanged, projectCwd }: SkillCenterProps) {
 
   const flushSave = useCallback(async (next: Settings) => {
     try {
-      // 整体保存前现读后端最新态，仅把 servers 取自 fresh：servers[].auth/headers 会被后端
-      // OAuth 刷新独立改写（mcp/manager.rs），若用本地快照整体保存会覆盖回旧 token。
-      // 其余 chatTools 字段（技能开关/扫描路径等）是本任务编辑值，仍以本地 next 为准。
+      // 只把技能页改过的字段盖到 fresh 上，避免把 MCP / 收藏 / 插件开关盖回旧值。
       const fresh = await refreshSettings()
+      const nextTools = next.chatTools ?? defaultChatTools()
+      const freshTools = fresh.chatTools ?? defaultChatTools()
       const merged: Settings = {
-        ...next,
+        ...fresh,
         chatTools: {
-          ...(next.chatTools ?? defaultChatTools()),
-          servers: fresh.chatTools?.servers ?? next.chatTools?.servers ?? [],
+          ...freshTools,
+          disabledSkillIds: nextTools.disabledSkillIds,
+          skillScanPaths: nextTools.skillScanPaths,
+          skillAutoMatch: nextTools.skillAutoMatch,
+          skillFallbackMode: nextTools.skillFallbackMode,
         },
       }
       const saved = await saveSettingsCached(merged)
@@ -730,6 +733,9 @@ export function SkillCenter({ onSkillsChanged, projectCwd }: SkillCenterProps) {
                 }`}
               >
                 {label}
+                {id === 'installed' && skills.length > 0 && (
+                  <span className="ml-1.5 text-[11px] tabular-nums text-neutral-400">{skills.length}</span>
+                )}
                 {view === id && (
                   <span className="chat-motion-tab-underline absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-[#2f6ff0] dark:bg-[#5c8df7]" />
                 )}

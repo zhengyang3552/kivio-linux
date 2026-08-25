@@ -405,6 +405,7 @@ pub enum WebSearchProvider {
     ExaMcp,
     Ollama,
     Grok,
+    Deepseek,
     Brave,
     Serper,
     Bocha,
@@ -458,6 +459,14 @@ pub struct LensWebSearchConfig {
     #[serde(default = "default_grok_system_prompt")]
     pub grok_system_prompt: String,
     #[serde(default)]
+    pub deepseek_api_key: String,
+    #[serde(default = "default_deepseek_model")]
+    pub deepseek_model: String,
+    #[serde(default = "default_deepseek_base_url")]
+    pub deepseek_base_url: String,
+    #[serde(default = "default_grok_system_prompt")]
+    pub deepseek_system_prompt: String,
+    #[serde(default)]
     pub brave_api_key: String,
     #[serde(default = "default_brave_base_url")]
     pub brave_base_url: String,
@@ -506,6 +515,10 @@ impl Default for LensWebSearchConfig {
             grok_model: default_grok_model(),
             grok_base_url: default_grok_base_url(),
             grok_system_prompt: default_grok_system_prompt(),
+            deepseek_api_key: String::new(),
+            deepseek_model: default_deepseek_model(),
+            deepseek_base_url: default_deepseek_base_url(),
+            deepseek_system_prompt: default_grok_system_prompt(),
             brave_api_key: String::new(),
             brave_base_url: default_brave_base_url(),
             serper_api_key: String::new(),
@@ -547,6 +560,14 @@ fn default_grok_model() -> String {
 
 fn default_grok_base_url() -> String {
     "https://api.x.ai/v1".to_string()
+}
+
+fn default_deepseek_model() -> String {
+    "deepseek-v4-flash".to_string()
+}
+
+fn default_deepseek_base_url() -> String {
+    "https://api.deepseek.com".to_string()
 }
 
 fn default_brave_base_url() -> String {
@@ -704,8 +725,9 @@ pub struct ChatConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChatModeConfig {
-    /// Extra Chat instructions stacked on the built-in capability contract.
-    /// Empty → contract only (`chat_runtime_prompt()`).
+    /// Optional extra Chat instructions. Empty → no Chat identity essay;
+    /// runtime still injects date plus conversation context (assistant / set /
+    /// memory / knowledge base). File/shell limits are the tool filter, not prompt.
     pub system_prompt: String,
     pub web_search: bool,
     pub web_fetch: bool,
@@ -767,8 +789,10 @@ pub struct ExternalCliAgentConfig {
 }
 
 /// 一个第三方供应商（中转站）。**各 CLI 用到的字段不同**：
-/// - claude / gemini / 其余 env 系：只用 `env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` …）
-/// - codex：只用 `config_toml` / `auth_json`，物化成一个私有 `CODEX_HOME`
+/// - claude / gemini / 其余 env 系：只用 `env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` …）；
+///   claude 聊天选模按 cc-switch 写入 `~/.claude/settings.json` 的 `model` / `env.ANTHROPIC_MODEL`
+/// - codex：只用 `config_toml` / `auth_json`，物化成一个私有 `CODEX_HOME`；聊天选模写入
+///   `~/.codex/config.toml` 顶层 `model`（文件已存在时）以及 CLI 正在读的那份
 /// - grok：只用 `config_toml`，把其中的 `[models]` / `[model.*]` 合并进 `~/.grok/config.toml`
 /// - opencode / pi：用 `config_json` / `auth_json` / `default_model` 合并进 CLI 原生全局配置
 /// - dsh：用 `config_json` 在 Kivio 私有 profile 中挂载 `llm-pi-ai`，Key 通过 `env` 注入
@@ -1036,8 +1060,6 @@ pub struct ChatNativeToolsConfig {
     pub edit_file: bool,
     #[serde(default)]
     pub run_command: bool,
-    #[serde(default)]
-    pub run_python: bool,
     #[serde(default = "default_true")]
     pub knowledge_search: bool,
     /// Default root for ordinary (non-project) conversation workbenches.
@@ -1059,7 +1081,6 @@ impl ChatNativeToolsConfig {
             || self.write_file
             || self.edit_file
             || self.run_command
-            || self.run_python
             || self.knowledge_search
     }
 }
@@ -1080,7 +1101,6 @@ impl Default for ChatNativeToolsConfig {
             write_file: true,
             edit_file: true,
             run_command: true,
-            run_python: true,
             knowledge_search: true,
             working_directory: default_chat_working_directory(),
             workspace_roots: Vec::new(),
@@ -1563,6 +1583,10 @@ pub struct Settings {
     /// 更新旧内置、补齐新增，**保留用户自建**。已 seed v1 的老用户靠它拿到新专家；置 true 后不再跑。
     #[serde(default)]
     pub builtin_assistants_seeded_v2: bool,
+    /// 一次性迁移标记（v3，非破坏性）：按 id upsert 补齐产品/法务/财务/教学/审查/求职。
+    /// 已 seed v2 的老用户靠它拿到新专家；置 true 后不再跑。
+    #[serde(default)]
+    pub builtin_assistants_seeded_v3: bool,
     /// 一次性迁移标记：把 pre-green-light 安装（原生工具默认全关 + 旧 approval_policy）
     /// 带到新默认——原生文件/命令工具置 true，且仅当 approval_policy 仍是旧默认时改 "auto"。
     /// 幂等：置 true 后不再翻转，尊重用户此后手动关闭某工具或改 policy 的选择。
@@ -1674,6 +1698,22 @@ impl Settings {
             None
         }
     }
+
+    /// Extra OAuth tokens stored outside `chat_tools.servers`, keyed by MCP resource URL.
+    /// The MCP manager persists a refreshed token to every slot bound to that URL
+    /// without knowing each product name.
+    pub(crate) fn detached_oauth_auth_for_url_mut(
+        &mut self,
+        resource_url: &str,
+    ) -> Option<&mut Option<ConnectorAuth>> {
+        fn url_matches(left: &str, right: &str) -> bool {
+            left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
+        }
+        if url_matches(self.lens.web_search.tinyfish_mcp_url.trim(), resource_url) {
+            return Some(&mut self.lens.web_search.tinyfish_mcp_auth);
+        }
+        None
+    }
 }
 
 impl Default for Settings {
@@ -1715,6 +1755,7 @@ impl Default for Settings {
             retry_attempts: default_retry_attempts(),
             builtin_assistants_seeded_v1: false,
             builtin_assistants_seeded_v2: false,
+            builtin_assistants_seeded_v3: false,
             chat_tools_greenlit_v1: false,
             onboarding_status: default_onboarding_status(),
             auto_check_update: true,
@@ -2221,6 +2262,8 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         settings.lens.web_search.ollama_api_key.trim().to_string();
     settings.lens.web_search.grok_api_key =
         settings.lens.web_search.grok_api_key.trim().to_string();
+    settings.lens.web_search.deepseek_api_key =
+        settings.lens.web_search.deepseek_api_key.trim().to_string();
     settings.lens.web_search.brave_api_key =
         settings.lens.web_search.brave_api_key.trim().to_string();
     settings.lens.web_search.serper_api_key =
@@ -2277,6 +2320,31 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         .is_empty()
     {
         settings.lens.web_search.grok_system_prompt = default_grok_system_prompt();
+    }
+    settings.lens.web_search.deepseek_model = {
+        let trimmed = settings.lens.web_search.deepseek_model.trim();
+        if trimmed.is_empty() {
+            default_deepseek_model()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    settings.lens.web_search.deepseek_base_url = {
+        let trimmed = settings.lens.web_search.deepseek_base_url.trim();
+        if trimmed.is_empty() {
+            default_deepseek_base_url()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    if settings
+        .lens
+        .web_search
+        .deepseek_system_prompt
+        .trim()
+        .is_empty()
+    {
+        settings.lens.web_search.deepseek_system_prompt = default_grok_system_prompt();
     }
     settings.lens.web_search.exa_mcp_url = {
         let trimmed = settings.lens.web_search.exa_mcp_url.trim();
@@ -2374,7 +2442,6 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         native.write_file = true;
         native.edit_file = true;
         native.run_command = true;
-        native.run_python = true;
         native.web_fetch = true;
         native.web_search = true;
         if settings.chat_tools.approval_policy == LEGACY_DEFAULT_APPROVAL_POLICY {

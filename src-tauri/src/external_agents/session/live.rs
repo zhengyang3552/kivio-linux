@@ -15,6 +15,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::external_agents::types::UnifiedAgentEvent;
 
+/// How long an unused live CLI **process** may sit before the sweeper drops it.
+///
+/// This is only a memory cap. The native session id stays on disk (`live-*.json`) and
+/// the next turn — 40 minutes later, or after the app restarts — must `thread/resume`
+/// / `--resume` that same id. Do not treat this TTL as a context lifetime.
+pub const LIVE_SESSION_IDLE_TTL: Duration = Duration::from_secs(600);
+
 /// 一条待用户答复的工具审批询问（claude 的 `control_request` / `can_use_tool`）。
 ///
 /// 会话侧只负责把它送出去、并在收到 `ApprovalDecision` 后回一条 `control_response`；
@@ -76,29 +83,6 @@ pub enum MessageInjectionKind {
     FollowUp,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PiSessionRequest {
-    GetTree,
-    GetEntries { since: Option<String> },
-    GetForkMessages,
-    Fork { entry_id: String },
-    Clone,
-    Switch { session_path: String },
-}
-
-impl PiSessionRequest {
-    pub fn changes_session(&self) -> bool {
-        matches!(self, Self::Fork { .. } | Self::Clone | Self::Switch { .. })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PiSessionRpcResult {
-    pub data: serde_json::Value,
-    /// Mutations are followed by `get_state`; this is Pi's authoritative new identity.
-    pub state: Option<serde_json::Value>,
-}
-
 /// A command sent to a live session's actor task.
 pub enum SessionCommand {
     /// Run one turn: write the prompt, stream `UnifiedAgentEvent`s into `events`, and report the
@@ -109,6 +93,9 @@ pub enum SessionCommand {
         reasoning: Option<String>,
         /// 本轮用户消息的原生图片块（ACP → image content block；Codex → localImage 临时文件）。空=无图。
         images: Vec<crate::external_agents::attachments::ImageBlock>,
+        /// Codex `workspace-write` 默认锁在 cwd：附件目录 / 临时图片必须作为
+        /// `runtimeWorkspaceRoots` 下发，否则 CLI 读不到。其它协议忽略。
+        extra_writable_roots: Vec<String>,
         events: mpsc::Sender<UnifiedAgentEvent>,
         done: oneshot::Sender<Result<(), String>>,
         /// 本轮的权限审批通道。`None` = 宿主不接权限询问（未启用 / 协议不支持）⇒ 会话对
@@ -132,11 +119,6 @@ pub enum SessionCommand {
         images: Vec<crate::external_agents::attachments::ImageBlock>,
         kind: MessageInjectionKind,
         accepted: oneshot::Sender<bool>,
-    },
-    /// Pi session tree/query/mutation RPC. The Pi actor is the sole stdin/stdout owner.
-    PiSession {
-        request: PiSessionRequest,
-        reply: oneshot::Sender<Result<PiSessionRpcResult, String>>,
     },
     /// 停止 CLI 侧的一个后台任务（Background tasks 面板的停止按钮）。
     ///
@@ -164,9 +146,9 @@ pub const CANCELLED_SESSION_LOST: &str = "__cancelled_session_lost__";
 /// 界面显示一套、会话实际跑另一套，这**违反 spec 第 8 条**（UI 所见必须与会话实际配置一致），
 /// 是功能退步而不是缺功能。指纹变了就换个进程。
 ///
-/// 只有把这些配置放在**启动参数**里的 CLI 需要它（claude：`--model` / `--effort` /
-/// `--permission-mode` / `--append-system-prompt-file`；Pi：`--model` / `--thinking`）。
-/// ACP / codex 能在会话内改模型与推理档位，指纹恒为 `default()`，永不触发重连，行为不变。
+/// 只有启动时锁死、会话内改不了的配置才进指纹（claude：`--effort` / `--permission-mode`；
+/// Pi：`--model` / `--thinking`；codex：sandbox / approvalPolicy，只在 `thread/start`）。
+/// ACP 能在会话内改相关项，指纹恒为 `default()`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchConfig {
     /// `model|reasoning|sandbox`，恒可知。
@@ -362,7 +344,7 @@ mod tests {
         assert!(established.accepts(&cfg("opus||", None)));
     }
 
-    /// 非 claude / Pi 协议指纹恒为默认值 ⇒ 永不触发重连，既有行为不变。
+    /// 两边都是默认指纹时互相接受（ACP 仍走这条）。
     #[test]
     fn default_launch_config_always_accepts() {
         assert!(LaunchConfig::default().accepts(&LaunchConfig::default()));

@@ -2,8 +2,9 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::chat::types::AgentRuntimeConfig;
 use crate::external_agents::detection::{
-    detect_agent_models, detect_availability_all, native_provider_summaries, AVAILABILITY_CACHE_KEY,
-    AVAILABILITY_CACHE_TTL, EXTERNAL_AGENT_MODELS_CACHE_TTL, EXTERNAL_AGENT_MODELS_FALLBACK_TTL,
+    detect_agent_models, detect_availability_all, native_provider_summaries,
+    AVAILABILITY_CACHE_KEY, AVAILABILITY_CACHE_TTL, EXTERNAL_AGENT_MODELS_CACHE_TTL,
+    EXTERNAL_AGENT_MODELS_FALLBACK_TTL,
 };
 use crate::external_agents::registry::get_agent_def;
 use crate::external_agents::slash::{cache_key, list_external_cli_slash_commands};
@@ -43,6 +44,10 @@ pub async fn chat_detect_external_agents(
 ) -> Result<serde_json::Value, String> {
     let _ = &conversation_id; // 可用性与 cwd 无关；参数保留为兼容前端签名。
     let force = force_refresh.unwrap_or(false);
+    if force {
+        crate::external_agents::wsl::invalidate_locator_cache();
+        crate::external_agents::spawn::clear_probe_cache();
+    }
     if !force {
         if let Some(agents) =
             state.get_cached_detected_agents(AVAILABILITY_CACHE_KEY, AVAILABILITY_CACHE_TTL)
@@ -339,6 +344,9 @@ pub async fn chat_set_agent_runtime(
     conversation_id: String,
     agent_runtime: AgentRuntimeConfig,
 ) -> Result<serde_json::Value, String> {
+    let persist_agent = agent_runtime.external_agent_id.clone();
+    let persist_model = agent_runtime.external_model.clone();
+    let persist_reasoning = agent_runtime.external_reasoning.clone();
     let conversation = crate::chat::repository::repository(&app)
         .mutate(&app, &conversation_id, |conversation| {
             check_runtime_switch_allowed(
@@ -351,6 +359,15 @@ pub async fn chat_set_agent_runtime(
         })
         .await
         .map_err(crate::chat::repository::repository_error)?;
+    if let Some(agent_id) = persist_agent.as_deref() {
+        if let Err(err) = crate::external_agents::provider_profile::persist_selected_model(
+            agent_id,
+            persist_model.as_deref(),
+            persist_reasoning.as_deref(),
+        ) {
+            eprintln!("[external-agent] 模型落盘失败（{agent_id}）：{err}");
+        }
+    }
     Ok(serde_json::json!({
         "success": true,
         "conversation": conversation,
@@ -576,4 +593,10 @@ pub async fn chat_import_cli_sessions(
 #[tauri::command]
 pub fn chat_imported_history_stale(app: AppHandle, conversation_id: String) -> bool {
     crate::external_agents::import::imported_history_is_stale(&app, &conversation_id)
+}
+
+/// 本地 CLI 对话绑定的原生会话 id（live handle，否则 Claude 的 `{id}.json`）。
+#[tauri::command]
+pub fn chat_external_native_session_id(app: AppHandle, conversation_id: String) -> Option<String> {
+    crate::external_agents::session::bound_native_session_id(&app, &conversation_id)
 }

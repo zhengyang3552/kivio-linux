@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -61,14 +62,84 @@ pub fn strip_parent_session_env(command: &mut Command) -> &mut Command {
 ///
 /// 新增拉起 CLI 的代码请一律用它而不是 `Command::new`——忘记剥离不会编译报错、
 /// 也不会立刻出错，只在「Kivio 从某个 agent 里启动」这种特定场景下才炸，极难排查。
-pub fn cli_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+fn command_for_program(program: &OsStr) -> Command {
+    if let Some(target) = crate::external_agents::wsl::parse_wsl_target(Path::new(program)) {
+        return crate::external_agents::wsl::wsl_exec_command(&target);
+    }
+    Command::new(program)
+}
+
+fn apply_env_for_cli(command: &mut Command, program: &Path, key: &str, value: String) {
+    let value = crate::external_agents::wsl::env_value_for_cli(program, key, value);
+    command.env(key, value);
+}
+
+fn cli_bin_stem(bin: &Path) -> Option<String> {
+    if let Some(target) = crate::external_agents::wsl::parse_wsl_target(bin) {
+        return Path::new(&target.linux_path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string);
+    }
+    bin.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::to_string)
+}
+
+fn is_codex_cli_bin(bin: &Path) -> bool {
+    cli_bin_stem(bin).is_some_and(|stem| {
+        stem.eq_ignore_ascii_case("codex") || stem.eq_ignore_ascii_case("codex-app-server")
+    })
+}
+
+/// WSL Codex 在没有私有 `CODEX_HOME` 时改读用户那份 `~/.codex`，否则会话写进 Linux 家目录，
+/// Windows 上的 Codex CLI / TUI 看不见。
+fn extra_codex_home_for_spawn(
+    cli_bin: &Path,
+    agent_id: Option<&str>,
+    already_has_codex_home: bool,
+) -> Option<PathBuf> {
+    if already_has_codex_home {
+        return None;
+    }
+    if agent_id != Some("codex") && !is_codex_cli_bin(cli_bin) {
+        return None;
+    }
+    crate::external_agents::provider_profile::wsl_shared_codex_home(cli_bin)
+}
+
+fn finish_codex_home(
+    command: &mut Command,
+    program: &Path,
+    agent_id: Option<&str>,
+    already_has_codex_home: bool,
+) {
+    if already_has_codex_home {
+        crate::external_agents::provider_profile::ensure_private_codex_sessions_shared();
+        return;
+    }
+    if let Some(home) = extra_codex_home_for_spawn(program, agent_id, false) {
+        apply_env_for_cli(
+            command,
+            program,
+            "CODEX_HOME",
+            home.to_string_lossy().into_owned(),
+        );
+    }
+}
+
+pub fn cli_command(program: impl AsRef<OsStr>) -> Command {
     let program = program.as_ref();
-    let mut command = Command::new(program);
+    let mut command = command_for_program(program);
     strip_parent_session_env(&mut command);
     // 设置页里针对这个 CLI 填的环境变量覆盖（`ANTHROPIC_BASE_URL` 之类），按二进制名反查。
-    for (key, value) in crate::external_agents::overrides::env_for_bin(Path::new(program)) {
-        command.env(key, value);
+    // 必须用原始路径（UNC 的 file_stem 仍是 `claude`），不能用改写后的 `wsl.exe`。
+    let extra = crate::external_agents::overrides::env_for_bin(Path::new(program));
+    let has_codex_home = extra.contains_key("CODEX_HOME");
+    for (key, value) in extra {
+        apply_env_for_cli(&mut command, Path::new(program), &key, value);
     }
+    finish_codex_home(&mut command, Path::new(program), None, has_codex_home);
     command
 }
 
@@ -76,15 +147,25 @@ pub fn cli_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 ///
 /// 探测（version / auth / 列模型）也要带上环境变量覆盖：用户配了 `ANTHROPIC_BASE_URL` 指向中转，
 /// 只在跑轮次时注入的话，认证探测仍打官方端点，设置页会显示「未认证」而实际能用。
-pub fn agent_cli_command(def: &RuntimeAgentDef, program: impl AsRef<std::ffi::OsStr>) -> Command {
-    let mut command = Command::new(program);
+pub fn agent_cli_command(def: &RuntimeAgentDef, program: impl AsRef<OsStr>) -> Command {
+    let program = program.as_ref();
+    let mut command = command_for_program(program);
     strip_parent_session_env(&mut command);
+    let mut has_codex_home = false;
     for (key, value) in def.env {
-        command.env(key, value);
+        has_codex_home |= *key == "CODEX_HOME";
+        apply_env_for_cli(&mut command, Path::new(program), key, value.to_string());
     }
     for (key, value) in crate::external_agents::overrides::env_for(def.id) {
-        command.env(key, value);
+        has_codex_home |= key == "CODEX_HOME";
+        apply_env_for_cli(&mut command, Path::new(program), &key, value);
     }
+    finish_codex_home(
+        &mut command,
+        Path::new(program),
+        Some(def.id),
+        has_codex_home,
+    );
     command
 }
 
@@ -233,6 +314,10 @@ struct ProbeOutcome {
 
 /// 缓存 key：把文件身份（mtime + size）编进去，文件一变就自然 miss。
 fn probe_cache_key(path: &Path) -> Option<String> {
+    // `\\wsl$\...` 走 9P，metadata 又慢又会把发行版唤醒；用路径本身当身份即可。
+    if crate::external_agents::wsl::is_wsl_target(path) {
+        return Some(format!("wsl|{}", path.display()));
+    }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -257,12 +342,22 @@ pub async fn resolve_binary(def: &RuntimeAgentDef) -> Option<PathBuf> {
     // 用户在设置页指定了路径就**只认它**：静默回退到 PATH 会让「我明明指了这个二进制」
     // 与实际跑的东西对不上，比诚实报「未安装」更难查。
     if let Some(path) = crate::external_agents::overrides::custom_path(def.id) {
+        let path = crate::external_agents::wsl::normalize_custom_path(path).await;
         return probe_executable_cached(&path, def.version_args)
             .await
             .then_some(path);
     }
     for candidate in std::iter::once(def.bin).chain(def.fallback_bins.iter().copied()) {
         for path in which_all(candidate).await {
+            if probe_executable_cached(&path, def.version_args).await {
+                return Some(path);
+            }
+        }
+    }
+    // Windows PATH 上没有能拉起来的 Win32 候选时，再看 WSL 里的 Linux 安装。
+    // 不插到 PATH 候选前面：本机已经装了 Windows 版 CLI 的人不能被 WSL 里同名二进制抢走。
+    for candidate in std::iter::once(def.bin).chain(def.fallback_bins.iter().copied()) {
+        if let Some(path) = crate::external_agents::wsl::linux_bin_unc(candidate).await {
             if probe_executable_cached(&path, def.version_args).await {
                 return Some(path);
             }
@@ -313,8 +408,15 @@ pub fn cached_cli_version(path: &Path) -> Option<String> {
 /// 会继续返回「能启动、无版本」。装完立刻丢掉这条，下次探测才会重新跑。
 pub fn invalidate_probe_cache(path: &Path) {
     let prefix = format!("{}|", path.display());
+    let wsl_key = format!("wsl|{}", path.display());
     if let Ok(mut cache) = PROBE_CACHE.lock() {
-        cache.retain(|key, _| !key.starts_with(&prefix));
+        cache.retain(|key, _| !key.starts_with(&prefix) && key.as_str() != wsl_key);
+    }
+}
+
+pub fn clear_probe_cache() {
+    if let Ok(mut cache) = PROBE_CACHE.lock() {
+        cache.clear();
     }
 }
 
@@ -352,14 +454,23 @@ async fn probe_executable(path: &Path, version_args: &[&str]) -> (bool, Option<S
     };
     // 超时时这个 future 被丢弃 ⇒ 连带丢弃 Child ⇒ `kill_on_drop(true)` 收尾，
     // 与改动前的显式 `start_kill()` 等价。
+    let is_wsl = crate::external_agents::wsl::is_wsl_target(path);
     match timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
-        // 起来了就算存在，**不看退出码**（见上方注释）。
-        Ok(Ok(output)) => (
-            true,
-            first_version_line(&String::from_utf8_lossy(&output.stdout)),
-        ),
-        Ok(Err(_)) => (true, None),
-        Err(_) => (true, None),
+        Ok(Ok(output)) => {
+            if is_wsl && crate::external_agents::wsl::wsl_stdout_is_system_error(&output.stdout) {
+                return (false, None);
+            }
+            let text = if is_wsl {
+                crate::external_agents::wsl::decode_wsl_output(&output.stdout)
+            } else {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            };
+            (true, first_version_line(&text))
+        }
+        // Win32：进程能起来就算在。WSL：真正启动的是 wsl.exe 垫片——没装组件时它
+        // 会卡在 MSI 几十秒（本机 61s / REGDB_E_CLASSNOTREG），超时绝不等于 CLI 在。
+        Ok(Err(_)) => (!is_wsl, None),
+        Err(_) => (!is_wsl, None),
     }
 }
 
@@ -528,7 +639,13 @@ mod tests {
         std::env::set_var("KIVIO_SPAWN_TEST_KEEP", "keep-me");
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "sk-test-token");
 
-        let out = cli_command("/usr/bin/env").output().await.expect("run env");
+        let out = if cfg!(windows) {
+            let mut cmd = cli_command("cmd.exe");
+            cmd.args(["/C", "set"]);
+            cmd.output().await.expect("run cmd set")
+        } else {
+            cli_command("/usr/bin/env").output().await.expect("run env")
+        };
         let text = String::from_utf8_lossy(&out.stdout);
         let has = |key: &str| {
             text.lines()
@@ -570,6 +687,59 @@ mod tests {
         std::env::remove_var("CLAUDE_CODE_HOST_AUTH_ENV_VAR");
         std::env::remove_var("KIVIO_SPAWN_TEST_KEEP");
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+    }
+
+    #[test]
+    fn cli_command_rewrites_wsl_unc_to_wsl_exe() {
+        let cmd = cli_command(r"\\wsl$\Ubuntu\usr\bin\claude");
+        let std = cmd.as_std();
+        assert_eq!(std.get_program(), std::ffi::OsStr::new("wsl.exe"));
+        let args: Vec<String> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..5], ["-d", "Ubuntu", "-e", "/bin/bash", "-c"]);
+        assert_eq!(args[6], "/usr/bin/claude");
+        // 环境覆盖必须仍按原始二进制名 `claude` 查找，不能变成 `wsl`。
+        // UNC 在 Unix Path 里是单个分量，要用 linux 路径取 stem。
+        assert_eq!(
+            cli_bin_stem(Path::new(r"\\wsl$\Ubuntu\usr\bin\claude")).as_deref(),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn extra_codex_home_for_spawn_only_fills_wsl_without_private_home() {
+        let wsl = PathBuf::from(r"\\wsl$\Ubuntu\usr\bin\codex");
+        let win = PathBuf::from(r"C:\codex.exe");
+        let claude = PathBuf::from(r"\\wsl$\Ubuntu\usr\bin\claude");
+        assert!(extra_codex_home_for_spawn(&win, Some("codex"), false).is_none());
+        assert!(extra_codex_home_for_spawn(&wsl, Some("codex"), true).is_none());
+        assert!(extra_codex_home_for_spawn(&claude, None, false).is_none());
+        let home =
+            extra_codex_home_for_spawn(&wsl, None, false).expect("wsl codex shares host home");
+        assert_eq!(
+            home.file_name().and_then(|name| name.to_str()),
+            Some(".codex")
+        );
+        assert!(!home
+            .to_string_lossy()
+            .replace('\\', "/")
+            .starts_with("/mnt/"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn probing_a_wsl_unc_when_wsl_is_broken_is_not_installed() {
+        let fake = std::path::PathBuf::from(r"\\wsl$\Ubuntu\usr\bin\claude");
+        let started = std::time::Instant::now();
+        let (ok, _) = probe_executable(&fake, &["--version"]).await;
+        assert!(!ok, "wsl.exe MSI stub must not count as an installed CLI");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "WSL probe hung for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

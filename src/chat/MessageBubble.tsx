@@ -6,7 +6,6 @@ import {
   Check,
   Copy,
   CornerDownRight,
-  FileCode2,
   FilePen,
   FileSearch,
   FileText,
@@ -43,7 +42,7 @@ import { ReasoningBlock } from './ReasoningBlock'
 import { ModelIcon } from './ModelIcon'
 import { ToolCallBlock } from './ToolCallBlock'
 import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
-import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ToolCallRecord } from './types'
+import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ModelRef, ToolCallRecord } from './types'
 import { buildCitationMap, type CitationView } from './citations'
 import {
   compareTimelineSegments,
@@ -79,6 +78,8 @@ interface MessageBubbleProps {
   sentModels?: { providerId: string | null; model: string | null }[]
   onUpdateMessage?: (messageId: string, content: string) => Promise<void>
   onRegenerateMessage?: (messageId: string, newContent?: string) => Promise<void>
+  onReplyWithModel?: (messageId: string, providerId: string, model: string) => Promise<void>
+  replyOccupiedModels?: ModelRef[]
   onForkMessage?: (messageId: string) => Promise<void>
   /** 一键 rewind：截掉这条提问及其之后的消息，原文回输入框（仅 user 气泡）。 */
   onRewindMessage?: (messageId: string) => Promise<void>
@@ -598,7 +599,6 @@ const GROUP_ICON_BY_CATEGORY: Record<
   runCommand: SquareTerminal,
   webFetch: Globe,
   webSearch: Search,
-  runPython: FileCode2,
   listDir: FolderOpen,
   fileOps: FolderInput,
   todo: ListChecks,
@@ -895,6 +895,8 @@ function MessageBubbleComponent({
   sentModels,
   onUpdateMessage,
   onRegenerateMessage,
+  onReplyWithModel,
+  replyOccupiedModels,
   onForkMessage,
   onRewindMessage,
   onDeleteMessage,
@@ -1272,6 +1274,14 @@ function MessageBubbleComponent({
                   }
                 : undefined
             }
+            onReplyWithModel={
+              onReplyWithModel
+                ? (providerId, model) => {
+                    void onReplyWithModel(message.id, providerId, model)
+                  }
+                : undefined
+            }
+            replyOccupiedModels={replyOccupiedModels}
             onFork={
               onForkMessage
                 ? () => {

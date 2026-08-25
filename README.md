@@ -159,7 +159,7 @@ Kivio Desktop 常驻托盘 / 菜单栏，工作在整个**屏幕**层面，而�
 
 ## 快速开始
 
-1. **[下载最新版](https://github.com/ZMGID/kivio/releases/latest)** —— macOS：Apple Silicon `.dmg` · Windows：NSIS `-setup.exe`。
+1. **[下载最新版](https://github.com/zhengyang3552/kivio-linux/releases/latest)** —— Linux：各种格式（.deb、.rpm、AppImage等）。
 2. **安装并启动。** DMG 未签名，首次打开请右键 → 打开，或执行：
    ```bash
    xattr -cr "/Applications/Kivio Desktop.app"
@@ -188,7 +188,7 @@ sudo apt update && sudo apt install kivio-desktop
 - **插件与技能** —— 一键跑官方安装命令；技能扫描 `~/.kivio` 与 `~/.agents`。
 - **其它** —— CLI 供应商可与 CLI 自带配置并存；账户菜单显示今日用量；重启记住当前对话。Windows 应用内更新静默安装。去掉 Email 连接器。
 
-完整历史见 [GitHub Releases](https://github.com/ZMGID/kivio/releases)。
+完整历史见 [GitHub Releases](https://github.com/zhengyang3552/kivio-linux/releases)。
 
 ## 开发
 
@@ -232,7 +232,7 @@ GPL-3.0-or-later © ZM。见 [LICENSE](LICENSE)。
 </p>
 
 <p align="center">
-  <a href="https://github.com/ZMGID/kivio/releases/latest"><strong>Download</strong></a>
+  <a href="https://github.com/zhengyang3552/kivio-linux/releases/latest"><strong>Download</strong></a>
   &nbsp;·&nbsp;
   <a href="#features">Features</a>
   &nbsp;·&nbsp;
@@ -372,7 +372,7 @@ All hotkeys act as toggles and are remappable in Settings (with conflict detecti
 
 ## Quick Start
 
-1. **[Download the latest release](https://github.com/ZMGID/kivio/releases/latest)** — macOS: Apple Silicon `.dmg` · Windows: NSIS `-setup.exe`.
+1. **[Download the latest release](https://github.com/zhengyang3552/kivio-linux/releases/latest)** — Linux: various formats (.deb, .rpm, AppImage, etc.).
 2. **Install and launch.** The DMG is unsigned; on first launch right-click → Open, or run:
    ```bash
    xattr -cr "/Applications/Kivio Desktop.app"
@@ -394,15 +394,19 @@ echo "deb [signed-by=/usr/share/keyrings/kivio-desktop.gpg] https://zhengyang355
 sudo apt update && sudo apt install kivio-desktop
 ```
 
-## What's New — v2.9.2
+## What's New — v2.9.3
 
+- Windows portable zip
+- Official / hosted DeepSeek search
+- Compact attachment cards; reply to the last turn with another model
+- External CLI catch-up: Claude Code 2.1.238, Codex 0.148, dsh rc.8
 - **Pi** — ask-user, native images, mid-turn steer and next-turn follow-up; Dock Trajectory can fork/clone; Settings manages extensions and Skills.
 - **DeepSeek Harness** — steer or queue while generating; sessions bind to the project working directory; close and cancel actually stop.
 - **Web search** — clickable source directory and `[n]` jump; adds Brave, Serper, Zhipu, TinyFish, and more.
 - **Plugins and skills** — one-click official install; Skills scan `~/.kivio` and `~/.agents`.
 - **More** — CLI providers can coexist with the CLI's own config; account menu shows today's usage; restart remembers the current conversation. Windows in-app updates install silently. Email connector removed.
 
-Full history: [GitHub Releases](https://github.com/ZMGID/kivio/releases).
+Full history: [GitHub Releases](https://github.com/zhengyang3552/kivio-linux/releases).
 
 ## Development
 

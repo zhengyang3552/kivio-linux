@@ -6,9 +6,10 @@
 //! 清单则来自已 compose 的 Loader 树。Kivio 不改 `profiles/kivio/cordis.patch.yml`
 //!（那份由 `dsh_profile::ensure_profile_ready` 每轮重写），所以：
 //!
-//! - **官方密钥**：写入 `.credentials.yaml` 的 `DEEPSEEK_API_KEY`，与官方网页版首次
-//!   填密钥同一条路径；不进 `cordis.patch.yml`。就绪判定对齐官方分层：进程环境 >
-//!   `.credentials.yaml` > 项目 `.env` > `$DSH_HOME/.env`。
+//! - **官方密钥**：写入 `.credentials.yaml` 的 `refs.DEEPSEEK_API_KEY`（`version: 1`），
+//!   与官方网页版同一条路径；不进 `cordis.patch.yml`。当前 dsh 只接受顶层
+//!   `version` / `refs` / `records`，环境变量名不能写在根上。就绪判定对齐官方分层：
+//!   进程环境 > `.credentials.yaml` > 项目 `.env` > `$DSH_HOME/.env`。
 //! - **插件配置**：读写 `settings.yaml` + 可选写凭据，热重载后 kivio / web 共用。
 //! - **插件列表**：优先 `dsh --profile kivio --dump-config`（boot-free）解析
 //!   id / name / disabled；失败则读安装包里的 `dsh-base` / `dsh-agent-presets`
@@ -43,6 +44,10 @@ const AGENT_LOOP_NS: &str = "agent-loop";
 const WEB_SEARCH_NS: &str = "web-search-deepseek";
 const LLM_PI_AI_NS: &str = "llm-pi-ai";
 const CREDENTIALS_FILENAME: &str = ".credentials.yaml";
+const CREDENTIALS_VERSION: i64 = 1;
+const CREDENTIALS_VERSION_KEY: &str = "version";
+const CREDENTIALS_REFS_KEY: &str = "refs";
+const CREDENTIALS_RECORDS_KEY: &str = "records";
 const DOTENV_FILENAME: &str = ".env";
 const DEFAULT_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 const DSH_OFFICIAL_PROVIDER_ID: &str = "deepseek-official";
@@ -185,7 +190,9 @@ fn credentials_path() -> Result<PathBuf, String> {
 fn mapping_u64(map: &Mapping, key: &str) -> Option<u64> {
     let value = map.get(serde_yaml::Value::String(key.to_string()))?;
     match value {
-        serde_yaml::Value::Number(n) => n.as_u64().or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok())),
+        serde_yaml::Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok())),
         serde_yaml::Value::String(text) => text.trim().parse().ok(),
         _ => None,
     }
@@ -197,6 +204,121 @@ fn mapping_string(map: &Mapping, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn yaml_key(name: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(name.to_string())
+}
+
+fn is_credentials_schema_key(name: &str) -> bool {
+    matches!(
+        name,
+        CREDENTIALS_VERSION_KEY | CREDENTIALS_REFS_KEY | CREDENTIALS_RECORDS_KEY
+    )
+}
+
+fn load_credentials_mapping(path: &Path) -> Result<Mapping, String> {
+    if !path.is_file() {
+        return Ok(Mapping::new());
+    }
+    let text = std::fs::read_to_string(path).map_err(|err| format!("读取 dsh 凭据失败：{err}"))?;
+    match serde_yaml::from_str::<serde_yaml::Value>(&text)
+        .map_err(|err| format!("解析 dsh 凭据失败：{err}"))?
+    {
+        serde_yaml::Value::Mapping(map) => Ok(map),
+        serde_yaml::Value::Null => Ok(Mapping::new()),
+        _ => Err("dsh .credentials.yaml 必须是映射".to_string()),
+    }
+}
+
+fn persist_credentials_mapping(path: &Path, mapping: Mapping) -> Result<(), String> {
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+        .map_err(|err| format!("序列化 dsh 凭据失败：{err}"))?;
+    crate::external_agents::provider_profile::write_private_atomic(path, &yaml)
+}
+
+fn refs_mapping(root: &Mapping) -> Option<&Mapping> {
+    root.get(&yaml_key(CREDENTIALS_REFS_KEY))
+        .and_then(serde_yaml::Value::as_mapping)
+}
+
+fn credential_lookup(root: &Mapping, api_key_env: &str) -> Option<String> {
+    if is_credentials_schema_key(api_key_env) {
+        return None;
+    }
+    refs_mapping(root)
+        .and_then(|refs| mapping_string(refs, api_key_env))
+        .or_else(|| mapping_string(root, api_key_env))
+}
+
+fn credentials_have_stray_top_level_keys(root: &Mapping) -> bool {
+    root.keys().any(|key| {
+        key.as_str()
+            .is_some_and(|name| !is_credentials_schema_key(name))
+    })
+}
+
+fn credentials_need_heal(root: &Mapping) -> bool {
+    if root.is_empty() {
+        return false;
+    }
+    match root.get(&yaml_key(CREDENTIALS_VERSION_KEY)) {
+        Some(serde_yaml::Value::Number(n)) if n.as_i64() == Some(CREDENTIALS_VERSION) => {
+            credentials_have_stray_top_level_keys(root)
+        }
+        _ => true,
+    }
+}
+
+/// Move stray top-level env keys into `refs` and pin `version: 1`.
+/// Matches dsh-credentials-local (`version` | `refs` | `records` only).
+/// Stray keys overwrite existing `refs` entries so a Kivio save wins.
+fn migrate_credentials_to_v1(mut root: Mapping) -> Mapping {
+    let mut stray = Mapping::new();
+    let keys: Vec<serde_yaml::Value> = root.keys().cloned().collect();
+    for key in keys {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        if is_credentials_schema_key(name) {
+            continue;
+        }
+        if let Some(value) = root.remove(&key) {
+            stray.insert(key, value);
+        }
+    }
+    root.insert(
+        yaml_key(CREDENTIALS_VERSION_KEY),
+        serde_yaml::Value::Number(CREDENTIALS_VERSION.into()),
+    );
+    let mut refs = match root.remove(&yaml_key(CREDENTIALS_REFS_KEY)) {
+        Some(serde_yaml::Value::Mapping(mapping)) => mapping,
+        _ => Mapping::new(),
+    };
+    for (key, value) in stray {
+        refs.insert(key, value);
+    }
+    root.insert(
+        yaml_key(CREDENTIALS_REFS_KEY),
+        serde_yaml::Value::Mapping(refs),
+    );
+    root
+}
+
+pub(crate) fn heal_credentials_store() -> Result<(), String> {
+    let path = credentials_path()?;
+    heal_credentials_file(&path)
+}
+
+fn heal_credentials_file(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let root = load_credentials_mapping(path)?;
+    if !credentials_need_heal(&root) {
+        return Ok(());
+    }
+    persist_credentials_mapping(path, migrate_credentials_to_v1(root))
 }
 
 fn namespace_map<'a>(root: &'a Mapping, key: &str) -> Option<&'a Mapping> {
@@ -236,15 +358,9 @@ fn user_dotenv_path() -> Option<PathBuf> {
 }
 
 fn credentials_contain(path: &Path, api_key_env: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
-        return false;
-    };
-    value
-        .as_mapping()
-        .and_then(|map| mapping_string(map, api_key_env))
+    load_credentials_mapping(path)
+        .ok()
+        .and_then(|root| credential_lookup(&root, api_key_env))
         .is_some()
 }
 
@@ -261,10 +377,7 @@ fn dotenv_has_key(text: &str, api_key_env: &str) -> bool {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line
-            .strip_prefix("export ")
-            .map(str::trim)
-            .unwrap_or(line);
+        let line = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -325,7 +438,10 @@ pub(crate) fn credentials_ready_for_provider(provider: &str, cwd: Option<&Path>)
     .0
 }
 
-fn parse_settings_snapshot(text: &str, settings_path: &Path) -> Result<DshPluginSettingsSnapshot, String> {
+fn parse_settings_snapshot(
+    text: &str,
+    settings_path: &Path,
+) -> Result<DshPluginSettingsSnapshot, String> {
     let root = if text.trim().is_empty() {
         Mapping::new()
     } else {
@@ -353,7 +469,8 @@ fn parse_settings_snapshot(text: &str, settings_path: &Path) -> Result<DshPlugin
             max_output_bytes_default: DEFAULT_MAX_OUTPUT_BYTES,
         },
         agent_loop: DshAgentLoopSettings {
-            max_parallel_tool_calls: agent_loop.and_then(|map| mapping_u64(map, "maxParallelToolCalls")),
+            max_parallel_tool_calls: agent_loop
+                .and_then(|map| mapping_u64(map, "maxParallelToolCalls")),
             max_parallel_tool_calls_default: DEFAULT_MAX_PARALLEL,
         },
         web_search: DshWebSearchSettings {
@@ -469,26 +586,20 @@ fn write_credential(api_key_env: &str, api_key: &str) -> Result<(), String> {
 }
 
 fn write_credential_at(path: &Path, api_key_env: &str, key: &str) -> Result<(), String> {
-    let mut root = if path.exists() {
-        let text = std::fs::read_to_string(path)
-            .map_err(|err| format!("读取 dsh 凭据失败：{err}"))?;
-        match serde_yaml::from_str::<serde_yaml::Value>(&text)
-            .map_err(|err| format!("解析 dsh 凭据失败：{err}"))?
-        {
-            serde_yaml::Value::Mapping(map) => map,
-            serde_yaml::Value::Null => Mapping::new(),
-            _ => return Err("dsh .credentials.yaml 必须是映射".to_string()),
-        }
-    } else {
-        Mapping::new()
+    let mut mapping = migrate_credentials_to_v1(load_credentials_mapping(path)?);
+    let mut refs = match mapping.remove(&yaml_key(CREDENTIALS_REFS_KEY)) {
+        Some(serde_yaml::Value::Mapping(refs)) => refs,
+        _ => Mapping::new(),
     };
-    root.insert(
-        serde_yaml::Value::String(api_key_env.to_string()),
+    refs.insert(
+        yaml_key(api_key_env),
         serde_yaml::Value::String(key.to_string()),
     );
-    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
-        .map_err(|err| format!("序列化 dsh 凭据失败：{err}"))?;
-    crate::external_agents::provider_profile::write_private_atomic(path, &yaml)
+    mapping.insert(
+        yaml_key(CREDENTIALS_REFS_KEY),
+        serde_yaml::Value::Mapping(refs),
+    );
+    persist_credentials_mapping(path, mapping)
 }
 
 fn persist_settings(path: &Path, root: Mapping) -> Result<(), String> {
@@ -569,8 +680,8 @@ fn parse_plugin_manifest(
     out: &mut BTreeMap<String, DshPluginEntry>,
 ) -> Result<(), String> {
     let neutralized = neutralize_js_tags(text);
-    let value: serde_yaml::Value = serde_yaml::from_str(&neutralized)
-        .map_err(|err| format!("解析插件清单失败：{err}"))?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(&neutralized).map_err(|err| format!("解析插件清单失败：{err}"))?;
     collect_entries(&value, out);
     Ok(())
 }
@@ -652,7 +763,10 @@ fn find_bundle_patch(start: &Path, package: &str) -> Option<PathBuf> {
     None
 }
 
-fn merge_manifest_file(path: &Path, out: &mut BTreeMap<String, DshPluginEntry>) -> Result<(), String> {
+fn merge_manifest_file(
+    path: &Path,
+    out: &mut BTreeMap<String, DshPluginEntry>,
+) -> Result<(), String> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| format!("读取 {} 失败：{err}", path.display()))?;
     parse_plugin_manifest(&text, out)
@@ -758,7 +872,8 @@ fn open_settings_file(app: &AppHandle, path: &Path) -> Result<(), String> {
 pub fn chat_dsh_plugin_settings_get() -> Result<DshPluginSettingsSnapshot, String> {
     let path = settings_path()?;
     let text = if path.exists() {
-        std::fs::read_to_string(&path).map_err(|err| format!("读取 dsh settings.yaml 失败：{err}"))?
+        std::fs::read_to_string(&path)
+            .map_err(|err| format!("读取 dsh settings.yaml 失败：{err}"))?
     } else {
         String::new()
     };
@@ -781,10 +896,7 @@ pub fn chat_dsh_plugin_settings_save(
             write_credential(&snapshot.web_search.api_key_env, api_key)?;
         }
     }
-    parse_settings_snapshot(
-        &std::fs::read_to_string(&path).unwrap_or_default(),
-        &path,
-    )
+    parse_settings_snapshot(&std::fs::read_to_string(&path).unwrap_or_default(), &path)
 }
 
 #[tauri::command]
@@ -824,9 +936,9 @@ fn credential_value(path: &Path, api_key_env: &str) -> Option<String> {
     if api_key_env.is_empty() {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    let value = serde_yaml::from_str::<serde_yaml::Value>(&text).ok()?;
-    mapping_string(value.as_mapping()?, api_key_env)
+    load_credentials_mapping(path)
+        .ok()
+        .and_then(|root| credential_lookup(&root, api_key_env))
 }
 
 fn parse_native_models(value: Option<&serde_yaml::Value>) -> Vec<DshNativeProviderModel> {
@@ -856,7 +968,10 @@ fn parse_native_models(value: Option<&serde_yaml::Value>) -> Vec<DshNativeProvid
 fn selected_default_model(root: &Mapping) -> (Option<String>, Option<String>) {
     for key in ["agent-default-model", "api-gateway"] {
         if let Some(map) = namespace_map(root, key) {
-            return (mapping_string(map, "provider"), mapping_string(map, "model"));
+            return (
+                mapping_string(map, "provider"),
+                mapping_string(map, "model"),
+            );
         }
     }
     (None, None)
@@ -1025,13 +1140,15 @@ fn reasoning_matches(existing: Option<&serde_yaml::Value>, decl: &ReasoningDecl)
             if map.len() != levels.len() {
                 return false;
             }
-            levels.iter().all(|(key, wire)| {
-                match map.get(serde_yaml::Value::String(key.clone())) {
+            levels.iter().all(
+                |(key, wire)| match map.get(serde_yaml::Value::String(key.clone())) {
                     Some(serde_yaml::Value::Null) => wire.is_none(),
-                    Some(serde_yaml::Value::String(value)) => wire.as_deref() == Some(value.as_str()),
+                    Some(serde_yaml::Value::String(value)) => {
+                        wire.as_deref() == Some(value.as_str())
+                    }
                     _ => false,
-                }
-            })
+                },
+            )
         }
         _ => false,
     }
@@ -1059,7 +1176,13 @@ fn model_caps_from_config_json(config_json: &str) -> BTreeMap<String, ModelCaps>
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("image")));
         let reasoning = model.get("reasoningEfforts").and_then(parse_reasoning_decl);
-        caps.insert(id.to_string(), ModelCaps { has_image, reasoning });
+        caps.insert(
+            id.to_string(),
+            ModelCaps {
+                has_image,
+                reasoning,
+            },
+        );
     }
     caps
 }
@@ -1127,7 +1250,11 @@ fn apply_model_caps(models: &mut serde_yaml::Value, caps: &BTreeMap<String, Mode
     changed
 }
 
-fn apply_provider_caps(root: &mut Mapping, route: &str, caps: &BTreeMap<String, ModelCaps>) -> bool {
+fn apply_provider_caps(
+    root: &mut Mapping,
+    route: &str,
+    caps: &BTreeMap<String, ModelCaps>,
+) -> bool {
     let Some(pi) = root
         .get_mut(serde_yaml::Value::String(LLM_PI_AI_NS.to_string()))
         .and_then(serde_yaml::Value::as_mapping_mut)
@@ -1189,7 +1316,9 @@ fn sync_kivio_model_capabilities_at(
 
 /// 把 Kivio 已保存的模型 `input` / `reasoningEfforts` 写回已存在的 `settings.yaml` 路由。
 /// 不新建供应商，也不写密钥；官方 web 的贴图和 effort 选择只认这些字段。
-pub(crate) fn sync_kivio_model_capabilities(providers: &[ExternalCliProvider]) -> Result<(), String> {
+pub(crate) fn sync_kivio_model_capabilities(
+    providers: &[ExternalCliProvider],
+) -> Result<(), String> {
     let Ok(path) = settings_path() else {
         return Ok(());
     };
@@ -1211,6 +1340,7 @@ pub fn chat_dsh_native_provider_delete(id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub fn chat_dsh_official_credential_status() -> Result<DshOfficialCredential, String> {
+    let _ = heal_credentials_store();
     let (configured, writable) = credential_status(DEFAULT_API_KEY_ENV);
     Ok(DshOfficialCredential {
         configured,
@@ -1351,10 +1481,16 @@ web-search-deepseek:
         let entries = parse_inventory_dump(dump).unwrap();
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].id, "group-tools");
-        assert!(entries.iter().any(|entry| entry.id == "include" && entry.enabled));
-        assert!(entries.iter().any(|entry| entry.id == "tool-bash" && !entry.enabled));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.id == "include" && entry.enabled));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.id == "tool-bash" && !entry.enabled));
         // !!js 清成 null：不当成 disabled。
-        assert!(entries.iter().any(|entry| entry.id == "tool-web" && entry.enabled));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.id == "tool-web" && entry.enabled));
     }
 
     #[test]
@@ -1373,8 +1509,12 @@ node: warning this is not yaml
 "#;
         let entries = parse_inventory_dump(dump).unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|entry| entry.id == "timer" && entry.enabled));
-        assert!(entries.iter().any(|entry| entry.id == "tool-bash" && !entry.enabled));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.id == "timer" && entry.enabled));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.id == "tool-bash" && !entry.enabled));
     }
 
     #[test]
@@ -1423,6 +1563,17 @@ node: warning this is not yaml
         assert!(write_credential(DEFAULT_API_KEY_ENV, "  ").is_ok());
     }
 
+    fn assert_no_top_level_env_keys(text: &str) {
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.starts_with("DEEPSEEK_API_KEY:")
+                    || line.starts_with("OTHER_KEY:")
+                    || line.starts_with("GPT_API_KEY:")),
+            "dsh credentials must not put env names at the YAML root:\n{text}"
+        );
+    }
+
     #[test]
     fn official_credential_writes_deepseek_key_and_keeps_neighbors() {
         let dir = std::env::temp_dir().join(format!("kivio-dsh-cred-{}", uuid::Uuid::new_v4()));
@@ -1431,10 +1582,57 @@ node: warning this is not yaml
         std::fs::write(&path, "OTHER_KEY: keep-me\n").unwrap();
         write_credential_at(&path, DEFAULT_API_KEY_ENV, "sk-test").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("version:"));
+        assert!(text.contains("refs:"));
         assert!(text.contains("DEEPSEEK_API_KEY"));
         assert!(text.contains("sk-test"));
         assert!(text.contains("OTHER_KEY"));
+        assert_no_top_level_env_keys(&text);
         assert!(credentials_contain(&path, DEFAULT_API_KEY_ENV));
+        assert_eq!(
+            credential_value(&path, "OTHER_KEY").as_deref(),
+            Some("keep-me")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heals_hybrid_versioned_file_with_stray_top_level_key() {
+        let dir = std::env::temp_dir().join(format!("kivio-dsh-heal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\nrefs:\n  GPT_API_KEY: keep-me\nDEEPSEEK_API_KEY: sk-stray\n",
+        )
+        .unwrap();
+        heal_credentials_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_no_top_level_env_keys(&text);
+        let root = load_credentials_mapping(&path).unwrap();
+        assert!(!credentials_need_heal(&root));
+        assert_eq!(
+            credential_lookup(&root, DEFAULT_API_KEY_ENV).as_deref(),
+            Some("sk-stray")
+        );
+        assert_eq!(
+            credential_lookup(&root, "GPT_API_KEY").as_deref(),
+            Some("keep-me")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credentials_contain_reads_refs_layout() {
+        let dir = std::env::temp_dir().join(format!("kivio-dsh-refs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".credentials.yaml");
+        std::fs::write(&path, "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-yaml\n").unwrap();
+        assert!(credentials_contain(&path, DEFAULT_API_KEY_ENV));
+        assert_eq!(
+            credential_value(&path, DEFAULT_API_KEY_ENV).as_deref(),
+            Some("sk-yaml")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1492,7 +1690,9 @@ llm-pi-ai:
                 },
             ]
         );
-        assert!(native_provider_detail_at(&settings, &credentials, DSH_OFFICIAL_PROVIDER_ID).is_err());
+        assert!(
+            native_provider_detail_at(&settings, &credentials, DSH_OFFICIAL_PROVIDER_ID).is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1596,7 +1796,10 @@ llm-pi-ai:
 
     #[test]
     fn dotenv_parser_accepts_export_quotes_and_skips_empty() {
-        assert!(dotenv_has_key("DEEPSEEK_API_KEY=sk-test\n", "DEEPSEEK_API_KEY"));
+        assert!(dotenv_has_key(
+            "DEEPSEEK_API_KEY=sk-test\n",
+            "DEEPSEEK_API_KEY"
+        ));
         assert!(dotenv_has_key(
             "export DEEPSEEK_API_KEY=sk-test\n",
             "DEEPSEEK_API_KEY"
@@ -1610,7 +1813,10 @@ llm-pi-ai:
             "DEEPSEEK_API_KEY"
         ));
         assert!(!dotenv_has_key("DEEPSEEK_API_KEY=\n", "DEEPSEEK_API_KEY"));
-        assert!(!dotenv_has_key("DEEPSEEK_API_KEY=\"\"\n", "DEEPSEEK_API_KEY"));
+        assert!(!dotenv_has_key(
+            "DEEPSEEK_API_KEY=\"\"\n",
+            "DEEPSEEK_API_KEY"
+        ));
         assert!(!dotenv_has_key(
             "# DEEPSEEK_API_KEY=sk-test\n",
             "DEEPSEEK_API_KEY"

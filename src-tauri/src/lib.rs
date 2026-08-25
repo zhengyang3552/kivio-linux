@@ -240,8 +240,8 @@ pub fn run() {
             // `conv_*` 目录，非空的孤儿工作区只报数不删（里面是用户产物）。
             chat::gc::sweep_conversation_side_artifacts(app.handle());
 
-            // 周期性回收闲置的持久外部 CLI 会话（10 分钟无活动即丢弃 → actor 关闭其子进程），
-            // 避免长时间挂着空转进程占内存。注册时也会做一次清扫 + LRU 限流，这里覆盖纯闲置场景。
+            // 周期性回收闲置的持久外部 CLI **进程**（10 分钟无活动即丢弃 → actor 关闭子进程）。
+            // 原生会话 id 仍落在 disk 上，下一轮（或重新打开这条对话）必须 resume，不是开新会话。
             {
                 let sweeper = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -252,7 +252,9 @@ pub fn run() {
                         let Some(state) = sweeper.try_state::<AppState>() else {
                             continue;
                         };
-                        state.sweep_idle_external_live_sessions(std::time::Duration::from_secs(600));
+                        state.sweep_idle_external_live_sessions(
+                            crate::external_agents::session::live::LIVE_SESSION_IDLE_TTL,
+                        );
                     }
                 });
             }
@@ -292,6 +294,23 @@ pub fn run() {
                         }
                     }
                     Err(err) => eprintln!("Failed to merge built-in assistants v2: {err}"),
+                }
+            }
+            // 非破坏性内置专家迁移（v3）：按 id upsert 补齐产品/法务/财务/教学/审查/求职，
+            // 保留用户自建。已 seed v2 的老用户靠它拿到新专家；新装用户 v1 已装全套，此处为幂等 no-op。
+            if !settings.builtin_assistants_seeded_v3 {
+                let now = chrono::Local::now().timestamp();
+                match chat::storage::merge_builtin_assistants_v3(&app.handle(), now) {
+                    Ok(()) => {
+                        settings.builtin_assistants_seeded_v3 = true;
+                        if let Err(err) = settings::persist_settings(&app.handle(), &settings) {
+                            eprintln!(
+                                "Failed to persist settings after merging built-in assistants v3: {err}"
+                            );
+                            settings.builtin_assistants_seeded_v3 = false;
+                        }
+                    }
+                    Err(err) => eprintln!("Failed to merge built-in assistants v3: {err}"),
                 }
             }
             if let Err(err) = apply_launch_at_startup(&app.handle(), settings.launch_at_startup) {
@@ -377,8 +396,9 @@ pub fn run() {
                 }
             });
 
-            // MCP 持久连接空闲回收 reaper：每 60s 扫描连接池，回收 last_used 超过
-            // 设置 mcp_idle_timeout_ms 的会话（Drop 杀子进程），发 Disconnected 事件。
+            // MCP 持久连接空闲回收 + HTTP 保活：每 60s 扫描连接池。stdio 空闲会话
+            // Drop 杀子进程；活着的 HTTP 会话不收，改发 ping（失败则按握手配置重连，
+            // 含 OAuth 刷新）。
             {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -400,6 +420,7 @@ pub fn run() {
                                 }),
                             );
                         }
+                        state.mcp_keepalive_http(Some(&app_handle)).await;
                     }
                 });
             }
@@ -564,6 +585,7 @@ pub fn run() {
             chat::commands::catalog::chat_delete_set,
             chat::commands::context::chat_get_context_stats,
             chat::commands::context::chat_compress_context,
+            chat::commands::context::chat_clear_context,
             chat::commands::interaction::chat_take_external_sends,
             chat::commands::interaction::chat_set_agent_plan_mode,
             chat::commands::interaction::chat_execute_agent_plan,
@@ -574,13 +596,6 @@ pub fn run() {
             chat::commands::interaction::chat_submit_user_choice,
             chat::commands::interaction::chat_steer_message,
             chat::commands::interaction::chat_follow_up_message,
-            external_agents::pi_session_tree::chat_pi_session_tree,
-            external_agents::pi_session_tree::chat_pi_session_entries,
-            external_agents::pi_session_tree::chat_pi_fork_messages,
-            external_agents::pi_session_tree::chat_pi_session_fork,
-            external_agents::pi_session_tree::chat_pi_session_clone,
-            external_agents::pi_session_tree::chat_pi_session_switch,
-            chat::commands::interaction::chat_python_complete,
             chat::commands::attachments::chat_read_attachment,
             chat::commands::attachments::chat_open_attachment,
             chat::commands::attachments::chat_open_generated_artifact,
@@ -590,12 +605,14 @@ pub fn run() {
             chat::commands::attachments::chat_read_clipboard_files,
             chat::commands::mutations::chat_delete_conversation,
             chat::commands::mutations::chat_update_conversation,
+            chat::commands::title::chat_regenerate_title,
             chat::commands::mutations::chat_bulk_update_conversations,
             chat::commands::mutations::chat_bulk_delete_conversations,
             chat::commands::reasoning::chat_reasoning_efforts_for_model,
             chat::commands::mutations::chat_update_message,
             chat::commands::mutations::chat_delete_message,
             chat::commands::mutations::chat_set_group_selection,
+            chat::commands::mutations::chat_reply_with_model,
             chat::commands::mutations::chat_regenerate_message,
             chat::commands::mutations::chat_rewind_to_message,
             chat::commands::mutations::chat_fork_conversation,
@@ -632,10 +649,12 @@ pub fn run() {
             external_agents::dsh_plugins::chat_dsh_official_credential_save,
             external_agents::dsh_plugins::chat_dsh_native_provider_get,
             external_agents::dsh_plugins::chat_dsh_native_provider_delete,
+            external_agents::dsh_profile::chat_dsh_list_agent_presets,
             external_agents::commands::chat_set_agent_runtime,
             external_agents::commands::chat_list_importable_cli_sessions,
             external_agents::commands::chat_import_cli_sessions,
             external_agents::commands::chat_imported_history_stale,
+            external_agents::commands::chat_external_native_session_id,
             chat::memory::chat_memory_get,
             chat::memory::chat_memory_save,
             chat::memory::chat_memory_open_folder,

@@ -1,6 +1,7 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { chatApi } from './api'
 import { ConversationList } from './ConversationList'
 import type { ConversationListItem } from './types'
 
@@ -22,6 +23,7 @@ const listProps = {
   lang: 'zh' as const,
   onSelectConversation: vi.fn(),
   onRenameConversation: vi.fn(),
+  onRegenerateConversationTitle: vi.fn(),
   onTogglePinConversation: vi.fn(),
   onArchiveConversation: vi.fn(),
   onExportConversation: vi.fn(),
@@ -39,6 +41,10 @@ function renderList(onRenameConversation = vi.fn()) {
   )
   return onRenameConversation
 }
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 describe('ConversationList inline rename', () => {
   it('opens rename input on double click and commits with Enter', async () => {
@@ -89,13 +95,60 @@ describe('ConversationList pin and archive', () => {
     expect(onArchive).toHaveBeenCalledWith('conversation-1')
   })
 
-  it('opens context menu on right-click with pin action', async () => {
+  it('collapses the archived row without remounting the rows below it', async () => {
     const user = userEvent.setup()
-    const onTogglePin = vi.fn()
+    const second: ConversationListItem = {
+      ...conversation,
+      id: 'conversation-2',
+      title: '留下的对话',
+    }
     const { container } = render(
       <ConversationList
         {...listProps}
-        onTogglePinConversation={onTogglePin}
+        conversations={[conversation, second]}
+      />,
+    )
+
+    await user.click(screen.getAllByRole('button', { name: '归档' })[0])
+
+    const exiting = container.querySelector('.kv-conv-exit.is-exiting')
+    expect(exiting).toBeTruthy()
+    expect(exiting).toHaveTextContent('原会话标题')
+    expect(screen.queryByRole('button', { name: '原会话标题' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '留下的对话' })).toBeInTheDocument()
+    const remainingWrap = screen.getByRole('button', { name: '留下的对话' }).closest('.kv-conv-exit')
+    expect(remainingWrap).toBeTruthy()
+    expect(remainingWrap).not.toHaveClass('is-exiting')
+  })
+
+  it('opens context menu on right-click without rename, pin, or native session', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<ConversationList {...listProps} />)
+
+    const row = container.querySelector('.kv-conv-row')
+    expect(row).toBeTruthy()
+    await user.pointer({ keys: '[MouseRight>]', target: row as Element })
+
+    expect(screen.getByRole('menuitem', { name: '重新生成标题' })).toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '重命名' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: '置顶聊天' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('menuitem', { name: /原生会话/ })).not.toBeInTheDocument()
+  })
+
+  it('shows the bound native session id for local CLI conversations', async () => {
+    const user = userEvent.setup()
+    vi.spyOn(chatApi, 'getExternalNativeSessionId').mockResolvedValue(
+      '0194abcd-61e2-7113-b077-58d3d91fb3d7',
+    )
+    const { container } = render(
+      <ConversationList
+        {...listProps}
+        conversations={[
+          {
+            ...conversation,
+            agent_runtime: { kind: 'external', externalAgentId: 'codex' },
+          },
+        ]}
       />,
     )
 
@@ -103,8 +156,27 @@ describe('ConversationList pin and archive', () => {
     expect(row).toBeTruthy()
     await user.pointer({ keys: '[MouseRight>]', target: row as Element })
 
-    await user.click(screen.getByRole('menuitem', { name: '置顶聊天' }))
-    expect(onTogglePin).toHaveBeenCalledWith('conversation-1', true)
+    await waitFor(() => {
+      expect(screen.getByRole('menuitem', { name: /原生会话/ })).toHaveTextContent('0194abcd')
+    })
+  })
+
+  it('regenerates title from the context menu', async () => {
+    const user = userEvent.setup()
+    const onRegenerate = vi.fn()
+    const { container } = render(
+      <ConversationList
+        {...listProps}
+        onRegenerateConversationTitle={onRegenerate}
+      />,
+    )
+
+    const row = container.querySelector('.kv-conv-row')
+    expect(row).toBeTruthy()
+    await user.pointer({ keys: '[MouseRight>]', target: row as Element })
+
+    await user.click(screen.getByRole('menuitem', { name: '重新生成标题' }))
+    expect(onRegenerate).toHaveBeenCalledWith('conversation-1')
   })
 })
 
@@ -154,6 +226,22 @@ describe('ConversationList generating wave', () => {
     expect(trailing).not.toHaveAttribute('data-busy')
     expect(screen.queryByRole('status', { name: '正在生成' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '取消置顶' })).toBeInTheDocument()
+  })
+})
+
+describe('ConversationList compact age', () => {
+  it('shows last-activity age in the trailing slot', () => {
+    const nowSec = Math.floor(Date.now() / 1000)
+    const { container } = render(
+      <ConversationList
+        {...listProps}
+        conversations={[{ ...conversation, updated_at: nowSec - 2 * 3600 }]}
+      />,
+    )
+
+    const age = container.querySelector('.kv-conv-age')
+    expect(age).toHaveTextContent('2h')
+    expect(age).toHaveAttribute('aria-label', '2 小时前')
   })
 })
 

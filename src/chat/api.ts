@@ -22,12 +22,6 @@ import type {
 } from './types'
 import type { ThinkingLevel, WebSearchMode, ModelRef } from './types'
 import type { CliImportResult, ImportableCliSession } from './types'
-import type {
-  PiForkMessage,
-  PiSessionMutationResult,
-  PiSessionTreeSnapshot,
-  PiSessionSwitchResult,
-} from './piSessionTree'
 
 export type { DetectedExternalAgent, AgentRuntimeConfig }
 
@@ -117,6 +111,13 @@ export interface DshNativeProviderDetail {
   apiKeyEnv: string
   models: DshNativeProviderModel[]
   defaultModel: string
+}
+
+/** `$DSH_HOME/.agent-presets` 里用户自己写的 Agent preset（不含官方四档）。 */
+export interface DshAgentPresetOption {
+  id: string
+  label: string
+  description?: string | null
 }
 
 /** PI 全局 Package 与 ~/.pi/agent/extensions 的结构化清单。 */
@@ -234,7 +235,7 @@ export const CHAT_AGENT_RUNTIME: AgentRuntimeConfig = {
 }
 
 export function normalizeAgentRuntime(
-  conversation?: Conversation | null,
+  conversation?: Pick<Conversation, 'agent_runtime' | 'agentRuntime'> | Pick<ConversationListItem, 'agent_runtime' | 'agentRuntime'> | null,
 ): AgentRuntimeConfig {
   const raw = conversation?.agent_runtime ?? conversation?.agentRuntime
   if (!raw || raw.kind === 'builtin') {
@@ -839,6 +840,30 @@ const mockChatApi = {
     saveMockConversations(loadMockConversations().filter((item) => item.id !== conversationId))
   },
 
+  async regenerateConversationTitle(conversationId: string): Promise<Conversation> {
+    const conversations = loadMockConversations()
+    const index = conversations.findIndex((item) => item.id === conversationId)
+    if (index < 0) throw new Error('Conversation not found')
+    const conversation = conversations[index]
+    const user = conversation.messages.find((message) => message.role === 'user')
+    const userContent = user?.content?.trim() ?? ''
+    if (!userContent && !(user?.attachments?.length)) {
+      throw new Error('对话还没有可用于生成标题的内容')
+    }
+    const compact = userContent.replace(/\s+/g, ' ').trim()
+    let title = compact ? (compact.length > 14 ? compact.slice(0, 14) : compact) : conversation.title
+    const isFork = Boolean(conversation.forked_from ?? conversation.forkedFrom)
+    if (isFork && !title.endsWith('（分支）')) title = `${title}（分支）`
+    const updated = {
+      ...conversation,
+      title,
+      updated_at: nowSeconds(),
+    }
+    conversations[index] = updated
+    saveMockConversations(conversations)
+    return updated
+  },
+
   async updateConversation(
     conversationId: string,
     updates: {
@@ -1012,6 +1037,59 @@ const mockChatApi = {
     return conversation
   },
 
+  async replyWithModel(
+    conversationId: string,
+    messageId: string,
+    providerId: string,
+    model: string,
+    groupId?: string,
+  ): Promise<Conversation> {
+    const conversations = loadMockConversations()
+    const index = conversations.findIndex((item) => item.id === conversationId)
+    if (index < 0) throw new Error('Conversation not found')
+    const conversation = { ...conversations[index] }
+    const messageIndex = conversation.messages.findIndex((message) => message.id === messageId)
+    if (messageIndex < 0) throw new Error('消息不存在')
+    const target = conversation.messages[messageIndex]
+    if (target.role !== 'assistant') throw new Error('仅支持对助手回复换模型回答')
+    if (messageIndex !== conversation.messages.length - 1
+      && conversation.messages.slice(messageIndex + 1).some((message) => message.role !== 'assistant')) {
+      throw new Error('只能对最后一轮回答换模型')
+    }
+    const resolvedGroup = target.group_id ?? target.groupId ?? groupId ?? `grp_dev_${crypto.randomUUID()}`
+    conversation.messages = conversation.messages.map((message, idx) => {
+      if (idx < messageIndex) return message
+      if (message.role !== 'assistant') return message
+      return {
+        ...message,
+        group_id: resolvedGroup,
+        provider_id: message.provider_id ?? message.providerId ?? conversation.provider_id,
+        model: message.model ?? conversation.model,
+      }
+    })
+    const newId = `msg_dev_${crypto.randomUUID()}`
+    conversation.messages = [
+      ...conversation.messages,
+      {
+        id: newId,
+        role: 'assistant',
+        content: `（换模型预览 · ${model}）`,
+        timestamp: nowSeconds(),
+        group_id: resolvedGroup,
+        provider_id: providerId,
+        model,
+      },
+    ]
+    conversation.group_selections = {
+      ...(conversation.group_selections ?? conversation.groupSelections ?? {}),
+      [resolvedGroup]: newId,
+    }
+    conversation.updated_at = nowSeconds()
+    conversations[index] = conversation
+    saveMockConversations(conversations)
+    return conversation
+  },
+
   async rewindToMessage(
     conversationId: string,
     messageId: string,
@@ -1094,6 +1172,40 @@ const mockChatApi = {
         ...(baseState.segments ?? []).filter((segment) => segment.id !== 'summarized_conversation'),
         { id: 'summarized_conversation', label: 'Summarized conversation', estimated_tokens: 20, color: '#BF3F66' },
       ],
+    }
+    conversation.contextState = conversation.context_state
+    conversations[index] = conversation
+    saveMockConversations(conversations)
+    return { contextState: conversation.context_state, conversation }
+  },
+
+  async clearContext(conversationId: string): Promise<{ contextState: ConversationContextState; conversation: Conversation }> {
+    const conversations = loadMockConversations()
+    const index = conversations.findIndex((item) => item.id === conversationId)
+    if (index < 0) throw new Error('Conversation not found')
+    const conversation = { ...conversations[index] }
+    const last = conversation.messages[conversation.messages.length - 1]
+    if (!last) throw new Error('没有可清空的上下文')
+    const priorClears = conversation.context_state?.clear_boundaries
+      ?? conversation.contextState?.clearBoundaries
+      ?? []
+    const lastClear = priorClears[priorClears.length - 1]
+    const lastClearUntil = lastClear?.source_until_message_id ?? lastClear?.sourceUntilMessageId
+    if (lastClearUntil === last.id) throw new Error('当前已是空上下文')
+    const boundary = {
+      id: `ctxclr_dev_${crypto.randomUUID()}`,
+      source_until_message_id: last.id,
+      created_at: nowSeconds(),
+    }
+    const baseState = estimateMockContext(conversation)
+    conversation.context_state = {
+      ...baseState,
+      summary: null,
+      compressed_message_count: 0,
+      clear_boundaries: [...priorClears, boundary],
+      compaction_boundaries: conversation.context_state?.compaction_boundaries
+        ?? conversation.contextState?.compactionBoundaries
+        ?? [],
     }
     conversation.contextState = conversation.context_state
     conversations[index] = conversation
@@ -1611,29 +1723,6 @@ export const chatApi = {
     })
   },
 
-  async piSessionTree(conversationId: string): Promise<PiSessionTreeSnapshot> {
-    if (!isTauriRuntime()) return { tree: [], leafId: null, sessionId: '', sessionFile: null }
-    return invoke<PiSessionTreeSnapshot>('chat_pi_session_tree', { conversationId })
-  },
-
-  async piForkMessages(conversationId: string): Promise<PiForkMessage[]> {
-    if (!isTauriRuntime()) return []
-    const result = await invoke<{ messages?: PiForkMessage[] }>('chat_pi_fork_messages', { conversationId })
-    return result.messages ?? []
-  },
-
-  async piSessionFork(conversationId: string, entryId: string): Promise<PiSessionMutationResult> {
-    return invoke<PiSessionMutationResult>('chat_pi_session_fork', { conversationId, entryId })
-  },
-
-  async piSessionClone(conversationId: string): Promise<PiSessionMutationResult> {
-    return invoke<PiSessionMutationResult>('chat_pi_session_clone', { conversationId })
-  },
-
-  async piSessionSwitch(conversationId: string, sessionPath: string): Promise<PiSessionSwitchResult> {
-    return invoke<PiSessionSwitchResult>('chat_pi_session_switch', { conversationId, sessionPath })
-  },
-
   // 删除对话。返回未能清理的副产物说明（工作区被占用等）——对话本身一定已经删掉了，
   // 后端只有在「对话文件 / 索引」这两步失败时才抛错。
   async deleteConversation(conversationId: string): Promise<string[]> {
@@ -1708,6 +1797,18 @@ export const chatApi = {
     return result.conversation
   },
 
+  async regenerateConversationTitle(conversationId: string): Promise<Conversation> {
+    if (!isTauriRuntime()) return mockChatApi.regenerateConversationTitle(conversationId)
+    const result = await invoke<{ success: boolean; conversation: Conversation }>(
+      'chat_regenerate_title',
+      { conversationId },
+    )
+    if (!result.success) {
+      throw new Error('Failed to regenerate conversation title')
+    }
+    return result.conversation
+  },
+
   async updateMessage(
     conversationId: string,
     messageId: string,
@@ -1777,6 +1878,33 @@ export const chatApi = {
     return result.conversation
   },
 
+  async replyWithModel(
+    conversationId: string,
+    messageId: string,
+    providerId: string,
+    model: string,
+    groupId?: string,
+  ): Promise<Conversation> {
+    if (!isTauriRuntime()) {
+      return mockChatApi.replyWithModel(conversationId, messageId, providerId, model, groupId)
+    }
+    const result = await invoke<{
+      success: boolean
+      conversation?: Conversation
+      error?: string
+    }>('chat_reply_with_model', {
+      conversationId,
+      messageId,
+      providerId,
+      model,
+      groupId: groupId ?? null,
+    })
+    if (!result.success || !result.conversation) {
+      throw new Error(result.error || 'Failed to reply with model')
+    }
+    return result.conversation
+  },
+
   // 一键 rewind：删掉该用户提问及其之后的消息，返回新会话 + 被删掉的原文（前端塞回输入框）。
   async rewindToMessage(
     conversationId: string,
@@ -1837,6 +1965,20 @@ export const chatApi = {
     }>('chat_compress_context', { conversationId })
     if (!result.success || !result.contextState || !result.conversation) {
       throw new Error(result.error || 'Failed to compress context')
+    }
+    return { contextState: result.contextState, conversation: result.conversation }
+  },
+
+  async clearContext(conversationId: string): Promise<{ contextState: ConversationContextState; conversation: Conversation }> {
+    if (!isTauriRuntime()) return mockChatApi.clearContext(conversationId)
+    const result = await invoke<{
+      success: boolean
+      contextState?: ConversationContextState
+      conversation?: Conversation
+      error?: string
+    }>('chat_clear_context', { conversationId })
+    if (!result.success || !result.contextState || !result.conversation) {
+      throw new Error(result.error || 'Failed to clear context')
     }
     return { contextState: result.contextState, conversation: result.conversation }
   },
@@ -2065,6 +2207,12 @@ export const chatApi = {
     await invoke('chat_dsh_native_provider_delete', { id })
   },
 
+  async listDshAgentPresets(): Promise<DshAgentPresetOption[]> {
+    if (!isTauriRuntime()) return []
+    const list = await invoke<DshAgentPresetOption[]>('chat_dsh_list_agent_presets')
+    return Array.isArray(list) ? list : []
+  },
+
   /**
    * 删除供应商后清掉它物化出来的文件。
    * 保存设置时后端会自动物化并清缓存（`persist_settings`），所以只有删除需要显式调用。
@@ -2179,5 +2327,12 @@ export const chatApi = {
   async importedHistoryStale(conversationId: string): Promise<boolean> {
     if (!isTauriRuntime()) return false
     return invoke<boolean>('chat_imported_history_stale', { conversationId })
+  },
+
+  /** 本地 CLI 对话绑定的原生会话 id；未聊过 / 无绑定文件时为 null。 */
+  async getExternalNativeSessionId(conversationId: string): Promise<string | null> {
+    if (!isTauriRuntime()) return null
+    const id = await invoke<string | null>('chat_external_native_session_id', { conversationId })
+    return id && id.trim() ? id : null
   },
 }

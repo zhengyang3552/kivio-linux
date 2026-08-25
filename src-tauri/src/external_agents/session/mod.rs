@@ -256,6 +256,18 @@ pub struct LiveSessionHandle {
     pub cwd: String,
 }
 
+impl LiveSessionHandle {
+    /// Same Kivio conversation + same CLI protocol ⇒ resume this native id.
+    ///
+    /// Cwd is **not** part of the match. The file is already keyed by conversation_id;
+    /// requiring a byte-identical cwd string (Windows `E:\` vs `E:/`, WSL `/mnt/e/...`)
+    /// dropped the id, started a blank thread, and overwrote the binding — so reopening
+    /// the conversation could not continue the original native session.
+    pub fn can_resume(&self, agent_id: &str, protocol: &str) -> bool {
+        self.agent_id == agent_id && self.protocol == protocol && !self.native_id.trim().is_empty()
+    }
+}
+
 fn live_handle_path(app: &AppHandle, conversation_id: &str) -> Result<PathBuf, String> {
     Ok(sessions_dir(app)?.join(format!("live-{conversation_id}.json")))
 }
@@ -263,6 +275,34 @@ fn live_handle_path(app: &AppHandle, conversation_id: &str) -> Result<PathBuf, S
 pub fn load_live_handle(app: &AppHandle, conversation_id: &str) -> Option<LiveSessionHandle> {
     let raw = fs::read_to_string(live_handle_path(app, conversation_id).ok()?).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Prefer the live handle (current binding); Claude's older `{conversation_id}.json` is fallback.
+pub fn bound_native_session_id(app: &AppHandle, conversation_id: &str) -> Option<String> {
+    pick_bound_native_session_id(
+        load_live_handle(app, conversation_id)
+            .as_ref()
+            .map(|handle| handle.native_id.as_str()),
+        load_session(app, conversation_id)
+            .as_ref()
+            .map(|session| session.session_id.as_str()),
+    )
+}
+
+pub(crate) fn pick_bound_native_session_id(
+    live_native_id: Option<&str>,
+    stored_session_id: Option<&str>,
+) -> Option<String> {
+    live_native_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            stored_session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
 }
 
 pub fn find_live_binding_by_native_path(
@@ -290,7 +330,9 @@ pub fn find_live_binding_by_native_path(
         };
         let candidate = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
         let matches = if cfg!(target_os = "windows") {
-            candidate.to_string_lossy().eq_ignore_ascii_case(&target.to_string_lossy())
+            candidate
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&target.to_string_lossy())
         } else {
             candidate == target
         };
@@ -346,4 +388,49 @@ pub fn remove_all_bindings(app: &AppHandle, conversation_id: &str) -> Vec<String
         }
     }
     warnings
+}
+
+#[cfg(test)]
+mod live_handle_tests {
+    use super::LiveSessionHandle;
+
+    fn handle(cwd: &str) -> LiveSessionHandle {
+        LiveSessionHandle {
+            agent_id: "codex".to_string(),
+            protocol: "codex_app_server".to_string(),
+            native_id: "thr_keep".to_string(),
+            native_path: None,
+            cwd: cwd.to_string(),
+        }
+    }
+
+    #[test]
+    fn resume_ignores_cwd_string_differences() {
+        let stored = handle(r"E:\proj");
+        assert!(stored.can_resume("codex", "codex_app_server"));
+        let slash = handle("E:/proj");
+        assert!(slash.can_resume("codex", "codex_app_server"));
+    }
+
+    #[test]
+    fn resume_rejects_other_agent_or_blank_id() {
+        let mut stored = handle(r"E:\proj");
+        assert!(!stored.can_resume("claude", "codex_app_server"));
+        assert!(!stored.can_resume("codex", "acp_json_rpc"));
+        stored.native_id.clear();
+        assert!(!stored.can_resume("codex", "codex_app_server"));
+    }
+
+    #[test]
+    fn bound_id_prefers_live_handle_over_stored_session() {
+        assert_eq!(
+            super::pick_bound_native_session_id(Some(" thr_live "), Some("old")),
+            Some("thr_live".into())
+        );
+        assert_eq!(
+            super::pick_bound_native_session_id(Some("  "), Some("ses_claude")),
+            Some("ses_claude".into())
+        );
+        assert!(super::pick_bound_native_session_id(None, None).is_none());
+    }
 }

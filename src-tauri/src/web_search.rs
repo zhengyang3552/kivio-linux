@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     api::{send_with_retry, with_standard_request_timeout},
-    settings::{ChatMcpServer, LensWebSearchConfig, WebSearchProvider},
+    settings::{ChatMcpServer, ConnectorAuth, LensWebSearchConfig, WebSearchProvider},
     state::AppState,
 };
 
@@ -235,6 +235,7 @@ pub fn provider_label(provider: WebSearchProvider) -> &'static str {
         WebSearchProvider::ExaMcp => "Exa MCP",
         WebSearchProvider::Ollama => "Ollama",
         WebSearchProvider::Grok => "Grok",
+        WebSearchProvider::Deepseek => "DeepSeek",
         WebSearchProvider::Brave => "Brave",
         WebSearchProvider::Serper => "Serper",
         WebSearchProvider::Bocha => "Bocha",
@@ -276,6 +277,7 @@ pub async fn search_web(
     config: &LensWebSearchConfig,
     query: &str,
     retry_attempts: usize,
+    app: Option<&tauri::AppHandle>,
 ) -> Result<Vec<WebSearchResult>, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -288,12 +290,13 @@ pub async fn search_web(
         WebSearchProvider::ExaMcp => search_exa_mcp(state, config, query).await,
         WebSearchProvider::Ollama => search_ollama(state, config, query, retry_attempts).await,
         WebSearchProvider::Grok => search_grok(state, config, query, retry_attempts).await,
+        WebSearchProvider::Deepseek => search_deepseek(state, config, query, retry_attempts).await,
         WebSearchProvider::Brave => search_brave(state, config, query, retry_attempts).await,
         WebSearchProvider::Serper => search_serper(state, config, query, retry_attempts).await,
         WebSearchProvider::Bocha => search_bocha(state, config, query, retry_attempts).await,
         WebSearchProvider::Zhipu => search_zhipu(state, config, query, retry_attempts).await,
         WebSearchProvider::Tinyfish => search_tinyfish(state, config, query, retry_attempts).await,
-        WebSearchProvider::TinyfishMcp => search_tinyfish_mcp(state, config, query).await,
+        WebSearchProvider::TinyfishMcp => search_tinyfish_mcp(state, config, query, app).await,
         WebSearchProvider::Searxng => search_searxng(state, config, query, retry_attempts).await,
         WebSearchProvider::Unknown => {
             Err("Selected web search provider is not supported yet".to_string())
@@ -614,41 +617,31 @@ async fn search_tinyfish(
 
 /// TinyFish MCP：`https://agent.tinyfish.ai/mcp` 的 `search` 工具。
 /// 不贴 API Key，走 OAuth Bearer（设置页授权，或复用已连接的同 URL MCP server）。
+///
+/// 走 MCP 连接池（`mcp_call_tool`），与聊天里其它远程 OAuth MCP 同一套预刷新、
+/// 401 重试和 HTTP 保活。不要再走 `call_tool_once`。
 async fn search_tinyfish_mcp(
     state: &AppState,
     config: &LensWebSearchConfig,
     query: &str,
+    app: Option<&tauri::AppHandle>,
 ) -> Result<Vec<WebSearchResult>, String> {
     let base = normalized_base_url(&config.tinyfish_mcp_url, "https://agent.tinyfish.ai/mcp");
     if base.is_empty() {
         return Err("TinyFish MCP endpoint is not configured".to_string());
     }
-    let authorization = tinyfish_mcp_authorization(state, config, base);
-    let mut server = ChatMcpServer {
-        id: "tinyfish-mcp".to_string(),
-        name: "TinyFish MCP".to_string(),
-        enabled: true,
-        transport: "streamable_http".to_string(),
-        url: base.to_string(),
-        ..ChatMcpServer::default()
-    };
-    if let Some(value) = authorization {
-        server.headers.insert("Authorization".to_string(), value);
-    }
+    let server = tinyfish_mcp_server(state, config, &base);
 
     let max_results = config.max_results.clamp(1, 10) as usize;
-    let raw = crate::mcp::conn::call_tool_once(
-        &server,
-        &state.http,
-        "search",
-        serde_json::json!({ "query": query }),
-        std::time::Duration::from_secs(30),
-    )
-    .await
-    .map_err(|err| map_tinyfish_mcp_error(&err))?;
-    let result = crate::mcp::result::parse_tool_result(
-        serde_json::to_value(&raw).map_err(|err| err.to_string())?,
-    );
+    let result = state
+        .mcp_call_tool(
+            app,
+            &server,
+            "search",
+            serde_json::json!({ "query": query }),
+        )
+        .await
+        .map_err(|err| map_tinyfish_mcp_error(&err))?;
     if result.is_error {
         return Err(map_tinyfish_mcp_error(&format!(
             "TinyFish MCP search failed: {}",
@@ -665,7 +658,7 @@ async fn search_tinyfish_mcp(
 
 fn map_tinyfish_mcp_error(err: &str) -> String {
     let lower = err.to_ascii_lowercase();
-    if err.contains("OAUTH_REQUIRED")
+    if crate::mcp::conn::is_oauth_error(err)
         || lower.contains("unauthorized")
         || lower.contains("valid oauth bearer")
     {
@@ -689,6 +682,67 @@ fn bearer_header(token: &str) -> Option<String> {
 
 fn mcp_url_matches(left: &str, right: &str) -> bool {
     left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
+}
+
+fn tinyfish_mcp_server(
+    state: &AppState,
+    config: &LensWebSearchConfig,
+    endpoint: &str,
+) -> ChatMcpServer {
+    if let Some(server) = existing_enabled_mcp_server(state, endpoint) {
+        return server;
+    }
+    let mut server = ChatMcpServer {
+        id: "tinyfish-mcp".to_string(),
+        name: "TinyFish MCP".to_string(),
+        enabled: true,
+        transport: "streamable_http".to_string(),
+        url: endpoint.to_string(),
+        ..ChatMcpServer::default()
+    };
+    if let Some(auth) = tinyfish_mcp_auth(state, config, endpoint) {
+        if let Some(header) = bearer_header(&auth.access_token) {
+            server.headers.insert("Authorization".to_string(), header);
+        }
+        server.auth = Some(auth);
+    } else if let Some(header) = tinyfish_mcp_authorization(state, config, endpoint) {
+        server.headers.insert("Authorization".to_string(), header);
+    }
+    server
+}
+
+fn existing_enabled_mcp_server(state: &AppState, endpoint: &str) -> Option<ChatMcpServer> {
+    let settings = state.settings_read();
+    settings
+        .chat_tools
+        .servers
+        .iter()
+        .find(|server| server.enabled && mcp_url_matches(&server.url, endpoint))
+        .cloned()
+}
+
+fn tinyfish_mcp_auth(
+    state: &AppState,
+    config: &LensWebSearchConfig,
+    endpoint: &str,
+) -> Option<ConnectorAuth> {
+    if let Some(auth) = &config.tinyfish_mcp_auth {
+        if !auth.access_token.trim().is_empty() || crate::connectors::oauth::can_refresh(auth) {
+            return Some(auth.clone());
+        }
+    }
+    let settings = state.settings_read();
+    for server in &settings.chat_tools.servers {
+        if !mcp_url_matches(&server.url, endpoint) {
+            continue;
+        }
+        if let Some(auth) = &server.auth {
+            if !auth.access_token.trim().is_empty() || crate::connectors::oauth::can_refresh(auth) {
+                return Some(auth.clone());
+            }
+        }
+    }
+    None
 }
 
 fn tinyfish_mcp_authorization(
@@ -1209,7 +1263,7 @@ async fn search_grok(
         )
     })?;
 
-    let (answer, citations) = parse_grok_response(&value);
+    let (answer, citations) = parse_hosted_web_search_response(&value);
     if answer.is_empty() && citations.is_empty() {
         return Err(format!(
             "Grok search returned no answer (body: {})",
@@ -1243,25 +1297,214 @@ async fn search_grok(
     Ok(results)
 }
 
-/// 从 xAI Responses API（或退化的 chat completions）返回体里尽力提取「答案文本」和
-/// 「引用 URL 列表」。字段形态随版本变化，故做多路径兜底：
-/// - 答案：`output_text` → `output[].content[].text`（type=output_text）→ `choices[0].message.content`
-/// - 引用：顶层 `citations` 数组 → `output[].content[].annotations[].url`
-fn parse_grok_response(value: &serde_json::Value) -> (String, Vec<String>) {
+/// 官方文档是 `POST {base}/responses`，`base_url` 为 `https://api.deepseek.com`（无 `/v1`）。
+/// 已带 `/responses` 的自定义地址原样使用；官方 Chat Completions 供应商常填 `/v1`，这里剥掉。
+/// 中转站的 `/v1` 不能剥——它们往往只挂了 `/v1/responses`。
+fn responses_url(base: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    if base.ends_with("/responses") {
+        return base.to_string();
+    }
+    let base = if crate::utils::is_official_deepseek_api(base)
+        && !crate::utils::is_official_deepseek_anthropic_api(base)
+        && base.to_ascii_lowercase().ends_with("/v1")
+    {
+        base[..base.len() - 3].trim_end_matches('/')
+    } else {
+        base
+    };
+    format!("{base}/responses")
+}
+
+/// Responses 成功体也带 `"error": null`（官方 DeepSeek / OpenAI 同形）。
+/// `null`、空对象、全空字段都不能当成失败，否则测试搜索会显示 `unknown error`。
+fn hosted_search_error(value: &serde_json::Value) -> Option<String> {
+    let err = value.get("error")?;
+    if err.is_null() {
+        return None;
+    }
+    for key in ["message", "code", "type"] {
+        if let Some(text) = err.get(key).and_then(|v| v.as_str()).map(str::trim) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    if let Some(text) = err.as_str().map(str::trim) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    let serialized = err.to_string();
+    if serialized == "{}" || serialized == "\"\"" || serialized.is_empty() {
+        return None;
+    }
+    // `{"message":null,"code":null}` 也是成功占位，不当失败。
+    if err.as_object().is_some_and(|obj| {
+        obj.values()
+            .all(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()))
+    }) {
+        return None;
+    }
+    Some(serialized)
+}
+
+/// 文档：`status` 为 `completed` / `incomplete` / `failed`；`error` 仅在失败时有对象，成功为 `null`。
+fn hosted_search_failure(value: &serde_json::Value) -> Option<String> {
+    if let Some(message) = hosted_search_error(value) {
+        return Some(message);
+    }
+    match value.get("status").and_then(|v| v.as_str()) {
+        Some("failed") => Some("response failed".to_string()),
+        _ => None,
+    }
+}
+
+fn hosted_search_incomplete_reason(value: &serde_json::Value) -> Option<&str> {
+    if value.get("status").and_then(|v| v.as_str()) != Some("incomplete") {
+        return None;
+    }
+    value
+        .pointer("/incomplete_details/reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .or(Some("incomplete"))
+}
+
+/// DeepSeek 官方 API 的服务端 web_search：走 Responses `POST {base}/responses`，
+/// `tools: [{type:"web_search"}]`，由 DeepSeek 在服务端检索并写回 `web_search_call`。
+/// 文档：https://api-docs.deepseek.com/guides/responses_api/
+async fn search_deepseek(
+    state: &AppState,
+    config: &LensWebSearchConfig,
+    query: &str,
+    retry_attempts: usize,
+) -> Result<Vec<WebSearchResult>, String> {
+    let api_key = config.deepseek_api_key.trim();
+    if api_key.is_empty() {
+        return Err("DeepSeek API key is not configured".to_string());
+    }
+    let base = normalized_base_url(&config.deepseek_base_url, "https://api.deepseek.com");
+    let model = {
+        let trimmed = config.deepseek_model.trim();
+        if trimmed.is_empty() {
+            "deepseek-v4-flash"
+        } else {
+            trimmed
+        }
+    };
+    let system = {
+        let trimmed = config.deepseek_system_prompt.trim();
+        if trimmed.is_empty() {
+            "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations."
+        } else {
+            trimmed
+        }
+    };
+    let url = responses_url(base);
+    let body = serde_json::json!({
+        "model": model,
+        "instructions": system,
+        "input": query,
+        "tools": [ { "type": "web_search" } ],
+        "tool_choice": { "type": "web_search" },
+    });
+
+    // 服务端 web_search 会连跑多轮检索 + 思考，60s 标准超时会把成功请求砍掉。
+    let response = send_with_retry("DeepSeek search", retry_attempts, || {
+        crate::api::with_chat_request_timeout(
+            state
+                .http
+                .post(url.clone())
+                .bearer_auth(api_key)
+                .json(&body),
+        )
+        .send()
+    })
+    .await?;
+
+    let raw = response
+        .text()
+        .await
+        .map_err(|err| format!("DeepSeek search read body: {err}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|err| {
+        format!(
+            "DeepSeek search parse JSON: {} (body: {})",
+            err,
+            raw.chars().take(500).collect::<String>()
+        )
+    })?;
+    if let Some(message) = hosted_search_failure(&value) {
+        return Err(format!("DeepSeek search: {message}"));
+    }
+
+    let (answer, citations) = parse_hosted_web_search_response(&value);
+    if answer.is_empty() && citations.is_empty() {
+        if let Some(reason) = hosted_search_incomplete_reason(&value) {
+            return Err(format!("DeepSeek search incomplete ({reason})"));
+        }
+        return Err(format!(
+            "DeepSeek search returned no answer (body: {})",
+            raw.chars().take(300).collect::<String>()
+        ));
+    }
+
+    let mut results: Vec<WebSearchResult> = Vec::new();
+    if !answer.is_empty() {
+        results.push(WebSearchResult {
+            title: "DeepSeek answer".to_string(),
+            url: citations
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "https://www.deepseek.com".to_string()),
+            content: answer,
+            published_date: None,
+            score: None,
+        });
+    }
+    let max_results = config.max_results.clamp(1, 10) as usize;
+    for citation in citations.into_iter().take(max_results) {
+        results.push(WebSearchResult {
+            title: citation.clone(),
+            url: citation,
+            content: String::new(),
+            published_date: None,
+            score: None,
+        });
+    }
+    Ok(results)
+}
+
+fn normalize_citation_url(url: &str) -> &str {
+    let url = url.trim();
+    match url.find("#ws_call_id=") {
+        Some(idx) => url[..idx].trim_end_matches('#').trim(),
+        None => url,
+    }
+}
+
+/// 从 xAI / DeepSeek Responses API（或退化的 chat completions）返回体里尽力提取
+/// 「答案文本」和「引用 URL 列表」。字段形态随版本变化，故做多路径兜底：
+/// - 答案：`output_text` → 最后一条 `message` 的 `content[].text` → `choices[0].message.content`
+///   （跳过 `reasoning`，DeepSeek 服务端会连跑多轮 search+message）
+/// - 引用：顶层 `citations` → `url_citation` 注解 → `web_search_call.action.sources[]` / `action.url`
+fn parse_hosted_web_search_response(value: &serde_json::Value) -> (String, Vec<String>) {
     let mut answer_parts: Vec<String> = Vec::new();
     let mut citations: Vec<String> = Vec::new();
 
     let mut push_citation = |url: &str| {
-        let url = url.trim();
+        let url = normalize_citation_url(url);
         if !url.is_empty() && !citations.iter().any(|c| c == url) {
             citations.push(url.to_string());
         }
     };
 
-    // 顶层便捷字段
+    let mut from_output_text = false;
     if let Some(text) = value.get("output_text").and_then(|v| v.as_str()) {
         if !text.trim().is_empty() {
             answer_parts.push(text.trim().to_string());
+            from_output_text = true;
         }
     }
     if let Some(list) = value.get("citations").and_then(|v| v.as_array()) {
@@ -1274,16 +1517,31 @@ fn parse_grok_response(value: &serde_json::Value) -> (String, Vec<String>) {
         }
     }
 
-    // Responses API：output[].content[]
     if let Some(output) = value.get("output").and_then(|v| v.as_array()) {
+        let mut message_texts: Vec<String> = Vec::new();
         for item in output {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if item_type == "web_search_call" {
+                collect_web_search_action_urls(item, &mut push_citation);
+            }
+            // Grok 固件有时不写 type；DeepSeek 的 reasoning 块也带 text，不能当答案。
+            let take_text = item_type.is_empty() || item_type == "message";
             let Some(content) = item.get("content").and_then(|v| v.as_array()) else {
                 continue;
             };
+            let mut parts: Vec<String> = Vec::new();
             for chunk in content {
-                if let Some(text) = chunk.get("text").and_then(|v| v.as_str()) {
-                    if !text.trim().is_empty() {
-                        answer_parts.push(text.trim().to_string());
+                // 文档：message 的 content 是 `output_text`；reasoning 是 `reasoning_text`。
+                // Grok 偶发不写 part type，无 type 时仍收 text。
+                let part_type = chunk.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let take_part = take_text
+                    && !from_output_text
+                    && (part_type.is_empty() || part_type == "output_text");
+                if take_part {
+                    if let Some(text) = chunk.get("text").and_then(|v| v.as_str()) {
+                        if !text.trim().is_empty() {
+                            parts.push(text.trim().to_string());
+                        }
                     }
                 }
                 if let Some(annotations) = chunk.get("annotations").and_then(|v| v.as_array()) {
@@ -1294,10 +1552,17 @@ fn parse_grok_response(value: &serde_json::Value) -> (String, Vec<String>) {
                     }
                 }
             }
+            if take_text && !parts.is_empty() {
+                message_texts.push(parts.join("\n"));
+            }
+        }
+        if !from_output_text {
+            if let Some(last) = message_texts.pop() {
+                answer_parts.push(last);
+            }
         }
     }
 
-    // 退化：chat completions 形态
     if answer_parts.is_empty() {
         if let Some(text) = value
             .get("choices")
@@ -1314,6 +1579,30 @@ fn parse_grok_response(value: &serde_json::Value) -> (String, Vec<String>) {
     }
 
     (answer_parts.join("\n\n"), citations)
+}
+
+fn collect_web_search_action_urls(item: &serde_json::Value, push: &mut impl FnMut(&str)) {
+    let Some(action) = item.get("action") else {
+        return;
+    };
+    if let Some(url) = action.get("url").and_then(|v| v.as_str()) {
+        push(url);
+    }
+    let Some(sources) = action.get("sources").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for source in sources {
+        if let Some(url) = source.as_str() {
+            push(url);
+        } else if let Some(url) = source.get("url").and_then(|v| v.as_str()) {
+            push(url);
+        }
+    }
+}
+
+#[cfg(test)]
+fn parse_grok_response(value: &serde_json::Value) -> (String, Vec<String>) {
+    parse_hosted_web_search_response(value)
 }
 
 /// Render web search results into the textual context block injected into the
@@ -1361,11 +1650,23 @@ pub fn format_web_context(results: &[WebSearchResult]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_web_context, parse_exa_mcp_results, parse_grok_response, parse_tinyfish_mcp_payload,
-        searxng_search_url, BochaSearchResponse, BraveSearchResponse, ExaSearchResponse,
-        OllamaSearchResponse, SearxngSearchResponse, SerperSearchResponse, TavilySearchResponse,
-        TinyfishSearchResponse, WebSearchResult, ZhipuSearchResponse,
+        format_web_context, parse_exa_mcp_results, parse_grok_response,
+        parse_hosted_web_search_response, parse_tinyfish_mcp_payload, searxng_search_url,
+        BochaSearchResponse, BraveSearchResponse, ExaSearchResponse, OllamaSearchResponse,
+        SearxngSearchResponse, SerperSearchResponse, TavilySearchResponse, TinyfishSearchResponse,
+        WebSearchResult, ZhipuSearchResponse,
     };
+
+    #[test]
+    fn tinyfish_mcp_maps_auth_required_initialize_to_authorize_prompt() {
+        let err = "MCP connect failed: Send message error Transport [rmcp::transport::worker::WorkerTransport<rmcp::transport::streamable_http_client::StreamableHttpClientWorker<reqwest::async_impl::client::Client>>] error: Auth required, when send initialize request";
+        let mapped = super::map_tinyfish_mcp_error(err);
+        assert!(mapped.contains("Authorize"), "{mapped}");
+        assert!(
+            !mapped.contains("WorkerTransport"),
+            "raw transport dump must not leak to the user: {mapped}"
+        );
+    }
 
     #[test]
     fn tavily_response_deserializes_results_and_answer() {
@@ -1528,6 +1829,203 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_parses_web_search_call_sources_and_url_citations() {
+        let raw = r#"{
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "rust tutorials",
+                        "sources": [
+                            { "type": "url", "url": "https://doc.rust-lang.org/book/" },
+                            "https://www.rust-lang.org/learn"
+                        ]
+                    }
+                },
+                {
+                    "type": "web_search_call",
+                    "action": { "type": "open_page", "url": "https://doc.rust-lang.org/book/ch01-00-getting-started.html" }
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Start with the official book.",
+                            "annotations": [
+                                { "type": "url_citation", "url": "https://doc.rust-lang.org/book/" }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let (answer, citations) = parse_hosted_web_search_response(&value);
+        assert_eq!(answer, "Start with the official book.");
+        assert_eq!(
+            citations,
+            vec![
+                "https://doc.rust-lang.org/book/",
+                "https://www.rust-lang.org/learn",
+                "https://doc.rust-lang.org/book/ch01-00-getting-started.html",
+            ]
+        );
+    }
+
+    #[test]
+    fn deepseek_provider_roundtrips_snake_case() {
+        let parsed: crate::settings::WebSearchProvider =
+            serde_json::from_str("\"deepseek\"").expect("provider");
+        assert_eq!(parsed, crate::settings::WebSearchProvider::Deepseek);
+        assert_eq!(
+            serde_json::to_string(&crate::settings::WebSearchProvider::Deepseek).unwrap(),
+            "\"deepseek\""
+        );
+    }
+
+    #[test]
+    fn responses_url_appends_path_unless_already_present() {
+        assert_eq!(
+            super::responses_url("https://api.deepseek.com"),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            super::responses_url("https://api.deepseek.com/"),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            super::responses_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/responses"
+        );
+        assert_eq!(
+            super::responses_url("https://relay.example/v1"),
+            "https://relay.example/v1/responses"
+        );
+        assert_eq!(
+            super::responses_url("https://relay.example/v1/responses"),
+            "https://relay.example/v1/responses"
+        );
+    }
+
+    #[test]
+    fn hosted_search_error_reads_deepseek_error_object() {
+        let value = serde_json::json!({
+            "error": { "message": "web_search tool must be present in tools", "type": "invalid_request_error" }
+        });
+        assert_eq!(
+            super::hosted_search_error(&value).as_deref(),
+            Some("web_search tool must be present in tools")
+        );
+        assert_eq!(super::hosted_search_error(&serde_json::json!({})), None);
+        assert_eq!(
+            super::hosted_search_error(&serde_json::json!({"error": serde_json::Value::Null})),
+            None,
+            "Responses success bodies carry error: null"
+        );
+        assert_eq!(
+            super::hosted_search_error(&serde_json::json!({"error": {}})),
+            None
+        );
+        assert_eq!(
+            super::hosted_search_error(&serde_json::json!({
+                "error": { "message": null, "code": null }
+            })),
+            None
+        );
+        assert_eq!(
+            super::hosted_search_error(&serde_json::json!({
+                "error": { "code": "server_error" }
+            }))
+            .as_deref(),
+            Some("server_error")
+        );
+        assert_eq!(
+            super::hosted_search_failure(&serde_json::json!({
+                "status": "completed",
+                "error": serde_json::Value::Null,
+                "output": []
+            })),
+            None
+        );
+        assert_eq!(
+            super::hosted_search_failure(&serde_json::json!({
+                "status": "failed",
+                "error": serde_json::Value::Null
+            }))
+            .as_deref(),
+            Some("response failed")
+        );
+        assert_eq!(
+            super::hosted_search_incomplete_reason(&serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" }
+            })),
+            Some("max_output_tokens")
+        );
+    }
+
+    #[test]
+    fn hosted_search_success_ignores_null_error_field() {
+        let value = serde_json::json!({
+            "error": serde_json::Value::Null,
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "Baidu is a search engine." }]
+            }]
+        });
+        assert!(super::hosted_search_error(&value).is_none());
+        let (answer, _) = parse_hosted_web_search_response(&value);
+        assert_eq!(answer, "Baidu is a search engine.");
+    }
+
+    #[test]
+    fn hosted_search_skips_reasoning_and_strips_ws_call_id() {
+        let raw = r#"{
+            "output": [
+                {
+                    "type": "reasoning",
+                    "content": [{ "type": "reasoning_text", "text": "thinking out loud" }]
+                },
+                {
+                    "type": "message",
+                    "content": [{ "type": "output_text", "text": "draft answer" }]
+                },
+                {
+                    "type": "web_search_call",
+                    "action": {
+                        "type": "open_page",
+                        "url": "https://api-docs.deepseek.com/news#ws_call_id=call_99"
+                    }
+                },
+                {
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Final DeepSeek answer.",
+                        "annotations": [
+                            { "type": "url_citation", "url": "https://www.deepseek.com/#ws_call_id=call_01" }
+                        ]
+                    }]
+                }
+            ]
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let (answer, citations) = parse_hosted_web_search_response(&value);
+        assert_eq!(answer, "Final DeepSeek answer.");
+        assert_eq!(
+            citations,
+            vec![
+                "https://api-docs.deepseek.com/news",
+                "https://www.deepseek.com/",
+            ]
+        );
+    }
+
+    #[test]
     fn brave_response_deserializes_web_results() {
         let raw = r#"{
             "web": {
@@ -1652,7 +2150,8 @@ mod tests {
 
     #[test]
     fn tinyfish_mcp_parses_content_json() {
-        let raw = r#"{"results":[{"title":"Docs","url":"https://docs.tinyfish.ai/","snippet":"MCP"}]}"#;
+        let raw =
+            r#"{"results":[{"title":"Docs","url":"https://docs.tinyfish.ai/","snippet":"MCP"}]}"#;
         let results = parse_tinyfish_mcp_payload(raw, None, 5);
         assert_eq!(results[0].url, "https://docs.tinyfish.ai/");
     }

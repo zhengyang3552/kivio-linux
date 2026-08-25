@@ -33,7 +33,7 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   creategoal: 'todo_write',
   updategoal: 'todo_write',
   readimage: 'read',
-  runcode: 'run_python',
+  runcode: 'bash',
   subagent: 'agent',
   subagentfork: 'agent',
   listagents: 'agent',
@@ -181,6 +181,29 @@ export function userFollowUpText(toolCall: ToolCallRecord): string {
   return typeof text === 'string' ? text : ''
 }
 
+function structuredStringField(
+  toolCall: ToolCallRecord,
+  snake: string,
+  camel: string,
+): string | null {
+  const structured = toolCall.structured_content ?? toolCall.structuredContent
+  if (!structured || typeof structured !== 'object') return null
+  const value = (structured as Record<string, unknown>)[snake]
+    ?? (structured as Record<string, unknown>)[camel]
+  return typeof value === 'string' ? value : null
+}
+
+/** 插话卡上的前端队列 id。蛇/驼峰都认，协议层 Value 原样穿过。 */
+export function userSteerId(toolCall: ToolCallRecord): string | null {
+  if (!isUserSteerToolCall(toolCall)) return null
+  return structuredStringField(toolCall, 'steer_id', 'steerId')
+}
+
+export function userFollowUpId(toolCall: ToolCallRecord): string | null {
+  if (!isUserFollowUpToolCall(toolCall)) return null
+  return structuredStringField(toolCall, 'follow_up_id', 'followUpId')
+}
+
 /** 外部 CLI 的子代理工具调用：claude 新版报 `Agent`、旧版报 `Task`；dsh 报
  *  `subagent` / `subagent_fork` / `workflow` / `ralph`（source 恒为 `external_cli`）。
  *  精确匹配整名，MCP/native 不受影响。 */
@@ -312,7 +335,6 @@ export type ToolGroupCategory =
   | 'runCommand'
   | 'webFetch'
   | 'webSearch'
-  | 'runPython'
   | 'listDir'
   | 'fileOps'
   | 'todo'
@@ -352,8 +374,6 @@ function categorizeTool(toolCall: ToolCallRecord): ToolGroupCategory {
       return 'webFetch'
     case 'web_search':
       return 'webSearch'
-    case 'run_python':
-      return 'runPython'
     case 'ls':
     case 'list_dir':
       return 'listDir'
@@ -434,8 +454,6 @@ function categoryFragment(category: ToolGroupCategory, count: number): string {
       return '搜索网络'
     case 'globFiles':
       return '查找文件'
-    case 'runPython':
-      return '运行代码'
     case 'todo':
       return '更新任务清单'
     case 'memory':

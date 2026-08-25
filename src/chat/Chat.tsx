@@ -46,7 +46,7 @@ import { ModelSelector } from './ModelSelector'
 import { ThinkingLevelSelector } from './ThinkingLevelSelector'
 import { ExternalModelSelector, RuntimePicker } from './RuntimePicker'
 import { PermissionPicker } from './PermissionPicker'
-import { deriveDshPresetModes, derivePermissionModes, useDetectedExternalAgents } from './permissionModes'
+import { deriveDshPresetModes, derivePermissionModes, useDetectedExternalAgents, useDshCustomPresets } from './permissionModes'
 import { BackgroundJobsIndicator } from './BackgroundJobsIndicator'
 import { ContextIndicator } from './ContextIndicator'
 import { isExecutableAgentPlanText } from './agentPlan'
@@ -58,6 +58,7 @@ import {
   type AgentRuntimeConfig,
 } from './api'
 import { loadLastAgentRuntime, saveLastAgentRuntime } from './lastAgentRuntime'
+import { loadLastModel, resolvePreferredChatModel, saveLastModel } from './lastModel'
 import {
   chatTitlebarMacInsetClass,
   chatTitlebarRowClass,
@@ -96,25 +97,27 @@ import {
   type ChatUserPromptPayload,
   type ChatSubagentPayload,
 } from '../api/tauri'
-import { getSettingsCached, refreshSettings, saveSettingsCached } from '../api/settingsCache'
+import { getSettingsCached, refreshSettings, saveSettingsCached, subscribeSettings } from '../api/settingsCache'
+import { isPluginManagedServer, preservePluginManagedServers } from '../settings/connectorCatalog'
 import { OnboardingShell } from '../onboarding/OnboardingShell'
 import type { SettingsShellHandle, SettingsTab } from '../settings/SettingsShell'
 import { i18n, LangContext, type Lang } from '../settings/i18n'
 import { estimateTokens } from '../utils/tokens'
 import {
   CHAT_MIN_SIZE_COLLAPSED,
-  CHAT_MIN_SIZE_EXPANDED,
   forgetRememberedChatRoute,
   getRememberedChatSidebarCollapsed,
   getRememberedDockOpen,
   getRememberedDockTab,
   getRememberedDockWidth,
+  getRememberedSidebarWidth,
   getRememberedTreeExpanded,
   rememberChatSidebarCollapsed,
   rememberChatSize,
   rememberDockOpen,
   rememberDockTab,
   rememberDockWidth,
+  rememberSidebarWidth,
   rememberTreeExpanded,
 } from './persistence'
 import { RightDock, type DockPreviewRequest, type DockRevealRequest, type DockTab } from './dock/RightDock'
@@ -153,8 +156,10 @@ import {
   restoreGroupArm,
   touchGroup,
 } from './groupStreamingStore'
-import { compareTimelineSegments, isExternalSubagentToolCall, isUserFollowUpToolCall, isUserSteerToolCall, segmentStepNumber, segmentToolCallId } from './segments'
+import { assistantTurnSpan } from './messageGroups'
+import { compareTimelineSegments, isExternalSubagentToolCall, segmentStepNumber, segmentToolCallId, userFollowUpId, userSteerId } from './segments'
 import { latestCompactionBoundaryId, mergeCompactionContextState } from './compactionBoundary'
+import { latestClearBoundaryId, mergeClearContextState } from './contextClearBoundary'
 import { applyLiveContextUsage } from './contextPanel'
 import { measureChatSurface, onChatPerfProfiler, useChatPerfLongTaskProbe, useChatPerfRenderProbe } from './chatPerformanceProbe'
 import { ChatRouteKeepAlive } from './ChatRouteKeepAlive'
@@ -289,35 +294,10 @@ const ChatSettingsPane = memo(function ChatSettingsPane({
 })
 
 /**
- * 记住用户在顶栏最后一次选的聊天模型与思考等级，作为新会话/空会话的默认（以用户的选择为准，
- * 取代旧的「默认模型」设置，也不再把思考等级硬回落到 high）。仅前端偏好，存 localStorage。
+ * 记住用户在顶栏最后一次选的思考等级，作为新会话/空会话草稿（以用户的选择为准，
+ * 也不再把思考等级硬回落到 high）。仅前端偏好，存 localStorage。聊天模型见 lastModel.ts。
  */
-const LAST_MODEL_KEY = 'kivio.chat.lastModel'
 const LAST_THINKING_KEY = 'kivio.chat.lastThinkingLevel'
-
-function loadLastModel(): { providerId: string; model: string } | null {
-  try {
-    const raw = window.localStorage.getItem(LAST_MODEL_KEY)
-    if (!raw) return null
-    const v = JSON.parse(raw)
-    if (v && typeof v.providerId === 'string' && typeof v.model === 'string' && v.providerId) {
-      return v
-    }
-  } catch {
-    /* ignore */
-  }
-  return null
-}
-
-function saveLastModel(providerId: string, model: string): void {
-  try {
-    if (providerId) {
-      window.localStorage.setItem(LAST_MODEL_KEY, JSON.stringify({ providerId, model }))
-    }
-  } catch {
-    /* ignore */
-  }
-}
 
 const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set([
   'off',
@@ -365,6 +345,27 @@ function saveLastThinkingLevel(level: ThinkingLevel | null): void {
     else window.localStorage.removeItem(LAST_THINKING_KEY)
   } catch {
     /* ignore */
+  }
+}
+
+/** 把聊天里刚选的模型同步进 settings，供 Mixer / 后端回落，不当作引导里的「默认模型」。 */
+async function persistLastChatModelToSettings(providerId: string, model: string): Promise<void> {
+  if (!providerId.trim()) return
+  try {
+    const settings = await refreshSettings()
+    const current = settings.defaultModels?.chat
+    if (current?.providerId === providerId && current?.model === model) return
+    await saveSettingsCached({
+      ...settings,
+      defaultModels: {
+        ...settings.defaultModels,
+        chat: { providerId, model },
+      },
+      chatProviderId: providerId,
+      chatModel: model,
+    })
+  } catch (err) {
+    console.error('Failed to persist last chat model:', err)
   }
 }
 
@@ -463,12 +464,19 @@ const TOOL_APPROVAL_VERBS: Record<string, { verb: string; path?: boolean }> = {
  */
 function toolApprovalTitle(payload: ChatToolConfirmPayload): string {
   const name = (payload.name || '').toLowerCase()
+  const target = payload.target?.trim()
   // claude 的计划批准：批的是卡片上那份计划，不是「一个叫 ExitPlanMode 的工具」。
   if (name === 'exitplanmode') return '批准这份计划，开始执行？'
   // claude 自己要求进入计划档：先探索、出方案，这一轮不动代码。
   if (name === 'enterplanmode') return '让 claude 先出方案，暂不改动代码？'
+  if (name === 'request_permissions' || name === 'permissions') {
+    const wantsNetwork = (payload.argumentsPreview || '').includes('Network access')
+    if (wantsNetwork && target) return `允许 Codex 联网并使用工作区 ${target}？`
+    if (wantsNetwork) return '允许 Codex 联网？'
+    if (target) return `允许 Codex 使用工作区 ${target}？`
+    return '允许 Codex 使用工作区 / 执行环境？'
+  }
   const spec = TOOL_APPROVAL_VERBS[name]
-  const target = payload.target?.trim()
   if (!spec || !target) return `允许调用工具 ${payload.name}？`
   const shown = spec.path ? target.split(/[\\/]/).filter(Boolean).pop() || target : target
   return `允许${spec.verb} ${shown}？`
@@ -1007,8 +1015,6 @@ type SendMessageOptions = {
 
 /** 稳定空数组：没有排队消息时不要每次渲染都造一个新引用。 */
 const NO_QUEUED_MESSAGES: QueuedMessage[] = []
-/** 轨迹未打开时不要把 displayMessages 灌进 Dock，避免流式每帧带动右侧栏。 */
-const NO_TRAJECTORY_MESSAGES: ChatMessage[] = []
 
 export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   useChatPerfRenderProbe('Chat', { view: hashPath() })
@@ -1045,6 +1051,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   /** 全局搜索跳转目标；MessageList 完成滚动后清空。 */
   const [focusMessageId, setFocusMessageId] = useState<string | null>(null)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => getRememberedChatSidebarCollapsed())
+  const [sidebarWidth, setSidebarWidth] = useState(() => getRememberedSidebarWidth())
   const [searchOpen, setSearchOpen] = useState(false)
   const [selectedProject, setSelectedProject] = useState<ChatProject | null>(null)
   const [selectedSet, setSelectedSet] = useState<ChatSet | null>(null)
@@ -1090,6 +1097,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [webSearchEnabled, setWebSearchEnabled] = useState(true)
   // provider id → apiFormat（任务 07-23）：用于判断当前模型是否支持内置搜索。
   const [providerApiFormats, setProviderApiFormats] = useState<Record<string, string>>({})
+  const [providerBaseUrls, setProviderBaseUrls] = useState<Record<string, string>>({})
   const [enabledToolCount, setEnabledToolCount] = useState<number | null>(null)
   const [toolsDisabledReason, setToolsDisabledReason] = useState('')
   const [toolsRequested, setToolsRequested] = useState(false)
@@ -1124,6 +1132,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     ? compactingConversationIds.has(currentConversation.id)
     : false
   const [animateCompactionBoundaryId, setAnimateCompactionBoundaryId] = useState<string | null>(null)
+  const [animateClearBoundaryId, setAnimateClearBoundaryId] = useState<string | null>(null)
   const [contextError, setContextError] = useState('')
   // Hook 执行失败：非阻断警告条。ponytail: 只留最新一条 —— Hook 是旁路观测，
   // 堆一个可滚动的失败列表没有对应的用户动作。
@@ -1316,7 +1325,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
 
   const patchContextState = useCallback((nextState: ConversationContextState) => {
     setContextState((prev) => {
-      const merged = mergeCompactionContextState(prev, nextState)
+      const merged = mergeClearContextState(prev, mergeCompactionContextState(prev, nextState))
       setCurrentConversation((conversation) => conversation
         ? { ...conversation, context_state: merged, contextState: merged }
         : conversation)
@@ -1511,9 +1520,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }),
     [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode],
   )
+  const dshCustomPresets = useDshCustomPresets(activeAgentRuntime)
   const composerPresets = useMemo(
-    () => deriveDshPresetModes(activeAgentRuntime),
-    [activeAgentRuntime],
+    () => deriveDshPresetModes(activeAgentRuntime, dshCustomPresets),
+    [activeAgentRuntime, dshCustomPresets],
   )
   const currentConversationIsBlank = isPlainBlankConversation(currentConversation)
   const activeProviderId = currentConversation && !currentConversationIsBlank
@@ -1536,8 +1546,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     return webSearchEnabled ? 'third_party' : 'off'
   }, [currentConversation, currentConversationIsBlank, draftWebSearchMode, webSearchEnabled])
   const activeBuiltinWebSearchSupported = useMemo(
-    () => builtinWebSearchSupported(providerApiFormats[activeProviderId ?? '']),
-    [providerApiFormats, activeProviderId],
+    () => builtinWebSearchSupported(
+      providerApiFormats[activeProviderId ?? ''],
+      providerBaseUrls[activeProviderId ?? ''],
+    ),
+    [providerApiFormats, providerBaseUrls, activeProviderId],
   )
   // 多模型一问多答（任务 06-30）：当前生效的多答模型集（会话级持久 reply_models，欢迎页用草稿）。
   const activeReplyModels = useMemo<ModelRef[]>(
@@ -1614,6 +1627,9 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       setProviderApiFormats(
         Object.fromEntries((settings.providers ?? []).map((p) => [p.id, p.apiFormat ?? ''])),
       )
+      setProviderBaseUrls(
+        Object.fromEntries((settings.providers ?? []).map((p) => [p.id, p.baseUrl ?? ''])),
+      )
       setApprovalPolicy(chatTools?.approvalPolicy || 'readonly_auto_sensitive_confirm')
       const nextDisabledSkillIds = chatTools?.disabledSkillIds ?? []
       setDisabledSkillIds((prev) =>
@@ -1681,8 +1697,14 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       // 读-改-写：现读后端最新态，避免用缓存快照 map servers[] 时把后端刚 OAuth 刷新的
       // token 覆盖回旧值（见 handleApprovalPolicyChange 注释）。
       const settings = await refreshSettings()
-      const servers = (settings.chatTools?.servers ?? []).map((server) =>
-        server.id === serverId ? { ...server, enabled: !server.enabled } : server,
+      const prevServers = settings.chatTools?.servers ?? []
+      const current = prevServers.find((server) => server.id === serverId)
+      if (current && isPluginManagedServer(current)) return
+      const servers = preservePluginManagedServers(
+        prevServers,
+        prevServers.map((server) =>
+          server.id === serverId ? { ...server, enabled: !server.enabled } : server,
+        ),
       )
       // 乐观更新本地列表（开关即时反馈），保存后由 refreshToolIndicator 校正。
       setMcpServers(servers)
@@ -1779,24 +1801,35 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     try {
       const settings = await getSettingsCached()
       setUiLang((settings.settingsLanguage as Lang) || 'zh')
-      // 以用户最后一次在顶栏选的模型为默认；provider 仍存在时才用。localStorage 为空时
-      // （首次运行）回落到 onboarding 写入的 defaultModels.chat，再回落 lens / 翻译模型。
       const last = loadLastModel()
-      const lastProviderOk =
-        last && (settings.providers || []).some((p) => p.id === last.providerId)
-      const chatDefault = settings.defaultModels?.chat
-      if (last && lastProviderOk) {
-        setDraftProviderId(last.providerId)
-        setDraftModel(last.model)
-      } else if (chatDefault?.providerId) {
-        setDraftProviderId(chatDefault.providerId)
-        setDraftModel(chatDefault.model || '')
-      } else if (settings.lens?.providerId) {
-        setDraftProviderId(settings.lens.providerId)
-        setDraftModel(settings.lens.model || '')
-      } else {
-        setDraftProviderId(settings.translatorProviderId || '')
-        setDraftModel(settings.translatorModel || '')
+      const preferred = resolvePreferredChatModel({
+        providers: settings.providers || [],
+        last,
+        storedChat: settings.defaultModels?.chat ?? { providerId: '', model: '' },
+        legacyChat: {
+          providerId: settings.chatProviderId || '',
+          model: settings.chatModel || '',
+        },
+        lens: {
+          providerId: settings.lens?.providerId || '',
+          model: settings.lens?.model || '',
+        },
+        translator: {
+          providerId: settings.translatorProviderId || '',
+          model: settings.translatorModel || '',
+        },
+      })
+      setDraftProviderId(preferred.providerId)
+      setDraftModel(preferred.model)
+      // 聊天里选过的模型才写回 settings，避免把 Lens/翻译回落误当成 Chat 默认。
+      const stored = settings.defaultModels?.chat
+      if (
+        last
+        && last.providerId === preferred.providerId
+        && last.model === preferred.model
+        && (stored?.providerId !== last.providerId || stored?.model !== last.model)
+      ) {
+        void persistLastChatModelToSettings(last.providerId, last.model)
       }
     } catch {
       setDraftProviderId('dev-provider')
@@ -1839,6 +1872,13 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       void refreshToolIndicator()
     }, 1500)
   }, [refreshToolIndicator])
+
+  useEffect(() => {
+    return subscribeSettings((next) => {
+      setMcpServers(next.chatTools?.servers ?? [])
+      setUiLang((next.settingsLanguage as Lang) || 'zh')
+    })
+  }, [])
 
   // 开窗预热：后台把所有启用的 MCP server 连接并抓一次工具清单（fire-and-forget，
   // 连接池单飞保证幂等），首轮对话的工具收集不再现场握手。
@@ -2126,6 +2166,30 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       markConversationCompacting(conversationId, false)
     }
   }, [compactingConversationIds, markConversationCompacting, patchContextState, refreshSidebar])
+
+  const handleClearContext = useCallback(async () => {
+    const conversationId = currentConversationIdRef.current
+    if (!conversationId) return
+    setContextError('')
+    try {
+      const result = await chatApi.clearContext(conversationId)
+      if (currentConversationIdRef.current === conversationId) {
+        const latestId = latestClearBoundaryId(result.contextState)
+        if (latestId) {
+          setAnimateClearBoundaryId(latestId)
+          window.setTimeout(() => {
+            setAnimateClearBoundaryId((current) => (current === latestId ? null : current))
+          }, 1800)
+        }
+        patchContextState(result.contextState)
+        refreshSidebar()
+      }
+    } catch (err) {
+      if (currentConversationIdRef.current === conversationId) {
+        setContextError(typeof err === 'string' ? err : (err as Error).message || '清空上下文失败')
+      }
+    }
+  }, [patchContextState, refreshSidebar])
 
   const finishStreamingRun = useCallback(
     async (payload: { reason?: string; conversationId?: string }) => {
@@ -2559,17 +2623,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       snapshot.reasoningStreaming = false
       // 插话卡到了 = 那条「立刻引导」真的进了模型历史，现在才把它从队列里摘掉。
       // （在此之前它一直留着，好让「没赶上轮次边界」退化成运行结束后的自动发送。）
-      if (isUserSteerToolCall(record)) {
-        const steerId = (record.structuredContent as { steer_id?: unknown } | undefined)?.steer_id
-        if (typeof steerId === 'string') {
-          messageQueueRef.current.confirmSteered(payload.conversationId, steerId)
-        }
-      } else if (isUserFollowUpToolCall(record)) {
-        const followUpId = (record.structuredContent as { follow_up_id?: unknown } | undefined)?.follow_up_id
-        if (typeof followUpId === 'string') {
-          messageQueueRef.current.confirmFollowUp(payload.conversationId, followUpId)
-        }
-      }
+      const injectionId = userSteerId(record) ?? userFollowUpId(record)
+      if (injectionId) messageQueueRef.current.confirm(payload.conversationId, injectionId)
       const index = snapshot.toolCalls.findIndex((item) => item.id === record.id)
       snapshot.toolCalls = index < 0
         ? [...snapshot.toolCalls, record]
@@ -2810,53 +2865,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       console.error('Failed to synchronize chat protocol state:', error)
     })
   }, [currentConversation?.id])
-
-  useEffect(() => {
-    let cancelled = false
-    let unlisten: (() => void) | undefined
-    let clientPromise: Promise<typeof import('./pyodideClient')> | null = null
-
-    const setupListener = async () => {
-      unlisten = await api.onChatRunPython((payload) => {
-        if (cancelled) return
-        void (async () => {
-          try {
-            clientPromise ??= import('./pyodideClient')
-            const { runPythonInSandbox } = await clientPromise
-            const outcome = await runPythonInSandbox(payload.code, payload.timeoutMs, payload.files)
-            await api.chatPythonComplete(
-              payload.runId,
-              outcome.content,
-              outcome.isError,
-              outcome.artifacts,
-            )
-          } catch (err) {
-            const message = err instanceof Error
-              ? err.message || err.stack || err.name
-              : String(err)
-            await api.chatPythonComplete(
-              payload.runId,
-              `Python 沙盒调用失败：${message || 'Unknown error'}。不要使用 run_command/pip 安装或修改本机 Python 环境来绕过沙盒；请直接基于已有数据回答，除非用户明确要求修改本机环境。`,
-              true,
-              [],
-            )
-          }
-        })()
-      })
-      if (cancelled) {
-        unlisten()
-      }
-    }
-
-    setupListener()
-    return () => {
-      cancelled = true
-      unlisten?.()
-      void clientPromise
-        ?.then(({ disposePythonSandbox }) => disposePythonSandbox())
-        .catch(() => {})
-    }
-  }, [])
 
   useEffect(() => {
     currentConversationIdRef.current = currentConversation?.id ?? null
@@ -3590,11 +3598,13 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         // 丢弃被延后的 finishStreamingRun(它会再次全量 reloadConversation),避免每轮随历史线性变慢。
         delete pendingStreamDoneRef.current[conversationId]
         finishStreamingRunWithConversation(conversationId, persistedConversation)
-        // 这一轮正常收尾 → 发出排队里的下一条（只发一条，它自己再跑一轮）。
-        // 报错 / 用户按停止的 run 走不到这里：那时队列条目留着，由用户决定要不要发。
-        void messageQueueRef.current.drain(persistedConversation)
-      } else if (!(await flushPendingStreamDone(conversationId))) {
-        if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
+        // 含取消：后端 cancelled 也回 success+conversation。硬失败走 else，只解开不自动发。
+        void messageQueueRef.current.settleAfterRun(conversationId, persistedConversation)
+      } else {
+        messageQueueRef.current.settleAfterRun(conversationId)
+        if (!(await flushPendingStreamDone(conversationId))) {
+          if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
+        }
       }
     }
     return sendAccepted
@@ -3776,9 +3786,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const canSteerCurrentConversation =
     (usesExternalRuntime ? activeExternalAgentSupportsSteering : true)
     && activeReplyModels.length < 2
-  // 自动 follow-up：内置循环终答后续跑；Pi / dsh 走原生下一轮。多模型一问多答同样不给。
+  // 自动 follow-up 只给原生支持「下一轮排队」的外部 CLI（Pi / dsh）。
+  // 内置循环不自动 follow-up：要留着可见队列和「立刻引导」。多模型一问多答同样不给。
   const canFollowUpCurrentConversation =
-    (usesExternalRuntime ? activeExternalAgentSupportsFollowUp : true)
+    usesExternalRuntime
+    && activeExternalAgentSupportsFollowUp
     && activeReplyModels.length < 2
 
   const handleQueueMessage = useCallback((content: string, attachments: PendingAttachment[]) => {
@@ -4148,12 +4160,102 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           // 同 handleSend:已有持久化对话,丢弃延后的全量重拉,直接套用。
           delete pendingStreamDoneRef.current[conversationId]
           finishStreamingRunWithConversation(conversationId, persistedConversation)
-        } else if (!(await flushPendingStreamDone(conversationId))) {
-          if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
+          void messageQueueRef.current.settleAfterRun(conversationId, persistedConversation)
+        } else {
+          messageQueueRef.current.settleAfterRun(conversationId)
+          if (!(await flushPendingStreamDone(conversationId))) {
+            if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
+          }
         }
       }
     },
     [applyAssistantStreamStats, applyConversation, clearConversationInFlight, clearStreamSnapshot, ensureStreamSnapshot, finishStreamingRunWithConversation, flushPendingStreamDone, freezeStreamSnapshot, markConversationInFlight, refreshSidebar, reloadConversation, resetLocalCancellation, setStreamErrorForConversation, syncGeneratingConversationIds],
+  )
+
+  const handleReplyWithModel = useCallback(
+    async (messageId: string, providerId: string, model: string) => {
+      const conv = currentConversationRef.current
+      if (!conv) return
+      const conversationId = conv.id
+      if (isConversationInFlight(inFlightConversationsRef.current, conversationId)) {
+        setStreamErrorForConversation(conversationId, '该对话正在生成中，请稍后再试')
+        return
+      }
+      const span = assistantTurnSpan(conv.messages, messageId)
+      if (!span || span.end !== conv.messages.length - 1) {
+        setStreamErrorForConversation(conversationId, '只能对最后一轮回答换模型')
+        return
+      }
+      const groupId = span.groupId || `grp_${crypto.randomUUID()}`
+      const sessionProvider = conv.provider_id ?? ''
+      const sessionModel = conv.model ?? ''
+      resetLocalCancellation()
+      beginGroup(
+        conversationId,
+        groupId,
+        [
+          ...span.siblings.map((message) => ({
+            providerId: message.provider_id ?? message.providerId ?? sessionProvider,
+            model: message.model ?? sessionModel,
+            messageId: message.id,
+            streaming: false,
+            content: message.content,
+            reasoning: message.reasoning,
+            toolCalls: message.tool_calls ?? message.toolCalls ?? [],
+            segments: message.segments ?? [],
+          })),
+          { providerId, model },
+        ],
+      )
+      if (currentConversationIdRef.current === conversationId) {
+        resetStreamStore()
+        setStreamCoarse({ streaming: true })
+        setStreamErrorForConversation(conversationId, '')
+        activeRunIdRef.current = null
+      }
+      markConversationInFlight(conversationId)
+      let persistedConversation: Conversation | null = null
+      try {
+        const updated = await chatApi.replyWithModel(
+          conversationId,
+          messageId,
+          providerId,
+          model,
+          groupId,
+        )
+        persistedConversation = updated
+        if (currentConversationIdRef.current === conversationId) {
+          applyAssistantStreamStats(updated)
+          applyConversation(updated)
+          refreshSidebar()
+        } else {
+          refreshSidebar()
+        }
+      } catch (err) {
+        console.error('Failed to reply with model:', err)
+        setStreamErrorForConversation(
+          conversationId,
+          typeof err === 'string' ? err : (err as Error).message || '换模型回答失败',
+        )
+        if (currentConversationIdRef.current === conversationId) {
+          void reloadConversation(conversationId)
+        }
+      } finally {
+        clearConversationInFlight(conversationId)
+        endGroup(conversationId)
+        if (persistedConversation) {
+          delete pendingStreamDoneRef.current[conversationId]
+          finishStreamingRunWithConversation(conversationId, persistedConversation)
+          void messageQueueRef.current.settleAfterRun(conversationId, persistedConversation)
+        } else {
+          messageQueueRef.current.settleAfterRun(conversationId)
+          if (!(await flushPendingStreamDone(conversationId))) {
+            if (!freezeStreamSnapshot(conversationId)) clearStreamSnapshot(conversationId)
+          }
+        }
+      }
+    },
+    [applyAssistantStreamStats, applyConversation, clearConversationInFlight, clearStreamSnapshot, finishStreamingRunWithConversation, flushPendingStreamDone, freezeStreamSnapshot, markConversationInFlight, refreshSidebar, reloadConversation, resetLocalCancellation, setStreamErrorForConversation],
   )
 
   const handleRuntimeChange = useCallback(async (runtime: AgentRuntimeConfig) => {
@@ -4240,7 +4342,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const handleModelChange = useCallback(async (providerId: string, model: string) => {
     setDraftProviderId(providerId)
     setDraftModel(model)
-    saveLastModel(providerId, model) // 记住为全局默认
+    saveLastModel(providerId, model)
+    void persistLastChatModelToSettings(providerId, model)
 
     if (!currentConversation) return
     const conversationId = currentConversation.id
@@ -4423,12 +4526,15 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       <ContextIndicator
         contextState={contextState}
         messageCount={displayMessages.length}
+        lastMessageId={displayMessages[displayMessages.length - 1]?.id}
         loading={contextLoading}
         compressing={contextCompressing}
+        generating={streamCoarse.streaming}
         error={contextError}
         usesExternalRuntime={usesExternalRuntime}
         onRefresh={handleRefreshContext}
         onCompress={handleCompressContext}
+        onClear={usesExternalRuntime ? undefined : handleClearContext}
         lang={uiLang}
       />
     ),
@@ -4437,9 +4543,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       contextError,
       contextLoading,
       contextState,
-      displayMessages.length,
+      displayMessages,
+      handleClearContext,
       handleCompressContext,
       handleRefreshContext,
+      streamCoarse.streaming,
       uiLang,
       usesExternalRuntime,
     ],
@@ -4491,6 +4599,18 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }
   }, [])
 
+  const handleSidebarWidthChange = useCallback((nextWidth: number) => {
+    setSidebarWidth(nextWidth)
+    rememberSidebarWidth(nextWidth)
+  }, [])
+
+  useLayoutEffect(() => {
+    const shell = document.querySelector('.chat-window-shell')
+    if (shell instanceof HTMLElement) {
+      shell.style.setProperty('--chat-sidebar-width', `${sidebarWidth}px`)
+    }
+  }, [sidebarWidth])
+
   // ---------- Right Dock ----------
   const [dockOpen, setDockOpen] = useState(() => getRememberedDockOpen())
   const [dockWidth, setDockWidth] = useState(() => getRememberedDockWidth())
@@ -4499,10 +4619,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [treeExpanded, setTreeExpanded] = useState<string[]>([])
   const [dockReveal, setDockReveal] = useState<DockRevealRequest>(null)
   const [dockPreview, setDockPreview] = useState<DockPreviewRequest>(null)
-  const piNativeEnabled = usesExternalRuntime
-    && activeAgentRuntime.externalAgentId === 'pi'
-    && Boolean(currentConversation?.id)
-  const trajectoryLive = dockOpen && dockTab === 'trajectory'
   // 工作目录跟随当前会话 / 选中项目 / agent runtime 变化，由后端 dock_resolve_cwd 解析
   // （外部 agent 与内置 runtime 的实际写入目录不同，runtime 切换必须重解析）。
   useEffect(() => {
@@ -4670,7 +4786,12 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     void (async () => {
       const { getCurrentWindow } = await import('@tauri-apps/api/window')
       const { LogicalSize } = await import('@tauri-apps/api/dpi')
-      const min = sidebarCollapsed ? CHAT_MIN_SIZE_COLLAPSED : CHAT_MIN_SIZE_EXPANDED
+      const min = sidebarCollapsed
+        ? CHAT_MIN_SIZE_COLLAPSED
+        : {
+            width: CHAT_MIN_SIZE_COLLAPSED.width + sidebarWidth,
+            height: CHAT_MIN_SIZE_COLLAPSED.height,
+          }
       const win = getCurrentWindow()
       // 最大化/全屏时不要动 min-size 或 size：Windows 上 setMinSize 会触发重排、把最大化状态取消掉
       // （表现为切换侧边栏后窗口退出最大化）。尺寸约束对铺满屏幕的窗口也没意义，等恢复到可调窗口再应用。
@@ -4696,7 +4817,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     return () => {
       cancelled = true
     }
-  }, [sidebarCollapsed])
+  }, [sidebarCollapsed, sidebarWidth])
 
   const handleSidebarSelectProject = useCallback((project: ChatProject | null) => {
     runAfterLeavingSettings(() => handleSelectProject(project))
@@ -4731,24 +4852,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     })
   }, [handleSelectConversation, runAfterLeavingSettings])
 
-  const handlePiConversationChanged = useCallback((
-    id: string,
-    conversation?: Conversation,
-    draft?: string,
-  ) => {
-    refreshSidebar()
-    if (conversation) {
-      currentConversationIdRef.current = id
-      applyConversation(conversation)
-      setChatView('conversation')
-      syncConversationRoute(id)
-    } else {
-      handleSidebarSelectConversation(id)
-    }
-    if (draft?.trim()) {
-      requestAnimationFrame(() => insertTextIntoComposer(draft))
-    }
-  }, [applyConversation, handleSidebarSelectConversation, refreshSidebar, syncConversationRoute])
   const handleSidebarNewConversation = useCallback(() => {
     runAfterLeavingSettings(() => void handleNewConversation())
   }, [handleNewConversation, runAfterLeavingSettings])
@@ -4761,8 +4864,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     if (getRouteConversationId() !== null || path === 'chat' || path === '') {
       syncConversationRoute(null)
     }
-    refreshSidebar()
-  }, [applyConversation, refreshSidebar, syncConversationRoute])
+    // 不在这里 refreshSidebar。归档会在 persist 之前就清当前会话；提前 refetch
+    // 会把尚未 archived 的条目写回侧栏，下面的行跟着上下抽一截。调用方在写盘
+    // 之后自己 loadSidebarData / onConversationsChanged。
+  }, [applyConversation, syncConversationRoute])
 
   const handleSidebarForceDropConversation = useCallback((id: string) => {
     // B3：侧栏删除时强制清掉该会话的 in-flight/快照/乐观项，
@@ -4805,26 +4910,19 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     openEmbeddedSettings('chat')
   }, [chatView, extensionsNavItem, handleSettingsClose, openEmbeddedSettings])
 
-  // 侧栏账户菜单：语言切换 / 检查更新 / 用量。都是全局行为，所以留在 Chat 这层，
+  // 侧栏账户菜单：语言切换 / 用量。都是全局行为，所以留在 Chat 这层，
   // 侧栏只负责触发（它拿不到 settings 也不该自己全量保存）。
   const handleSidebarSelectLang = useCallback((next: Lang) => {
     setUiLang(next)
     void (async () => {
       try {
-        const settings = await getSettingsCached()
+        const settings = await refreshSettings()
         await saveSettingsCached({ ...settings, settingsLanguage: next })
       } catch (err) {
         console.error('Failed to save UI language:', err)
       }
     })()
   }, [])
-
-  // 检查更新：设置「关于」页已有完整流程（检查中 / 有新版 / 已最新 + 下载入口），
-  // 这里只负责把用户送过去，不重造一套。
-  const handleSidebarCheckUpdate = useCallback(() => {
-    setExtensionsNavItem(null)
-    openEmbeddedSettings('about')
-  }, [openEmbeddedSettings])
 
   const handleSidebarOpenUsage = useCallback(() => {
     setExtensionsNavItem(null)
@@ -5104,6 +5202,13 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     assistantStreamStatsByMessageId,
     onUpdateMessage: handleUpdateMessage,
     onRegenerateMessage: handleRegenerateMessage,
+    onReplyWithModel: (
+      usesExternalRuntime || activeAgentPlanMode !== 'act'
+        ? undefined
+        : handleReplyWithModel
+    ),
+    sessionProviderId: currentConversation?.provider_id,
+    sessionModel: currentConversation?.model,
     onForkMessage: handleForkMessage,
     onRewindMessage: handleRewindMessage,
     onDeleteMessage: handleDeleteMessage,
@@ -5115,11 +5220,13 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     contextState,
     compactionInProgress: contextCompressing,
     animateCompactionBoundaryId: animateCompactionBoundaryId,
+    animateClearBoundaryId: animateClearBoundaryId,
     lang: uiLang,
     focusMessageId,
     onFocusMessageHandled: () => setFocusMessageId(null),
   }), [
     animateCompactionBoundaryId,
+    animateClearBoundaryId,
     assistantStreamStatsByMessageId,
     contextCompressing,
     contextState,
@@ -5131,12 +5238,15 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     handleExecuteAgentPlan,
     handleForkMessage,
     handleRegenerateMessage,
+    handleReplyWithModel,
     handleRewindMessage,
     handleSaveMessageToNote,
     handleSetGroupSelection,
     handleUpdateMessage,
     uiLang,
     focusMessageId,
+    usesExternalRuntime,
+    activeAgentPlanMode,
   ])
 
   const forkOrigin = useMemo(() => {
@@ -5302,7 +5412,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         <ChatTitlebar
           sidebarExpanded={!sidebarCollapsed}
           /* 与下方 <Sidebar collapsed> 取反同源：设置页里侧栏也是收起的，
-             只看 sidebarCollapsed 会在设置页多留 240px 空档。 */
+             只看 sidebarCollapsed 会在设置页多留一侧栏宽的空档。 */
           sidebarVisible={!(sidebarCollapsed || settingsPanelActive)}
           settingsMode={settingsPanelActive}
           onToggleSidebar={handleTitlebarToggleSidebar}
@@ -5335,12 +5445,13 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           onOpenExtensionsItem={handleSidebarOpenExtensionsItem}
           onOpenSettings={handleSidebarOpenSettings}
           onSelectLang={handleSidebarSelectLang}
-          onCheckUpdate={handleSidebarCheckUpdate}
           onOpenUsage={handleSidebarOpenUsage}
           settingsActive={settingsPanelActive}
           extensionsActive={extensionsActive}
           collapsed={sidebarCollapsed || settingsPanelActive}
           onToggleCollapsed={handleCollapseSidebar}
+          width={sidebarWidth}
+          onWidthChange={handleSidebarWidthChange}
           refreshKey={sidebarRefreshKey}
           profileRefreshKey={sidebarProfileRefreshKey}
           searchOpen={searchOpen}
@@ -5477,9 +5588,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             workdir={dockWorkdir}
             lang={uiLang}
             conversationId={currentConversation?.id ?? null}
-            conversation={trajectoryLive ? currentConversation : null}
-            messages={trajectoryLive ? displayMessages : NO_TRAJECTORY_MESSAGES}
-            piNativeEnabled={trajectoryLive && piNativeEnabled}
             treeExpanded={treeExpanded}
             revealRequest={dockReveal}
             previewRequest={dockPreview}
@@ -5488,8 +5596,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onClose={handleCloseDock}
             onTreeExpandedChange={handleTreeExpandedChange}
             onInsertMention={handleInsertFileMention}
-            onPiConversationChanged={handlePiConversationChanged}
-            onFocusMessage={setFocusMessageId}
             onRevealInTree={handleDockRevealInTree}
           />
         )}
