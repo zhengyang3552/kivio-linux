@@ -897,6 +897,7 @@ pub(super) async fn compute_context_state(
         .as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
+        &conversation.additional_directories,
     );
     let last_user_idx = conversation.messages.iter().rposition(|m| m.role == "user");
     let request_messages = build_chat_api_messages(
@@ -1000,10 +1001,16 @@ pub(super) async fn rollback_user_message_after_failed_send(
     state: &State<'_, AppState>,
     conversation: &mut Conversation,
     user_message_id: &str,
+    revert_title: Option<&str>,
 ) -> Result<(), String> {
     conversation
         .messages
         .retain(|message| message.id != user_message_id);
+    if let Some(title) = revert_title {
+        if conversation.title == title {
+            conversation.title = super::title::PLACEHOLDER_CONVERSATION_TITLE.to_string();
+        }
+    }
     conversation.updated_at = chrono::Local::now().timestamp();
     match compute_context_state(app, state, conversation, None, &[]).await {
         Ok(mut context_state) => {
@@ -1021,6 +1028,11 @@ pub(super) async fn rollback_user_message_after_failed_send(
                 .messages
                 .retain(|message| message.id != user_message_id);
             latest.context_state = context_state;
+            if let Some(title) = revert_title {
+                if latest.title == title {
+                    latest.title = super::title::PLACEHOLDER_CONVERSATION_TITLE.to_string();
+                }
+            }
             Ok(())
         })
         .await

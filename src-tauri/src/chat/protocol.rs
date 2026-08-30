@@ -4,17 +4,57 @@ use std::time::{Duration, Instant};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use ts_rs::TS;
 
 use crate::state::AppState;
 
 pub const CHAT_PROTOCOL_VERSION: u32 = 1;
+/// 旧全局事件名。debug probe 改为进程内 sink，不再 `app.emit` 到每个 WebView。
+#[allow(dead_code)]
 pub const CHAT_PROTOCOL_EVENT: &str = "chat-protocol";
+/// Channel 投递失败但窗口还在时，请该 WebView 重建通道并 `chat_sync_state`。
+pub const CHAT_PROTOCOL_CHANNEL_RESET_EVENT: &str = "chat-protocol-channel-reset";
 const MAX_REPLAY_EVENTS: usize = 512;
 const MAX_REPLAY_BYTES: usize = 2 * 1024 * 1024;
 const COMPLETED_RUN_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_COMPLETED_RUNS: usize = 32;
+/// Text/Reasoning delta 的合帧窗口。多对话并发时「每 token 一条 IPC 事件」是压垮
+/// WebView 主线程和协议锁的主因；窗口内的同段 delta 合并成一条再入库+emit。
+/// 前端渲染本身按 50–220ms 合帧，25ms 的后端窗口对观感不可见。
+const DELTA_COALESCE_WINDOW: Duration = Duration::from_millis(25);
+/// 单条合帧缓冲的尺寸上限：SSE 偶发的大块（整段贴文）不该在缓冲里再攒一份。
+const DELTA_COALESCE_MAX_BYTES: usize = 8 * 1024;
+
+#[cfg(debug_assertions)]
+type ProtocolDebugSink = std::sync::Arc<dyn Fn(&ChatProtocolEvent) + Send + Sync>;
+
+#[cfg(debug_assertions)]
+static PROTOCOL_DEBUG_SINK: std::sync::OnceLock<std::sync::Mutex<Option<ProtocolDebugSink>>> =
+    std::sync::OnceLock::new();
+
+/// Probe 注册进程内回调，避免 `app.emit` 把每条 token 广播进所有 WebView。
+#[cfg(debug_assertions)]
+pub fn set_protocol_debug_sink(sink: Option<ProtocolDebugSink>) {
+    *PROTOCOL_DEBUG_SINK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = sink;
+}
+
+#[cfg(debug_assertions)]
+fn notify_protocol_debug_sink(event: &ChatProtocolEvent) {
+    let Some(slot) = PROTOCOL_DEBUG_SINK.get() else {
+        return;
+    };
+    let sink = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(sink) = sink {
+        sink(event);
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -608,6 +648,24 @@ impl ChatRunEvent {
     fn is_hook_failed(&self) -> bool {
         matches!(self, Self::HookFailed { .. })
     }
+
+    /// Token / 工具卡 / 子代理进度：弹出窗独占该对话时主窗 `All` 订阅者不应再收。
+    /// 生命周期边沿（started/completed/failed/cancelled）和审批询问仍给主窗，侧栏生成中指示才准。
+    fn is_high_frequency(&self) -> bool {
+        matches!(
+            self,
+            Self::TextDelta { .. }
+                | Self::ReasoningDelta { .. }
+                | Self::ToolUpdated { .. }
+                | Self::SubagentUpdated { .. }
+                | Self::ContextUsageUpdated { .. }
+                | Self::CompactionUpdated { .. }
+                | Self::TodoUpdated { .. }
+                | Self::PlanUpdated { .. }
+                | Self::StatusNoteUpdated { .. }
+                | Self::HookFailed { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq)]
@@ -668,6 +726,84 @@ pub struct ChatConversationEventEnvelope {
 pub enum ChatProtocolEvent {
     Run(ChatRunEventEnvelope),
     Conversation(ChatConversationEventEnvelope),
+}
+
+impl ChatProtocolEvent {
+    fn conversation_id(&self) -> &str {
+        match self {
+            Self::Run(event) => &event.conversation_id,
+            Self::Conversation(event) => &event.conversation_id,
+        }
+    }
+
+    fn is_high_frequency(&self) -> bool {
+        match self {
+            Self::Run(event) => event.event.is_high_frequency(),
+            Self::Conversation(_) => true,
+        }
+    }
+}
+
+/// 协议通道过滤：主聊天窗订全部；弹出窗只订自己那条对话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatProtocolFilter {
+    All,
+    Conversation(String),
+}
+
+impl ChatProtocolFilter {
+    /// `exclusive_live`：此刻已有窗口以 `Conversation(id)` 订了这条对话。
+    /// 不能用「弹出窗是否存在」代替——窗口已建但通道订成 `All`、或 Channel 已死时，
+    /// 再按窗口集合跳过 All 会把 token 投进黑洞，弹出窗表现为生成直接断。
+    pub fn accepts(&self, conversation_id: &str, high_frequency: bool, exclusive_live: bool) -> bool {
+        match self {
+            Self::Conversation(id) => id == conversation_id,
+            Self::All => !(high_frequency && exclusive_live),
+        }
+    }
+}
+
+pub struct ChatProtocolSubscriber {
+    pub filter: ChatProtocolFilter,
+    pub channel: tauri::ipc::Channel<ChatProtocolEvent>,
+}
+
+pub fn matching_subscriber_labels(
+    subscribers: &HashMap<String, ChatProtocolSubscriber>,
+    conversation_id: &str,
+    high_frequency: bool,
+) -> Vec<String> {
+    labels_matching_filters(
+        subscribers
+            .iter()
+            .map(|(label, subscriber)| (label.as_str(), &subscriber.filter)),
+        conversation_id,
+        high_frequency,
+    )
+}
+
+fn labels_matching_filters<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a ChatProtocolFilter)>,
+    conversation_id: &str,
+    high_frequency: bool,
+) -> Vec<String> {
+    let entries: Vec<_> = entries.into_iter().collect();
+    let exclusive_live = entries.iter().any(|(_, filter)| {
+        matches!(filter, ChatProtocolFilter::Conversation(id) if id == conversation_id)
+    });
+    entries
+        .into_iter()
+        .filter(|(_, filter)| filter.accepts(conversation_id, high_frequency, exclusive_live))
+        .map(|(label, _)| label.to_string())
+        .collect()
+}
+
+pub fn unsubscribe_label(state: &AppState, label: &str) {
+    state
+        .chat_protocol_subscribers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(label);
 }
 
 impl<'de> Deserialize<'de> for ChatProtocolEvent {
@@ -949,11 +1085,46 @@ pub struct ChatSyncResult {
     pub runs: Vec<ChatRunSync>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingDeltaKind {
+    Text,
+    Reasoning,
+}
+
+/// 合帧缓冲：还没入库（没有 seq、不在 replay/snapshot 里）的流式增量。
+/// 只有「同 kind + 段 payload 完全相等」的连续 delta 会并进来，所以冲刷时
+/// 折叠结果与逐条入库逐字节一致。
+#[derive(Debug)]
+struct PendingDelta {
+    kind: PendingDeltaKind,
+    delta: String,
+    segment: Option<ChatSegmentPayload>,
+    buffered_at: Instant,
+}
+
+impl PendingDelta {
+    fn into_event(self) -> ChatRunEvent {
+        match self.kind {
+            PendingDeltaKind::Text => ChatRunEvent::TextDelta {
+                delta: self.delta,
+                segment: self.segment,
+            },
+            PendingDeltaKind::Reasoning => ChatRunEvent::ReasoningDelta {
+                delta: self.delta,
+                segment: self.segment,
+            },
+        }
+    }
+}
+
 struct RunState {
     snapshot: ChatRunSnapshot,
     replay: VecDeque<(usize, ChatRunEventEnvelope)>,
     replay_bytes: usize,
     terminal_at: Option<Instant>,
+    pending_delta: Option<PendingDelta>,
+    /// 已有一个延迟冲刷任务在飞，别再叠加计时器。
+    flush_scheduled: bool,
 }
 
 #[derive(Default)]
@@ -1034,6 +1205,8 @@ impl ChatProtocolHub {
                 replay: VecDeque::new(),
                 replay_bytes: 0,
                 terminal_at: None,
+                pending_delta: None,
+                flush_scheduled: false,
             },
         );
         self.push(run_id, ChatRunEvent::RunStarted { recovery })
@@ -1066,9 +1239,7 @@ impl ChatProtocolHub {
         if envelope.event.is_terminal() {
             run.terminal_at = Some(Instant::now());
         }
-        let bytes = serde_json::to_vec(&envelope)
-            .map(|value| value.len())
-            .unwrap_or(0);
+        let bytes = replay_bytes_estimate(&envelope);
         run.replay.push_back((bytes, envelope.clone()));
         run.replay_bytes = run.replay_bytes.saturating_add(bytes);
         while run.replay.len() > MAX_REPLAY_EVENTS || run.replay_bytes > MAX_REPLAY_BYTES {
@@ -1082,6 +1253,69 @@ impl ChatProtocolHub {
             self.prune();
         }
         Ok(envelope)
+    }
+
+    /// 把该 run 的合帧缓冲作为一条正式事件入库（拿 seq、进 replay/snapshot），
+    /// 返回待 emit 的 envelope。没有缓冲或 run 已不在时是 no-op。
+    fn flush_pending_delta(&mut self, run_id: &str) -> Option<ChatRunEventEnvelope> {
+        let pending = self.runs.get_mut(run_id)?.pending_delta.take()?;
+        self.push(run_id, pending.into_event()).ok()
+    }
+
+    /// 尝试把一条流式 delta 并入合帧缓冲。`Err` 把 delta 原样退回，让调用方走常规
+    /// `push`——run 不存在 / 已终态的错误信息是 push 的对外契约，不在这里复刻。
+    /// `Ok` 返回（需要立即 emit 的已入库事件, 是否要调度一次延迟冲刷）。
+    fn buffer_delta(
+        &mut self,
+        run_id: &str,
+        pending: PendingDelta,
+    ) -> Result<(Vec<ChatRunEventEnvelope>, bool), PendingDelta> {
+        let now = pending.buffered_at;
+        let (previous, flush_now, schedule_flush) = {
+            let Some(run) = self.runs.get_mut(run_id) else {
+                return Err(pending);
+            };
+            if run.terminal_at.is_some() {
+                return Err(pending);
+            }
+            let previous = match run.pending_delta.as_mut() {
+                Some(current)
+                    if current.kind == pending.kind && current.segment == pending.segment =>
+                {
+                    current.delta.push_str(&pending.delta);
+                    None
+                }
+                // 段位或种类切换：旧缓冲先按原顺序入库，再另起新缓冲。
+                _ => {
+                    let previous = run.pending_delta.take();
+                    run.pending_delta = Some(pending);
+                    previous
+                }
+            };
+            let current = run
+                .pending_delta
+                .as_ref()
+                .expect("pending delta was just set");
+            let flush_now = current.delta.len() >= DELTA_COALESCE_MAX_BYTES
+                || now.duration_since(current.buffered_at) >= DELTA_COALESCE_WINDOW;
+            let schedule_flush = !flush_now && !run.flush_scheduled;
+            if schedule_flush {
+                run.flush_scheduled = true;
+            }
+            (previous, flush_now, schedule_flush)
+        };
+        let mut envelopes = Vec::new();
+        if let Some(previous) = previous {
+            if let Ok(envelope) = self.push(run_id, previous.into_event()) {
+                envelopes.push(envelope);
+            }
+        }
+        if flush_now {
+            if let Some(envelope) = self.flush_pending_delta(run_id) {
+                envelopes.push(envelope);
+            }
+        }
+        Ok((envelopes, schedule_flush))
     }
 
     fn sync(&mut self, request: &ChatSyncRequest) -> ChatSyncResult {
@@ -1404,9 +1638,12 @@ fn upsert_segment(
 ) {
     let Some(segment) = segment else { return };
     if let Some(existing) = segments.iter_mut().find(|item| item.id == segment.id) {
-        let accumulated = existing.text.clone().unwrap_or_default();
+        // move + push_str，不 clone：clone+format 是 O(已累积长度)，长答案下每个
+        // delta 都整段拷贝，多对话并发时在协议锁内滚成显著 CPU。
+        let mut accumulated = existing.text.take().unwrap_or_default();
+        accumulated.push_str(delta);
         *existing = segment.clone();
-        existing.text = Some(format!("{accumulated}{delta}"));
+        existing.text = Some(accumulated);
     } else {
         let mut segment = segment.clone();
         let base = segment.text.take().unwrap_or_default();
@@ -1420,10 +1657,97 @@ fn upsert_segment(
     }
 }
 
+/// 实时协议的唯一出口。生产路径走 Tauri ipc `Channel`(点对点、保序、绕过全局事件总线,
+/// 不再向每个 WebView 广播+反序列化);无人订阅时事件直接丢弃——协议本就为此设计了
+/// sync/replay,前端挂载时 `chat_sync_state` 全量对账补齐。
+/// 多窗口：按 label 分槽，弹出窗只收自己那条对话；仅当该对话已有活着的 `Conversation`
+/// 订阅者时，才跳过主窗 All 的高频事件。按「窗口已打开」跳过会在通道未订上/已死时黑洞。
+/// debug 构建额外广播到全局事件总线,喂 chat probe(probe.rs 靠 `app.listen` 收实时载荷)。
 fn emit_protocol(app: &AppHandle, event: ChatProtocolEvent) {
-    if let Err(error) = app.emit(CHAT_PROTOCOL_EVENT, event) {
-        eprintln!("Failed to emit {CHAT_PROTOCOL_EVENT}: {error}");
+    #[cfg(debug_assertions)]
+    notify_protocol_debug_sink(&event);
+    let conversation_id = event.conversation_id().to_string();
+    let high_frequency = event.is_high_frequency();
+    let state = app.state::<AppState>();
+    let targets: Vec<(String, tauri::ipc::Channel<ChatProtocolEvent>)> = {
+        let slots = state
+            .chat_protocol_subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        matching_subscriber_labels(&slots, &conversation_id, high_frequency)
+            .into_iter()
+            .filter_map(|label| {
+                slots
+                    .get(&label)
+                    .map(|subscriber| (label, subscriber.channel.clone()))
+            })
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
     }
+    let mut dead = Vec::new();
+    let mut payload = Some(event);
+    let last = targets.len();
+    for (index, (label, channel)) in targets.iter().enumerate() {
+        let next = if index + 1 == last {
+            payload.take().expect("protocol event still owned")
+        } else {
+            payload
+                .as_ref()
+                .expect("protocol event still owned")
+                .clone()
+        };
+        if channel.send(next).is_err() {
+            dead.push((label.clone(), channel.id()));
+        }
+    }
+    if dead.is_empty() {
+        return;
+    }
+    let mut reset = Vec::new();
+    {
+        let mut slots = state
+            .chat_protocol_subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (label, channel_id) in dead {
+            let still_dead = slots
+                .get(&label)
+                .is_some_and(|subscriber| subscriber.channel.id() == channel_id);
+            if still_dead {
+                slots.remove(&label);
+                reset.push(label);
+            }
+        }
+    }
+    for label in reset {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.emit(CHAT_PROTOCOL_CHANNEL_RESET_EVENT, ());
+        }
+    }
+}
+
+/// Chat / 弹出窗挂载时调用。同一窗口 label 再订阅会替换旧槽（WebView 重载）。
+/// 弹出窗以窗口 label 为准订自己那条对话（不信任前端漏传 `conversation_id`）。
+/// 其它窗口：`conversation_id` 有值 = 只收该对话；缺省 = 主聊天窗订全部。
+/// 订阅后前端立即对打开的会话跑 `chat_sync_state`,补齐订阅空窗期的事件。
+#[tauri::command]
+pub fn chat_protocol_subscribe(
+    window: WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    channel: tauri::ipc::Channel<ChatProtocolEvent>,
+    conversation_id: Option<String>,
+) {
+    let filter = crate::chat::popout::protocol_filter_for_window(window.label(), conversation_id);
+    state
+        .chat_protocol_subscribers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            window.label().to_string(),
+            ChatProtocolSubscriber { filter, channel },
+        );
 }
 
 pub fn register_run(
@@ -1480,16 +1804,122 @@ pub fn emit_live_run_event(app: &AppHandle, conversation_id: &str, event: ChatRu
     );
 }
 
+/// replay 预算用的字节估算。delta 事件每秒成百上千条，为算长度整包 `serde_json::to_vec`
+/// 一遍纯属浪费——按字段长度估；低频事件（工具卡、终态携带全文）才实序列化拿准数。
+fn replay_bytes_estimate(envelope: &ChatRunEventEnvelope) -> usize {
+    const ENVELOPE_OVERHEAD: usize = 128;
+    const SEGMENT_OVERHEAD: usize = 160;
+    let base = ENVELOPE_OVERHEAD
+        + envelope.conversation_id.len()
+        + envelope.run_id.len()
+        + envelope.message_id.len();
+    match &envelope.event {
+        ChatRunEvent::TextDelta { delta, segment } | ChatRunEvent::ReasoningDelta { delta, segment } => {
+            let segment_bytes = segment.as_ref().map_or(0, |segment| {
+                SEGMENT_OVERHEAD
+                    + segment.id.len()
+                    + segment.text.as_ref().map_or(0, |text| text.len())
+            });
+            base + delta.len() + segment_bytes
+        }
+        _ => serde_json::to_vec(envelope)
+            .map(|value| value.len())
+            .unwrap_or(0)
+            .max(base),
+    }
+}
+
+/// 能进合帧缓冲的 delta 拆出来；其余事件原样退回。段 payload 自带 `text` 的 delta 不合
+/// 帧——fold 的 `ends_with` 去重语义对「合并后的 delta」不再成立，宁可单发。
+fn split_coalescible_delta(event: ChatRunEvent) -> Result<PendingDelta, ChatRunEvent> {
+    let has_inline_text = |segment: &Option<ChatSegmentPayload>| {
+        segment
+            .as_ref()
+            .is_some_and(|segment| segment.text.is_some())
+    };
+    match event {
+        ChatRunEvent::TextDelta { delta, segment } if !has_inline_text(&segment) => {
+            Ok(PendingDelta {
+                kind: PendingDeltaKind::Text,
+                delta,
+                segment,
+                buffered_at: Instant::now(),
+            })
+        }
+        ChatRunEvent::ReasoningDelta { delta, segment } if !has_inline_text(&segment) => {
+            Ok(PendingDelta {
+                kind: PendingDeltaKind::Reasoning,
+                delta,
+                segment,
+                buffered_at: Instant::now(),
+            })
+        }
+        other => Err(other),
+    }
+}
+
+/// 合帧窗口到点后的兜底冲刷：没有后续事件（模型停顿、流已结束但终态还没到）时，
+/// 缓冲里的尾巴也必须在 ~25ms 内上屏。
+fn schedule_delta_flush(app: &AppHandle, run_id: &str) {
+    let app = app.clone();
+    let run_id = run_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(DELTA_COALESCE_WINDOW).await;
+        let state = app.state::<AppState>();
+        // emit 必须在锁内：本任务与 emit_run_event 并发时，锁外 emit 会把已按 seq
+        // 入库的事件乱序发出（前端会误判丢事件、白触发一次 sync）。
+        let mut hub = state
+            .chat_protocol
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(run) = hub.runs.get_mut(&run_id) {
+            run.flush_scheduled = false;
+        }
+        if let Some(envelope) = hub.flush_pending_delta(&run_id) {
+            emit_protocol(&app, ChatProtocolEvent::Run(envelope));
+        }
+    });
+}
+
 pub fn emit_run_event(app: &AppHandle, run_id: &str, event: ChatRunEvent) {
     let state = app.state::<AppState>();
-    let result = state
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .push(run_id, event);
-    match result {
-        Ok(event) => emit_protocol(app, ChatProtocolEvent::Run(event)),
-        Err(error) => eprintln!("Failed to record chat protocol event: {error}"),
+    let mut schedule = false;
+    {
+        // emit 留在锁内：入库（拿 seq）与发出必须是同一个临界区，否则与
+        // 延迟冲刷任务并发时事件会乱序到达前端。合帧后事件频率已经很低，
+        // 锁内一次 payload 序列化不构成争用点。
+        let mut hub = state
+            .chat_protocol
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let passthrough = match split_coalescible_delta(event) {
+            Ok(pending) => match hub.buffer_delta(run_id, pending) {
+                Ok((envelopes, schedule_flush)) => {
+                    for envelope in envelopes {
+                        emit_protocol(app, ChatProtocolEvent::Run(envelope));
+                    }
+                    schedule = schedule_flush;
+                    None
+                }
+                Err(pending) => Some(pending.into_event()),
+            },
+            Err(event) => {
+                // 非 delta 事件必须先把缓冲按原顺序入库，seq 才与到达顺序一致。
+                if let Some(envelope) = hub.flush_pending_delta(run_id) {
+                    emit_protocol(app, ChatProtocolEvent::Run(envelope));
+                }
+                Some(event)
+            }
+        };
+        if let Some(event) = passthrough {
+            match hub.push(run_id, event) {
+                Ok(envelope) => emit_protocol(app, ChatProtocolEvent::Run(envelope)),
+                Err(error) => eprintln!("Failed to record chat protocol event: {error}"),
+            }
+        }
+    }
+    if schedule {
+        schedule_delta_flush(app, run_id);
     }
 }
 
@@ -2221,6 +2651,107 @@ mod tests {
         assert_eq!(sequences, (2..=17).collect::<Vec<_>>());
     }
 
+    fn pending_text(delta: &str, segment: Option<ChatSegmentPayload>) -> PendingDelta {
+        PendingDelta {
+            kind: PendingDeltaKind::Text,
+            delta: delta.to_string(),
+            segment,
+            buffered_at: Instant::now(),
+        }
+    }
+
+    fn text_segment(id: &str) -> ChatSegmentPayload {
+        ChatSegmentPayload {
+            id: id.to_string(),
+            kind: ChatSegmentKind::Text,
+            phase: ChatSegmentPhase::Plain,
+            order: 0,
+            step_number: None,
+            round: None,
+            text: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn buffered_deltas_merge_into_single_event_with_identical_fold() {
+        let mut hub = ChatProtocolHub::default();
+        hub.register("conv", "run", "message", 0).unwrap();
+        let (envelopes, schedule) = hub.buffer_delta("run", pending_text("你好", None)).unwrap();
+        assert!(envelopes.is_empty());
+        assert!(schedule);
+        let (envelopes, schedule) = hub
+            .buffer_delta("run", pending_text("，世界", None))
+            .unwrap();
+        assert!(envelopes.is_empty());
+        // 已有一个在飞的延迟冲刷，不重复调度。
+        assert!(!schedule);
+        // 缓冲期间不占 seq、不进快照。
+        assert_eq!(hub.runs["run"].snapshot.last_seq, 1);
+        assert_eq!(hub.runs["run"].snapshot.content, "");
+        let flushed = hub.flush_pending_delta("run").unwrap();
+        assert_eq!(flushed.seq, 2);
+        assert!(matches!(
+            &flushed.event,
+            ChatRunEvent::TextDelta { delta, .. } if delta == "你好，世界"
+        ));
+        assert_eq!(hub.runs["run"].snapshot.content, "你好，世界");
+        assert!(hub.flush_pending_delta("run").is_none());
+    }
+
+    #[test]
+    fn segment_switch_flushes_previous_buffer_in_arrival_order() {
+        let mut hub = ChatProtocolHub::default();
+        hub.register("conv", "run", "message", 0).unwrap();
+        hub.buffer_delta("run", pending_text("a", Some(text_segment("seg_1"))))
+            .unwrap();
+        let (envelopes, _) = hub
+            .buffer_delta("run", pending_text("b", Some(text_segment("seg_2"))))
+            .unwrap();
+        // 段位切换：旧缓冲立即入库，seq 在新缓冲之前。
+        assert_eq!(envelopes.len(), 1);
+        assert!(matches!(
+            &envelopes[0].event,
+            ChatRunEvent::TextDelta { delta, segment: Some(segment) }
+                if delta == "a" && segment.id == "seg_1"
+        ));
+        let flushed = hub.flush_pending_delta("run").unwrap();
+        assert!(flushed.seq > envelopes[0].seq);
+        assert!(matches!(
+            &flushed.event,
+            ChatRunEvent::TextDelta { delta, segment: Some(segment) }
+                if delta == "b" && segment.id == "seg_2"
+        ));
+    }
+
+    #[test]
+    fn oversized_buffer_flushes_immediately() {
+        let mut hub = ChatProtocolHub::default();
+        hub.register("conv", "run", "message", 0).unwrap();
+        let (envelopes, schedule) = hub
+            .buffer_delta("run", pending_text(&"x".repeat(DELTA_COALESCE_MAX_BYTES), None))
+            .unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert!(!schedule);
+        assert!(hub.runs["run"].pending_delta.is_none());
+    }
+
+    #[test]
+    fn buffer_delta_refuses_unknown_and_terminal_runs() {
+        let mut hub = ChatProtocolHub::default();
+        assert!(hub.buffer_delta("missing", pending_text("x", None)).is_err());
+        hub.register("conv", "run", "message", 0).unwrap();
+        hub.push(
+            "run",
+            ChatRunEvent::RunCompleted {
+                full: String::new(),
+                conversation_revision: 1,
+            },
+        )
+        .unwrap();
+        assert!(hub.buffer_delta("run", pending_text("x", None)).is_err());
+    }
+
     #[test]
     fn oversized_event_falls_back_to_snapshot_when_replay_is_empty() {
         let mut hub = ChatProtocolHub::default();
@@ -2340,5 +2871,93 @@ mod tests {
             Some(Instant::now() - COMPLETED_RUN_TTL - Duration::from_secs(1));
         hub.prune();
         assert!(!hub.runs.contains_key(&expired));
+    }
+
+    #[test]
+    fn all_filter_accepts_every_conversation_until_exclusive_high_frequency() {
+        let all = ChatProtocolFilter::All;
+        let popout = ChatProtocolFilter::Conversation("conv-a".into());
+
+        assert!(all.accepts("conv-a", false, false));
+        assert!(all.accepts("conv-b", true, false));
+        assert!(popout.accepts("conv-a", true, true));
+        assert!(!popout.accepts("conv-b", true, true));
+
+        assert!(
+            all.accepts("conv-a", false, true),
+            "lifecycle edges still reach the main window"
+        );
+        assert!(
+            !all.accepts("conv-a", true, true),
+            "token stream of a popped conversation stays off the main window"
+        );
+        assert!(all.accepts("conv-b", true, false));
+        assert!(
+            all.accepts("conv-a", true, false),
+            "no live Conversation subscriber → do not black-hole tokens"
+        );
+    }
+
+    #[test]
+    fn popped_conversation_does_not_black_hole_when_popout_subscribed_as_all() {
+        let all = ChatProtocolFilter::All;
+        let popout = ChatProtocolFilter::Conversation("conv-a".into());
+        let both_all = labels_matching_filters(
+            [("chat", &all), ("chat-popout-conv-a", &all)],
+            "conv-a",
+            true,
+        );
+        assert_eq!(
+            both_all,
+            vec!["chat".to_string(), "chat-popout-conv-a".to_string()],
+            "a popout that subscribed as All must still receive tokens"
+        );
+
+        let exclusive = labels_matching_filters(
+            [("chat", &all), ("chat-popout-conv-a", &popout)],
+            "conv-a",
+            true,
+        );
+        assert_eq!(exclusive, vec!["chat-popout-conv-a".to_string()]);
+
+        let lifecycle = labels_matching_filters(
+            [("chat", &all), ("chat-popout-conv-a", &popout)],
+            "conv-a",
+            false,
+        );
+        assert_eq!(
+            lifecycle,
+            vec!["chat".to_string(), "chat-popout-conv-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_delta_is_high_frequency_but_run_started_is_not() {
+        let delta = ChatProtocolEvent::Run(ChatRunEventEnvelope {
+            protocol_version: CHAT_PROTOCOL_VERSION,
+            scope: ChatProtocolScope::Run,
+            conversation_id: "conv-a".into(),
+            run_id: "run".into(),
+            message_id: "msg".into(),
+            seq: 2,
+            base_revision: 0,
+            event: ChatRunEvent::TextDelta {
+                delta: "x".into(),
+                segment: None,
+            },
+        });
+        let started = ChatProtocolEvent::Run(ChatRunEventEnvelope {
+            protocol_version: CHAT_PROTOCOL_VERSION,
+            scope: ChatProtocolScope::Run,
+            conversation_id: "conv-a".into(),
+            run_id: "run".into(),
+            message_id: "msg".into(),
+            seq: 1,
+            base_revision: 0,
+            event: ChatRunEvent::RunStarted { recovery: None },
+        });
+        assert!(delta.is_high_frequency());
+        assert!(!started.is_high_frequency());
+        assert_eq!(delta.conversation_id(), "conv-a");
     }
 }

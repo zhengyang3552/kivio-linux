@@ -1173,6 +1173,7 @@ pub fn handle_agent_spawn<'a>(
             None,
             (!settings.obsidian_vault_path.trim().is_empty())
                 .then_some(settings.obsidian_vault_path.as_str()),
+            &parent_conversation.additional_directories,
         );
 
         let task_id = format!("agent-{}", uuid::Uuid::new_v4().simple());
@@ -1219,7 +1220,7 @@ pub fn handle_agent_spawn<'a>(
 
         // Model-aware output cap: prefer the model library / provider override
         // (matching top-level chat); the raw setting is only a fallback.
-        let max_output_tokens = crate::chat::model_metadata::chat_max_output_tokens_for_model(
+        let max_output_tokens = crate::chat::model_metadata::chat_max_output_tokens_on_wire(
             Some(&provider),
             &model,
             settings.chat.max_output_tokens,
@@ -2253,6 +2254,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         }
     }
 
@@ -2341,6 +2343,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         }
     }
 

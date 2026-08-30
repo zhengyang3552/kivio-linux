@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeSettings, type Settings } from './tauri'
+import {
+  normalizeSettings,
+  clampedActiveKeyIndex,
+  activeKeyIndexAfterRemove,
+  type Settings,
+} from './tauri'
 import { defaultChatTools } from '../settings/chatToolsShared'
 
 /**
@@ -72,6 +77,13 @@ describe('normalizeSettings', () => {
     expect(normalizeSettings(input).launchMinimizedToTray).toBe(false)
   })
 
+  it('旧设置缺少 keepChatWindowAlive 时默认关闭（关闭即销毁）', () => {
+    const input = baseSettings()
+    delete (input as Partial<Settings>).keepChatWindowAlive
+
+    expect(normalizeSettings(input).keepChatWindowAlive).toBe(false)
+  })
+
   it('保留 chat.externalCliAgents（回归：重建 chat 时丢掉 → 供应商列表变空）', () => {
     const providers = [
       {
@@ -131,5 +143,31 @@ describe('normalizeSettings', () => {
     // 其它 chat 字段仍归一
     expect(out.chat?.streamEnabled).toBe(false)
     expect(out.chat?.systemPrompt).toBe('hi')
+  })
+})
+
+describe('clampedActiveKeyIndex', () => {
+  it('空池和缺省都是 0', () => {
+    expect(clampedActiveKeyIndex([])).toBe(0)
+    expect(clampedActiveKeyIndex(['a', 'b'])).toBe(0)
+  })
+
+  it('越界夹到最后一条', () => {
+    expect(clampedActiveKeyIndex(['a', 'b'], 9)).toBe(1)
+    expect(clampedActiveKeyIndex(['a', 'b'], -1)).toBe(0)
+  })
+})
+
+describe('activeKeyIndexAfterRemove', () => {
+  it('删当前槽前面的条目时下标减一', () => {
+    expect(activeKeyIndexAfterRemove(2, 0, 2)).toBe(1)
+  })
+
+  it('删当前槽时夹到剩余范围', () => {
+    expect(activeKeyIndexAfterRemove(1, 1, 1)).toBe(0)
+  })
+
+  it('删后面的条目时下标不动', () => {
+    expect(activeKeyIndexAfterRemove(0, 1, 1)).toBe(0)
   })
 })

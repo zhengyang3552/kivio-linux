@@ -1501,11 +1501,32 @@ fn restore_macos_development_app_icon() {
     }
 }
 
-/// 关闭独立 AI 客户端窗口（销毁 chat WebView，与点右上角 × 一致）。
+/// 关闭独立 AI 客户端窗口（与点右上角 × 一致：默认销毁，开启保持后台时隐藏）。
 pub(crate) fn close_chat_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("chat") {
         let _ = window.close();
     }
+}
+
+/// 隐藏 chat 窗口并回收 Dock 身份，WebView 进程保留以便下次立刻复用。
+pub(crate) fn hide_chat_window(app: &AppHandle, window: &tauri::Window) {
+    let _ = window.hide();
+    #[cfg(target_os = "macos")]
+    crate::chat::popout::sync_macos_activation_policy(app);
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
+/// 关闭策略从「保持后台」切回「销毁」时，拆掉已隐藏的 chat WebView 以回收内存。
+/// 可见窗口不动——设置页就在 chat 里，不能把用户正在看的窗拆掉。
+pub(crate) fn destroy_hidden_chat_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("chat") else {
+        return;
+    };
+    if window.is_visible().ok().unwrap_or(true) {
+        return;
+    }
+    let _ = window.destroy();
 }
 
 /// 打开独立 AI 客户端窗口。
@@ -1652,6 +1673,16 @@ pub(crate) fn open_settings_window_for_activation(app: &AppHandle) -> Result<(),
         if label == "chat" {
             apply_macos_traffic_light_position(&window);
         }
+        return Ok(());
+    }
+    if let Some(window) = crate::chat::popout::first_visible_popout(app) {
+        #[cfg(target_os = "macos")]
+        set_macos_regular_activation_policy(app);
+        if window.is_minimized().unwrap_or(false) {
+            let _ = window.unminimize();
+        }
+        let _ = window.show();
+        let _ = window.set_focus();
         return Ok(());
     }
     open_chat_window(app)

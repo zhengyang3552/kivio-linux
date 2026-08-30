@@ -1,5 +1,6 @@
 // Chat API 调用封装
 import { invoke } from '@tauri-apps/api/core'
+import { isPlaceholderTitle, optimisticConversationTitle } from './conversationTitle'
 import { estimateTokens } from '../utils/tokens'
 import { isExecutableAgentPlanText } from './agentPlan'
 import { isTauriRuntime } from './utils'
@@ -20,7 +21,7 @@ import type {
   DetectedExternalAgent,
   PendingAttachment,
 } from './types'
-import type { ThinkingLevel, WebSearchMode, ModelRef } from './types'
+import type { ThinkingLevel, WebSearchMode, ModelRef, AdditionalDirectory } from './types'
 import type { CliImportResult, ImportableCliSession } from './types'
 
 export type { DetectedExternalAgent, AgentRuntimeConfig }
@@ -753,8 +754,12 @@ const mockChatApi = {
         }
       }
     }
-    if (conversation.title === '新对话') {
-      conversation.title = content.length > 30 ? `${content.slice(0, 30)}...` : content
+    if (isPlaceholderTitle(conversation.title)) {
+      const nextTitle = optimisticConversationTitle(
+        content,
+        attachments.map((attachment) => attachment.name),
+      )
+      if (nextTitle) conversation.title = nextTitle
     }
     conversation.updated_at = now
     const contextState = estimateMockContext(conversation)
@@ -875,6 +880,7 @@ const mockChatApi = {
       model?: string
       activeSkillId?: string | null
       assistantId?: string | null
+      additionalDirectories?: AdditionalDirectory[]
     }
   ): Promise<Conversation> {
     const conversations = loadMockConversations()
@@ -929,6 +935,10 @@ const mockChatApi = {
       }
     }
     conversation.activeSkillId = conversation.active_skill_id
+    if (updates.additionalDirectories !== undefined) {
+      conversation.additional_directories = updates.additionalDirectories
+      conversation.additionalDirectories = updates.additionalDirectories
+    }
     const contextState = estimateMockContext(conversation)
     conversation.context_state = contextState
     conversation.contextState = contextState
@@ -1756,6 +1766,7 @@ export const chatApi = {
       assistantId?: string | null
       knowledgeBaseIds?: string[]
       forceKnowledgeSearch?: boolean
+      additionalDirectories?: AdditionalDirectory[]
       thinkingLevel?: ThinkingLevel | null
       webSearchMode?: WebSearchMode | null
       replyModels?: ModelRef[]
@@ -1783,6 +1794,7 @@ export const chatApi = {
         assistantId: updates.assistantId,
         knowledgeBaseIds: updates.knowledgeBaseIds,
         forceKnowledgeSearch: updates.forceKnowledgeSearch,
+        additionalDirectories: updates.additionalDirectories,
         // null/未知 → 空串，后端解析为 None（回到「跟随全局」）。
         thinkingLevel: hasThinkingUpdate ? updates.thinkingLevel ?? '' : undefined,
         // 会话级三态联网搜索（任务 07-23）：null/未知 → 空串，后端回退全局开关。
@@ -2334,5 +2346,25 @@ export const chatApi = {
     if (!isTauriRuntime()) return null
     const id = await invoke<string | null>('chat_external_native_session_id', { conversationId })
     return id && id.trim() ? id : null
+  },
+
+  async openConversationPopout(conversationId: string): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke<void>('chat_open_conversation_popout', { conversationId })
+  },
+
+  async focusConversationPopout(conversationId: string): Promise<boolean> {
+    if (!isTauriRuntime()) return false
+    return invoke<boolean>('chat_focus_conversation_popout', { conversationId })
+  },
+
+  async closeConversationPopout(conversationId: string): Promise<void> {
+    if (!isTauriRuntime()) return
+    await invoke<void>('chat_close_conversation_popout', { conversationId })
+  },
+
+  async listConversationPopouts(): Promise<string[]> {
+    if (!isTauriRuntime()) return []
+    return invoke<string[]>('chat_list_conversation_popouts')
   },
 }

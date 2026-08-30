@@ -10,10 +10,12 @@ use crate::state::AppState;
 
 use super::super::storage::{
     assistant_snapshot, conversation_attachments_dir, find_project_by_id, find_project_by_name,
-    find_set_by_id, load_conversation,
+    find_set_by_id, load_conversation, normalize_additional_directories,
+    resolve_conversation_working_directory,
 };
 use super::super::{
-    AgentPlanState, AgentTodoState, ChatMessage, Conversation, ConversationContextState, ForkOrigin,
+    AdditionalDirectory, AgentPlanState, AgentTodoState, ChatMessage, Conversation,
+    ConversationContextState, ForkOrigin,
 };
 use super::catalog::{reconcile_conversation_orphan_tool_segments, strip_transcripts_for_frontend};
 use super::context::{
@@ -778,6 +780,7 @@ pub(crate) async fn chat_fork_conversation(
         agent_plan_state: AgentPlanState::default(),
         knowledge_base_ids: source.knowledge_base_ids.clone(),
         force_knowledge_search: source.force_knowledge_search,
+        additional_directories: source.additional_directories.clone(),
         thinking_level: source.thinking_level.clone(),
         web_search_mode: source.web_search_mode,
         reply_models: source.reply_models.clone(),
@@ -884,6 +887,7 @@ pub(crate) async fn chat_delete_conversation(
     if killed > 0 {
         eprintln!("Deleted conversation {conversation_id}: killed {killed} background command(s)");
     }
+    crate::chat::popout::close_popout_for_conversation(&app, &conversation_id);
     // 顺手清掉该对话在内存里按 conversation_id 累积的运行态小 map（stream 代际计数 /
     // 会话级工具同意），它们只插不删、严格无界——对话删了便永远不会再被引用。
     state.forget_chat_conversation_runtime(&conversation_id);
@@ -914,6 +918,7 @@ pub(crate) async fn chat_update_conversation(
     assistant_id: Option<String>,
     knowledge_base_ids: Option<Vec<String>>,
     force_knowledge_search: Option<bool>,
+    additional_directories: Option<Vec<AdditionalDirectory>>,
     thinking_level: Option<String>,
     web_search_mode: Option<String>,
     reply_models: Option<Vec<crate::chat::ModelRef>>,
@@ -921,7 +926,9 @@ pub(crate) async fn chat_update_conversation(
     let mut conversation = crate::chat::repository::repository(&app)
         .mutate(&app, &conversation_id, |conversation| {
             if let Some(t) = title {
-                conversation.title = t;
+                if !super::title::is_placeholder_title(&t) {
+                    conversation.title = t;
+                }
             }
             if let Some(p) = pinned {
                 conversation.pinned = p;
@@ -1004,6 +1011,18 @@ pub(crate) async fn chat_update_conversation(
             }
             if let Some(force) = force_knowledge_search {
                 conversation.force_knowledge_search = force;
+            }
+            if let Some(entries) = additional_directories {
+                let settings = crate::settings::load_settings(&app);
+                let primary = resolve_conversation_working_directory(
+                    &app,
+                    conversation,
+                    &settings.chat_tools.native_tools.working_directory,
+                )
+                .ok()
+                .map(|path| path.to_string_lossy().to_string());
+                conversation.additional_directories =
+                    normalize_additional_directories(entries, primary.as_deref())?;
             }
             if let Some(level) = thinking_level {
                 // 仅接受已知值；空串/未知 → 清除（回到「跟随全局」）。
@@ -1184,6 +1203,7 @@ pub(crate) async fn chat_bulk_delete_conversations(
             );
         }
         state.forget_chat_conversation_runtime(&conversation_id);
+        crate::chat::popout::close_popout_for_conversation(&app, &conversation_id);
         match crate::chat::repository::repository(&app)
             .delete(&app, &conversation_id)
             .await

@@ -9,7 +9,7 @@ use crate::chat::attachments::{
     compose_text_attachments_for_api, text_attachments_from_attachments,
 };
 use crate::chat::model_metadata::{
-    chat_max_output_tokens_for_model, model_can_generate_images_directly,
+    chat_max_output_tokens_on_wire, model_can_generate_images_directly,
 };
 use crate::chat::storage::live_set_system_prompt;
 use crate::chat::vision::{
@@ -536,6 +536,7 @@ pub(super) async fn complete_assistant_reply_inner(
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
+        &conversation.additional_directories,
     );
     // 从未成功连接的 MCP server：工具没法降级进列表，注一行说明让模型知道
     // "配置了但连不上"，而不是回答"没有这个工具"。
@@ -600,6 +601,7 @@ pub(super) async fn complete_assistant_reply_inner(
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
+        &conversation.additional_directories,
     );
 
     let chat_host = ChatAgentHost {
@@ -632,6 +634,7 @@ pub(super) async fn complete_assistant_reply_inner(
     // 否则模型调用敏感工具或 ask_user 会 await GUI 应答而永久挂起。
     #[cfg(debug_assertions)]
     let probe_host = ProbeAgentHost {
+        app: app.clone(),
         state: state.inner(),
     };
     let host: &dyn crate::chat::agent::AgentHost = {
@@ -653,7 +656,7 @@ pub(super) async fn complete_assistant_reply_inner(
         app: app.clone(),
         state: state.inner(),
     };
-    let max_output_tokens = chat_max_output_tokens_for_model(
+    let max_output_tokens = chat_max_output_tokens_on_wire(
         Some(&provider),
         &resolved_model,
         settings.chat.max_output_tokens,

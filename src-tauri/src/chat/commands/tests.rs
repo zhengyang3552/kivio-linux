@@ -203,6 +203,7 @@ fn test_provider(id: &str, name: &str, enabled_models: Vec<&str>) -> ModelProvid
         model_overrides: HashMap::new(),
         compress_request_body: false,
         request: Default::default(),
+        active_key_index: 0,
     }
 }
 
@@ -1585,6 +1586,7 @@ fn test_conversation_with_summary(stale: bool) -> Conversation {
         agent_plan_state: AgentPlanState::default(),
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
+        additional_directories: Vec::new(),
         thinking_level: None,
         web_search_mode: None,
         reply_models: Vec::new(),
@@ -2008,6 +2010,7 @@ fn auxiliary_vision_result_becomes_text_for_main_chat_model() {
         agent_plan_state: AgentPlanState::default(),
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
+        additional_directories: Vec::new(),
         thinking_level: None,
         web_search_mode: None,
         reply_models: Vec::new(),
@@ -2292,6 +2295,7 @@ fn build_chat_api_messages_replays_hidden_tool_transcript() {
         agent_plan_state: AgentPlanState::default(),
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
+        additional_directories: Vec::new(),
         thinking_level: None,
         web_search_mode: None,
         reply_models: Vec::new(),
@@ -2421,6 +2425,7 @@ fn build_chat_api_messages_sanitizes_image_payloads_in_replayed_history() {
             agent_plan_state: AgentPlanState::default(),
             knowledge_base_ids: Vec::new(),
             force_knowledge_search: false,
+            additional_directories: Vec::new(),
         thinking_level: None,
         web_search_mode: None,
             reply_models: Vec::new(),
@@ -2515,6 +2520,7 @@ fn test_conversation_with_messages(messages: Vec<ChatMessage>) -> Conversation {
         agent_plan_state: AgentPlanState::default(),
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
+        additional_directories: Vec::new(),
         thinking_level: None,
         web_search_mode: None,
         reply_models: Vec::new(),

@@ -1,16 +1,16 @@
 import { useEffect, useState } from 'react'
 import {
   Plus, Minus, Trash2, RefreshCw, Eye, EyeOff, Wrench, Brain,
-  ArrowLeft, ChevronRight, SlidersHorizontal,
+  ArrowLeft, ChevronRight, SlidersHorizontal, List,
   Image as ImageIcon,
 } from 'lucide-react'
-import { Select, Input, SettingsGroup, FieldBlock } from '../components'
+import { Select, Input, SettingsGroup, FieldBlock, Toggle } from '../components'
 import { Button, IconButton } from '../../components/Button'
 import { ModelIcon } from '../../chat/ModelIcon'
 import { PROVIDER_PRESETS } from '../providerPresets'
 import { ProviderRequestPanel } from '../ProviderRequestPanel'
 import { resolveModelInfo } from '../../data/modelMatching'
-import { api, normalizeProviderApiFormat } from '../../api/tauri'
+import { api, normalizeProviderApiFormat, clampedActiveKeyIndex, activeKeyIndexAfterRemove } from '../../api/tauri'
 import type { I18n, Lang } from '../i18n'
 import type { ModelProvider } from '../../api/tauri'
 
@@ -21,7 +21,6 @@ export function ProviderDetail({
   lang,
   revealedKeys,
   gzipInfoOpen,
-  fetchingProviderId,
   onUpdateProvider,
   onToggleGzipInfo,
   onToggleKeyReveal,
@@ -35,7 +34,6 @@ export function ProviderDetail({
   lang: Lang
   revealedKeys: Set<string>
   gzipInfoOpen: Set<string>
-  fetchingProviderId: string | null
   onUpdateProvider: (id: string, updates: Partial<ModelProvider>) => void
   onToggleGzipInfo: (id: string) => void
   onToggleKeyReveal: (keyId: string) => void
@@ -120,50 +118,68 @@ export function ProviderDetail({
               </button>
             )
           })()}
-          {(provider.apiKeys.length > 0 ? provider.apiKeys : ['']).map((key, idx) => {
-            const total = Math.max(provider.apiKeys.length, 1)
-            const keyId = `${provider.id}-${idx}`
-            const revealed = revealedKeys.has(keyId)
-            return (
-              <div key={`${provider.id}-${total}-${idx}`} className="flex items-center gap-1.5">
-                <Input
-                  type={revealed ? 'text' : 'password'}
-                  value={key}
-                  mono
-                  onChange={(v) => {
-                    const base = provider.apiKeys.length > 0 ? [...provider.apiKeys] : ['']
-                    base[idx] = v
-                    onUpdateProvider(provider.id, { apiKeys: base })
-                  }}
-                  placeholder={idx === 0 ? `sk-... (${t.apiKeyPrimary})` : `sk-... (${t.apiKeyBackup})`}
-                />
-                <IconButton
-                  size="xs"
-                  onClick={() => onToggleKeyReveal(keyId)}
-                  title={revealed ? (lang === 'zh' ? '隐藏密钥' : 'Hide key') : (lang === 'zh' ? '显示密钥' : 'Show key')}
-                  label={revealed ? (lang === 'zh' ? '隐藏密钥' : 'Hide key') : (lang === 'zh' ? '显示密钥' : 'Show key')}
-                  data-tauri-drag-region="false"
-                >
-                  {revealed ? <EyeOff size={12} /> : <Eye size={12} />}
-                </IconButton>
-                {total > 1 && (
-                  <IconButton
-                    variant="danger"
-                    size="xs"
-                    onClick={() => {
-                      const next = provider.apiKeys.filter((_, i) => i !== idx)
-                      onUpdateProvider(provider.id, { apiKeys: next })
+          {(() => {
+            const keys = provider.apiKeys.length > 0 ? provider.apiKeys : ['']
+            const total = keys.length
+            const activeIndex = clampedActiveKeyIndex(keys, provider.activeKeyIndex)
+            return keys.map((key, idx) => {
+              const keyId = `${provider.id}-${idx}`
+              const revealed = revealedKeys.has(keyId)
+              const isCurrent = idx === activeIndex
+              return (
+                <div key={`${provider.id}-${total}-${idx}`} className="flex items-center gap-1.5">
+                  {total > 1 && (
+                    <Toggle
+                      checked={isCurrent}
+                      onChange={() => {
+                        if (isCurrent) return
+                        onUpdateProvider(provider.id, { activeKeyIndex: idx })
+                      }}
+                      ariaLabel={isCurrent ? t.apiKeyCurrent : t.apiKeyUse}
+                    />
+                  )}
+                  <Input
+                    type={revealed ? 'text' : 'password'}
+                    value={key}
+                    mono
+                    onChange={(v) => {
+                      const base = provider.apiKeys.length > 0 ? [...provider.apiKeys] : ['']
+                      base[idx] = v
+                      onUpdateProvider(provider.id, { apiKeys: base })
                     }}
-                    title={t.removeKey}
-                    label={t.removeKey}
+                    placeholder={isCurrent ? `sk-... (${t.apiKeyPrimary})` : `sk-... (${t.apiKeyBackup})`}
+                  />
+                  <IconButton
+                    size="xs"
+                    onClick={() => onToggleKeyReveal(keyId)}
+                    title={revealed ? (lang === 'zh' ? '隐藏密钥' : 'Hide key') : (lang === 'zh' ? '显示密钥' : 'Show key')}
+                    label={revealed ? (lang === 'zh' ? '隐藏密钥' : 'Hide key') : (lang === 'zh' ? '显示密钥' : 'Show key')}
                     data-tauri-drag-region="false"
                   >
-                    <Trash2 size={12} />
+                    {revealed ? <EyeOff size={12} /> : <Eye size={12} />}
                   </IconButton>
-                )}
-              </div>
-            )
-          })}
+                  {total > 1 && (
+                    <IconButton
+                      variant="danger"
+                      size="xs"
+                      onClick={() => {
+                        const next = provider.apiKeys.filter((_, i) => i !== idx)
+                        onUpdateProvider(provider.id, {
+                          apiKeys: next,
+                          activeKeyIndex: activeKeyIndexAfterRemove(activeIndex, idx, next.length),
+                        })
+                      }}
+                      title={t.removeKey}
+                      label={t.removeKey}
+                      data-tauri-drag-region="false"
+                    >
+                      <Trash2 size={12} />
+                    </IconButton>
+                  )}
+                </div>
+              )
+            })
+          })()}
         </div>
         <Button
           size="sm"
@@ -189,10 +205,8 @@ export function ProviderDetail({
             onClick={() => onOpenModelPicker(provider.id)}
             data-tauri-drag-region="false"
           >
-            <RefreshCw size={10} className={fetchingProviderId === provider.id ? 'animate-spin' : ''} />
-            {provider.availableModels.length > 0
-              ? (lang === 'zh' ? '管理模型' : 'Models')
-              : t.fetchModels}
+            <List size={12} />
+            {lang === 'zh' ? '管理模型' : 'Models'}
           </Button>
           <Button
             size="sm"
@@ -244,7 +258,7 @@ export function ProviderDetail({
         <ul className="kv-enabled-model-list">
           {provider.enabledModels.length === 0 && (
             <li className="kv-enabled-model-empty">
-              {lang === 'zh' ? '点击上方「获取模型列表」拉取并添加模型。' : 'Use "Fetch Models" above to load and add models.'}
+              {lang === 'zh' ? '打开「管理模型」拉取并添加。' : 'Open “Models” to fetch and add models.'}
             </li>
           )}
           {provider.enabledModels.map(model => {

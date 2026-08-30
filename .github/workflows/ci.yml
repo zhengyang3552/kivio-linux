@@ -3,9 +3,16 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
   pull_request:
     branches: [main]
-
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
 jobs:
   app-checks:
     runs-on: ubuntu-latest

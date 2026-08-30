@@ -204,6 +204,18 @@ pub(super) fn sanitize_generated_title(raw: &str) -> Option<String> {
 
 const FORK_TITLE_SUFFIX: &str = "（分支）";
 
+/// 创建会话时写入的内部占位。界面不得展示这个字样。
+pub(crate) const PLACEHOLDER_CONVERSATION_TITLE: &str = "新对话";
+
+pub(crate) fn is_placeholder_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    let base = trimmed
+        .strip_suffix(FORK_TITLE_SUFFIX)
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    base == PLACEHOLDER_CONVERSATION_TITLE
+}
+
 /// 首轮用户消息 + 第一条非空助手回复，供标题模型使用。
 /// 空对话、或首条用户消息既无正文也无附件时返回 `None`。
 pub(super) fn first_turn_title_inputs(messages: &[ChatMessage]) -> Option<(String, String)> {
@@ -297,6 +309,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn placeholder_title_is_the_create_sentinel() {
+        assert!(is_placeholder_title("新对话"));
+        assert!(is_placeholder_title(" 新对话 "));
+        assert!(is_placeholder_title("新对话（分支）"));
+        assert!(!is_placeholder_title("Apex 掉帧"));
+        assert!(!is_placeholder_title(""));
+    }
+
+    #[test]
     fn title_model_call_spec_stays_stream_friendly() {
         let spec = title_model_call_spec();
         // thinking_enabled=false would inject effort:"none" and 400 on xAI.
@@ -315,8 +336,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             crate::macos_ocr::MacOcrClient::disabled(),
             offline_models.clone(),
-            crate::rapidocr::RapidOcrClient::new(offline_models.clone()),
-            crate::inpainting::InpaintingClient::new(offline_models),
+            crate::rapidocr::RapidOcrClient::new(offline_models),
         )
     }
 
@@ -334,6 +354,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         }
     }
 

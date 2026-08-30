@@ -422,10 +422,11 @@ impl AnthropicMessagesProvider<'_> {
     }
 
     fn request_body(&self, request: &GenerateRequest, stream: bool) -> Value {
+        let max_tokens = anthropic_required_max_tokens(request.options.max_tokens);
         let mut body = serde_json::json!({
             "model": request.model,
             "messages": anthropic_messages_from_generate_request(request),
-            "max_tokens": request.options.max_tokens,
+            "max_tokens": max_tokens,
         });
         let profile = crate::chat::model_metadata::claude_thinking_profile(&request.model);
         if !profile.is_some_and(|profile| profile.forbid_temperature) {
@@ -558,8 +559,8 @@ impl AnthropicMessagesProvider<'_> {
         metadata: &crate::chat::model::RequestMetadata,
     ) -> std::collections::BTreeMap<String, String> {
         let mut headers = std::collections::BTreeMap::new();
-        if let Some(key) = self.provider.api_keys.first() {
-            headers.insert("x-api-key".to_string(), key.clone());
+        if let Some(key) = self.provider.preferred_api_key() {
+            headers.insert("x-api-key".to_string(), key.to_string());
         }
         headers.insert(
             "anthropic-version".to_string(),
@@ -754,7 +755,7 @@ fn apply_anthropic_thinking(
         ClaudeThinkingKind::Extended => {
             let Some(budget) = clamp_extended_thinking_budget(
                 extended_thinking_budget_for_level(level),
-                request.options.max_tokens,
+                anthropic_required_max_tokens(request.options.max_tokens),
             ) else {
                 return;
             };
@@ -778,6 +779,15 @@ fn apply_anthropic_thinking(
             body["output_config"]["effort"] = serde_json::json!(level);
         }
         ClaudeThinkingKind::Unsupported => {}
+    }
+}
+
+/// Anthropic Messages 的 `max_tokens` 是必填字段，0 时用代码默认（16384）。
+fn anthropic_required_max_tokens(requested: u32) -> u32 {
+    if requested > 0 {
+        requested
+    } else {
+        crate::settings::default_chat_max_output_tokens()
     }
 }
 
@@ -1812,6 +1822,7 @@ mod tests {
             model_overrides,
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         let adapter = AnthropicMessagesProvider::new(&state, &provider, 1);
         let request = GenerateRequest {
@@ -1970,6 +1981,7 @@ mod tests {
             model_overrides: Default::default(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         let adapter = AnthropicMessagesProvider::new(&state, &provider, 1);
         let base = GenerateRequest {
@@ -2174,6 +2186,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            active_key_index: 0,
         }
     }
 

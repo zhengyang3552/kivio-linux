@@ -10,7 +10,6 @@ pub mod connectors;
 pub mod dock;
 pub mod external_agents;
 pub mod fonts;
-pub mod inpainting;
 pub mod lens;
 pub mod lens_commands;
 #[cfg(target_os = "linux")]
@@ -59,8 +58,8 @@ use settings::load_settings;
 #[cfg(target_os = "macos")]
 use shortcuts::set_macos_regular_activation_policy;
 use shortcuts::{
-    display_hotkey_errors, open_chat_window, open_settings_window_for_activation, register_hotkeys,
-    setup_tray,
+    display_hotkey_errors, hide_chat_window, open_chat_window, open_settings_window_for_activation,
+    register_hotkeys, setup_tray,
 };
 use state::AppState;
 use updates::check_github_latest_release;
@@ -77,10 +76,13 @@ const USER_WINDOW_LABELS: &[&str] = &["chat", "main"];
 
 #[cfg(target_os = "macos")]
 fn first_visible_user_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
-    USER_WINDOW_LABELS.iter().find_map(|label| {
-        app.get_webview_window(label)
-            .filter(|window| window.is_visible().ok().unwrap_or(false))
-    })
+    USER_WINDOW_LABELS
+        .iter()
+        .find_map(|label| {
+            app.get_webview_window(label)
+                .filter(|window| window.is_visible().ok().unwrap_or(false))
+        })
+        .or_else(|| crate::chat::popout::first_visible_popout(app))
 }
 
 /// Windows：让本进程退出 EcoQoS 执行速度节流，使其在无窗口/后台空闲时仍保持正常调度，
@@ -157,6 +159,22 @@ pub fn run() {
         .plugin(autostart_plugin)
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
+                if window.label() == "chat" {
+                    let keep_alive = window
+                        .app_handle()
+                        .state::<AppState>()
+                        .settings_read()
+                        .keep_chat_window_alive;
+                    if keep_alive {
+                        api.prevent_close();
+                        hide_chat_window(window.app_handle(), window);
+                    }
+                    return;
+                }
+                if crate::chat::popout::is_popout_label(window.label()) {
+                    // 弹出窗关即销毁，不走主聊天窗 keep-alive。
+                    return;
+                }
                 if window.label() == "lens" || window.label() == "translate" {
                     api.prevent_close();
                     // Windows：原生关闭（Alt+F4 等 WM_CLOSE）也要走完整清理 + destroy，回收内存，
@@ -199,15 +217,18 @@ pub fn run() {
                 }
             }
             tauri::WindowEvent::Destroyed => {
-                // macOS：Dock 图标身份由 Chat 窗口撑起（open/reveal 时切 Regular）。Chat
-                // 销毁后切回 Accessory 隐藏 Dock 图标，回到后台常驻形态；其余窗口
-                // （translator/lens/translate）本就是 Accessory 友好的浮层，不占 Dock。
-                // 下次打开 Chat 时 open_chat_window/reveal_chat_window 会再切回 Regular。
+                let label = window.label();
+                if crate::chat::popout::is_popout_label(label) {
+                    crate::chat::popout::on_popout_destroyed(window.app_handle(), label);
+                } else if label == "chat" {
+                    crate::chat::protocol::unsubscribe_label(
+                        &window.app_handle().state::<AppState>(),
+                        "chat",
+                    );
+                }
                 #[cfg(target_os = "macos")]
-                if window.label() == "chat" {
-                    let _ = window
-                        .app_handle()
-                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                if label == "chat" || crate::chat::popout::is_popout_label(label) {
+                    crate::chat::popout::sync_macos_activation_policy(window.app_handle());
                 }
             }
             _ => {}
@@ -215,10 +236,9 @@ pub fn run() {
         .setup(|app| {
             let launched_from_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
 
-            // Windows：退出后台执行速度节流（EcoQoS）。本应用所有窗口都可关闭（关闭即销毁,
-            // 空闲降到 ~50MB），无窗口时进程会被 Win11 当后台空闲进程节流,饿死全局热键的
-            // WM_HOTKEY 消息泵 → 热键失灵（托盘点击是 shell 唤醒故仍可用）。退出 EXECUTION_SPEED
-            // 节流后,即便无窗口空闲也保持正常调度,热键消息泵持续工作。
+            // Windows：退出后台执行速度节流（EcoQoS）。无可见窗口时进程会被 Win11 当后台空闲
+            // 进程节流,饿死全局热键的 WM_HOTKEY 消息泵 → 热键失灵（托盘点击是 shell 唤醒故仍
+            // 可用）。退出 EXECUTION_SPEED 节流后,即便无窗口空闲也保持正常调度,热键消息泵持续工作。
             #[cfg(target_os = "windows")]
             disable_process_power_throttling();
 
@@ -239,6 +259,15 @@ pub fn run() {
             // 会话副产物：空/孤儿工作区目录、已删会话残留的附件目录。只碰 Kivio 自己造的
             // `conv_*` 目录，非空的孤儿工作区只报数不删（里面是用户产物）。
             chat::gc::sweep_conversation_side_artifacts(app.handle());
+
+            // 崩溃残留的中断草稿日志:按每个 message_id 的最后一行合并回会话文件后删除。
+            // setup 阶段不可能有活跃 run,没有并发写冲突。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    chat::draft_journal::recover_orphan_drafts(&handle).await;
+                });
+            }
 
             // 周期性回收闲置的持久外部 CLI **进程**（10 分钟无活动即丢弃 → actor 关闭子进程）。
             // 原生会话 id 仍落在 disk 上，下一轮（或重新打开这条对话）必须 resume，不是开新会话。
@@ -333,7 +362,6 @@ pub fn run() {
 
             let offline_models =
                 offline_models::OfflineModelManager::new(&app.handle(), build_http_client());
-            let inpainting = inpainting::InpaintingClient::new(offline_models.clone());
             app.manage(AppState::base(
                 settings,
                 usage_dir,
@@ -342,7 +370,6 @@ pub fn run() {
                 macos_ocr::MacOcrClient::new(&app.handle()),
                 offline_models.clone(),
                 rapidocr::RapidOcrClient::new(offline_models),
-                inpainting,
             ));
             app.manage(chat::repository::ConversationRepository::default());
             // Dock 的 workspace 文件监听服务（文件树 / Git 面板的秒级刷新源）。
@@ -554,6 +581,11 @@ pub fn run() {
             chat::commands::interaction::get_request_debug_records,
             chat::commands::interaction::clear_request_debug_records,
             chat::protocol::chat_sync_state,
+            chat::protocol::chat_protocol_subscribe,
+            chat::popout::chat_open_conversation_popout,
+            chat::popout::chat_focus_conversation_popout,
+            chat::popout::chat_close_conversation_popout,
+            chat::popout::chat_list_conversation_popouts,
             // Chat 模块命令
             chat::commands::catalog::chat_get_conversations,
             chat::commands::interaction::chat_list_background_tasks,

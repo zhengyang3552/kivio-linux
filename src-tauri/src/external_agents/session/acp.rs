@@ -8,6 +8,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
+use super::acp_terminal::{AcpTerminalHost, TerminalReply};
 use crate::external_agents::session::live::SessionCommand;
 use crate::external_agents::stream::{usage_from_parts, CliUsageParts};
 use crate::external_agents::types::{
@@ -47,7 +48,11 @@ pub struct AcpMcpServer {
     pub env: Vec<(String, String)>,
 }
 
-fn build_session_new_params(cwd: &Path, mcp_servers: &[AcpMcpServer]) -> Value {
+fn build_session_new_params(
+    cwd: &Path,
+    mcp_servers: &[AcpMcpServer],
+    additional_directories: Option<&[String]>,
+) -> Value {
     let servers: Vec<Value> = mcp_servers
         .iter()
         .map(|s| {
@@ -60,14 +65,23 @@ fn build_session_new_params(cwd: &Path, mcp_servers: &[AcpMcpServer]) -> Value {
             })
         })
         .collect();
-    json!({
+    let mut params = json!({
         "cwd": cwd.to_string_lossy(),
         "mcpServers": servers,
-    })
+    });
+    if let Some(dirs) = additional_directories {
+        params["additionalDirectories"] = json!(dirs);
+    }
+    params
 }
 
-fn build_session_load_params(cwd: &Path, session_id: &str, mcp_servers: &[AcpMcpServer]) -> Value {
-    let mut params = build_session_new_params(cwd, mcp_servers);
+fn build_session_load_params(
+    cwd: &Path,
+    session_id: &str,
+    mcp_servers: &[AcpMcpServer],
+    additional_directories: Option<&[String]>,
+) -> Value {
+    let mut params = build_session_new_params(cwd, mcp_servers, additional_directories);
     params["sessionId"] = json!(session_id);
     params
 }
@@ -128,6 +142,53 @@ async fn write_rpc_result(
         .write_all(line.as_bytes())
         .await
         .map_err(|e| e.to_string())
+}
+
+async fn write_rpc_error(
+    stdin: &mut tokio::process::ChildStdin,
+    id: &Value,
+    code: i64,
+    message: &str,
+) -> Result<(), String> {
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
+    });
+    let mut line = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    line.push('\n');
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn agent_supports_additional_directories(initialize_result: &Value) -> bool {
+    if initialize_result
+        .pointer("/agentCapabilities/sessionCapabilities/additionalDirectories")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    initialize_result
+        .pointer("/capabilities/session/additionalDirectories")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn acp_initialize_params(terminal: bool) -> Value {
+    // Live chat sessions must advertise `terminal: true` and implement `terminal/*`.
+    // Probe/import processes never handle those methods, so they keep it false.
+    json!({
+        "protocolVersion": ACP_PROTOCOL_VERSION,
+        "clientCapabilities": { "terminal": terminal },
+        "clientInfo": {
+            "name": "kivio",
+            "title": "Kivio",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+    })
 }
 
 fn rpc_error_message(value: &Value) -> Option<String> {
@@ -514,18 +575,9 @@ pub async fn detect_acp_models(
     let mut reasoning_options: Vec<RuntimeModelOption> = Vec::new();
     let deadline = Duration::from_secs(timeout_secs);
 
-    write_rpc(
-        &mut stdin,
-        1,
-        "initialize",
-        json!({
-            "protocolVersion": ACP_PROTOCOL_VERSION,
-            "clientCapabilities": { "terminal": false },
-            "clientInfo": { "name": "kivio", "version": "external-agents" },
-        }),
-    )
-    .await
-    .ok()?;
+    write_rpc(&mut stdin, 1, "initialize", acp_initialize_params(false))
+        .await
+        .ok()?;
 
     let started = std::time::Instant::now();
     // 收到 session/new 结果后再留一个短窗口（1.5s）收异步 session/update 推送的模型（N4）——
@@ -589,7 +641,7 @@ pub async fn detect_acp_models(
                 &mut stdin,
                 next_id,
                 "session/new",
-                build_session_new_params(&cli_protocol_cwd(bin, cwd), &[]),
+                build_session_new_params(&cli_protocol_cwd(bin, cwd), &[], None),
             )
             .await
             .ok()?;
@@ -696,18 +748,9 @@ pub async fn detect_acp_commands(
     let mut commands: Option<Vec<ExternalCliSlashCommand>> = None;
     let deadline = Duration::from_secs(timeout_secs);
 
-    write_rpc(
-        &mut stdin,
-        1,
-        "initialize",
-        json!({
-            "protocolVersion": ACP_PROTOCOL_VERSION,
-            "clientCapabilities": { "terminal": false },
-            "clientInfo": { "name": "kivio", "version": "external-agents" },
-        }),
-    )
-    .await
-    .ok()?;
+    write_rpc(&mut stdin, 1, "initialize", acp_initialize_params(false))
+        .await
+        .ok()?;
 
     let started = std::time::Instant::now();
     loop {
@@ -774,7 +817,7 @@ pub async fn detect_acp_commands(
                 &mut stdin,
                 next_id,
                 "session/new",
-                build_session_new_params(&cli_protocol_cwd(bin, cwd), &[]),
+                build_session_new_params(&cli_protocol_cwd(bin, cwd), &[], None),
             )
             .await
             .ok()?;
@@ -980,24 +1023,105 @@ fn acp_is_terminal_failure(status: &str) -> bool {
     )
 }
 
-fn acp_result_content(update: &serde_json::Map<String, Value>) -> String {
-    update
+fn acp_result_content(
+    update: &serde_json::Map<String, Value>,
+    terminals: Option<&AcpTerminalHost>,
+) -> String {
+    let Some(value) = update
         .get("content")
         .or_else(|| update.get("output"))
         .or_else(|| update.get("result"))
-        .map(|value| {
-            if let Some(text) = value.as_str() {
-                text.to_string()
-            } else {
-                value.to_string()
-            }
-        })
-        .unwrap_or_else(|| acp_tool_name(update))
+    else {
+        return acp_tool_name(update);
+    };
+    let text = explain_acp_agent_policy_error(&flatten_acp_tool_blocks(value, terminals));
+    if text.is_empty() {
+        acp_tool_name(update)
+    } else {
+        text
+    }
+}
+
+/// Pull readable text out of ACP `tool_call` content (string, text blocks, or a
+/// `{type:"terminal"}` block whose stdout lives on the host).
+pub(crate) fn flatten_acp_tool_content(content: &Value) -> String {
+    flatten_acp_tool_blocks(content, None)
+}
+
+fn flatten_acp_tool_blocks(content: &Value, terminals: Option<&AcpTerminalHost>) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| acp_tool_block_text(item, terminals))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(_) => acp_tool_block_text(content, terminals).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn acp_tool_block_text(block: &Value, terminals: Option<&AcpTerminalHost>) -> Option<String> {
+    if let Some(text) = block.as_str() {
+        return Some(text.to_string());
+    }
+    match block.get("type").and_then(Value::as_str).unwrap_or("") {
+        "terminal" => {
+            let id = block
+                .get("terminalId")
+                .or_else(|| block.get("terminal_id"))
+                .and_then(Value::as_str)?;
+            terminals
+                .and_then(|host| host.preview_output(id))
+                .filter(|output| !output.is_empty())
+        }
+        "content" => block
+            .get("content")
+            .and_then(|inner| acp_tool_block_text(inner, terminals)),
+        "diff" => None,
+        _ => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// Kimi 0.37 在广告 `terminal` 后把全部 spawn 换成宿主终端，又只放行 `bash -c`。
+/// 原文看起来像 Kivio 没接好，其实是 agent 策略。
+pub(crate) fn explain_acp_agent_policy_error(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return raw.to_string();
+    }
+    if trimmed.contains("Kimi 在 ACP 下") || trimmed.contains("Kimi 需要宿主提供 ACP 终端")
+    {
+        return raw.to_string();
+    }
+    if trimmed.contains("ACP runtime only supports interactive Bash tool processes") {
+        return format!(
+            "Kimi 在 ACP 下只用 Bash 执行命令，不会把 Glob/Grep 交给宿主。可用 Bash 查找或搜索。\n\n{trimmed}"
+        );
+    }
+    if trimmed.contains("ACP terminal capability is unavailable") {
+        return format!(
+            "Kimi 需要宿主提供 ACP 终端才能跑命令。当前会话没有广告该能力，Bash 也会失败。\n\n{trimmed}"
+        );
+    }
+    raw.to_string()
 }
 
 fn apply_acp_session_update(
     update: &serde_json::Map<String, Value>,
     emitted_tool_ids: &mut HashSet<String>,
+    sink: &mut impl FnMut(UnifiedAgentEvent),
+) -> bool {
+    apply_acp_session_update_ex(update, emitted_tool_ids, None, sink)
+}
+
+fn apply_acp_session_update_ex(
+    update: &serde_json::Map<String, Value>,
+    emitted_tool_ids: &mut HashSet<String>,
+    terminals: Option<&AcpTerminalHost>,
     sink: &mut impl FnMut(UnifiedAgentEvent),
 ) -> bool {
     let session_update = update
@@ -1034,7 +1158,7 @@ fn apply_acp_session_update(
                 if acp_is_terminal_success(&status) || acp_is_terminal_failure(&status) {
                     sink(UnifiedAgentEvent::ToolResult {
                         tool_use_id: id,
-                        content: acp_result_content(update),
+                        content: acp_result_content(update, terminals),
                         is_error: acp_is_terminal_failure(&status),
                     });
                 }
@@ -1117,6 +1241,15 @@ fn acp_apply_session_update(
     state: &mut AcpUpdateState,
     sink: &mut dyn FnMut(UnifiedAgentEvent),
 ) {
+    acp_apply_session_update_ex(update, state, None, sink);
+}
+
+fn acp_apply_session_update_ex(
+    update: &serde_json::Map<String, Value>,
+    state: &mut AcpUpdateState,
+    terminals: Option<&AcpTerminalHost>,
+    sink: &mut dyn FnMut(UnifiedAgentEvent),
+) {
     let session_update = update
         .get("sessionUpdate")
         .and_then(|v| v.as_str())
@@ -1154,7 +1287,9 @@ fn acp_apply_session_update(
         _ => {
             // tool_call / tool_call_update 是消息边界:发出工具事件后,重置正文与思考游标,
             // 使其后到来的累积快照被识别为新消息起点。
-            if apply_acp_session_update(update, &mut state.emitted_tools, &mut |e| sink(e)) {
+            if apply_acp_session_update_ex(update, &mut state.emitted_tools, terminals, &mut |e| {
+                sink(e)
+            }) {
                 state.text.on_boundary();
                 state.thought.on_boundary();
             }
@@ -1234,6 +1369,7 @@ pub struct AcpSession {
     /// detection (N3). `None` = agent default.
     current_model: Option<String>,
     current_reasoning: Option<String>,
+    terminals: AcpTerminalHost,
 }
 
 /// Sentinel returned by `run_turn` when a config change (reasoning without a config option) can
@@ -1334,6 +1470,7 @@ impl AcpSession {
         reasoning: Option<&str>,
         mcp_servers: &[AcpMcpServer],
         resume_session: Option<&str>,
+        additional_directories: &[String],
     ) -> Result<Self, String> {
         let mut child = crate::external_agents::spawn::cli_command(resolved_bin)
             .args(args)
@@ -1362,24 +1499,24 @@ impl AcpSession {
             }
         };
         let mut reader = BufReader::new(stdout).lines();
+        let mut terminals = AcpTerminalHost::new(cwd.to_path_buf());
 
         // Fallible handshake, isolated so an error path can kill the child and fold in stderr.
         let handshake = async {
-            write_rpc(
+            write_rpc(&mut stdin, 1, "initialize", acp_initialize_params(true))
+                .await
+                .map_err(|e| format!("initialize: {e}"))?;
+            let init_result = acp_read_until_id(
+                &mut reader,
                 &mut stdin,
+                &mut terminals,
                 1,
-                "initialize",
-                json!({
-                    "protocolVersion": ACP_PROTOCOL_VERSION,
-                    "clientCapabilities": { "terminal": false },
-                    "clientInfo": { "name": "kivio", "version": "external-agents" },
-                }),
+                ACP_INITIALIZE_TIMEOUT,
             )
             .await
             .map_err(|e| format!("initialize: {e}"))?;
-            acp_read_until_id(&mut reader, &mut stdin, 1, ACP_INITIALIZE_TIMEOUT)
-                .await
-                .map_err(|e| format!("initialize: {e}"))?;
+            let additional_directories = agent_supports_additional_directories(&init_result)
+                .then_some(additional_directories);
 
             // session/new for a fresh session, session/load to resume a prior one.
             // One Kivio conversation ↔ one native session id: load failure must
@@ -1392,13 +1529,19 @@ impl AcpSession {
                     for cwd_try in
                         crate::external_agents::wsl::cwd_spellings_for_cli(resolved_bin, cwd)
                     {
-                        let params = build_session_load_params(&cwd_try, sid, mcp_servers);
+                        let params = build_session_load_params(
+                            &cwd_try,
+                            sid,
+                            mcp_servers,
+                            additional_directories,
+                        );
                         write_rpc(&mut stdin, next_id, "session/load", params)
                             .await
                             .map_err(|e| format!("session/load: {e}"))?;
                         match acp_read_until_id(
                             &mut reader,
                             &mut stdin,
+                            &mut terminals,
                             next_id,
                             ACP_SESSION_NEW_TIMEOUT,
                         )
@@ -1428,13 +1571,18 @@ impl AcpSession {
                         &mut stdin,
                         next_id,
                         "session/new",
-                        build_session_new_params(&cli_protocol_cwd(resolved_bin, cwd), mcp_servers),
+                        build_session_new_params(
+                            &cli_protocol_cwd(resolved_bin, cwd),
+                            mcp_servers,
+                            additional_directories,
+                        ),
                     )
                     .await
                     .map_err(|e| format!("session-new: {e}"))?;
                     let result = acp_read_until_id(
                         &mut reader,
                         &mut stdin,
+                        &mut terminals,
                         next_id,
                         ACP_SESSION_NEW_TIMEOUT,
                     )
@@ -1450,6 +1598,8 @@ impl AcpSession {
                 }
             };
 
+            terminals.set_session_id(session_id.clone());
+
             let (model_config_id, reasoning_config_id) = find_config_ids(&result);
 
             // Optional model selection (set_config_option / set_model), mirroring run_acp_session.
@@ -1461,9 +1611,14 @@ impl AcpSession {
                     .await
                     .map_err(|e| format!("session-new: {e}"))?;
                 // Best-effort: wait for the ack but don't fail the session if the agent ignores it.
-                let _ =
-                    acp_read_until_id(&mut reader, &mut stdin, next_id, Duration::from_secs(10))
-                        .await;
+                let _ = acp_read_until_id(
+                    &mut reader,
+                    &mut stdin,
+                    &mut terminals,
+                    next_id,
+                    Duration::from_secs(10),
+                )
+                .await;
                 next_id += 1;
             }
 
@@ -1490,6 +1645,7 @@ impl AcpSession {
                     reasoning_config_id,
                     current_model,
                     current_reasoning: normalize_opt(reasoning),
+                    terminals,
                 })
             }
             Err(msg) => {
@@ -1522,9 +1678,11 @@ impl AcpSession {
         model: Option<&str>,
         reasoning: Option<&str>,
         images: &[crate::external_agents::attachments::ImageBlock],
+        extra_writable_roots: &[String],
         events: &mpsc::Sender<UnifiedAgentEvent>,
         control: &mut mpsc::Receiver<SessionCommand>,
     ) -> Result<(), String> {
+        self.terminals.set_extra_roots(extra_writable_roots);
         // Apply mid-session config changes before sending the prompt (N3).
         let desired_reasoning = normalize_opt(reasoning);
         match reasoning_action(
@@ -1546,6 +1704,7 @@ impl AcpSession {
                 let _ = acp_read_until_id(
                     &mut self.reader,
                     &mut self.stdin,
+                    &mut self.terminals,
                     id,
                     Duration::from_secs(10),
                 )
@@ -1567,6 +1726,7 @@ impl AcpSession {
                 let _ = acp_read_until_id(
                     &mut self.reader,
                     &mut self.stdin,
+                    &mut self.terminals,
                     id,
                     Duration::from_secs(10),
                 )
@@ -1621,35 +1781,20 @@ impl AcpSession {
                 }
             }
 
-            let line = match timeout(Duration::from_millis(200), self.reader.next_line()).await {
-                Ok(Ok(Some(l))) => l,
-                Ok(Ok(None)) => return Err("ACP session exited mid-turn".to_string()),
-                Ok(Err(e)) => return Err(e.to_string()),
-                Err(_) => continue,
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: Value = match serde_json::from_str(line.trim()) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let value = match acp_next_message(
+                &mut self.reader,
+                &mut self.stdin,
+                &mut self.terminals,
+                Duration::from_millis(200),
+            )
+            .await?
+            {
+                AcpNext::Value(value) => value,
+                AcpNext::Eof => return Err("ACP session exited mid-turn".to_string()),
+                AcpNext::Idle => continue,
             };
 
             if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
-                if method == "session/request_permission" {
-                    let option_id = choose_permission_outcome(
-                        value.get("params").and_then(|p| p.get("options")),
-                    );
-                    if let (Some(id), Some(option_id)) = (value.get("id"), option_id) {
-                        write_rpc_result(
-                            &mut self.stdin,
-                            id,
-                            json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-                        )
-                        .await?;
-                    }
-                    continue;
-                }
                 if method == "session/update" {
                     if let Some(update) = value
                         .get("params")
@@ -1657,7 +1802,12 @@ impl AcpSession {
                         .and_then(|v| v.as_object())
                     {
                         let mut buf: Vec<UnifiedAgentEvent> = Vec::new();
-                        acp_apply_session_update(update, &mut update_state, &mut |e| buf.push(e));
+                        acp_apply_session_update_ex(
+                            update,
+                            &mut update_state,
+                            Some(&self.terminals),
+                            &mut |e| buf.push(e),
+                        );
                         for e in buf {
                             let _ = events.send(e).await;
                         }
@@ -1699,6 +1849,8 @@ impl AcpSession {
     }
 
     pub async fn close(mut self) {
+        self.terminals.close_all();
+        let _ = flush_terminal_side_effects(&mut self.stdin, &mut self.terminals).await;
         let _ = self.stdin.shutdown().await;
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
@@ -1708,10 +1860,11 @@ impl AcpSession {
 }
 
 /// Read ACP JSON-RPC lines until the response for `target_id`, auto-answering permission
-/// requests and skipping notifications.
+/// and `terminal/*` requests and skipping notifications.
 async fn acp_read_until_id(
     reader: &mut Lines<BufReader<ChildStdout>>,
     stdin: &mut ChildStdin,
+    terminals: &mut AcpTerminalHost,
     target_id: u64,
     overall: Duration,
 ) -> Result<Value, String> {
@@ -1720,44 +1873,118 @@ async fn acp_read_until_id(
         if start.elapsed() > overall {
             return Err("ACP handshake timeout".to_string());
         }
-        let line = match timeout(Duration::from_millis(200), reader.next_line()).await {
-            Ok(Ok(Some(l))) => l,
-            Ok(Ok(None)) => return Err("ACP agent exited during handshake".to_string()),
-            Ok(Err(e)) => return Err(e.to_string()),
-            Err(_) => continue,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: Value = match serde_json::from_str(line.trim()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
-            if method == "session/request_permission" {
-                let option_id =
-                    choose_permission_outcome(value.get("params").and_then(|p| p.get("options")));
-                if let (Some(id), Some(option_id)) = (value.get("id"), option_id) {
-                    write_rpc_result(
-                        stdin,
-                        id,
-                        json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
-                    )
-                    .await?;
+        match acp_next_message(reader, stdin, terminals, Duration::from_millis(200)).await? {
+            AcpNext::Value(value) => {
+                if let Some(err) = rpc_error_message(&value) {
+                    if value.get("id").and_then(|v| v.as_u64()) == Some(target_id) {
+                        return Err(err);
+                    }
+                    continue;
+                }
+                if value.get("id").and_then(|v| v.as_u64()) == Some(target_id) {
+                    return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                 }
             }
-            continue; // notification or handled request
-        }
-        if let Some(err) = rpc_error_message(&value) {
-            if value.get("id").and_then(|v| v.as_u64()) == Some(target_id) {
-                return Err(err);
-            }
-            continue;
-        }
-        if value.get("id").and_then(|v| v.as_u64()) == Some(target_id) {
-            return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+            AcpNext::Eof => return Err("ACP agent exited during handshake".to_string()),
+            AcpNext::Idle => {}
         }
     }
+}
+
+enum AcpNext {
+    Value(Value),
+    Idle,
+    Eof,
+}
+
+async fn acp_next_message(
+    reader: &mut Lines<BufReader<ChildStdout>>,
+    stdin: &mut ChildStdin,
+    terminals: &mut AcpTerminalHost,
+    slice: Duration,
+) -> Result<AcpNext, String> {
+    flush_terminal_side_effects(stdin, terminals).await?;
+    let line = match timeout(slice, reader.next_line()).await {
+        Ok(Ok(Some(raw))) => raw,
+        Ok(Ok(None)) => return Ok(AcpNext::Eof),
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(_) => return Ok(AcpNext::Idle),
+    };
+    if line.trim().is_empty() {
+        return Ok(AcpNext::Idle);
+    }
+    let value: Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return Ok(AcpNext::Idle),
+    };
+    if handle_agent_to_client_request(&value, stdin, terminals).await? {
+        return Ok(AcpNext::Idle);
+    }
+    Ok(AcpNext::Value(value))
+}
+
+async fn flush_terminal_side_effects(
+    stdin: &mut ChildStdin,
+    terminals: &mut AcpTerminalHost,
+) -> Result<(), String> {
+    while let Ok((id, exit)) = terminals.exit_rx().try_recv() {
+        for (rpc_id, result) in terminals.on_exit(id, exit) {
+            write_rpc_result(stdin, &rpc_id, result).await?;
+        }
+    }
+    for (rpc_id, result) in terminals.take_completed_waits() {
+        write_rpc_result(stdin, &rpc_id, result).await?;
+    }
+    for (rpc_id, code, message) in terminals.take_aborted_waits() {
+        write_rpc_error(stdin, &rpc_id, code, &message).await?;
+    }
+    Ok(())
+}
+
+async fn handle_agent_to_client_request(
+    value: &Value,
+    stdin: &mut ChildStdin,
+    terminals: &mut AcpTerminalHost,
+) -> Result<bool, String> {
+    let Some(method) = value.get("method").and_then(|v| v.as_str()) else {
+        return Ok(false);
+    };
+    if method == "session/request_permission" {
+        let option_id =
+            choose_permission_outcome(value.get("params").and_then(|p| p.get("options")));
+        if let (Some(id), Some(option_id)) = (value.get("id"), option_id) {
+            write_rpc_result(
+                stdin,
+                id,
+                json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+            )
+            .await?;
+        }
+        return Ok(true);
+    }
+    if method.starts_with("terminal/") {
+        let Some(id) = value.get("id") else {
+            return Ok(true);
+        };
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        match terminals.handle(method, &params, id) {
+            TerminalReply::Result(result) => write_rpc_result(stdin, id, result).await?,
+            TerminalReply::Pending => {}
+            TerminalReply::Error { code, message } => {
+                write_rpc_error(stdin, id, code, &message).await?;
+            }
+        }
+        flush_terminal_side_effects(stdin, terminals).await?;
+        return Ok(true);
+    }
+    if method == "session/update" || method == "_x.ai/session_notification" {
+        return Ok(false);
+    }
+    if let Some(id) = value.get("id") {
+        write_rpc_error(stdin, id, -32601, &format!("Method not found: {method}")).await?;
+        return Ok(true);
+    }
+    Ok(true)
 }
 
 /// Build the ACP `session/prompt` content array: text block first, then a native image block
@@ -1794,7 +2021,7 @@ pub fn spawn_acp_session_actor(mut session: AcpSession) -> mpsc::Sender<SessionC
                     // 通道从来不会被建起来（`run.rs::turn_asks_for_permission` 只对带
                     // `--permission-prompt-tool` 的 argv 为真，那是 claude 专属 flag）。
                     approvals: _,
-                    extra_writable_roots: _,
+                    extra_writable_roots,
                 } => {
                     // Invariant (A4): `run_turn` sends all its `events` before returning, and mpsc
                     // preserves order, so every event is already queued when `done` fires — the
@@ -1805,6 +2032,7 @@ pub fn spawn_acp_session_actor(mut session: AcpSession) -> mpsc::Sender<SessionC
                             model.as_deref(),
                             reasoning.as_deref(),
                             &images,
+                            &extra_writable_roots,
                             &events,
                             &mut rx,
                         )
@@ -1861,10 +2089,56 @@ mod tests {
 
     #[test]
     fn session_load_params_carry_session_id_and_cwd() {
-        let params = build_session_load_params(Path::new("/mnt/e/proj"), "sess-1", &[]);
+        let params = build_session_load_params(Path::new("/mnt/e/proj"), "sess-1", &[], None);
         assert_eq!(params["sessionId"], json!("sess-1"));
         assert_eq!(params["cwd"], json!("/mnt/e/proj"));
         assert_eq!(params["mcpServers"], json!([]));
+        assert!(params.get("additionalDirectories").is_none());
+    }
+
+    #[test]
+    fn session_new_omits_additional_directories_unless_advertised() {
+        let params = build_session_new_params(Path::new("/tmp"), &[], None);
+        assert!(params.get("additionalDirectories").is_none());
+        let params = build_session_new_params(
+            Path::new("/tmp"),
+            &[],
+            Some(&["/home/me/biz-a".to_string()]),
+        );
+        assert_eq!(params["additionalDirectories"], json!(["/home/me/biz-a"]));
+        let params = build_session_new_params(Path::new("/tmp"), &[], Some(&[]));
+        assert_eq!(params["additionalDirectories"], json!([]));
+    }
+
+    #[test]
+    fn additional_directories_capability_reads_v1_and_v2() {
+        assert!(agent_supports_additional_directories(&json!({
+            "agentCapabilities": {
+                "sessionCapabilities": { "additionalDirectories": true }
+            }
+        })));
+        assert!(agent_supports_additional_directories(&json!({
+            "capabilities": { "session": { "additionalDirectories": true } }
+        })));
+        assert!(!agent_supports_additional_directories(&json!({
+            "agentCapabilities": { "loadSession": true }
+        })));
+        assert!(!agent_supports_additional_directories(&json!({})));
+    }
+
+    #[test]
+    fn live_handshake_advertises_terminal_capability() {
+        let params = acp_initialize_params(true);
+        assert_eq!(params["clientCapabilities"]["terminal"], json!(true));
+        assert_eq!(params["protocolVersion"], json!(ACP_PROTOCOL_VERSION));
+        assert_eq!(params["clientInfo"]["name"], json!("kivio"));
+        assert_eq!(params["clientInfo"]["title"], json!("Kivio"));
+        assert_eq!(
+            params["clientInfo"]["version"],
+            json!(env!("CARGO_PKG_VERSION"))
+        );
+        let probe = acp_initialize_params(false);
+        assert_eq!(probe["clientCapabilities"]["terminal"], json!(false));
     }
 
     #[test]
@@ -2048,9 +2322,10 @@ mod tests {
 
         let bin = which_bin("cursor-agent").expect("cursor-agent on PATH");
         let cwd = std::env::temp_dir();
-        let session = AcpSession::connect(&bin, &["acp".to_string()], &cwd, None, None, &[], None)
-            .await
-            .expect("connect cursor-agent acp");
+        let session =
+            AcpSession::connect(&bin, &["acp".to_string()], &cwd, None, None, &[], None, &[])
+                .await
+                .expect("connect cursor-agent acp");
         let sid = session.session_id().to_string();
         assert!(!sid.is_empty());
         let control = spawn_acp_session_actor(session);
@@ -2160,6 +2435,104 @@ mod tests {
             UnifiedAgentEvent::ToolResult { tool_use_id, content, is_error }
                 if tool_use_id == "acp-1" && content == "done" && !*is_error
         )));
+    }
+
+    #[test]
+    fn flatten_acp_tool_content_prefers_text_blocks_over_json() {
+        assert_eq!(
+            flatten_acp_tool_content(&json!([{
+                "type": "content",
+                "content": { "type": "text", "text": "hello" }
+            }])),
+            "hello"
+        );
+        assert_eq!(
+            flatten_acp_tool_content(&json!([{
+                "type": "terminal",
+                "terminalId": "term_missing"
+            }])),
+            ""
+        );
+    }
+
+    #[test]
+    fn flatten_acp_tool_content_resolves_terminal_output() {
+        let mut host = AcpTerminalHost::new(std::env::temp_dir());
+        host.seed_output("term_1", "KIVIO_ACP_TERMINAL_OK\n");
+        let finished = serde_json::Map::from_iter([
+            ("sessionUpdate".to_string(), json!("tool_call_update")),
+            ("toolCallId".to_string(), json!("bash-1")),
+            ("title".to_string(), json!("Bash")),
+            ("status".to_string(), json!("completed")),
+            (
+                "content".to_string(),
+                json!([{ "type": "terminal", "terminalId": "term_1" }]),
+            ),
+        ]);
+        let mut emitted = HashSet::new();
+        let mut events = Vec::new();
+        assert!(apply_acp_session_update_ex(
+            &finished,
+            &mut emitted,
+            Some(&host),
+            &mut |event| events.push(event),
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UnifiedAgentEvent::ToolResult { tool_use_id, content, is_error }
+                if tool_use_id == "bash-1"
+                    && content.contains("KIVIO_ACP_TERMINAL_OK")
+                    && !*is_error
+        )));
+    }
+
+    #[test]
+    fn kimi_glob_policy_error_is_explained() {
+        let finished = serde_json::Map::from_iter([
+            ("sessionUpdate".to_string(), json!("tool_call_update")),
+            ("toolCallId".to_string(), json!("glob-1")),
+            ("title".to_string(), json!("Glob")),
+            ("status".to_string(), json!("failed")),
+            (
+                "content".to_string(),
+                json!([{
+                    "type": "content",
+                    "content": {
+                        "type": "text",
+                        "text": "ACP runtime only supports interactive Bash tool processes"
+                    }
+                }]),
+            ),
+        ]);
+        let mut emitted = HashSet::new();
+        let mut events = Vec::new();
+        assert!(apply_acp_session_update(
+            &finished,
+            &mut emitted,
+            &mut |event| events.push(event),
+        ));
+        let content = events.iter().find_map(|event| match event {
+            UnifiedAgentEvent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == "glob-1" && *is_error => Some(content.clone()),
+            _ => None,
+        });
+        let content = content.expect("failed Glob result");
+        assert!(
+            content.contains("不会把 Glob/Grep 交给宿主"),
+            "content={content}"
+        );
+        assert!(content.contains("ACP runtime only supports interactive Bash tool processes"));
+    }
+
+    #[test]
+    fn explain_acp_agent_policy_error_is_idempotent() {
+        let once = explain_acp_agent_policy_error(
+            "ACP runtime only supports interactive Bash tool processes",
+        );
+        assert_eq!(explain_acp_agent_policy_error(&once), once);
     }
 
     // ---- AcpTextAssembler / shared update-dedup (Step 2) ----
@@ -2826,23 +3199,16 @@ mod tests {
             return;
         };
         let cwd = std::env::temp_dir();
-        let session = match AcpSession::connect(
-            &bin,
-            &["acp".to_string()],
-            &cwd,
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                eprintln!("SKIP: 连接失败（未登录 / 网络？）：{err}");
-                return;
-            }
-        };
+        let session =
+            match AcpSession::connect(&bin, &["acp".to_string()], &cwd, None, None, &[], None, &[])
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    eprintln!("SKIP: 连接失败（未登录 / 网络？）：{err}");
+                    return;
+                }
+            };
         let control = spawn_acp_session_actor(session);
         let captured = run_one_live_turn(
             &control,
@@ -2964,23 +3330,16 @@ mod tests {
         };
         let cwd = std::env::temp_dir();
         // 走生产用的常驻 actor（此前驱动的是只被真机测试吊着命的一次性 `run_acp_session`）。
-        let session = match AcpSession::connect(
-            &bin,
-            &["acp".to_string()],
-            &cwd,
-            None,
-            None,
-            &[],
-            None,
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(err) => {
-                eprintln!("SKIP: 连接失败（未登录 / 网络？）：{err}");
-                return;
-            }
-        };
+        let session =
+            match AcpSession::connect(&bin, &["acp".to_string()], &cwd, None, None, &[], None, &[])
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    eprintln!("SKIP: 连接失败（未登录 / 网络？）：{err}");
+                    return;
+                }
+            };
         let control = spawn_acp_session_actor(session);
         // 这里不用 `run_one_live_turn`：它的墙钟超时是 panic，而 opencode 密钥失效导致的
         // 挂起是**环境**问题不是本层回归，必须按 SKIP 处理。
@@ -3151,18 +3510,9 @@ pub async fn probe_acp_sessions(
     let deadline = Duration::from_secs(timeout_secs);
     let started = std::time::Instant::now();
 
-    write_rpc(
-        &mut stdin,
-        1,
-        "initialize",
-        json!({
-            "protocolVersion": ACP_PROTOCOL_VERSION,
-            "clientCapabilities": { "terminal": false },
-            "clientInfo": { "name": "kivio", "version": "external-agents" },
-        }),
-    )
-    .await
-    .ok()?;
+    write_rpc(&mut stdin, 1, "initialize", acp_initialize_params(false))
+        .await
+        .ok()?;
 
     let init = read_rpc_response(&mut reader, 1, started, deadline).await?;
     let supports_load = init
@@ -3299,18 +3649,9 @@ pub async fn probe_acp_session_history(
     let deadline = Duration::from_secs(timeout_secs);
     let started = std::time::Instant::now();
 
-    write_rpc(
-        &mut stdin,
-        1,
-        "initialize",
-        json!({
-            "protocolVersion": ACP_PROTOCOL_VERSION,
-            "clientCapabilities": { "terminal": false },
-            "clientInfo": { "name": "kivio", "version": "external-agents" },
-        }),
-    )
-    .await
-    .ok()?;
+    write_rpc(&mut stdin, 1, "initialize", acp_initialize_params(false))
+        .await
+        .ok()?;
     read_rpc_response(&mut reader, 1, started, deadline).await?;
 
     write_rpc(

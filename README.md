@@ -180,13 +180,16 @@ echo "deb [signed-by=/usr/share/keyrings/kivio-desktop.gpg] https://zhengyang355
 sudo apt update && sudo apt install kivio-desktop
 ```
 
-## 新版本 —— v2.9.2
+## 新版本 —— v2.9.4
 
-- **Pi** —— 问用户、原生图片、轮内引导和下一轮排队；Dock「轨迹」可分叉克隆；设置里管理扩展与 Skill。
-- **DeepSeek Harness** —— 生成中可引导或排队；会话绑到项目工作目录；关窗和取消真正停掉。
-- **联网搜索** —— 来源目录可点，答案 `[n]` 跳转；新增 Brave、Serper、智谱、TinyFish 等。
-- **插件与技能** —— 一键跑官方安装命令；技能扫描 `~/.kivio` 与 `~/.agents`。
-- **其它** —— CLI 供应商可与 CLI 自带配置并存；账户菜单显示今日用量；重启记住当前对话。Windows 应用内更新静默安装。去掉 Email 连接器。
+- **过程条** —— 推理、工具和轮内说明收成一条 Codex 式 Working / Worked 行，最终回答留在外面。
+- **替换翻译** —— 按段落铺一层底板盖住原文再排译文，不再透出残影，也不再依赖修复模型。
+- **联网搜索** —— 接入 Kimi 官方搜索。
+- **聊天窗口** —— 设置里可选择关闭后隐藏而不是销毁，下次打开不用冷启动。
+- **侧栏** —— 可拖宽度；对话行显示上次活跃（如 2m / 13h）。
+- **外部 CLI** —— 一条对话绑一个原生会话；Kimi 等 ACP 代理补齐终端能力；dsh 官方密钥写到正确的凭据位置。
+- **性能** —— 流式增量合并、草稿改追加写入、多对话并发生成更顺。
+- **修复** —— Claude 4.5 用 extended thinking 而不是 adaptive；设置保活草稿不再覆盖插件 MCP。
 
 完整历史见 [GitHub Releases](https://github.com/zhengyang3552/kivio-linux/releases)。
 
@@ -394,17 +397,16 @@ echo "deb [signed-by=/usr/share/keyrings/kivio-desktop.gpg] https://zhengyang355
 sudo apt update && sudo apt install kivio-desktop
 ```
 
-## What's New — v2.9.3
+## What's New — v2.9.4
 
-- Windows portable zip
-- Official / hosted DeepSeek search
-- Compact attachment cards; reply to the last turn with another model
-- External CLI catch-up: Claude Code 2.1.238, Codex 0.148, dsh rc.8
-- **Pi** — ask-user, native images, mid-turn steer and next-turn follow-up; Dock Trajectory can fork/clone; Settings manages extensions and Skills.
-- **DeepSeek Harness** — steer or queue while generating; sessions bind to the project working directory; close and cancel actually stop.
-- **Web search** — clickable source directory and `[n]` jump; adds Brave, Serper, Zhipu, TinyFish, and more.
-- **Plugins and skills** — one-click official install; Skills scan `~/.kivio` and `~/.agents`.
-- **More** — CLI providers can coexist with the CLI's own config; account menu shows today's usage; restart remembers the current conversation. Windows in-app updates install silently. Email connector removed.
+- **Working row** — reasoning, tools, and mid-turn commentary collapse into one Codex-style Working / Worked row; the final answer stays outside.
+- **Replace translation** — each paragraph is covered by one plate before the translation flows in, so ghost text is gone and the repair model is not needed.
+- **Web search** — official Kimi search joins the provider list.
+- **Chat window** — an opt-in setting hides on close instead of destroying, so reopen skips a cold start.
+- **Sidebar** — drag to resize; conversation rows show last-active age (e.g. 2m / 13h).
+- **External CLIs** — one conversation stays on one native session; ACP agents such as Kimi get terminal methods; the official dsh key is written where the CLI actually reads it.
+- **Performance** — coalesced stream deltas, append-only crash drafts, smoother concurrent generations.
+- **Fixes** — Claude 4.5 sends extended thinking instead of adaptive; keep-alive settings drafts no longer clobber plugin MCP.
 
 Full history: [GitHub Releases](https://github.com/zhengyang3552/kivio-linux/releases).
 

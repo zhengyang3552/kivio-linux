@@ -419,7 +419,7 @@ impl OpenAiChatProvider<'_> {
         metadata: &crate::chat::model::RequestMetadata,
     ) -> std::collections::BTreeMap<String, String> {
         let mut headers = std::collections::BTreeMap::new();
-        if let Some(key) = self.provider.api_keys.first() {
+        if let Some(key) = self.provider.preferred_api_key() {
             headers.insert("Authorization".to_string(), format!("Bearer {key}"));
         }
         headers.insert("Accept-Encoding".to_string(), "identity".to_string());
@@ -515,8 +515,10 @@ impl OpenAiChatProvider<'_> {
         let mut body = serde_json::json!({
             "model": request.model,
             "messages": openai_messages_from_generate_request(request),
-            "max_tokens": request.options.max_tokens,
         });
+        if request.options.max_tokens > 0 {
+            body["max_tokens"] = Value::from(request.options.max_tokens);
+        }
         if let Some(temperature) = crate::chat::model_metadata::temperature_for_request(
             request.options.temperature,
             Some(self.provider),
@@ -1146,6 +1148,7 @@ mod tests {
             model_overrides: Default::default(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         let adapter = OpenAiChatProvider::new(&state, &provider, 1);
         let request = GenerateRequest {
@@ -1195,6 +1198,7 @@ mod tests {
             model_overrides,
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         let adapter = OpenAiChatProvider::new(&state, &provider, 1);
         let request = GenerateRequest {
@@ -1264,6 +1268,56 @@ mod tests {
     }
 
     #[test]
+    fn request_body_omits_max_tokens_when_zero() {
+        let state =
+            AppState::new_headless(crate::settings::Settings::default(), std::env::temp_dir());
+        let provider = ModelProvider {
+            id: "test".into(),
+            name: "Test".into(),
+            api_keys: vec!["sk-test".into()],
+            api_key_legacy: None,
+            base_url: "https://api.example.com/v1".into(),
+            available_models: vec!["glm-5.3".into()],
+            enabled_models: vec!["glm-5.3".into()],
+            enabled: true,
+            api_format: "openai_chat".into(),
+            model_overrides: Default::default(),
+            compress_request_body: false,
+            request: Default::default(),
+            active_key_index: 0,
+        };
+        let adapter = OpenAiChatProvider::new(&state, &provider, 1);
+        let request = GenerateRequest {
+            model: "glm-5.3".into(),
+            system: String::new(),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![MessagePart::Text { text: "hi".into() }],
+            }],
+            tools: Vec::new(),
+            options: GenerateOptions {
+                max_tokens: 0,
+                ..Default::default()
+            },
+            metadata: Default::default(),
+        };
+        let body = adapter.request_body(&request, true);
+        assert!(
+            body.get("max_tokens").is_none(),
+            "max_tokens=0 must omit the field: {body}"
+        );
+        let capped = GenerateRequest {
+            options: GenerateOptions {
+                max_tokens: 16_384,
+                ..Default::default()
+            },
+            ..request
+        };
+        let capped_body = adapter.request_body(&capped, true);
+        assert_eq!(capped_body["max_tokens"], 16_384);
+    }
+
+    #[test]
     fn request_body_uses_provider_temperature_override() {
         let body = build_openai_temperature_body(Some(0.4), None);
         assert_eq!(body["temperature"], serde_json::json!(0.4), "body: {body}");
@@ -1303,6 +1357,7 @@ mod tests {
             model_overrides,
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         let adapter = OpenAiChatProvider::new(&state, &provider, 1);
         let request = GenerateRequest {
@@ -1352,6 +1407,7 @@ mod tests {
             model_overrides: Default::default(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         let adapter = OpenAiChatProvider::new(&state, &provider, 1);
         let tool = crate::chat::model::ModelTool {
@@ -1417,6 +1473,7 @@ mod tests {
                 model_overrides: Default::default(),
                 compress_request_body: false,
                 request: Default::default(),
+                active_key_index: 0,
             };
             let adapter = OpenAiChatProvider::new(&state, &provider, 1);
             let request = GenerateRequest {
@@ -1475,6 +1532,7 @@ mod tests {
                     prompt_cache_retention: retention.into(),
                     ..Default::default()
                 },
+                active_key_index: 0,
             };
             let adapter = OpenAiChatProvider::new(&state, &provider, 1);
             adapter.request_body(
@@ -1526,6 +1584,7 @@ mod tests {
             model_overrides: Default::default(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         };
         assert_eq!(p.request.prompt_cache_retention, "short");
         assert!(p.prompt_caching_enabled());

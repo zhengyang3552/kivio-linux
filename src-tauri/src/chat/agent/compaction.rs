@@ -773,7 +773,11 @@ fn extract_summary_text(response: &str) -> String {
 }
 
 /// 摘要调用的最大输出 token：`min(config.max_output_tokens, SUMMARY_OUTPUT_TOKENS)`（R9）。
+/// `0` 仍用本常数封顶（适配器层 0=省略字段；摘要路径不要产出 0）。
 fn summary_output_tokens(config_max: u32) -> u32 {
+    if config_max == 0 {
+        return SUMMARY_OUTPUT_TOKENS;
+    }
     config_max.min(SUMMARY_OUTPUT_TOKENS)
 }
 
@@ -1379,11 +1383,28 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     // Kivio footer 也含 `estimate_tool_segments`）。工具定义随每次请求发送、provider 会计入，漏算会
     // 让无锚点的首轮低估数千 token、压缩过晚——故这里补上（与 footer `count_tokens_in_value` 同口径，
     // 都基于 `estimate_value_tokens(tool.to_openai_tool())`）。
-    let tool_schema_tokens: usize = state
-        .tools
-        .iter()
-        .map(|tool| estimate_value_tokens(&tool.to_openai_tool()))
-        .sum();
+    // 按「工具名集合哈希」做轮间缓存：每轮为上百个工具重建整份 schema JSON 只为估个
+    // token 数太浪费；工具集只在 Skill 激活时变（同名工具的 schema run 内稳定）。
+    let tool_schema_tokens = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for tool in &state.tools {
+            tool.name.hash(&mut hasher);
+        }
+        let fingerprint = hasher.finish();
+        match state.tool_schema_tokens_cache {
+            Some((cached_fingerprint, cached)) if cached_fingerprint == fingerprint => cached,
+            _ => {
+                let estimated: usize = state
+                    .tools
+                    .iter()
+                    .map(|tool| estimate_value_tokens(&tool.to_openai_tool()))
+                    .sum();
+                state.tool_schema_tokens_cache = Some((fingerprint, estimated));
+                estimated
+            }
+        }
+    };
     let estimate_full =
         estimate_messages_tokens(&state.runtime_messages).saturating_add(tool_schema_tokens);
     let (anchor_prompt, trailing) = if let Some(usage) = &state.last_step_usage {
@@ -1470,11 +1491,8 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
         window,
         // 用模型真实 max output（而非 run 的 config.max_output_tokens），与持久化路径
         // compact_conversation 口径统一——否则 run 配的小输出会把摘要卡短、9 段产出被截。
-        chat_max_output_tokens_for_model(
-            Some(&config.provider),
-            &config.model,
-            config.max_output_tokens,
-        ),
+        chat_max_output_tokens_for_model(Some(&config.provider), &config.model)
+            .unwrap_or(SUMMARY_OUTPUT_TOKENS),
         config.retry_attempts,
         &config.conversation_id,
         &config.message_id,
@@ -1746,7 +1764,7 @@ async fn compact_conversation_inner(
         // 一轮，边界天然不劈开 turn，无需 TurnPrefix。
         SummaryKind::History,
         window,
-        chat_max_output_tokens_for_model(Some(&provider), &model, settings.chat.max_output_tokens),
+        chat_max_output_tokens_for_model(Some(&provider), &model).unwrap_or(SUMMARY_OUTPUT_TOKENS),
         retry_attempts,
         &conversation.id,
         &message_id,
@@ -1905,6 +1923,7 @@ mod tests {
             agent_plan_state: Default::default(),
             knowledge_base_ids: Vec::new(),
             force_knowledge_search: false,
+            additional_directories: Vec::new(),
             thinking_level: None,
             web_search_mode: None,
             reply_models: Vec::new(),
@@ -3097,6 +3116,7 @@ mod tests {
         // 大 config_max → 封顶到 SUMMARY_OUTPUT_TOKENS；小 config_max → 保留 min() 语义。
         assert_eq!(summary_output_tokens(100_000), SUMMARY_OUTPUT_TOKENS);
         assert_eq!(summary_output_tokens(1_000), 1_000);
+        assert_eq!(summary_output_tokens(0), SUMMARY_OUTPUT_TOKENS);
     }
 
     #[test]

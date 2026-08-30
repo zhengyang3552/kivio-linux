@@ -15,8 +15,8 @@ import type {
   ChatModeConfig,
 } from '../../api/tauri'
 
-/** 兜底最大输出 token 的可选档位。 */
-const CHAT_MAX_OUTPUT_TOKEN_OPTIONS = [2048, 8192, 16384, 32768]
+/** 对齐 Pi：自定义模型未填 maxTokens 时的缺省，也是唯一的协议兜底。 */
+const CHAT_FALLBACK_MAX_OUTPUT_TOKENS = 16384
 
 function formatTokenCount(tokens?: number): string {
   if (!tokens || !Number.isFinite(tokens)) return ''
@@ -45,7 +45,6 @@ interface ChatTabProps {
   chatDefaults: string | undefined
   /** Built-in Chat runtime prompt (exact string used when chatMode.systemPrompt is empty). */
   chatRuntimeDefaults: string | undefined
-  chatFallbackMaxOutputTokens: number
   effectiveChatMaxOutput: { maxOutput: number; source: string }
   chatMaxOutputSourceLabel: string
   chatMaxOutputModelLabel: string
@@ -66,7 +65,6 @@ export function ChatTab({
   chatMemory,
   chatDefaults,
   chatRuntimeDefaults,
-  chatFallbackMaxOutputTokens,
   effectiveChatMaxOutput,
   chatMaxOutputSourceLabel,
   chatMaxOutputModelLabel,
@@ -175,15 +173,9 @@ export function ChatTab({
               <span className="kv-row-desc whitespace-nowrap">
                 {lang === 'zh' ? '兜底' : 'Fallback'}
               </span>
-              <Select
-                className="w-44"
-                value={String(chatFallbackMaxOutputTokens)}
-                onChange={(maxOutputTokens) => onUpdateChat({ maxOutputTokens: Number(maxOutputTokens) })}
-                options={CHAT_MAX_OUTPUT_TOKEN_OPTIONS.map((tokens) => ({
-                  value: String(tokens),
-                  label: formatTokenCount(tokens),
-                }))}
-              />
+              <span className="text-[13px] tabular-nums text-neutral-800 dark:text-neutral-200">
+                {formatTokenCount(CHAT_FALLBACK_MAX_OUTPUT_TOKENS)}
+              </span>
             </div>
           </div>
         </SettingRow>

@@ -708,7 +708,7 @@ export type LensReplaceStreamPayload = {
   groups: LensReplaceGroup[]
   slots: LensReplaceRenderSlot[]
   cleanedImage?: string | null
-  // 硬失败（整张替换翻译不可用）才带 error；局部降级（如修复回退、个别区域回退原文）只带 warning。
+  // 硬失败（整张替换翻译不可用）才带 error；局部降级（如个别区域缺少译文回退原文）只带 warning。
   error?: string | null
   warning?: string | null
 }
@@ -884,8 +884,8 @@ export type ModelInfo = {
 }
 
 // AI 模型提供商配置
-// apiKeys 支持多 key failover：第一个为主 key，其余为备用 key；
-// 当某个 key 触发限流/配额/鉴权失败时后端会自动切下一个。
+// apiKeys 是密钥池；activeKeyIndex 是用户点选的当前 Key。
+// 鉴权/配额失败时后端仍会自动切到池里其它 Key。
 export type ProviderRequestConfig = {
   /** 附加到该供应商所有请求上的自定义头。同名时覆盖 CLI 身份预设。 */
   customHeaders?: { key: string; value: string }[]
@@ -911,6 +911,8 @@ export type ModelProvider = {
   id: string
   name: string
   apiKeys: string[]
+  /** 用户点选的当前 Key 下标。缺省 / 越界按 0。 */
+  activeKeyIndex?: number
   baseUrl: string
   availableModels: string[]
   enabledModels: string[]
@@ -929,6 +931,8 @@ export type ProviderConnectionInput = {
   id?: string
   baseUrl: string
   apiKeys: string[]
+  /** 测试 / 拉模型时用这条；不传则后端回落已保存的点选下标。 */
+  activeKeyIndex?: number
   model?: string
   apiFormat?: string
   /** 编辑中（可能尚未保存）的请求配置。不传则后端回落已保存的那份。 */
@@ -1012,6 +1016,7 @@ export type WebSearchProviderId =
   | 'tinyfish'
   | 'tinyfish_mcp'
   | 'searxng'
+  | 'kimi'
 
 export type WebSearchMcpAuth = NonNullable<ChatMcpServer['auth']>
 
@@ -1046,6 +1051,8 @@ export type WebSearchConfig = {
   tinyfishMcpUrl?: string
   tinyfishMcpAuth?: WebSearchMcpAuth | null
   searxngBaseUrl?: string
+  kimiApiKey?: string
+  kimiBaseUrl?: string
   maxResults: number
   searchDepth: 'ultra-fast' | 'fast' | 'basic' | 'advanced'
 }
@@ -1066,6 +1073,8 @@ export type Settings = {
   launchAtStartup: boolean
   /** 启动后不打开聊天窗口，进程留在托盘（适合开机自启后后台常驻） */
   launchMinimizedToTray: boolean
+  /** 关闭聊天窗口时隐藏复用（默认 false = 销毁）。下次打开无需重新加载，占用更多内存。 */
+  keepChatWindowAlive?: boolean
   translatorProviderId: string
   translatorModel: string
   chatProviderId: string
@@ -1451,9 +1460,11 @@ export type OfflineModelProgress = {
 }
 
 function normalizeProvider(provider: ModelProvider): ModelProvider {
+  const apiKeys = Array.isArray(provider.apiKeys) ? provider.apiKeys : []
   return {
     ...provider,
-    apiKeys: Array.isArray(provider.apiKeys) ? provider.apiKeys : [],
+    apiKeys,
+    activeKeyIndex: clampedActiveKeyIndex(apiKeys, provider.activeKeyIndex),
     availableModels: Array.isArray(provider.availableModels) ? provider.availableModels : [],
     enabledModels: Array.isArray(provider.enabledModels) ? provider.enabledModels : [],
     enabled: provider.enabled !== false,
@@ -1470,6 +1481,21 @@ function normalizeProvider(provider: ModelProvider): ModelProvider {
       cliIdentityVersion: provider.request?.cliIdentityVersion ?? '',
     },
   }
+}
+
+/** 把点选下标夹到密钥池范围内；空池为 0。 */
+export function clampedActiveKeyIndex(apiKeys: string[], index?: number): number {
+  if (apiKeys.length <= 0) return 0
+  if (!Number.isFinite(index) || (index ?? 0) < 0) return 0
+  return Math.min(Math.floor(index ?? 0), apiKeys.length - 1)
+}
+
+/** 删掉一条 Key 后，当前点选下标怎么跟着挪。 */
+export function activeKeyIndexAfterRemove(current: number, removedIdx: number, remaining: number): number {
+  if (remaining <= 0) return 0
+  if (removedIdx < current) return Math.max(0, current - 1)
+  if (removedIdx === current) return Math.min(current, remaining - 1)
+  return Math.min(current, remaining - 1)
 }
 
 export function normalizeProviderApiFormat(apiFormat?: string): string {
@@ -1684,6 +1710,7 @@ export function normalizeSettings(settings: Settings): Settings {
     autoPaste: current.autoPaste ?? true,
     launchAtStartup: current.launchAtStartup ?? false,
     launchMinimizedToTray: current.launchMinimizedToTray ?? false,
+    keepChatWindowAlive: current.keepChatWindowAlive ?? false,
     translatorProviderId: current.translatorProviderId ?? '',
     translatorModel: current.translatorModel ?? '',
     chatProviderId: effectiveChatModel.providerId,
@@ -1692,7 +1719,7 @@ export function normalizeSettings(settings: Settings): Settings {
     chat: {
       streamEnabled: current.chat?.streamEnabled ?? current.lens?.streamEnabled ?? true,
       thinkingEnabled: current.chat?.thinkingEnabled ?? current.lens?.thinkingEnabled ?? true,
-      maxOutputTokens: current.chat?.maxOutputTokens ?? 8192,
+      maxOutputTokens: current.chat?.maxOutputTokens ?? 16384,
       defaultLanguage: current.chat?.defaultLanguage ?? '',
       systemPrompt: current.chat?.systemPrompt ?? '',
       userDisplayName: current.chat?.userDisplayName ?? '',
@@ -1785,6 +1812,8 @@ export function normalizeSettings(settings: Settings): Settings {
         tinyfishMcpUrl: current.lens?.webSearch?.tinyfishMcpUrl ?? 'https://agent.tinyfish.ai/mcp',
         tinyfishMcpAuth: current.lens?.webSearch?.tinyfishMcpAuth ?? null,
         searxngBaseUrl: current.lens?.webSearch?.searxngBaseUrl ?? '',
+        kimiApiKey: current.lens?.webSearch?.kimiApiKey ?? '',
+        kimiBaseUrl: current.lens?.webSearch?.kimiBaseUrl ?? 'https://api.kimi.com/coding/v1/search',
         maxResults: current.lens?.webSearch?.maxResults ?? 5,
         searchDepth: current.lens?.webSearch?.searchDepth ?? 'basic',
       },
@@ -2203,6 +2232,10 @@ export const api = {
   onChatOpenConversation: (listener: (payload: { conversationId: string; reload?: boolean | null; error?: string | null }) => void) => {
     if (!isTauriRuntime()) return Promise.resolve(() => {})
     return on<{ conversationId: string; reload?: boolean | null; error?: string | null }>('chat-open-conversation', (payload) => listener(payload))
+  },
+  onConversationPopoutsChanged: (listener: (payload: { conversationIds: string[] }) => void) => {
+    if (!isTauriRuntime()) return Promise.resolve(() => {})
+    return on<{ conversationIds: string[] }>('chat-popouts-changed', (payload) => listener(payload))
   },
   onChatExternalSendReady: (listener: () => void) => {
     if (!isTauriRuntime()) return Promise.resolve(() => {})

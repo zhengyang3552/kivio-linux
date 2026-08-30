@@ -3,6 +3,7 @@ pub mod agent;
 pub mod ask_user;
 pub mod attachments;
 pub mod commands;
+pub mod draft_journal;
 pub mod dsml_tools;
 pub mod export;
 pub mod gc;
@@ -17,6 +18,7 @@ pub mod plan;
 #[cfg(debug_assertions)]
 pub mod probe;
 pub mod protocol;
+pub mod popout;
 pub mod repository;
 pub mod request_debug;
 pub mod storage;
