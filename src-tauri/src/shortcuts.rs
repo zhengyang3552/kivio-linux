@@ -1023,6 +1023,7 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
             HotkeyScope::ScreenshotReplace => ("替换翻译快捷键", "Replace translation hotkey"),
             HotkeyScope::ScreenshotAnnotate => ("截图标注", "Screenshot annotate"),
             HotkeyScope::Lens => ("Lens", "Lens"),
+            HotkeyScope::Automation => ("自动化快捷键", "Automation hotkey"),
         };
         let description = if is_en { desc_en } else { desc_zh };
         let hotkey_key = hotkey.to_lowercase();
@@ -1046,6 +1047,7 @@ fn register_hotkeys_portal(app: &AppHandle, settings: &Settings) -> Result<(), S
                     HotkeyScope::ScreenshotReplace => "screenshot_replace",
                     HotkeyScope::ScreenshotAnnotate => "screenshot_annotate",
                     HotkeyScope::Lens => "lens",
+                    HotkeyScope::Automation => "automation",
                 };
                 entries.push(PortalShortcutEntry {
                     id,
