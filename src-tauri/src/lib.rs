@@ -3,6 +3,7 @@
 pub mod agents;
 pub mod api;
 pub mod app_data;
+pub mod automation;
 pub mod capture_geometry;
 pub mod chat;
 pub mod commands;
@@ -395,6 +396,7 @@ pub fn run() {
                     display_hotkey_errors(&err)
                 );
             }
+            crate::automation::spawn_scheduler(app.handle().clone());
             if let Err(err) = setup_tray(&app.handle()) {
                 eprintln!("Failed to setup tray: {err}");
             }
@@ -719,6 +721,17 @@ pub fn run() {
             notes::notes_folder_delete,
             notes::notes_open_folder,
             notes::notes_dir_path,
+            automation::commands::automation_list,
+            automation::commands::automation_get,
+            automation::commands::automation_save,
+            automation::commands::automation_delete,
+            automation::commands::automation_set_enabled,
+            automation::commands::automation_run,
+            automation::commands::automation_cancel,
+            automation::commands::automation_export,
+            automation::commands::automation_import,
+            automation::commands::automation_runs_list,
+            automation::commands::automation_run_get,
             skills::chat_skills_list,
             skills::chat_skills_read,
             skills::chat_skills_import,
@@ -780,6 +793,23 @@ pub fn run() {
                 } else {
                     // 真正退出：同步排干 MCP 连接池，杀掉所有持久子进程，避免孤儿进程。
                     let state: State<AppState> = app_handle.state();
+                    // 自动化先于 MCP：运行中的图可能正跑 agent loop（依赖 MCP/供应商）或
+                    // 命令节点（Child 靠 kill_on_drop 收尸）。先标记取消、限时等收尾，
+                    // 此时运行时还活着，select! 的取消分支才来得及 drop 掉 Child。
+                    let cancelled = crate::automation::cancel_all_runs(app_handle);
+                    if cancelled > 0 {
+                        // 同上：timeout 必须在 async 块里构造。
+                        let finished = tauri::async_runtime::block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                crate::automation::wait_runs_finished(app_handle),
+                            )
+                            .await
+                        });
+                        if finished.is_err() {
+                            eprintln!("Automation runs did not finish in time on exit.");
+                        }
+                    }
                     // 带超时：一个卡在握手里的 server 会占着会话锁不放，没有这层
                     // 上限的话退出钩子会永久阻塞在主线程上 —— 表现是「点关闭没反应、
                     // 进程不退」，连带其余所有 MCP 子进程全留在系统里。

@@ -96,7 +96,7 @@ pub(super) struct ChatToolList {
     pub unavailable_mcp_servers: Vec<String>,
 }
 
-pub(super) async fn list_tools_for_chat(
+pub(crate) async fn list_tools_for_chat(
     app: &AppHandle,
     state: &AppState,
     settings: &Settings,
@@ -167,7 +167,7 @@ pub(super) fn apply_agent_plan_tool_filter(
 
 /// Chat mode: conversational research tools only — gated by `ChatModeConfig` toggles.
 /// Blocks local fs mutation, shell, sub-agents, skills, todos, and write-capable MCP.
-pub(super) fn apply_chat_mode_tool_filter(
+pub(crate) fn apply_chat_mode_tool_filter(
     tools: &mut Vec<ChatToolDefinition>,
     chat_mode: bool,
     config: &crate::settings::ChatModeConfig,
@@ -203,6 +203,7 @@ fn chat_mode_allows_tool(
         "web_search" | "search_web" => config.web_search,
         "web_fetch" => config.web_fetch,
         "knowledge_search" => config.knowledge_search,
+        "automation_list" | "automation_get" | "automation_runs" => true,
         "memory_read" | "memory_search" => config.memory_tools,
         _ => false,
     }

@@ -1,13 +1,14 @@
-import { lazy, memo, Profiler, Suspense, type ProfilerOnRenderCallback, type ReactNode } from 'react'
+import { lazy, memo, Profiler, Suspense, useRef, type ProfilerOnRenderCallback, type ReactNode } from 'react'
 import { GitBranch, TriangleAlert, X } from 'lucide-react'
-import { ChatDotGridBackground } from './ChatDotGridBackground'
 import { ChatImageViewer } from './ChatImageViewer'
 import { ConversationLoadingState } from './ConversationLoadingState'
 import { ChatTitlebarActions } from './ChatTitlebarActions'
 import { useConversationTransition } from './conversationTransitionStore'
 import { InputBar, type InputBarProps } from './InputBar'
-import { QueuedMessages } from './QueuedMessages'
+import { KivioBlob, type KivioBlobHandle } from './KivioBlob'
+import { useEmptyHeroJab, useEmptyHeroLine } from './emptyHero'
 import { TypewriterText } from './TypewriterText'
+import { QueuedMessages } from './QueuedMessages'
 import { IconButton } from '../components/Button'
 import type { QueuedMessage } from './hooks/useMessageQueue'
 import type { MessageListProps } from './MessageList'
@@ -28,6 +29,49 @@ function MessageListLoading() {
   )
 }
 
+function EmptyHeroHeading({
+  lang,
+  assistantName,
+  projectName,
+  setName,
+  seed,
+  active,
+}: {
+  lang: Lang
+  assistantName: string | null
+  projectName: string | null
+  setName: string | null
+  seed: string | null
+  active: boolean
+}) {
+  const blobRef = useRef<KivioBlobHandle>(null)
+  const { jab, onPoke } = useEmptyHeroJab(lang)
+  const greeting = useEmptyHeroLine({
+    lang,
+    assistantName,
+    projectName,
+    setName,
+    seed,
+    active: active && !jab,
+  })
+  const text = jab ?? greeting
+  return (
+    <div className="chat-motion-fade-up chat-empty-hero-heading">
+      <KivioBlob ref={blobRef} size={56} mood="idle" pulse={greeting} onPoke={onPoke} />
+      <h2
+        className="chat-empty-hero-title cursor-pointer select-none"
+        onPointerDown={(event) => {
+          if (event.button !== 0) return
+          event.preventDefault()
+          blobRef.current?.pokeAt(event.clientX)
+        }}
+      >
+        <TypewriterText text={text} active={active} />
+      </h2>
+    </div>
+  )
+}
+
 export interface ChatConversationPaneProps {
   titlebarControls: ReactNode
   usesNativeTitlebar: boolean
@@ -41,7 +85,6 @@ export interface ChatConversationPaneProps {
   currentAssistantName: string | null
   selectedProjectName: string | null
   selectedSetName: string | null
-  emptyHeroGreeting: { key: string | null | undefined; text: string }
   inputBarProps: InputBarProps
   messageListProps: MessageListProps
   hookWarning: ChatHookPayload | null
@@ -81,7 +124,6 @@ export const ChatConversationPane = memo(function ChatConversationPane({
   currentAssistantName,
   selectedProjectName,
   selectedSetName,
-  emptyHeroGreeting,
   inputBarProps,
   messageListProps,
   hookWarning,
@@ -137,32 +179,16 @@ export const ChatConversationPane = memo(function ChatConversationPane({
 
       <div className="relative flex min-h-0 flex-1 flex-col">
         {showEmptyHero ? (
-          <div className="chat-empty-hero flex flex-1 flex-col items-center justify-center px-6 pb-16">
-            <ChatDotGridBackground />
-            <div className="chat-empty-hero-stack relative z-10 w-full max-w-4xl space-y-8">
-              <h2
-                className="chat-motion-fade-up chat-empty-hero-title text-center text-[1.75rem] font-medium leading-snug tracking-[-0.02em] text-neutral-900 dark:text-neutral-50 sm:text-[2rem]"
-                aria-label={
-                  currentAssistantName
-                    ?? (selectedProjectName ? `Start in “${selectedProjectName}”` : null)
-                    ?? (selectedSetName ? `Start in “${selectedSetName}”` : null)
-                    ?? emptyHeroGreeting.text
-                }
-              >
-                {currentAssistantName ? (
-                  currentAssistantName
-                ) : selectedProjectName ? (
-                  `Start in “${selectedProjectName}”`
-                ) : selectedSetName ? (
-                  `Start in “${selectedSetName}”`
-                ) : (
-                  <TypewriterText
-                    key={emptyHeroGreeting.key}
-                    text={emptyHeroGreeting.text}
-                    active={showEmptyHero}
-                  />
-                )}
-              </h2>
+          <div className="chat-empty-hero flex flex-1 flex-col items-center justify-center px-6 pb-10">
+            <div className="chat-empty-hero-stack relative z-10 w-full max-w-4xl">
+              <EmptyHeroHeading
+                lang={lang}
+                assistantName={currentAssistantName}
+                projectName={selectedProjectName}
+                setName={selectedSetName}
+                seed={currentConversationId}
+                active={showEmptyHero}
+              />
               <div className="chat-motion-fade-up" style={{ ['--chat-motion-delay' as string]: '120ms' }}>
                 <InputBar {...inputBarProps} layout="inline" />
               </div>

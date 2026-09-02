@@ -464,6 +464,9 @@ pub struct LensWebSearchConfig {
     pub enabled: bool,
     #[serde(default)]
     pub provider: WebSearchProvider,
+    /// Independent `web_fetch` provider. `None` follows `provider` (legacy configs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_provider: Option<WebSearchProvider>,
     #[serde(default)]
     pub tavily_api_key: String,
     #[serde(default = "default_tavily_base_url")]
@@ -536,6 +539,7 @@ impl Default for LensWebSearchConfig {
         Self {
             enabled: false,
             provider: WebSearchProvider::Tavily,
+            fetch_provider: None,
             tavily_api_key: String::new(),
             tavily_base_url: default_tavily_base_url(),
             exa_api_key: String::new(),
@@ -1102,6 +1106,9 @@ pub struct ChatNativeToolsConfig {
     pub run_command: bool,
     #[serde(default = "default_true")]
     pub knowledge_search: bool,
+    /// Agent tools to list / create / edit / run automations.
+    #[serde(default = "default_true")]
+    pub automation: bool,
     /// Default root for ordinary (non-project) conversation workbenches.
     /// Missing legacy configs deserialize to an empty string so sanitize can
     /// migrate `workspace_roots[0]` before falling back to the platform default.
@@ -1122,6 +1129,7 @@ impl ChatNativeToolsConfig {
             || self.edit_file
             || self.run_command
             || self.knowledge_search
+            || self.automation
     }
 }
 
@@ -1142,6 +1150,7 @@ impl Default for ChatNativeToolsConfig {
             edit_file: true,
             run_command: true,
             knowledge_search: true,
+            automation: true,
             working_directory: default_chat_working_directory(),
             workspace_roots: Vec::new(),
         }
@@ -2424,6 +2433,19 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         WebSearchProvider::Unknown
     ) {
         settings.lens.web_search.provider = WebSearchProvider::Tavily;
+    }
+    // Fetch 源未设 = 跟随搜索。未知、或没有 URL fetch 接口的源清掉，避免配了却永远走直连。
+    if settings
+        .lens
+        .web_search
+        .fetch_provider
+        .is_some_and(|provider| {
+            matches!(provider, WebSearchProvider::Unknown)
+                || !crate::web_search::provider_supports_fetch(provider)
+                || provider == settings.lens.web_search.provider
+        })
+    {
+        settings.lens.web_search.fetch_provider = None;
     }
     settings.lens.web_search.max_results = settings.lens.web_search.max_results.clamp(1, 10);
     if !matches!(
