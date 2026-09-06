@@ -31,6 +31,7 @@ import {
 import { ApprovalCard } from './ApprovalCard'
 import { AskUserBlock } from './AskUserBlock'
 import { ChatTitlebar } from './ChatTitlebar'
+import { withExternalModel } from './externalModelEffort'
 import { ChatTitlebarActions } from './ChatTitlebarActions'
 import {
   beginConversationTransition,
@@ -88,6 +89,7 @@ import type {
 import {
   api,
   builtinWebSearchSupported,
+  resolveProviderWebSearchMode,
   type ChatSessionConsentPayload,
   type ChatHookPayload,
   type ChatToolConfirmPayload,
@@ -137,6 +139,7 @@ import {
 import { isPlaceholderTitle, optimisticConversationTitle } from './conversationTitle'
 import {
   getCoarse as getStreamCoarse,
+  getSnapshot as getStreamSnapshot,
   patchSnapshot as patchStreamSnapshot,
   reset as resetStreamStore,
   setCoarse as setStreamCoarse,
@@ -736,6 +739,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [webSearchEnabled, setWebSearchEnabled] = useState(true)
   // provider id → apiFormat（任务 07-23）：用于判断当前模型是否支持内置搜索。
   const [providerApiFormats, setProviderApiFormats] = useState<Record<string, string>>({})
+  const [providerOAuthTypes, setProviderOAuthTypes] = useState<Record<string, string>>({})
   const [providerBaseUrls, setProviderBaseUrls] = useState<Record<string, string>>({})
   const [enabledToolCount, setEnabledToolCount] = useState<number | null>(null)
   const [toolsDisabledReason, setToolsDisabledReason] = useState('')
@@ -814,7 +818,12 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const restoredRunIdsRef = useRef<Set<string>>(new Set())
   const pendingStreamDoneRef = useRef<Record<string, () => Promise<void>>>({})
   /** run 结束但落库 twin 尚未随 startTransition 提交时，冻结的预览等它落地再清（防收尾闪帧）。 */
-  const pendingPreviewClearRef = useRef<{ conversationId: string; messageId: string | null } | null>(null)
+  const pendingPreviewClearRef = useRef<{
+    conversationId: string
+    messageId: string | null
+    /** 冻结时已提交的 messages 引用；twinId 未知时，引用一变即视为 twin 落地。 */
+    committedMessages: ChatMessage[]
+  } | null>(null)
   /** 写 ref 不触发渲染；这个 epoch 保证挂起标记一旦设置，落地 effect 至少跑一次（武装超时兜底）。 */
   const [previewClearEpoch, setPreviewClearEpoch] = useState(0)
   const streamSnapshotsRef = useRef<Record<string, ConversationStreamSnapshot>>({})
@@ -1034,30 +1043,30 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     return true
   }, [cancelPendingFrame, syncGeneratingConversationIds])
 
-  /**
-   * run 收尾时的预览清除（两条收尾路径共用）。⚠️ 不能直接 clearStreamingPreview：
-   * 它的 store 更新走 SyncLane（useSyncExternalStore 防撕裂强制同步刷新），会抢在
-   * applyConversation 的 setState（DefaultLane）/ reloadConversation 的 startTransition
-   * 之前**单独提交一帧** —— 那一帧 live 已卸载、落库 twin 还没进已提交的 messages，
-   * 整条回答消失又出现（实测 Δsh −294～−4288、scrollTop 被钳，就是「生成完闪/沉」）。
-   * 同一同步代码块里先调 applyConversation 也没用，lane 优先级会把顺序反转。
-   * twin 尚未出现在**已提交**的 messages（currentConversationRef 在 render 期赋值，
-   * 语义即「已渲染的会话」）时，先冻结预览 —— 冻结同样是 SyncLane 先上屏，但
-   * frozen=true 让 live 气泡留在原地，那一帧无害；等 pendingPreviewClear effect 看到
-   * twin 真正落地再清，live→twin 就是同一 commit 的原子交换。
+  /** Freeze the visible preview until the committed conversation contains its answer.
+   * The external store can flush before the conversation's React state update.
    */
   const settleStreamingPreview = useCallback((conversationId: string) => {
-    const snapshot = streamSnapshotsRef.current[conversationId]
-    const twinId = snapshot?.messageId ?? null
-    const twinLanded = !twinId
-      || (currentConversationRef.current?.messages ?? []).some((m) => m.id === twinId)
-    if (!twinLanded && freezeStreamSnapshot(conversationId)) {
-      pendingPreviewClearRef.current = { conversationId, messageId: twinId }
-      setPreviewClearEpoch((value) => value + 1)
-    } else {
+    // Completion already removed the per-conversation snapshot; read the visible store.
+    const shown = getStreamSnapshot()
+    if (!hasStreamPreview(shown)) {
       clearStreamingPreview()
+      return
     }
-  }, [clearStreamingPreview, freezeStreamSnapshot])
+    const committed = currentConversationRef.current?.messages ?? []
+    const twinId = shown.messageId ?? null
+    if (twinId && committed.some((m) => m.id === twinId)) {
+      clearStreamingPreview()
+      return
+    }
+    // 冻结：停动画、留 live 气泡在原地（SyncLane 先上屏也无害），等 twin 真正提交再清。
+    // twinId 未知（run 事件没带 messageId）时按「已提交 messages 引用变化」判落地。
+    cancelPendingFrame()
+    patchStreamSnapshot({ streaming: false, reasoningStreaming: false })
+    setStreamCoarse({ streaming: false, streamFrozen: true, cancelling: false })
+    pendingPreviewClearRef.current = { conversationId, messageId: twinId, committedMessages: committed }
+    setPreviewClearEpoch((value) => value + 1)
+  }, [cancelPendingFrame, clearStreamingPreview])
 
   const ensureStreamSnapshot = useCallback((conversationId: string) => {
     const existing = streamSnapshotsRef.current[conversationId]
@@ -1193,7 +1202,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     : draftModel
   // 会话级三态联网搜索（任务 07-23）：会话显式模式优先 → 记住的全局默认（上次选择）
   // → 全局 nativeTools.webSearch 开关。这样选一次内置即成为所有新对话的默认。
-  const activeWebSearchMode = useMemo<WebSearchMode>(() => {
+  const requestedWebSearchMode = useMemo<WebSearchMode>(() => {
     if (currentConversation && !currentConversationIsBlank) {
       const explicit = currentConversation.webSearchMode ?? currentConversation.web_search_mode
       if (explicit) return explicit
@@ -1204,12 +1213,14 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     if (remembered) return remembered
     return webSearchEnabled ? 'third_party' : 'off'
   }, [currentConversation, currentConversationIsBlank, draftWebSearchMode, webSearchEnabled])
+  const activeWebSearchMode = resolveProviderWebSearchMode(requestedWebSearchMode, providerOAuthTypes[activeProviderId ?? ''])
   const activeBuiltinWebSearchSupported = useMemo(
     () => builtinWebSearchSupported(
       providerApiFormats[activeProviderId ?? ''],
       providerBaseUrls[activeProviderId ?? ''],
+      providerOAuthTypes[activeProviderId ?? ''],
     ),
-    [providerApiFormats, providerBaseUrls, activeProviderId],
+    [providerApiFormats, providerBaseUrls, providerOAuthTypes, activeProviderId],
   )
   // 多模型一问多答（任务 06-30）：当前生效的多答模型集（会话级持久 reply_models，欢迎页用草稿）。
   const activeReplyModels = useMemo<ModelRef[]>(
@@ -1283,6 +1294,9 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       const chatTools = settings.chatTools
       setMcpServers(chatTools?.servers ?? [])
       setWebSearchEnabled(chatTools?.nativeTools?.webSearch !== false)
+      setProviderOAuthTypes(
+        Object.fromEntries((settings.providers ?? []).map((p) => [p.id, p.request?.oauth?.provider ?? ''])),
+      )
       setProviderApiFormats(
         Object.fromEntries((settings.providers ?? []).map((p) => [p.id, p.apiFormat ?? ''])),
       )
@@ -1951,7 +1965,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }
     const landed = pending.messageId
       ? (currentConversation?.messages ?? []).some((m) => m.id === pending.messageId)
-      : true
+      : (currentConversation?.messages ?? []) !== pending.committedMessages
     if (landed) {
       pendingPreviewClearRef.current = null
       clearStreamingPreview()
@@ -2699,6 +2713,13 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       currentConversationIdRef.current === conversationId
       && currentConversationRef.current?.id === conversationId
     ) {
+      // 若正有一个指向其他会话的加载在途（点了大会话还没落地，又点回当前会话），
+      // 这次点击的语义是「留在这里」：作废在途转场，否则它落地时会把界面切走，
+      // 用户看到的就是「点了没反应，必须等加载完」。
+      const inFlight = getConversationTransitionSnapshot()
+      if (inFlight.loading && inFlight.targetConversationId !== conversationId) {
+        invalidateConversationTransition()
+      }
       setFocusMessageId(conversationHint?.focusMessageId ?? null)
       // 路由可能因为停留在中心页（技能/MCP/设置…）而偏离当前会话，补一次对齐。
       syncConversationRoute(conversationId)
@@ -3170,7 +3191,9 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     // 会话级三态联网搜索（任务 07-23）：把欢迎页草稿或记住的全局默认落到新会话上
     // （仅当会话尚未显式设过模式时），后端 Builtin 注入依赖会话字段而非前端展示值。
     {
-      const desiredMode = draftWebSearchMode ?? loadLastWebSearchMode()
+      const desiredMode = resolveProviderWebSearchMode(
+        draftWebSearchMode ?? loadLastWebSearchMode(), providerOAuthTypes[conversation.provider_id],
+      )
       const convMode = conversation.web_search_mode ?? conversation.webSearchMode ?? null
       if (desiredMode && convMode === null) {
         try {
@@ -3382,6 +3405,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     draftThinkingLevel,
     draftReplyModels,
     draftWebSearchMode,
+    providerOAuthTypes,
     effectiveSkillId,
     enabledSkills,
     usesChatRuntime,
@@ -4037,12 +4061,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const handleExternalModelChange = useCallback(async (model: string, reasoning?: string | null) => {
     // Route through handleRuntimeChange so the draft updates even before a conversation exists
     // (the draft is applied when the conversation is created on first send).
-    const next: AgentRuntimeConfig = {
-      ...activeAgentRuntime,
-      kind: 'external',
-      externalModel: model,
-      externalReasoning: reasoning ?? activeAgentRuntime.externalReasoning ?? null,
-    }
+    const next = withExternalModel(activeAgentRuntime, model, reasoning)
     await handleRuntimeChange(next)
   }, [activeAgentRuntime, handleRuntimeChange])
 
@@ -4933,6 +4952,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     usesExternalRuntime,
     externalAgentName: activeAgentRuntime.externalAgentId ?? null,
     conversationId: currentConversation?.id ?? null,
+    inputHistory: currentConversation?.messages.filter((message) => message.role === 'user').map((message) => message.content),
     knowledgeBaseIds: composerKnowledgeBaseIds,
     onChangeKnowledgeBaseIds: handleChangeKnowledgeBaseIds,
     forceKnowledgeSearch: composerForceKnowledgeSearch,

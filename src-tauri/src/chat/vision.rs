@@ -197,7 +197,7 @@ pub(super) async fn analyze_chat_images_with_auxiliary_model(
         .get_provider(&auxiliary_model.provider_id)
         .ok_or_else(|| "Vision auxiliary provider not found".to_string())?
         .clone();
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Err(format_chat_missing_api_key_error(&provider.name));
     }
     if auxiliary_model.model.trim().is_empty() {
@@ -251,6 +251,45 @@ pub(super) async fn analyze_chat_images_with_auxiliary_model(
     })
 }
 
+/// 读盘硬顶。超过才拒；12–16MB 的相机 JPEG 先走入口降采样。
+const MAX_READ_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_READ_IMAGES: usize = super::image_collage::COLLAGE_MAX_IMAGES;
+
+fn image_file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image")
+        .to_string()
+}
+
+fn image_read_artifact(path: &Path) -> mcp::types::ChatToolArtifact {
+    let size_bytes = fs::metadata(path).ok().map(|meta| meta.len());
+    mcp::types::ChatToolArtifact {
+        id: None,
+        name: image_file_name(path),
+        mime_type: image_mime_for_path(path).to_string(),
+        data_url: String::new(),
+        size_bytes,
+        path: Some(path.display().to_string()),
+    }
+}
+
+fn image_read_structured(count: usize, collage: Option<(u32, u32)>) -> Value {
+    match collage {
+        Some((cols, rows)) => serde_json::json!({
+            "type": "image_read",
+            "count": count,
+            "collage": true,
+            "cols": cols,
+            "rows": rows,
+        }),
+        None => serde_json::json!({
+            "type": "image_read",
+            "count": count,
+        }),
+    }
+}
+
 /// `read` 工具读到图片文件时的三级策略，复用对话级图片附件那套现成实现：
 /// ① 主模型支持视觉 → 直喂原图（作为 follow-up user 消息，因为工具结果本身只能
 /// 回文本）；② 纯文本主模型 → 辅助视觉模型出客观文字描述；③ 兜底 → OCR。
@@ -262,98 +301,217 @@ pub(super) async fn read_image_as_tool_result(
     message_id: &str,
     path: &Path,
 ) -> Result<mcp::types::McpToolCallResult, String> {
+    read_images_as_tool_result(
+        app,
+        settings,
+        conversation_id,
+        message_id,
+        std::slice::from_ref(&path.to_path_buf()),
+        false,
+    )
+    .await
+}
+
+pub(super) async fn read_images_as_tool_result(
+    app: &AppHandle,
+    settings: &Settings,
+    conversation_id: &str,
+    message_id: &str,
+    paths: &[PathBuf],
+    overview: bool,
+) -> Result<mcp::types::McpToolCallResult, String> {
     use crate::mcp::native_registry::text_tool_result;
-    // 直传 base64 不压缩；超大图片会撑爆上下文，故设上限兜底。
-    // ponytail: 不压缩直传，12MB 上限兜底；上下文吃紧再加 resize helper。
-    const MAX_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
 
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("image")
-        .to_string();
+    if paths.is_empty() {
+        return Ok(text_tool_result("没有要读取的图片。".to_string()));
+    }
+    if paths.len() > MAX_READ_IMAGES {
+        return Ok(text_tool_result(format!(
+            "一次最多读取 {MAX_READ_IMAGES} 张图片，本次传了 {} 张。",
+            paths.len()
+        )));
+    }
 
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.len() > MAX_IMAGE_BYTES {
-            return Ok(text_tool_result(format!(
-                "图片 {name} 过大（{} 字节，上限 {MAX_IMAGE_BYTES} 字节），未读取。请压缩后重试。",
-                meta.len()
-            )));
+    let mut accepted = Vec::new();
+    let mut notes = Vec::new();
+    for path in paths {
+        let name = image_file_name(path);
+        match fs::metadata(path) {
+            Ok(meta) if meta.len() > MAX_READ_IMAGE_BYTES => {
+                notes.push(format!(
+                    "图片 {name} 过大（{} 字节，上限 {MAX_READ_IMAGE_BYTES} 字节），未读取。",
+                    meta.len()
+                ));
+            }
+            Ok(_) => accepted.push(path.clone()),
+            Err(err) => notes.push(format!("图片 {name} 无法读取（{err}）。")),
         }
     }
+    if accepted.is_empty() {
+        return Ok(text_tool_result(notes.join("\n")));
+    }
+
+    let artifacts: Vec<mcp::types::ChatToolArtifact> =
+        accepted.iter().map(|path| image_read_artifact(path)).collect();
+    let names = artifacts
+        .iter()
+        .map(|artifact| artifact.name.as_str())
+        .collect::<Vec<_>>()
+        .join("、");
+    let language = crate::settings::resolve_chat_language(settings);
+    let zh = language.starts_with("zh");
 
     let state = app.state::<AppState>();
     let conversation = load_conversation(app, conversation_id)?;
     let provider = settings.get_provider(&conversation.provider_id);
     let model = conversation.model.as_str();
-    let path_buf = path.to_path_buf();
+    // 默认分张。细部分析一票否决；只有概览意图或 overview=true 且张数够才拼。
+    let collage = if super::image_collage::should_collage(
+        accepted.len(),
+        last_user_question(&conversation),
+        overview,
+    ) {
+        super::image_collage::collage_from_paths(&accepted)
+    } else {
+        None
+    };
+    let structured = image_read_structured(
+        artifacts.len(),
+        collage.as_ref().map(|sheet| (sheet.cols, sheet.rows)),
+    );
 
-    // ① 主模型支持视觉 → 直喂原图。工具结果只能回文本，所以真正的图片作为紧随
-    // 其后的一条 user 消息追加（rounds::push_tool_execution_result 负责排在 tool
-    // 结果之后；Anthropic 侧会与 tool_result 合并进同一 user turn）。
+    let with_notes = |mut content: String| {
+        if !notes.is_empty() {
+            content.push_str("\n\n");
+            content.push_str(&notes.join("\n"));
+        }
+        content
+    };
+
+    // ① 主模型支持视觉 → 直喂。默认原图分张；仅概览门槛命中才改喂一张联系表。
+    // 工具结果只能回文本，图片作为紧随其后的 user 消息追加。
     if model_supports_vision(provider, model) == Some(true) {
-        let part = image_content_part(&path_buf)?;
-        let follow_up = serde_json::json!({ "role": "user", "content": [part] });
+        let (parts, content) = if let Some(sheet) = &collage {
+            (
+                vec![image_bytes_content_part(&sheet.jpeg, "image/jpeg")?],
+                sheet.tool_message(zh),
+            )
+        } else {
+            let mut parts = Vec::new();
+            for path in &accepted {
+                parts.push(image_content_part(path)?);
+            }
+            let content = if accepted.len() == 1 {
+                format!("已读取图片 {names}，已作为图片直接提供给你查看（见下一条消息）。")
+            } else {
+                format!(
+                    "已读取 {} 张图片（{names}），已作为图片直接提供给你查看（见下一条消息）。",
+                    accepted.len()
+                )
+            };
+            (parts, content)
+        };
+        let follow_up = serde_json::json!({ "role": "user", "content": parts });
         return Ok(mcp::types::McpToolCallResult {
-            content: format!("已读取图片 {name}，已作为图片直接提供给你查看（见下一条消息）。"),
+            content: with_notes(content),
             is_error: false,
-            raw: Value::Null,
-            artifacts: Vec::new(),
-            structured_content: None,
+            raw: structured.clone(),
+            artifacts,
+            structured_content: Some(structured),
             follow_up_user_messages: vec![follow_up],
         });
     }
 
     // ② 纯文本主模型 → 辅助视觉模型出客观文字描述（复用对话级图片那套）。
+    // 联系表同样喂给副模型，避免 9 张原图把副调用也撑爆。
+    let mut collage_temp: Vec<PathBuf> = Vec::new();
+    let aux_paths: &[PathBuf] = if let Some(sheet) = &collage {
+        let path = std::env::temp_dir().join(format!("kivio-collage-{}.jpg", Uuid::new_v4()));
+        if fs::write(&path, &sheet.jpeg).is_ok() {
+            collage_temp.push(path);
+            collage_temp.as_slice()
+        } else {
+            accepted.as_slice()
+        }
+    } else {
+        accepted.as_slice()
+    };
     if let Some(aux) = auxiliary_vision_model_for_images(
         settings,
         provider,
         model,
-        std::slice::from_ref(&path_buf),
+        aux_paths,
         Some(session_model_for_conversation(&conversation)),
     ) {
-        let language = crate::settings::resolve_chat_language(settings);
         let retry_attempts = if settings.retry_enabled {
             settings.retry_attempts as usize
         } else {
             1
         };
-        if let Ok(result) = analyze_chat_images_with_auxiliary_model(
+        let analysis = analyze_chat_images_with_auxiliary_model(
             &state,
             settings,
             &aux,
             conversation_id,
             message_id,
             last_user_question(&conversation),
-            std::slice::from_ref(&path_buf),
+            aux_paths,
             retry_attempts,
             &language,
         )
-        .await
-        {
-            return Ok(text_tool_result(format!(
-                "图片 {name} 的视觉分析（{} / {}）：\n\n{}",
-                result.provider_name, result.model, result.content
-            )));
+        .await;
+        for path in &collage_temp {
+            let _ = fs::remove_file(path);
+        }
+        if let Ok(result) = analysis {
+            let header = if let Some(sheet) = &collage {
+                sheet.tool_message(zh)
+            } else {
+                format!("图片 {names} 的视觉分析")
+            };
+            return Ok(mcp::types::McpToolCallResult {
+                content: with_notes(format!(
+                    "{header}（{} / {}）：\n\n{}",
+                    result.provider_name, result.model, result.content
+                )),
+                is_error: false,
+                raw: structured.clone(),
+                artifacts,
+                structured_content: Some(structured),
+                follow_up_user_messages: Vec::new(),
+            });
+        }
+    } else {
+        for path in &collage_temp {
+            let _ = fs::remove_file(path);
         }
     }
 
-    // ③ 兜底 OCR。
-    match crate::chat::knowledge_base::process::process_document(
-        state.inner(),
-        &settings.document_processing,
-        path,
-    )
-    .await
-    {
-        Ok(doc) => Ok(text_tool_result(format!(
-            "图片 {name} 的 OCR 文本：\n\n{}",
-            doc.text
-        ))),
-        Err(err) => Ok(text_tool_result(format!(
-            "图片 {name}：当前模型不支持视觉，且无可用视觉模型，OCR 也未成功（{err}）。如需识别请在设置启用视觉模型或 OCR 引擎。"
-        ))),
+    // ③ 兜底 OCR：对原图逐张做，不 OCR 联系表（格子太小，字会糊）。
+    let mut ocr_chunks = Vec::new();
+    for path in &accepted {
+        let name = image_file_name(path);
+        match crate::chat::knowledge_base::process::process_document(
+            state.inner(),
+            &settings.document_processing,
+            path,
+        )
+        .await
+        {
+            Ok(doc) => ocr_chunks.push(format!("图片 {name} 的 OCR 文本：\n\n{}", doc.text)),
+            Err(err) => ocr_chunks.push(format!(
+                "图片 {name}：当前模型不支持视觉，且无可用视觉模型，OCR 也未成功（{err}）。如需识别请在设置启用视觉模型或 OCR 引擎。"
+            )),
+        }
     }
+    Ok(mcp::types::McpToolCallResult {
+        content: with_notes(ocr_chunks.join("\n\n")),
+        is_error: false,
+        raw: structured.clone(),
+        artifacts,
+        structured_content: Some(structured),
+        follow_up_user_messages: Vec::new(),
+    })
 }
 
 /// R1：MCP 工具结果里的图片 artifact「直达模型」。通用于所有 MCP server（非
@@ -397,7 +555,17 @@ pub(super) async fn attach_image_artifacts_for_model(
     if model_supports_vision(provider, model) == Some(true) {
         let parts: Vec<Value> = accepted
             .iter()
-            .filter_map(|(artifact, _)| data_url_image_part(&artifact.data_url).ok())
+            .filter_map(|(artifact, bytes)| {
+                // 与 image_content_part 同一入口收口：超界的 MCP 图片先降采样再直喂。
+                match super::image_prep::prepare_image_bytes_for_model(bytes) {
+                    Some((processed, mime)) => data_url_image_part(&format!(
+                        "data:{mime};base64,{}",
+                        general_purpose::STANDARD.encode(processed)
+                    ))
+                    .ok(),
+                    None => data_url_image_part(&artifact.data_url).ok(),
+                }
+            })
             .collect();
         if !parts.is_empty() {
             result
@@ -559,8 +727,20 @@ pub(super) fn user_content_with_auxiliary_vision_result(
 
 pub(super) fn image_content_part(path: &PathBuf) -> Result<serde_json::Value, String> {
     let bytes = fs::read(path).map_err(|e| format!("读取图片附件失败: {e}"))?;
+    image_bytes_content_part(&bytes, image_mime_for_path(path))
+}
+
+pub(super) fn image_bytes_content_part(
+    bytes: &[u8],
+    fallback_mime: &str,
+) -> Result<serde_json::Value, String> {
+    // 入口降采样（治本）：超尺寸/超体积的图在进上下文前收敛到有界大小，
+    // 历史层的字节预算（compaction::prune_image_parts）只剩保险作用。
+    let (bytes, mime) = match super::image_prep::prepare_image_bytes_for_model(bytes) {
+        Some((processed, mime)) => (processed, mime),
+        None => (bytes.to_vec(), fallback_mime),
+    };
     let base64 = general_purpose::STANDARD.encode(bytes);
-    let mime = image_mime_for_path(path);
     Ok(serde_json::json!({
         "type": "image_url",
         "image_url": { "url": format!("data:{mime};base64,{base64}") },

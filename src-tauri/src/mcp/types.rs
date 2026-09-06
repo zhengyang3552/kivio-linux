@@ -274,7 +274,7 @@ pub fn native_read_file_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__read_file".to_string(),
         name: "read".to_string(),
-        description: "Read a local file or directory. For a file: text is line-numbered as `N<TAB>line` for easy reference; the numbers are display-only and are NOT part of the file — never include them in edit old_string. Output is capped at 2000 lines or 50KB, whichever is hit first, so a single read can never flood the context; when the cap or your own limit stops the read early the result says so and reports total_lines and next_offset — continue with offset until you have what you need. Optional offset/limit select a 1-based line window (the cap still applies on top). For a directory path: returns its entries (folded in the former `ls` tool); offset/limit are ignored. Image files (png/jpg/webp/…) are also supported: the image is shown to you directly when your model has vision, otherwise it is described or OCR'd to text — so you can `read` screenshots and photos by path. For PDF/Word/Excel, use the matching skill instead.".to_string(),
+        description: "Read a local file or directory. For a file: text is line-numbered as `N<TAB>line` for easy reference; the numbers are display-only and are NOT part of the file — never include them in edit old_string. Output is capped at 2000 lines or 50KB, whichever is hit first, so a single read can never flood the context; when the cap or your own limit stops the read early the result says so and reports total_lines and next_offset — continue with offset until you have what you need. Optional offset/limit select a 1-based line window (the cap still applies on top). For a directory path: returns its entries (folded in the former `ls` tool); offset/limit are ignored. Image files (png/jpg/webp/…) are also supported: the image is shown to you directly when your model has vision, otherwise it is described or OCR'd to text. To inspect several images at once, pass `paths` (up to 12). Images are read individually by default — always do that for analysis, QA, spelling, logos, or any per-image detail. A numbered contact sheet is used only for a first-pass overview of 6–12 similar images when the user asked to skim the set, or when you set overview=true for that skim; never for analysis. Re-read a single path for fine text. For PDF/Word/Excel, use the matching skill instead.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -282,10 +282,20 @@ pub fn native_read_file_tool() -> ChatToolDefinition {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File path to read. Relative paths resolve from the project root/current workspace; absolute and ~/ paths are also accepted when allowed by workspace mode." },
+                "paths": {
+                    "type": "array",
+                    "description": "Several image files to inspect in one call (png/jpg/webp/gif, max 12). Default is one image each. Do not use this for text files.",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1,
+                    "maxItems": 12
+                },
+                "overview": {
+                    "type": "boolean",
+                    "description": "If true, combine 6–12 images into one numbered contact sheet for a first-pass skim. Ignored when the user asked to analyze, verify, read text, or inspect each image — those always stay separate. Omit this (or false) unless you only need a coarse overview."
+                },
                 "offset": { "type": "integer", "description": "1-based start line (optional)" },
                 "limit": { "type": "integer", "description": "Max lines to return (optional)" }
-            },
-            "required": ["path"]
+            }
         }),
         sensitive: false,
         annotations: None,
@@ -436,7 +446,7 @@ pub fn native_run_command_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__run_command".to_string(),
         name: "bash".to_string(),
-        description: format!("Run a host shell command (build, test, etc.).{shell_hint} In a project conversation, the command starts from the bound project root by default; any explicit cwd is only a startup directory and is validated as workspace-local. Do not use `cd path && command` when the path contains spaces—pass `cwd` and run only the remaining command. Do not combine `cwd` with a leading `cd ... &&` prefix. Long-running dev servers such as `npm run dev`, `npm run tauri dev`, and `vite` are started in the background automatically and return immediately with a pid. This is a sensitive host-shell capability, not the same boundary as the file tools: obey user constraints and explain or seek confirmation before cross-directory, destructive, network, or environment-changing commands. A non-zero exit code is returned as a tool error with stdout/stderr. Host Python package installs require an explicit user request and allow_host_python_package_install=true."),
+        description: format!("Run a host shell command (build, test, etc.).{shell_hint} In a project conversation, the command starts from the bound project root by default; any explicit cwd is only a startup directory and is validated as workspace-local. Do not use `cd path && command` when the path contains spaces—pass `cwd` and run only the remaining command. Do not combine `cwd` with a leading `cd ... &&` prefix. Foreground commands wait until they exit — omit timeout_ms unless you want the process killed at a deadline. Do not background finite jobs (builds, tests, image-generation batches); put parallel work inside one command. Long-running never-ending servers such as `npm run dev`, `npm run tauri dev`, and `vite` are started in the background automatically and return immediately with a job_id. This is a sensitive host-shell capability, not the same boundary as the file tools: obey user constraints and explain or seek confirmation before cross-directory, destructive, network, or environment-changing commands. A non-zero exit code is returned as a tool error with stdout/stderr. Host Python package installs require an explicit user request and allow_host_python_package_install=true."),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -445,8 +455,8 @@ pub fn native_run_command_tool() -> ChatToolDefinition {
             "properties": {
                 "command": { "type": "string", "description": "Shell command" },
                 "cwd": { "type": "string", "description": "Working directory (required when the path contains spaces; do not use `cd ... &&` for that)" },
-                "background": { "type": "boolean", "description": "Run in background and return immediately (auto-enabled for common dev servers)" },
-                "timeout_ms": { "type": "integer", "description": "Timeout in ms (optional)" },
+                "background": { "type": "boolean", "description": "Run in background and return a job_id immediately. Auto-enabled for never-ending dev servers. Do not use this for finite jobs that will exit." },
+                "timeout_ms": { "type": "integer", "description": "Optional kill deadline in ms (max 600000). Omit to wait until the command exits. Timeout kills the process and returns partial output; it does not background the job." },
                 "allow_host_python_package_install": { "type": "boolean", "description": "Only true when the user explicitly asked to modify the host Python environment; installs must use --user or a virtual environment." }
             },
             "required": ["command"]
@@ -461,7 +471,7 @@ pub fn native_bash_output_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__bash_output".to_string(),
         name: "bash_output".to_string(),
-        description: "Inspect background commands started by bash (background:true). With a job_id: returns that job's captured stdout/stderr since since_offset (default 0), the current status (running / exited with exit_code / killed / error), and next_offset for incremental reads. With NO job_id: lists all background commands tracked in this app session (job_id, status, command, working directory, age) — background commands survive across turns until killed or the app exits. After dispatching a background command, do NOT poll immediately — keep working, then poll a bounded number of times (≤20). Always refresh once with bash_output before reporting a background command's result to the user.".to_string(),
+        description: "Inspect background commands started by bash (background:true / auto-detected never-ending servers). With a job_id: waits until that process exits or wait_ms elapses (default 30000; 0 = return immediately), then returns captured stdout/stderr since since_offset (default 0), status (running / exited with exit_code / killed / error), and next_offset. New log lines do not end the wait. Finite jobs should use foreground bash (wait until exit) instead of this tool. With NO job_id: lists all background commands tracked in this app session (job_id, status, command, working directory, age) — background commands survive across turns until killed or the app exits. Always refresh once with bash_output before reporting a background command's result to the user.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -469,7 +479,8 @@ pub fn native_bash_output_tool() -> ChatToolDefinition {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string", "description": "The job_id returned when the background command was started. Omit to list all tracked background jobs instead." },
-                "since_offset": { "type": "integer", "description": "Byte offset to read from (use next_offset from the previous bash_output call for incremental reads; default 0)" }
+                "since_offset": { "type": "integer", "description": "Byte offset to read from (use next_offset from the previous bash_output call for incremental reads; default 0)" },
+                "wait_ms": { "type": "integer", "description": "Maximum time to wait for the process to exit (default 30000). Returns sooner if it exits. New output does not end the wait. 0 returns a snapshot immediately. Capped at the tool timeout." }
             }
         }),
         sensitive: false,
@@ -526,11 +537,15 @@ pub fn native_save_assistant_tool() -> ChatToolDefinition {
     }
 }
 
+/// `present_artifacts` only takes id/path strings. Models sometimes dump
+/// base64 or file contents into the argument stream; abort past this.
+pub const PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS: usize = 8_192;
+
 pub fn native_present_artifacts_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__present_artifacts".to_string(),
         name: "present_artifacts".to_string(),
-        description: "Show files or images in the chat. You must call this when the user asks to show, preview, attach, or send a file; reading or describing a file does not display it. Pass artifact_ids for files this conversation generated, or paths for files that already exist on disk — never both for the same file, and never invent a path for a generated file. Unselected files remain hidden.".to_string(),
+        description: "Show files or images in the chat. Call this when the user should see a file; reading or describing it does not display it. Pass only a short JSON of identifiers: copy `art_…` ids from tool results into artifact_ids, or pass existing disk paths. Never both for the same file. Never invent a path for a generated file. Never put file contents, image bytes, base64, or data URLs in any field. Caption is optional plain text. Max 16 files. Unselected files stay hidden. Example: {\"artifact_ids\":[\"art_…\"]}".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -539,21 +554,21 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
             "properties": {
                 "artifact_ids": {
                     "type": "array",
-                    "description": "IDs of files generated in this conversation (e.g. images from mixer_generate_image). These have no filesystem path — do not also list them in paths.",
+                    "description": "Copy `art_…` ids from tool results verbatim. Short strings only — not file names, paths, bytes, base64, or data URLs. Generated files have these ids and no usable path.",
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 16
                 },
                 "paths": {
                     "type": "array",
-                    "description": "Paths of files that already exist on disk. Only for files you read or wrote yourself; never for generated artifacts.",
+                    "description": "Existing disk paths for files you already read or wrote. Do not use for generated artifacts (those use artifact_ids). Never file contents.",
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 16
                 },
                 "caption": {
                     "type": "string",
-                    "description": "Optional short caption",
+                    "description": "Optional plain-text caption (max 300 chars). Not for file contents or base64.",
                     "maxLength": 300
                 }
             },
@@ -684,7 +699,7 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "mixer__generate_image".to_string(),
         name: "mixer_generate_image".to_string(),
-        description: "Generate image artifacts from a text prompt using the Mixer image generation model configured in Settings.".to_string(),
+        description: "Generate or edit image artifacts using the Mixer image generation model configured in Settings. For image-to-image / edits, pass paths of local images or artifact_ids of images generated earlier in this conversation. If the user attached images this turn and you omit both, those attachments are used automatically.".to_string(),
         source: "mixer".to_string(),
         server_id: None,
         server_name: Some("Mixer".to_string()),
@@ -693,7 +708,7 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Detailed image generation prompt"
+                    "description": "Detailed image generation or edit prompt"
                 },
                 "size": {
                     "type": "string",
@@ -710,6 +725,20 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
                     "minimum": 1,
                     "maximum": 4,
                     "description": "Number of images to generate"
+                },
+                "paths": {
+                    "type": "array",
+                    "description": "Local image files to edit or use as references. Use Kivio attachment copy paths from this turn, or files you already read.",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1,
+                    "maxItems": 4
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "description": "IDs of images generated earlier in this conversation to edit or use as references.",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1,
+                    "maxItems": 4
                 }
             },
             "required": ["prompt"]
@@ -1115,6 +1144,29 @@ mod tests {
     }
 
     #[test]
+    fn present_artifacts_tool_tells_model_to_pass_ids_only() {
+        let def = native_present_artifacts_tool();
+        assert!(
+            def.description.contains(r#"{"artifact_ids":["art_…"]}"#),
+            "{}",
+            def.description
+        );
+        assert!(def.description.contains("base64"), "{}", def.description);
+        assert!(
+            def.input_schema["properties"]["artifact_ids"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("`art_…`"),
+        );
+        assert!(
+            def.input_schema["properties"]["caption"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("plain-text"),
+        );
+    }
+
+    #[test]
     fn native_file_and_web_tools_have_expected_sensitivity() {
         assert!(!native_read_file_tool().sensitive);
         assert!(!native_web_fetch_tool().sensitive);
@@ -1135,6 +1187,8 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("File path"));
+        assert!(read_schema["properties"].get("paths").is_some());
+        assert!(read_schema.get("required").is_none());
         // read 现在也列目录，描述里应提到目录
         assert!(native_read_file_tool().description.contains("directory"));
         assert!(grep.description.contains("file or under a directory"));

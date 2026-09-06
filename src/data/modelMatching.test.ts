@@ -2,6 +2,42 @@ import { describe, expect, it } from 'vitest'
 import { matchModel, matchModelExact, resolveModelInfo } from './modelMatching'
 
 describe('matchModel', () => {
+  it('resolves all eight OpenCode free variants without inheriting paid limits or prices', () => {
+    for (const id of ['big-pickle', 'deepseek-v4-flash-free', 'ling-3.0-flash-fin-free', 'mimo-v2.5-free', 'muse-spark-1.2-contributor-free', 'muse-spark-1.3-contributor-free', 'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free']) {
+      const info = matchModelExact(id)
+      expect(info, id).not.toBeNull()
+      expect(info?.pricing?.input).toBe(0)
+      expect(info?.pricing?.output).toBe(0)
+      expect(matchModel(`opencode/${id}`)).toEqual(info)
+    }
+    expect(matchModelExact('muse-spark-1.3-contributor-free')?.maxOutput).toBe(131072)
+    expect(matchModelExact('muse-spark-1.3-contributor')?.pricing?.input).toBeGreaterThan(0)
+    expect(matchModelExact('deepseek-v4-flash-free')?.contextWindow).toBe(200000)
+    expect(matchModelExact('nemotron-3.5-lightning-free')?.reasoningEfforts).toEqual([])
+  })
+
+  it('resolves Kimi Code short IDs only with provider context and preserves overrides', () => {
+    const provider = { baseUrl: 'https://api.kimi.com/coding/v1' }
+    expect(resolveModelInfo('k3', undefined, provider).displayName).toBe('Kimi K3')
+    expect(resolveModelInfo('k3-256k', undefined, provider).contextWindow).toBe(262144)
+    expect(resolveModelInfo('k3', undefined, provider).reasoningEfforts).toEqual(['low', 'high', 'max'])
+    expect(resolveModelInfo('k3', undefined, provider).pricing?.input).toBeUndefined()
+    expect(resolveModelInfo('k3', { k3: { contextWindow: 1048576 } }, provider).contextWindow).toBe(1048576)
+    expect(matchModel('k3')).toBeNull()
+    expect(resolveModelInfo('k3', undefined, { baseUrl: 'https://other.example/v1' })).toEqual({})
+  })
+
+  it('resolves September models through provider and effort aliases without losing variants', () => {
+    expect(matchModel('gemini-3.8-flash-high')).toEqual(matchModelExact('gemini-3.8-flash'))
+    expect(matchModel('openai/gpt-6-astra')?.contextWindow).toBe(1050000)
+    expect(matchModel('anthropic/claude-fable-5-1')?.displayName).toBe('Claude Fable 5.1')
+    expect(matchModel('claude-mythos-5-1')?.displayName).toBe('Claude Mythos 5.1')
+    expect(matchModel('meta/muse-spark-1.3-contributor')?.pricing?.input).toBe(0.1)
+    expect(matchModel('meta/muse-spark-1.3')?.pricing?.input).toBe(1.25)
+    expect(matchModel('gemini-3.8-flash-high')?.reasoningEfforts).toEqual(['low', 'medium', 'high'])
+    expect(matchModelExact('gpt-6')).toBeNull()
+  })
+
   it('returns null for blank model names', () => {
     expect(matchModel('')).toBeNull()
     expect(matchModel('   ')).toBeNull()
@@ -58,6 +94,34 @@ describe('matchModel', () => {
   it('recognizes image generation model naming patterns', () => {
     const info = matchModel('dall-e-3')
     expect(info?.capabilities?.imageGeneration).toBe(true)
+  })
+
+  it('matches current Grok Imagine image ids without collapsing variants', () => {
+    expect(matchModel('grok-imagine-image')?.displayName).toBe('Grok Imagine Image')
+    expect(matchModel('grok-imagine-image')?.capabilities?.imageGeneration).toBe(true)
+    expect(matchModel('grok-imagine-image-2.0')?.displayName).toBe('Grok Imagine Image 2.0')
+    expect(matchModel('grok-imagine-image-2.0')?.displayName).not.toBe('Grok Imagine Image')
+    expect(matchModel('x-ai/grok-imagine-image-2.0')?.displayName).toBe('Grok Imagine Image 2.0')
+    expect(matchModel('grok-imagine-image-quality')?.displayName).toBe('Grok Imagine Image Quality')
+    expect(matchModel('grok-imagine-image-quality')?.displayName).not.toBe('Grok Imagine Image')
+    expect(matchModel('x-ai/grok-imagine-image-quality')?.displayName).toBe('Grok Imagine Image Quality')
+  })
+
+  it('matches current third-party image models used by Mixer', () => {
+    expect(matchModel('gemini-3.1-flash-lite-image')?.capabilities?.imageGeneration).toBe(true)
+    expect(matchModel('google/gemini-3.1-flash-lite-image')?.displayName).toBe(
+      'Gemini 3.1 Flash Lite Image',
+    )
+    expect(matchModel('nano-banana-2')?.displayName).toBe('Nano Banana 2')
+    expect(matchModel('nano-banana-2')?.displayName).not.toBe('Nano Banana')
+    expect(matchModel('qwen/qwen-image-3')?.displayName).toBe('Qwen Image 3')
+    expect(matchModel('qwen-image-3-pro')?.displayName).toBe('Qwen Image 3 Pro')
+    expect(matchModel('qwen-image-3')?.displayName).not.toBe('Qwen Image')
+    expect(matchModel('krea-2-large')?.capabilities?.imageGeneration).toBe(true)
+    expect(matchModel('meta/muse-image')?.displayName).toBe('Muse Image')
+    expect(matchModel('mai-image-2.5-pro')?.displayName).toBe('MAI Image 2.5 Pro')
+    expect(matchModel('riverflow-v2.5-pro')?.displayName).toBe('Riverflow V2.5 Pro')
+    expect(matchModel('black-forest-labs/flux.2-klein-4b')?.displayName).toBe('FLUX.2 Klein 4B')
   })
 
   it('matches the latest official Kimi model ids', () => {

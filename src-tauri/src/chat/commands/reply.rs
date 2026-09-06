@@ -155,7 +155,7 @@ pub(super) async fn complete_assistant_reply_inner(
         .get_provider(&resolved_provider_id)
         .ok_or_else(|| "Chat provider not found".to_string())?
         .clone();
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Err(format_chat_missing_api_key_error(&provider.name));
     }
     if resolved_model.trim().is_empty() {
@@ -436,7 +436,8 @@ pub(super) async fn complete_assistant_reply_inner(
     // 内置搜索走 `config.web_search_mode` → 各适配器请求体注入，不在工具列表里。
     // builder 会话已清空工具（只留 save_assistant），不参与搜索门控。
     let web_search_mode =
-        crate::chat::types::WebSearchMode::resolve(conversation.web_search_mode, &settings);
+        crate::chat::types::WebSearchMode::resolve(conversation.web_search_mode, &settings)
+            .for_provider(&provider);
     if !builder_mode {
         apply_web_search_mode_tool_filter(&mut tools, web_search_mode, &settings);
     }
@@ -605,6 +606,20 @@ pub(super) async fn complete_assistant_reply_inner(
     );
 
     let chat_host = ChatAgentHost {
+        workflow_hooks: if chat_mode {
+            Default::default()
+        } else {
+            crate::plugins::packages::hook_runtime(
+                workbench_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+                "main".into(),
+                last_user_idx
+                    .and_then(|index| conversation.messages.get(index))
+                    .map(|m| m.content.clone()),
+            )
+        },
         app: app.clone(),
         state: state.inner(),
         run_id: run_id.clone(),

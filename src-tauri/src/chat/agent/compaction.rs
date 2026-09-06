@@ -215,12 +215,16 @@ const DUPLICATE_IMAGE_PLACEHOLDER: &str = "[与后文同一张图片，此处省
 
 /// 发送视图里所有图片 base64 的总字节预算。超出后从**最旧**的图片开始换占位符。
 ///
-/// 4MB base64 ≈ 3MB 原始字节，够放四五张全分辨率截图；再多的历史图片对当前一步几乎
-/// 没有价值，却每轮都要重传。参照 Codex 的实测事故：图片 base64 反复重放把请求打到
-/// 8.34MB，多家 OpenAI 兼容中转直接 502/524 或返回空流。
+/// 与入口降采样（`chat/image_prep.rs`）分工：入口把每张图收敛到 ≤2000px / ≤2MB 原始
+/// 字节（base64 ≈ 2.7MB，典型只有几百 KB），所以这里是**保险不是主力**——16MB 对齐
+/// pi 的溢出恢复预算（Anthropic 32MB 请求体上限的一半），装得下几十张典型缩放图。
+/// 曾经是 4MB：入口不缩放时它每轮必砍，会把模型**上一轮刚读、还没看到**的图挤出
+/// 上下文，模型按占位符提示重读 → 再挤掉别的图，原地绕圈（实测于电商 9 图核验会话）。
+/// 参照 Codex 的实测事故（openai/codex#28316）：无预算时图片 base64 反复重放把请求
+/// 打到 8.34MB+，多家 OpenAI 兼容中转直接 502/524 或返回空流——预算本身必须保留。
 ///
 /// ponytail: 固定常量，不做设置项。真有人需要不同额度再提成 `chat_tools` 配置。
-const IMAGE_BYTES_BUDGET: usize = 4 * 1024 * 1024;
+const IMAGE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
 
 /// 收敛发送视图里的图片体积：**倒序**（新→旧）遍历，重复的图片只留最新那份，
 /// 累计 base64 字节超过 [`IMAGE_BYTES_BUDGET`] 后把更早的图片换成占位文本。
@@ -852,7 +856,11 @@ fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> usize {
                     } => estimate_tokens(name) + estimate_tokens(arguments_raw),
                     MessagePart::ToolResult { content, .. } => estimate_tokens(content),
                     // 图片部件记 0（与 estimate_value_tokens 同口径，不把 base64 算进 token）。
-                    MessagePart::Image { .. } | MessagePart::ImageUrl { .. } => 0,
+                    // reasoning item 同理：encrypted_content 是密文 base64，按字符估算会
+                    // 数倍虚高；其真实占用由 usage 锚点覆盖。
+                    MessagePart::Image { .. }
+                    | MessagePart::ImageUrl { .. }
+                    | MessagePart::ReasoningItem { .. } => 0,
                 })
                 .sum();
             parts + 4
@@ -1569,7 +1577,23 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
                     None,
                 );
             }
-            compacted
+            match crate::chat::workflow_hooks::compact_context(
+                env.host,
+                &config.conversation_id,
+                config.generation,
+            )
+            .await
+            {
+                Ok(context) => crate::chat::workflow_hooks::inject_context(
+                    &mut state.runtime_messages,
+                    &context,
+                ),
+                Err(error) => crate::chat::workflow_hooks::inject_context(
+                    &mut state.runtime_messages,
+                    &[format!("SessionStart compact hook failed: {error}")],
+                ),
+            }
+            state.runtime_messages.clone()
         }
         CompactOutcome::Cancelled => {
             // 用户主动取消进行中的 run：不计入 anti-thrashing（取消 ≠ 压缩无能为力），
@@ -1736,7 +1760,7 @@ async fn compact_conversation_inner(
         .get_provider(&provider_id)
         .ok_or_else(|| "Compression provider not found".to_string())?
         .clone();
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Err(format_chat_missing_api_key_error(&provider.name));
     }
     if model.trim().is_empty() {

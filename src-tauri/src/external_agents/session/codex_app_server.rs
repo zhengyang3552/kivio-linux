@@ -215,9 +215,16 @@ fn granted_codex_permissions(params: &Value) -> Value {
     permissions
 }
 
+fn is_codex_elicitation(method: &str) -> bool {
+    method == "mcpServer/elicitation/request" || method.starts_with("openai/elicitation")
+}
+
 /// Approve payload when the user allows (or the 「完全」档 auto-allows). Each method
 /// maps to a different response shape (see the `*RequestApprovalResponse` schemas).
 fn approval_response(method: &str, params: &Value) -> Option<Value> {
+    if is_codex_elicitation(method) {
+        return Some(json!({ "action": "decline", "content": null }));
+    }
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             Some(json!({ "decision": "acceptForSession" }))
@@ -230,7 +237,6 @@ fn approval_response(method: &str, params: &Value) -> Option<Value> {
             "permissions": granted_codex_permissions(params),
             "scope": "session"
         })),
-        "mcpServer/elicitation/request" => Some(json!({ "action": "decline", "content": null })),
         _ => None,
     }
 }
@@ -238,6 +244,9 @@ fn approval_response(method: &str, params: &Value) -> Option<Value> {
 /// Deny payload. `interrupt` maps to Codex's cancel/abort (stop the turn); otherwise the
 /// agent continues and tries something else.
 fn approval_deny_response(method: &str, interrupt: bool) -> Option<Value> {
+    if is_codex_elicitation(method) {
+        return Some(json!({ "action": "decline", "content": null }));
+    }
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             Some(json!({
@@ -253,7 +262,6 @@ fn approval_deny_response(method: &str, interrupt: bool) -> Option<Value> {
             "permissions": {},
             "scope": "turn"
         })),
-        "mcpServer/elicitation/request" => Some(json!({ "action": "decline", "content": null })),
         _ => None,
     }
 }
@@ -766,6 +774,37 @@ fn emit_thread_item(
                     Some(ms) => format!("{ms}ms"),
                     None => duration_ms.to_string(),
                 },
+            );
+        }
+        Some("clock") => {
+            let duration_ms = item.get("durationMs").cloned().unwrap_or(Value::Null);
+            let current_time = map_str(item, "currentTime")
+                .or_else(|| map_str(item, "time"))
+                .or_else(|| map_str(item, "now"))
+                .map(str::to_string);
+            let result = if let Some(time) = current_time.as_deref() {
+                time.to_string()
+            } else {
+                match duration_ms.as_u64() {
+                    Some(ms) => format!("{ms}ms"),
+                    None => item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed")
+                        .to_string(),
+                }
+            };
+            emit_named_tool(
+                item,
+                emitted_tools,
+                sink,
+                include_result,
+                "clock",
+                json!({
+                    "durationMs": duration_ms,
+                    "currentTime": current_time,
+                }),
+                result,
             );
         }
         Some("collabToolCall") | Some("collabAgentToolCall") => {
@@ -1592,7 +1631,12 @@ async fn answer_codex_server_request(
     if let Some(result) = approval_response(method, params) {
         return write_rpc_result(stdin, id, result).await;
     }
-    write_rpc_error(stdin, id, -32601, &format!("Method not found: {method}")).await
+    write_rpc_result(stdin, id, unknown_server_request_result()).await
+}
+
+/// 未知的带 `id` 请求：回 decline 结果而不是 `-32601`，避免这一轮挂死。
+fn unknown_server_request_result() -> Value {
+    json!({ "decision": "decline" })
 }
 
 async fn answer_codex_tool_approval(
@@ -1818,7 +1862,7 @@ async fn answer_handshake_request(
     if let Some(result) = approval_response(method, params) {
         write_rpc_result(stdin, id, result).await
     } else {
-        write_rpc_error(stdin, id, -32601, &format!("Method not found: {method}")).await
+        write_rpc_result(stdin, id, unknown_server_request_result()).await
     }
 }
 
@@ -3065,6 +3109,7 @@ mod tests {
             UnifiedAgentEvent::CliCompacted { .. } => "CliCompacted",
             UnifiedAgentEvent::UserSteer { .. } => "UserSteer",
             UnifiedAgentEvent::UserFollowUp { .. } => "UserFollowUp",
+            UnifiedAgentEvent::QueuedTextsRestored { .. } => "QueuedTextsRestored",
             UnifiedAgentEvent::StatusNote { .. } => "StatusNote",
             UnifiedAgentEvent::BackgroundTask { .. } => "BackgroundTask",
             UnifiedAgentEvent::TodoWrite { .. } => "TodoWrite",
@@ -3502,6 +3547,22 @@ mod tests {
             approval_deny_response("item/permissions/requestApproval", false),
             Some(json!({ "permissions": {}, "scope": "turn" }))
         );
+        assert_eq!(
+            approval_response("mcpServer/elicitation/request", &empty),
+            Some(json!({ "action": "decline", "content": null }))
+        );
+        assert_eq!(
+            approval_response("openai/elicitation/create", &empty),
+            Some(json!({ "action": "decline", "content": null }))
+        );
+        assert_eq!(
+            approval_deny_response("openai/elicitation", false),
+            Some(json!({ "action": "decline", "content": null }))
+        );
+        assert_eq!(
+            unknown_server_request_result(),
+            json!({ "decision": "decline" })
+        );
     }
 
     #[test]
@@ -3733,6 +3794,33 @@ mod tests {
             event,
             UnifiedAgentEvent::ToolResult { tool_use_id, content, .. }
                 if tool_use_id == "slp-1" && content == "1500ms"
+        )));
+    }
+
+    #[test]
+    fn clock_item_emits_tool_card() {
+        let clock = json!({
+            "item": {
+                "type": "clock",
+                "id": "clk-1",
+                "status": "completed",
+                "currentTime": "2026-09-01T15:00:00Z"
+            }
+        });
+        let mut events = Vec::new();
+        let mut tools = HashSet::new();
+        map_codex_notification("item/started", &clock, &mut tools, &mut |e| events.push(e));
+        map_codex_notification("item/completed", &clock, &mut tools, &mut |e| {
+            events.push(e)
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UnifiedAgentEvent::ToolUse { name, .. } if name == "clock"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UnifiedAgentEvent::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "clk-1" && content == "2026-09-01T15:00:00Z"
         )));
     }
 

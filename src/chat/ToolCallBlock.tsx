@@ -1,9 +1,11 @@
 import { type ComponentType, type ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
+import { ChatDisclosureBody } from './ChatDisclosureBody'
 import {
   AlertCircle,
   Bot,
   Brain,
   CheckCircle2,
+  ChevronDown,
   CircleSlash,
   Copy,
   Download,
@@ -16,6 +18,7 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  ImageOff,
   ImagePlus,
   ListChecks,
   Loader2,
@@ -35,7 +38,7 @@ import type { AgentTodoItem, AgentTodoState, AgentTodoStatus, ToolCallRecord, To
 import { normalizeToolCallStatus } from './toolStatus'
 import { formatToolResultPreview } from './toolResultPreview'
 import { hasAskUserStructuredContent, isAskUserToolName } from './askUserTools'
-import { canonicalToolName, isExternalSubagentToolCall, toolCallDiffStats, toolRecordRawName } from './segments'
+import { canonicalToolName, isExternalSubagentToolCall, isImageReadToolCall, imageReadCount, imageReadItems, toolCallDiffStats, toolRecordRawName } from './segments'
 import { requestDockDiffPreview, requestDockPreview } from './dock/dockPreview'
 import { DiffView } from './dock/DiffView'
 import { knowledgeSearchHits, type KbHitView } from './knowledgeBaseHits'
@@ -46,6 +49,9 @@ import { WebSearchIcon } from '../settings/NavIcons'
 import { api } from '../api/tauri'
 import { useT } from '../settings/i18n'
 import { setHash } from './chatRoutes'
+import { loadAttachmentDataUrl } from './attachmentPreview'
+import { openChatImageViewer } from './imageViewer'
+import type { ImageReadItem } from './segments'
 
 export interface ToolCallBlockProps {
   toolCall: ToolCallRecord
@@ -109,6 +115,12 @@ function parsedArguments(toolCall: ToolCallRecord): Record<string, unknown> | nu
   } catch {
     return null
   }
+}
+
+function isKivioToolDraft(toolCall: ToolCallRecord): boolean {
+  const args = parsedArguments(toolCall)
+  if (args?._kivioToolDraft === true) return true
+  return Boolean(objectValue(objectValue(toolCall.structured_content ?? toolCall.structuredContent)?.toolDraft))
 }
 
 /** 展示映射用的规范工具名（别名表在 `canonicalToolName`）。
@@ -509,6 +521,7 @@ function ConsultCard({
         type="button"
         onClick={() => { if (hasBody) setOpen((v) => !v) }}
         aria-expanded={hasBody ? open : undefined}
+        data-chat-disclosure={hasBody || undefined}
         className={`flex w-full max-w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-left ${hasBody ? '' : 'cursor-default'}`}
         data-tauri-drag-region="false"
       >
@@ -534,10 +547,12 @@ function ConsultCard({
         )}
       </button>
 
-      {hasBody && open && (
-        <div className="chat-motion-search-reveal mt-2 space-y-2 border-t border-neutral-200 pt-2 text-[12.5px] dark:border-white/10">
-          {children}
-        </div>
+      {hasBody && (
+        <ChatDisclosureBody open={open}>
+          <div className="mt-2 space-y-2 border-t border-neutral-200 pt-2 text-[12.5px] dark:border-white/10">
+            {children}
+          </div>
+        </ChatDisclosureBody>
       )}
     </div>
   )
@@ -1600,6 +1615,7 @@ function getToolTarget(toolCall: ToolCallRecord): string {
 }
 
 function getArgumentPreview(toolCall: ToolCallRecord): string {
+  if (isKivioToolDraft(toolCall)) return ''
   const rawName = toolRawName(toolCall)
   const args = parsedArguments(toolCall)
   if (rawName === 'todo_write') {
@@ -1646,6 +1662,7 @@ function getArgumentPreview(toolCall: ToolCallRecord): string {
 }
 
 function getResultPreview(toolCall: ToolCallRecord): string {
+  if (isKivioToolDraft(toolCall)) return ''
   const rawName = toolRawName(toolCall)
   const todoItems = structuredTodoState(toolCall)?.items
   if (rawName === 'todo_write' || rawName === 'todo_update' || todoItems) {
@@ -1819,6 +1836,7 @@ function DefaultToolCallBlock({
           if (hasDetails) setOpen((value) => !value)
         }}
         aria-expanded={hasDetails ? open : undefined}
+        data-chat-disclosure={hasDetails || undefined}
         className={`max-w-full min-w-0 inline-flex items-center gap-1.5 rounded-md py-0 text-[11.5px] transition-colors ${
           hasDetails
             ? 'hover:text-neutral-700 dark:hover:text-neutral-200'
@@ -1872,7 +1890,7 @@ function DefaultToolCallBlock({
       </button>
 
       {hasDetails && (
-        <div className={`chat-motion-reveal ${open ? 'is-open' : ''}`} aria-hidden={!open}>
+        <ChatDisclosureBody open={open}>
           <div className="mt-1.5 ml-1.5 space-y-1.5 border-l border-black/[0.08] pl-2.5 dark:border-white/[0.1]">
             {argumentPreview && (
               <div>
@@ -1884,7 +1902,7 @@ function DefaultToolCallBlock({
                 </div>
               </div>
             )}
-            {open && resultPreview && !knowledgeHits && (
+            {resultPreview && !knowledgeHits && (
               <div>
                 <div className="text-[10.5px] font-medium text-neutral-400 dark:text-neutral-500">
                   {'结果'}
@@ -1894,11 +1912,11 @@ function DefaultToolCallBlock({
                 </div>
               </div>
             )}
-            {open && knowledgeHits && <KnowledgeHits hits={knowledgeHits} />}
+            {knowledgeHits && <KnowledgeHits hits={knowledgeHits} />}
             {fileMutation && hasFileMutationDetails && (
               <FileMutationDetails mutation={fileMutation} />
             )}
-            {open && argDiff && (
+            {argDiff && (
               <div className="custom-scrollbar max-h-72 overflow-auto rounded-md border border-neutral-200/80 dark:border-neutral-700/60">
                 <pre className="font-mono text-[11px] leading-[1.5]">
                   {argDiff.split('\n').map((line, index) => (
@@ -1924,7 +1942,135 @@ function DefaultToolCallBlock({
               </div>
             )}
           </div>
-        </div>
+        </ChatDisclosureBody>
+      )}
+    </div>
+  )
+}
+
+function collectImageReadItems(toolCalls: ToolCallRecord[]): ImageReadItem[] {
+  const seen = new Set<string>()
+  const items: ImageReadItem[] = []
+  for (const toolCall of toolCalls) {
+    for (const item of imageReadItems(toolCall)) {
+      const key = item.path || item.name
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      items.push(item)
+    }
+  }
+  return items
+}
+
+function ImageReadThumb({ item }: { item: ImageReadItem }) {
+  const t = useT()
+  const [src, setSrc] = useState<string | null>(item.dataUrl || null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    if (item.dataUrl) {
+      setSrc(item.dataUrl)
+      setFailed(false)
+      return
+    }
+    if (!item.path) {
+      setFailed(true)
+      return
+    }
+    let cancelled = false
+    setSrc(null)
+    setFailed(false)
+    void loadAttachmentDataUrl({ type: 'image', path: item.path, name: item.name }, null).then((dataUrl) => {
+      if (cancelled) return
+      if (dataUrl) setSrc(dataUrl)
+      else setFailed(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [item.dataUrl, item.path, item.name])
+
+  if (failed) {
+    return (
+      <div
+        className="flex h-16 w-16 items-center justify-center rounded-lg bg-neutral-100 text-neutral-400 dark:bg-neutral-800"
+        title={item.name}
+      >
+        <ImageOff size={16} strokeWidth={1.8} />
+        <span className="sr-only">{t.chatImagePreviewFailed}</span>
+      </div>
+    )
+  }
+
+  if (!src) {
+    return <div className="kv-skeleton h-16 w-16 rounded-lg" aria-hidden="true" />
+  }
+
+  return (
+    <button
+      type="button"
+      className="h-16 w-16 shrink-0 overflow-hidden rounded-lg bg-neutral-100 p-0 dark:bg-neutral-800"
+      title={item.name}
+      aria-label={t.chatPreviewImage}
+      onClick={() => openChatImageViewer({
+        src,
+        alt: item.name,
+        name: item.name,
+        path: item.path || null,
+        conversationId: null,
+      })}
+    >
+      <img src={src} alt="" className="h-full w-full object-cover" loading="lazy" />
+    </button>
+  )
+}
+
+export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] }) {
+  const t = useT()
+  const [open, setOpen] = useState(false)
+  const items = useMemo(() => collectImageReadItems(toolCalls), [toolCalls])
+  const count = Math.max(
+    items.length,
+    toolCalls.reduce((total, toolCall) => total + imageReadCount(toolCall), 0),
+  )
+  const running = toolCalls.some((toolCall) => normalizeToolCallStatus(toolCall.status) === 'running')
+  const label = (running ? t.chatViewingImages : t.chatViewedImages).replace('{n}', String(Math.max(1, count)))
+
+  return (
+    <div className="not-prose mb-1 text-[12.5px] leading-5 text-neutral-500 dark:text-neutral-400">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        data-chat-disclosure
+        className="max-w-full min-w-0 inline-flex items-center gap-1.5 rounded-md py-0 text-[11.5px] text-neutral-500 transition-colors hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+      >
+        <Eye
+          className="shrink-0 text-neutral-400 dark:text-neutral-500"
+          size={14}
+          strokeWidth={1.9}
+        />
+        <span
+          className={`shrink-0 font-medium text-neutral-700 dark:text-neutral-200${
+            running ? ' chat-motion-tool-shimmer' : ''
+          }`}
+        >
+          {label}
+        </span>
+        <ChevronDown
+          className={`shrink-0 text-neutral-400 transition-transform dark:text-neutral-500 ${open ? '' : '-rotate-90'}`}
+          size={12}
+          strokeWidth={2}
+        />
+      </button>
+      {items.length > 0 && (
+        <ChatDisclosureBody open={open}>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {items.map((item, index) => (
+              <ImageReadThumb key={item.path || `${item.name}-${index}`} item={item} />
+            ))}
+          </div>
+        </ChatDisclosureBody>
       )}
     </div>
   )
@@ -1933,6 +2079,9 @@ function DefaultToolCallBlock({
 function ToolCallBlockComponent(props: ToolCallBlockProps) {
   if (isAskUserTool(props.toolCall)) {
     return <AskUserBlock toolCall={props.toolCall} />
+  }
+  if (isImageReadToolCall(props.toolCall)) {
+    return <ImageReadCluster toolCalls={[props.toolCall]} />
   }
   if (isSubAgentRecord(props.toolCall)) {
     return <SubAgentCard {...props} />

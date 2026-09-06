@@ -1,4 +1,5 @@
-import type { VirtualItem } from '@tanstack/react-virtual'
+import type { VirtualItem, Virtualizer } from '@tanstack/react-virtual'
+import { normalizeToolCallStatus } from './toolStatus'
 import type { ChatMessage } from './types'
 
 /**
@@ -70,10 +71,11 @@ export function chatMessageBodyLayoutRevision(message: ChatMessage): string {
   if (cached !== undefined) return cached
 
   const tools = message.tool_calls ?? message.toolCalls ?? []
+  // Stream and persisted tools use different status aliases for the same layout.
   const toolRevision = tools.map((tool) => [
     tool.id,
     tool.name ?? tool.tool_name ?? tool.toolName,
-    tool.status,
+    normalizeToolCallStatus(tool.status),
     contentRevision(tool.argument_preview ?? tool.argumentPreview ?? tool.argumentsPreview),
     contentRevision(tool.result_preview ?? tool.resultPreview),
     contentRevision(tool.error),
@@ -88,9 +90,11 @@ export function chatMessageBodyLayoutRevision(message: ChatMessage): string {
   ].join(':')).join('|')
   const agentPlan = message.agent_plan ?? message.agentPlan
   const degraded = message.degraded
+  // Timeline segments replace top-level content/reasoning; degraded answers may fall back to them.
+  const hasTimeline = (message.segments?.length ?? 0) > 0 && !degraded
   const revision = [
-    contentRevision(message.content),
-    contentRevision(message.reasoning),
+    hasTimeline ? 'seg' : contentRevision(message.content),
+    hasTimeline ? 'seg' : contentRevision(message.reasoning),
     message.segments?.map((segment) => [
       segment.id,
       segment.kind,
@@ -163,16 +167,6 @@ export function chatMessageLayoutRevision(message: ChatMessage): string {
 }
 
 /**
- * Seed the outside live row's height onto the settled twin when the body
- * matches. Footer extras (usage / stream_outcome / stats) are tens of pixels;
- * skipping the seed falls back to an estimate that can be hundreds short.
- * measureElement / RO add the footer delta on the next frame.
- */
-export function canReuseLiveRowHeight(live: ChatMessage, settled: ChatMessage): boolean {
-  return chatMessageBodyLayoutRevision(live) === chatMessageBodyLayoutRevision(settled)
-}
-
-/**
  * A mounted absolute row must correct stale TanStack cache before paint. ResizeObserver
  * entries remain the cheap steady-state path; callback-ref mounts read the real DOM box.
  */
@@ -186,6 +180,23 @@ export function measureChatVirtualRow(
     if (box) return Math.round(box[horizontal ? 'inlineSize' : 'blockSize'])
   }
   return element[horizontal ? 'offsetWidth' : 'offsetHeight']
+}
+
+/**
+ * TanStack defers ref measurements while scrolling. A live row switching from
+ * flow to absolute positioning cannot wait for ResizeObserver: its last live
+ * height may predate collapsed reasoning or the completed footer. Register the
+ * observer normally, then replace that estimate before the handoff paints.
+ */
+export function measureSettledChatRow(
+  element: HTMLDivElement,
+  instance: Virtualizer<HTMLDivElement, HTMLDivElement>,
+): void {
+  instance.measureElement(element)
+  instance.resizeItem(
+    instance.indexFromElement(element),
+    instance.options.measureElement(element, undefined, instance),
+  )
 }
 
 /** Prevent TanStack's internal itemSizeCache from crossing width layouts. */

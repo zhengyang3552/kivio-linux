@@ -26,6 +26,8 @@ pub mod plugins;
 pub mod proc;
 pub mod prompts;
 pub mod provider_request;
+pub mod provider_oauth;
+mod opencode_free;
 pub mod rapidocr;
 pub mod replace_translation;
 #[cfg(target_os = "macos")]
@@ -261,15 +263,6 @@ pub fn run() {
             // `conv_*` 目录，非空的孤儿工作区只报数不删（里面是用户产物）。
             chat::gc::sweep_conversation_side_artifacts(app.handle());
 
-            // 崩溃残留的中断草稿日志:按每个 message_id 的最后一行合并回会话文件后删除。
-            // setup 阶段不可能有活跃 run,没有并发写冲突。
-            {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    chat::draft_journal::recover_orphan_drafts(&handle).await;
-                });
-            }
-
             // 周期性回收闲置的持久外部 CLI **进程**（10 分钟无活动即丢弃 → actor 关闭子进程）。
             // 原生会话 id 仍落在 disk 上，下一轮（或重新打开这条对话）必须 resume，不是开新会话。
             {
@@ -373,6 +366,17 @@ pub fn run() {
                 rapidocr::RapidOcrClient::new(offline_models),
             ));
             app.manage(chat::repository::ConversationRepository::default());
+
+            // 崩溃残留的中断草稿日志:按每个 message_id 的最后一行合并回会话文件后删除。
+            // setup 阶段不可能有活跃 run,没有并发写冲突。
+            // 必须放在 ConversationRepository manage 之后：恢复路径要取仓库状态，
+            // 曾在 manage 之前 spawn，有草稿残留且调度赶巧时直接 state() panic、启动即崩。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    chat::draft_journal::recover_orphan_drafts(&handle).await;
+                });
+            }
             // Dock 的 workspace 文件监听服务（文件树 / Git 面板的秒级刷新源）。
             app.manage(std::sync::Arc::new(dock::watch::WorkspaceWatchService::new(
                 app.handle().clone(),
@@ -520,6 +524,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            provider_oauth::provider_oauth_start,
+            provider_oauth::provider_oauth_poll,
+            provider_oauth::provider_oauth_cancel,
+            provider_oauth::provider_oauth_disconnect,
+            provider_oauth::usage::provider_oauth_usage,
+            provider_oauth::account::provider_oauth_account,
             commands::get_settings,
             commands::set_hotkeys_suspended,
             commands::list_gnome_system_shortcuts,
@@ -642,6 +652,7 @@ pub fn run() {
             chat::commands::mutations::chat_delete_conversation,
             chat::commands::mutations::chat_update_conversation,
             chat::commands::title::chat_regenerate_title,
+            chat::commands::prompt_optimize::chat_optimize_prompt,
             chat::commands::mutations::chat_bulk_update_conversations,
             chat::commands::mutations::chat_bulk_delete_conversations,
             chat::commands::reasoning::chat_reasoning_efforts_for_model,
@@ -705,6 +716,12 @@ pub fn run() {
             connectors::connector_oauth_connect,
             connectors::obsidian::list_obsidian_vaults_cmd,
             plugins::plugins_list,
+            plugins::packages::plugin_packages_list,
+            plugins::packages::plugin_packages_import,
+            plugins::packages::plugin_packages_set_enabled,
+            plugins::packages::plugin_packages_remove,
+            plugins::packages::workflow_hooks_get,
+            plugins::packages::workflow_hooks_save,
             plugins::plugins_list_cached,
             plugins::plugins_install_brief,
             plugins::plugins_run_official_install,

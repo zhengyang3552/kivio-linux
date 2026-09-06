@@ -493,6 +493,8 @@ export type ChatConfig = {
   maxOutputTokens?: number
   defaultLanguage?: string
   systemPrompt?: string
+  /** 输入框问题优化的自定义系统提示词；空则用内置。 */
+  promptOptimizePrompt?: string
   userDisplayName?: string
   userAvatar?: string
   defaultAgentRuntime?: AgentRuntimeConfig
@@ -889,7 +891,26 @@ export type ModelInfo = {
 // AI 模型提供商配置
 // apiKeys 是密钥池；activeKeyIndex 是用户点选的当前 Key。
 // 鉴权/配额失败时后端仍会自动切到池里其它 Key。
+export type ProviderOAuthConfig = { provider: 'codex' | 'kimi' | 'antigravity'; credentialId?: string }
+export type ProviderOAuthAccount = { email: string | null; name: string | null; accountId: string | null }
+export type ProviderOAuthUsage = { plan: string | null; fetchedAt: number; windows: { label: string; usedPercent: number | null; used: number | null; limit: number | null; resetsAt: number | null; resetHint?: string | null }[] }
+export type ProviderOAuthLogin = { loginId: string; userCode: string; verificationUrl: string; interval: number; expiresAt: number }
+export type ProviderOAuthPoll = { status: 'pending' | 'authorized'; interval: number; auth: ProviderOAuthConfig | null }
+
+export function isOpenCodeFree(provider: ModelProvider): boolean {
+  return !provider.request?.oauth
+    && (!provider.apiFormat || provider.apiFormat === 'openai_chat')
+    && provider.baseUrl.trim().replace(/\/+$/, '') === 'https://opencode.ai/zen/v1'
+    && provider.apiKeys.every(key => !key.trim())
+}
+
+export function providerHasCredentials(provider: ModelProvider): boolean {
+  if (isOpenCodeFree(provider)) return true
+  return provider.request?.oauth ? Boolean(provider.request.oauth.credentialId) : provider.apiKeys.some(key => key.trim() !== '')
+}
+
 export type ProviderRequestConfig = {
+  oauth?: ProviderOAuthConfig | null
   /** 附加到该供应商所有请求上的自定义头。同名时覆盖 CLI 身份预设。 */
   customHeaders?: { key: string; value: string }[]
   /** 是否跟随系统代理。默认 true；关掉走直连。 */
@@ -953,6 +974,7 @@ export type DefaultModelsConfig = {
   titleSummary: DefaultModelSelection
   compression: DefaultModelSelection
   imageGeneration: DefaultModelSelection
+  promptOptimize: DefaultModelSelection
   advisor: DefaultModelSelection
 }
 
@@ -1476,6 +1498,7 @@ function normalizeProvider(provider: ModelProvider): ModelProvider {
     compressRequestBody: provider.compressRequestBody === true,
     apiFormat: normalizeProviderApiFormat(provider.apiFormat),
     request: {
+      oauth: provider.request?.oauth ?? null,
       customHeaders: Array.isArray(provider.request?.customHeaders)
         ? provider.request.customHeaders
         : [],
@@ -1529,7 +1552,12 @@ export function isOfficialDeepSeekApi(baseUrl?: string): boolean {
   }
 }
 
-export function builtinWebSearchSupported(apiFormat?: string, baseUrl?: string): boolean {
+export function resolveProviderWebSearchMode<T extends 'off' | 'builtin' | 'third_party' | undefined>(mode: T, oauthProvider?: string): T | 'third_party' {
+  return oauthProvider === 'antigravity' && mode === 'builtin' ? 'third_party' : mode
+}
+
+export function builtinWebSearchSupported(apiFormat?: string, baseUrl?: string, oauthProvider?: string): boolean {
+  if (oauthProvider === 'antigravity') return false
   const kind = normalizeProviderApiFormat(apiFormat)
   if (
     kind === 'openai_responses' ||
@@ -1643,6 +1671,7 @@ function normalizeDefaultModels(
     titleSummary: normalizeDefaultModelSelection(config?.titleSummary),
     compression: normalizeDefaultModelSelection(config?.compression),
     imageGeneration: normalizeDefaultModelSelection(config?.imageGeneration),
+    promptOptimize: normalizeDefaultModelSelection(config?.promptOptimize),
     advisor: normalizeDefaultModelSelection(config?.advisor),
   }
 }
@@ -1653,7 +1682,7 @@ function isDefaultModelConfigured(selection: DefaultModelSelection): boolean {
 
 function providerHasUsableConfig(provider: ModelProvider): boolean {
   return provider.enabled !== false
-    && provider.apiKeys.some((key) => key.trim() !== '')
+    && providerHasCredentials(provider)
     && provider.enabledModels.length > 0
 }
 
@@ -1727,6 +1756,7 @@ export function normalizeSettings(settings: Settings): Settings {
       maxOutputTokens: current.chat?.maxOutputTokens ?? 16384,
       defaultLanguage: current.chat?.defaultLanguage ?? '',
       systemPrompt: current.chat?.systemPrompt ?? '',
+      promptOptimizePrompt: current.chat?.promptOptimizePrompt ?? '',
       userDisplayName: current.chat?.userDisplayName ?? '',
       userAvatar: current.chat?.userAvatar ?? '',
       // 本地 CLI 覆盖（供应商列表 / 路径 / 停用）与默认运行时：之前重建 chat 时丢掉了，
@@ -1849,6 +1879,10 @@ export type DefaultPromptTemplates = {
   }
   /** Built-in Kivio Chat runtime prompt (exact string injected when chatMode.systemPrompt is empty). */
   chatRuntimePrompt?: string
+  promptOptimizePrompts?: {
+    zh: string
+    en: string
+  }
 }
 
 // 权限状态（macOS 辅助功能/屏幕录制；Linux Wayland 屏幕捕获）
@@ -1885,6 +1919,13 @@ async function onChatProtocol(
 // ========== API 导出 ==========
 
 export const api = {
+  providerOAuthStart: (provider: ProviderOAuthConfig['provider'], useSystemProxy = true) =>
+    invoke<ProviderOAuthLogin>('provider_oauth_start', { provider, useSystemProxy }),
+  providerOAuthPoll: (loginId: string) => invoke<ProviderOAuthPoll>('provider_oauth_poll', { loginId }),
+  providerOAuthCancel: (loginId: string) => invoke<void>('provider_oauth_cancel', { loginId }),
+  providerOAuthAccount: (provider: ModelProvider) => invoke<ProviderOAuthAccount>('provider_oauth_account', { provider }),
+  providerOAuthUsage: (provider: ModelProvider) => invoke<ProviderOAuthUsage>('provider_oauth_usage', { provider }),
+  providerOAuthDisconnect: (credentialId: string) => invoke<void>('provider_oauth_disconnect', { credentialId }),
   // 设置相关
   getSettings: async () => normalizeSettings(await invoke<Settings>('get_settings')),
   // 某模型可选的思考等级列表（用户覆盖 modelOverrides → 模型库 reasoningEfforts → 家族兜底）。
@@ -2152,6 +2193,20 @@ export const api = {
         hookName: event.hookName,
         event: event.event,
         message: event.message,
+      })
+    })
+  },
+  /** Pi `clear_queue` 退回的立刻引导 / follow-up 原文，写回输入框。快照回放忽略。 */
+  onChatQueuedTextsRestored: (
+    listener: (payload: { conversationId: string; texts: string[] }) => void,
+  ) => {
+    if (!isTauriRuntime()) return Promise.resolve(() => {})
+    return onChatProtocol((event, delivery) => {
+      if (event.scope !== 'run' || event.type !== 'queued_texts_restored') return
+      if (delivery.source === 'snapshot') return
+      listener({
+        conversationId: event.conversationId,
+        texts: event.texts,
       })
     })
   },

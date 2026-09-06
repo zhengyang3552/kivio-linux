@@ -12,9 +12,10 @@ import DeepSeek from '@lobehub/icons/es/DeepSeek/components/Color'
 import Qwen from '@lobehub/icons/es/Qwen/components/Color'
 import ChatGLM from '@lobehub/icons/es/ChatGLM/components/Color'
 import Zhipu from '@lobehub/icons/es/Zhipu/components/Color'
-import Kimi from '@lobehub/icons/es/Kimi/components/Color'
+import KimiMono from '@lobehub/icons/es/Kimi/components/Mono'
 import Mistral from '@lobehub/icons/es/Mistral/components/Color'
 import Meta from '@lobehub/icons/es/Meta/components/Color'
+import AntGroup from '@lobehub/icons/es/AntGroup/components/Color'
 import Yi from '@lobehub/icons/es/Yi/components/Color'
 import Doubao from '@lobehub/icons/es/Doubao/components/Color'
 import Wenxin from '@lobehub/icons/es/Wenxin/components/Color'
@@ -61,6 +62,11 @@ import OpenCode from '@lobehub/icons/es/OpenCode/components/Mono'
 // map stays typed without fighting their prop types.
 type Glyph = ComponentType<{ size?: number; style?: CSSProperties }>
 const G = (icon: unknown) => icon as Glyph
+
+// Fixed signature blue from https://www.kimi.com/en/resources/kimi-brand.
+function Kimi({ size = 16, style }: { size?: number; style?: CSSProperties }) {
+  return <KimiMono size={size} style={{ ...style, color: '#007CFF' }} />
+}
 
 /** lobehub 的 XiaomiMiMo Mono 是整段字标，18px 格子里会糊成「XIAOMI MIMO」字。橙色 Mi 标在格子里才认得出。 */
 function XiaomiMiMoMark({ size = 16, style }: { size?: number; style?: CSSProperties }) {
@@ -123,11 +129,14 @@ const MODEL_ICON_MAP: Array<[RegExp, Glyph]> = [
   [/deepseek/, G(DeepSeek)],
   [/qwen|qwq|qvq|tongyi|wanx/, G(Qwen)],
   [/grok/, G(Grok)],
-  [/kimi/, G(Kimi)],
+  [/kimi|^(?:k3|k3-256k)$/, G(Kimi)],
   [/moonshot/, G(Moonshot)],
   [/glm|chatglm|zhipu|ox-alpha/, G(Zhipu)],
   [/mistral|mixtral|codestral|pixtral|ministral|magistral|devstral/, G(Mistral)],
-  [/llama|llava/, G(Meta)],
+  [/llama|llava|muse-spark/, G(Meta)],
+  [/nemotron/, G(Nvidia)],
+  [/(?:^|[-/])ling-/, G(AntGroup)],
+  [/(?:^|\/)big-pickle$/, G(OpenCode)],
   [/(?:^|[-/])yi-/, G(Yi)],
   [/doubao|seedream|(?:^|[-/])seed-[12]/, G(Doubao)],
   [/ernie|wenxin/, G(Wenxin)],

@@ -403,6 +403,7 @@ impl ProgressState {
 }
 
 struct SubAgentHost {
+    workflow_hooks: crate::chat::workflow_hooks::Runtime,
     app: AppHandle,
     parent_conversation_id: String,
     parent_run_id: String,
@@ -461,6 +462,9 @@ impl SubAgentHost {
 }
 
 impl AgentHost for SubAgentHost {
+    fn workflow_hooks(&self) -> Option<&crate::chat::workflow_hooks::Runtime> {
+        Some(&self.workflow_hooks)
+    }
     fn emit_stream_delta(
         &self,
         _conversation_id: &str,
@@ -637,7 +641,7 @@ fn resolve_sub_agent_provider_model(
     if !ov_provider_id.is_empty() && !ov_model.is_empty() {
         if let Some(p) = settings
             .get_provider(ov_provider_id)
-            .filter(|p| p.enabled && !p.api_keys.is_empty())
+            .filter(|p| p.enabled && p.has_credentials())
         {
             return Ok((p.clone(), ov_model.to_string()));
         }
@@ -704,6 +708,13 @@ async fn run_sub_agent(app: AppHandle, req: SubAgentRequest) -> Result<AgentRunR
         ];
 
         let host = SubAgentHost {
+            workflow_hooks: crate::plugins::packages::hook_runtime(
+                req.skill_project_cwd
+                    .clone()
+                    .unwrap_or_else(std::env::temp_dir),
+                req.agent_type.clone(),
+                None,
+            ),
             app: app.clone(),
             parent_conversation_id: req.parent_conversation_id.clone(),
             parent_run_id: req.parent_run_id.clone(),
@@ -1067,7 +1078,7 @@ pub fn handle_agent_spawn<'a>(
             &parent_conversation.model,
             def.model.as_deref(),
         )?;
-        if provider.api_keys.is_empty() {
+        if !provider.has_credentials() {
             return Ok(err_result(
                 "Sub-agent provider has no API key configured.".to_string(),
             ));

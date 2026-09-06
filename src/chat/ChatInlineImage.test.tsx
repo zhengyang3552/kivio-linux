@@ -15,16 +15,24 @@ function fireLoad(img: HTMLImageElement, width: number, height: number) {
 }
 
 describe('ChatInlineImage', () => {
-  it('reserves an aspect-ratio box after load so the row stops resizing', () => {
+  it('caps the long edge at 128px so tiles can sit in a row', () => {
     const { container } = render(<ChatInlineImage src={`${PNG}A`} alt="x" />)
     const button = container.querySelector('button')!
-    // 解码前不占宽高比盒子（还不知道比例）。
-    expect(button.style.aspectRatio).toBe('')
+    // 未知比例先按 1:1 占位，避免解码前撑满整行。
+    expect(button.style.aspectRatio).toBe('1')
+    expect(button.style.width).toBe('128px')
+    expect(button.style.maxWidth).toBe('100%')
 
     fireLoad(container.querySelector('img')!, 1000, 500)
     expect(button.style.aspectRatio).toBe('2')
-    // 高度封顶 420 ⇒ 宽度 = 2 * 420。
-    expect(button.style.width).toBe('min(100%, 840px)')
+    // 横图：宽封顶 128，高 = 64。
+    expect(button.style.width).toBe('128px')
+  })
+
+  it('caps portrait tiles by height so they stay 240 tall', () => {
+    const { container } = render(<ChatInlineImage src={`${PNG}P`} alt="x" />)
+    fireLoad(container.querySelector('img')!, 500, 1000)
+    expect(container.querySelector('button')!.style.width).toBe('64px')
   })
 
   it('remembers the ratio across unmount so scrolling back does not re-measure', () => {
@@ -33,7 +41,6 @@ describe('ChatInlineImage', () => {
     fireLoad(first.container.querySelector('img')!, 800, 400)
     first.unmount()
 
-    // 虚拟列表滚回来 = 重新挂载：必须一挂载就带着盒子，而不是从 0 高长起。
     const second = render(<ChatInlineImage src={src} alt="x" />)
     expect(second.container.querySelector('button')!.style.aspectRatio).toBe('2')
   })
@@ -46,8 +53,6 @@ describe('ChatInlineImage', () => {
     expect(remote.container.querySelector('img')!.getAttribute('loading')).toBe('lazy')
   })
 
-  // 滚动容器上挂着消息级右键菜单（MessageList.handleContextMenu）。图片的右键必须掐断冒泡,
-  // 否则那个菜单也会开，且 portal 挂得更晚 ⇒ 盖住图片菜单，用户以为图片右键没了。
   it('stops the contextmenu from reaching the message-level menu', () => {
     const onParentContextMenu = vi.fn()
     const { container } = render(
@@ -61,7 +66,6 @@ describe('ChatInlineImage', () => {
         .dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
     })
     expect(onParentContextMenu).not.toHaveBeenCalled()
-    // 自己的菜单要开出来（复制图片/另存那一层）。
     expect(document.body.textContent).toContain('复制图片')
   })
 })

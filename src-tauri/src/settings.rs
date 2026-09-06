@@ -45,6 +45,9 @@ pub struct ProviderCustomHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderRequestConfig {
+    /// OAuth metadata only; secrets live in the operating system credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::provider_oauth::OAuthConfig>,
     /// 附加到该供应商所有请求上的自定义头。同名时覆盖 CLI 身份预设。
     pub custom_headers: Vec<ProviderCustomHeader>,
     /// 是否跟随系统代理。默认 true —— 与加这个开关之前的行为一致；关掉才走直连。
@@ -66,6 +69,7 @@ pub struct ProviderRequestConfig {
 impl Default for ProviderRequestConfig {
     fn default() -> Self {
         Self {
+            oauth: None,
             custom_headers: Vec::new(),
             use_system_proxy: true,
             prompt_caching: None,
@@ -166,6 +170,21 @@ impl ProviderApiFormat {
 }
 
 impl ModelProvider {
+    pub fn is_opencode_free(&self) -> bool {
+        self.request.oauth.is_none()
+            && self.api_format_kind() == ProviderApiFormat::OpenAiChat
+            && crate::opencode_free::is_endpoint(&self.base_url)
+            && self.api_keys.iter().all(|key| key.trim().is_empty())
+    }
+
+    pub fn has_credentials(&self) -> bool {
+        if self.is_opencode_free() { return true; }
+        if let Some(auth) = &self.request.oauth {
+            return auth.credential_id.is_some();
+        }
+        self.api_keys.iter().any(|key| !key.trim().is_empty())
+    }
+
     pub fn api_format_kind(&self) -> ProviderApiFormat {
         ProviderApiFormat::from_raw(&self.api_format)
     }
@@ -747,6 +766,9 @@ pub struct ChatConfig {
     /// 自定义 system prompt；空则使用内置 Chat 模板（Kivio Agent 运行时）。
     #[serde(default)]
     pub system_prompt: String,
+    /// 输入框「问题优化」的自定义系统提示词；空则使用内置优化提示词。
+    #[serde(default)]
+    pub prompt_optimize_prompt: String,
     /// Chat 侧栏显示的用户名；空则前端使用默认文案。
     #[serde(default)]
     pub user_display_name: String,
@@ -803,6 +825,7 @@ impl Default for ChatConfig {
             max_output_tokens: default_chat_max_output_tokens(),
             default_language: String::new(),
             system_prompt: String::new(),
+            prompt_optimize_prompt: String::new(),
             user_display_name: String::new(),
             user_avatar: String::new(),
             default_agent_runtime: crate::chat::AgentRuntimeConfig::default(),
@@ -971,6 +994,7 @@ fn resolve_mixer_side_model(
  * title_summary：标题总结副任务使用；为空时继承当前会话主模型（无会话时回退有效 Chat 默认）。
  * compression：上下文/历史对话压缩副任务使用；为空时继承当前会话主模型（无会话时回退有效 Chat 默认）。
  * image_generation：生图副任务使用；为空时若当前会话主模型支持直接生图则继承该模型。
+ * prompt_optimize：输入框问题优化副任务使用；为空时继承当前会话主模型。
  * advisor：顾问模型（executor-advisor 模式）——主循环模型可用 `advisor` 工具向它
  *   单次咨询；为空 = 功能关闭（工具不注册），没有继承语义。
  */
@@ -988,6 +1012,8 @@ pub struct DefaultModelsConfig {
     #[serde(default)]
     pub image_generation: DefaultModelSelection,
     #[serde(default)]
+    pub prompt_optimize: DefaultModelSelection,
+    #[serde(default)]
     pub advisor: DefaultModelSelection,
 }
 
@@ -999,6 +1025,7 @@ impl Default for DefaultModelsConfig {
             title_summary: DefaultModelSelection::default(),
             compression: DefaultModelSelection::default(),
             image_generation: DefaultModelSelection::default(),
+            prompt_optimize: DefaultModelSelection::default(),
             advisor: DefaultModelSelection::default(),
         }
     }
@@ -1174,7 +1201,9 @@ fn default_skill_fallback_mode() -> String {
 }
 
 pub const CHAT_TOOL_MIN_TIMEOUT_MS: u64 = 1_000;
-pub const CHAT_TOOL_MAX_TIMEOUT_MS: u64 = 300_000;
+/// 显式 `bash` `timeout_ms` 与 `bash_output` wait 的上限。省略 timeout 的
+/// 前台 bash 等到进程退出，不受默认 60s 工具超时约束。
+pub const CHAT_TOOL_MAX_TIMEOUT_MS: u64 = 600_000;
 /// 旧版工具轮次默认值。现默认**不限**（`None`），此常量仅供一次性迁移
 /// （`sanitize_settings` 把存量 20 归一到不限）与前端展示预设使用。
 pub const CHAT_TOOL_LEGACY_DEFAULT_ROUNDS: u32 = 20;
@@ -1724,6 +1753,13 @@ impl Settings {
         resolve_mixer_side_model(&self.default_models.compression, session, self)
     }
 
+    pub fn effective_prompt_optimize_model_for_session(
+        &self,
+        session: Option<SessionModel<'_>>,
+    ) -> (String, String) {
+        resolve_mixer_side_model(&self.default_models.prompt_optimize, session, self)
+    }
+
     pub fn image_generation_model(&self) -> Option<(String, String)> {
         if self.default_models.image_generation.is_configured()
             && !self.default_models.image_generation.model.trim().is_empty()
@@ -2159,6 +2195,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
             &mut settings.default_models.title_summary,
             &mut settings.default_models.compression,
             &mut settings.default_models.image_generation,
+            &mut settings.default_models.prompt_optimize,
         ] {
             if removed_legacy_local_provider_ids.contains(&selection.provider_id) {
                 if let Some((id, model)) = fallback.as_ref() {
@@ -2254,6 +2291,10 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         );
         sanitize_default_model_selection(
             &mut settings.default_models.image_generation,
+            &settings.providers,
+        );
+        sanitize_default_model_selection(
+            &mut settings.default_models.prompt_optimize,
             &settings.providers,
         );
         sanitize_default_model_selection(&mut settings.default_models.advisor, &settings.providers);
@@ -2769,7 +2810,7 @@ fn onboarding_status_is_set(raw: &str) -> bool {
 
 fn provider_has_usable_config(provider: &ModelProvider) -> bool {
     provider.enabled
-        && provider.api_keys.iter().any(|k| !k.trim().is_empty())
+        && provider.has_credentials()
         && !provider.enabled_models.is_empty()
 }
 
@@ -4095,6 +4136,10 @@ mod tests {
             s.effective_compression_model_for_session(None),
             s.effective_chat_model()
         );
+        assert_eq!(
+            s.effective_prompt_optimize_model_for_session(None),
+            s.effective_chat_model()
+        );
         assert!(s.image_generation_model().is_none());
         assert!(s.default_models.vision.provider_id.is_empty());
         assert!(s.default_models.title_summary.provider_id.is_empty());
@@ -4153,6 +4198,10 @@ mod tests {
         );
         assert_eq!(
             settings.effective_vision_model_for_session(Some(session)),
+            ("session".to_string(), "gpt-4.1".to_string())
+        );
+        assert_eq!(
+            settings.effective_prompt_optimize_model_for_session(Some(session)),
             ("session".to_string(), "gpt-4.1".to_string())
         );
     }
@@ -4296,6 +4345,10 @@ mod tests {
             ("compression".to_string(), "compression-model".to_string())
         );
         assert_eq!(
+            s.effective_prompt_optimize_model_for_session(None),
+            s.effective_chat_model()
+        );
+        assert_eq!(
             s.image_generation_model(),
             Some(("image".to_string(), "image-model".to_string()))
         );
@@ -4430,6 +4483,8 @@ mod tests {
             value["defaultModels"]["imageGeneration"]["model"],
             "image-model"
         );
+        assert_eq!(value["defaultModels"]["promptOptimize"]["providerId"], "");
+        assert_eq!(value["defaultModels"]["promptOptimize"]["model"], "");
         assert!(value["defaultModels"]["chat"]["providerId"]
             .as_str()
             .unwrap()

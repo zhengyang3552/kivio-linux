@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
+import { Virtualizer } from '@tanstack/react-virtual'
 import {
-  canReuseLiveRowHeight,
+  chatMessageBodyLayoutRevision,
   chatMessageLayoutRevision,
   contentRevision,
   clearRowMeasurementCache,
@@ -9,6 +10,7 @@ import {
   getCachedRowMeasurement,
   layoutScopedVirtualKey,
   measureChatVirtualRow,
+  measureSettledChatRow,
   restoreMeasurementSnapshot,
   saveMeasurementSnapshot,
   sendReserveHeight,
@@ -40,12 +42,49 @@ describe('message layout revision', () => {
       .not.toBe(chatMessageLayoutRevision(base))
   })
 
-  it('正文相同则继承 live 高度，页脚 usage/终止态交给测高补', () => {
+  it('正文 revision 不包含完成状态和页脚统计', () => {
     const live = assistant()
-    expect(canReuseLiveRowHeight(live, assistant({ stream_outcome: 'interrupted' }))).toBe(true)
-    expect(canReuseLiveRowHeight(live, assistant({ usage: { input_tokens: 10, output_tokens: 20 } }))).toBe(true)
-    expect(canReuseLiveRowHeight(live, assistant({ content: '回答已补全' }))).toBe(false)
-    expect(canReuseLiveRowHeight(live, assistant())).toBe(true)
+    const revision = chatMessageBodyLayoutRevision(live)
+    expect(chatMessageBodyLayoutRevision(assistant({ stream_outcome: 'interrupted' }))).toBe(revision)
+    expect(chatMessageBodyLayoutRevision(assistant({ usage: { input_tokens: 10, output_tokens: 20 } }))).toBe(revision)
+    expect(chatMessageBodyLayoutRevision(assistant({ content: '回答已补全' }))).not.toBe(revision)
+  })
+
+  it('有时间线分段时，顶层 content/reasoning 的拼接差异不影响 live 高度复用', () => {
+    const segments: ChatMessage['segments'] = [
+      { id: 's1', kind: 'reasoning', phase: 'plain', order: 1000, text: '想一想' },
+      { id: 's2', kind: 'text', phase: 'plain', order: 1002, text: '回答' },
+    ]
+    const live = assistant({ segments, content: '回答', reasoning: '想一想' })
+    // 后端落库时用 "\n\n" 拼多步文本 / 推理，与前端流式累加的字符串不同
+    const settled = assistant({ segments, content: '回答\n\n', reasoning: '想一想\n\n' })
+    expect(chatMessageBodyLayoutRevision(settled)).toBe(chatMessageBodyLayoutRevision(live))
+    // 分段本身变了才算正文变了
+    const changed = assistant({
+      segments: [segments![0]!, { ...segments![1]!, text: '回答已补全' }],
+    })
+    expect(chatMessageBodyLayoutRevision(changed)).not.toBe(chatMessageBodyLayoutRevision(live))
+  })
+
+  it('工具状态 completed（流式）与 success（落库）视为同一几何', () => {
+    const segments: ChatMessage['segments'] = [
+      { id: 's1', kind: 'tool', phase: 'tool_loop', order: 1003, tool_call_id: 'c1' },
+      { id: 's2', kind: 'text', phase: 'plain', order: 1007, text: '完成' },
+    ]
+    const live = assistant({
+      segments,
+      tool_calls: [{ id: 'c1', name: 'read_file', source: 'native', status: 'completed' }],
+    })
+    const settled = assistant({
+      segments,
+      tool_calls: [{ id: 'c1', name: 'read_file', source: 'native', status: 'success' }],
+    })
+    expect(chatMessageBodyLayoutRevision(settled)).toBe(chatMessageBodyLayoutRevision(live))
+    const failed = assistant({
+      segments,
+      tool_calls: [{ id: 'c1', name: 'read_file', source: 'native', status: 'error' }],
+    })
+    expect(chatMessageBodyLayoutRevision(failed)).not.toBe(chatMessageBodyLayoutRevision(live))
   })
 
   it('同长度中间改写会换测量 key', () => {
@@ -68,6 +107,43 @@ describe('message layout revision', () => {
 })
 
 describe('virtual row measurement', () => {
+  it.each([724, 812])('settles to %i px before an observer tick while scrolling', (completedHeight) => {
+    const element = {
+      offsetHeight: completedHeight,
+      isConnected: true,
+      getAttribute: () => '0',
+    } as unknown as HTMLDivElement
+    const instance = new Virtualizer<HTMLDivElement, HTMLDivElement>({
+      count: 1,
+      getScrollElement: () => null,
+      estimateSize: () => 761,
+      getItemKey: () => 'answer',
+      initialRect: { width: 848, height: 663 },
+      observeElementRect: () => undefined,
+      observeElementOffset: () => undefined,
+      scrollToFn: () => undefined,
+      measureElement: (node, entry) => {
+        const size = measureChatVirtualRow(node, entry)
+        setCachedRowMeasurement('conversation:848', 'answer', size)
+        return size
+      },
+    })
+    expect(instance.getTotalSize()).toBe(761)
+    instance.isScrolling = true
+
+    // The regular ref deliberately defers to RO during a scroll, leaving the
+    // expanded live estimate in place. No observer has delivered yet.
+    instance.measureElement(element)
+    expect(instance.getTotalSize()).toBe(761)
+    expect(getCachedRowMeasurement('conversation:848', 'answer')).toBeUndefined()
+
+    measureSettledChatRow(element, instance)
+    expect(instance.getTotalSize()).toBe(completedHeight)
+    expect(instance.itemSizeCache.get('answer')).toBe(completedHeight)
+    expect(getCachedRowMeasurement('conversation:848', 'answer')).toBe(completedHeight)
+    expect(instance.elementsCache.get('answer')).toBe(element)
+  })
+
   it('同步挂载时读取真实 DOM 高度，不复用旧缓存高度', () => {
     const element = { offsetHeight: 252, offsetWidth: 640 } as HTMLElement
     expect(measureChatVirtualRow(element, undefined)).toBe(252)

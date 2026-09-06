@@ -7,6 +7,7 @@ use crate::chat::model::ModelUsage;
 #[serde(rename_all = "snake_case")]
 pub enum StreamFormat {
     ClaudeStreamJson,
+    AntigravityStreamJson,
     PiRpc,
     AcpJsonRpc,
     CodexAppServer,
@@ -52,6 +53,8 @@ pub enum SlashStrategy {
     /// Discover via `session/commands` (`ctx.commands.list`) after the kivio
     /// profile mounts. Builtins are only the pre-connect fallback.
     Dsh,
+    /// Kivio-maintained builtins, with standalone reports and native skill passthrough.
+    Antigravity,
     /// No discoverable slash commands for this CLI in headless mode.
     None,
 }
@@ -264,6 +267,13 @@ pub enum UnifiedAgentEvent {
         /// 前端排队消息 id，回到 `structured_content.follow_up_id` 供前端对账。
         id: String,
         text: String,
+    },
+    /// Pi `clear_queue` 在取消时退回的立刻引导 / follow-up 原文。
+    ///
+    /// 交互式 Esc 会把这些字写回编辑器；Kivio 同样写回输入框，而不是留在 Pi 队列里
+    /// 等下一轮 prompt 被悄悄注入。
+    QueuedTextsRestored {
+        texts: Vec<String>,
     },
     /// CLI 在**自己内部**完成了一次上下文压缩（claude 的
     /// `{"type":"system","subtype":"compact_boundary"}`）。

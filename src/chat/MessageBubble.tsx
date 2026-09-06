@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   AlertCircle,
   Check,
@@ -24,18 +24,21 @@ import { isExecutableAgentPlanText } from './agentPlan'
 import { artifactDataUrl, isImageArtifact } from './artifacts'
 import { loadArtifactDataUrl } from './attachmentPreview'
 import { openChatImageViewer } from './imageViewer'
-import { ChatInlineImage } from './ChatInlineImage'
+import { ChatInlineImage, CHAT_IMAGE_TILE_MAX_PX } from './ChatInlineImage'
 import { ReasoningBlock } from './ReasoningBlock'
+import { ChatDisclosureBody } from './ChatDisclosureBody'
 import { ModelIcon } from './ModelIcon'
-import { ToolCallBlock } from './ToolCallBlock'
+import { ToolCallBlock, ImageReadCluster } from './ToolCallBlock'
 import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
 import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ModelRef, ToolCallRecord } from './types'
 import { buildCitationMap, type CitationView } from './citations'
 import {
   compareTimelineSegments,
+  clusterToolCallsForDisplay,
   formatWorkDuration,
   groupTimelineSegments,
   groupWorkDurationMs,
+  isImageReadToolCall,
   isProcessCommentaryText,
   isStandaloneToolCard,
   isUserFollowUpToolCall,
@@ -64,6 +67,14 @@ interface MessageBubbleProps {
   reasoningStreaming?: boolean
   /** 这条消息整体是否在流式生成中（仅 streaming-assistant bubble 为 true） */
   messageStreaming?: boolean
+  /**
+   * MarkdownStreamingContext 的值（默认跟 messageStreaming）。它不再决定 Streamdown 的
+   * 模式 / key（整条消息终身 streaming 模式，见 ChatMarkdown），只管「出字中」的内容策略：
+   * mermaid 显示源码还是出图、重内容岛是否 eager、高亮缓存只读。live 行在 settle 冻结帧会把
+   * messageStreaming 置 false（停 shimmer / 入场动画）但把这个值留为 true，让上述变化只在
+   * 落库 twin 首挂时发生一次。
+   */
+  markdownStreaming?: boolean
   /** R8（多模型一问多答）：本条 user 消息这一问发给了哪些模型；多模型时渲染在气泡顶部。 */
   sentModels?: { providerId: string | null; model: string | null }[]
   onUpdateMessage?: (messageId: string, content: string) => Promise<void>
@@ -173,7 +184,7 @@ function ArtifactImage({
       conversationId,
     })
   return (
-    <figure className="m-0">
+    <figure className="m-0 min-w-0 max-w-full shrink-0">
       <ChatInlineImage
         src={src}
         alt={label || name}
@@ -181,7 +192,10 @@ function ArtifactImage({
         onOpenViewer={openViewer}
       />
       {label ? (
-        <figcaption className="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+        <figcaption
+          className="mt-1 truncate text-[11px] text-neutral-400 dark:text-neutral-500"
+          style={{ maxWidth: CHAT_IMAGE_TILE_MAX_PX }}
+        >
           {label}
         </figcaption>
       ) : null}
@@ -208,6 +222,7 @@ function selectGalleryImageArtifacts(
   // 找最后一个产生图片的 round，只展示该轮（通常是最终 screenshot 验收）
   let lastImageRound: number | null = null
   for (const tc of toolCalls) {
+    if (isImageReadToolCall(tc)) continue
     const hasImg = (tc.artifacts ?? []).some(isImageArtifact)
     if (!hasImg) continue
     const r = tc.round ?? 0
@@ -217,6 +232,7 @@ function selectGalleryImageArtifacts(
 
   const fromLastRound: ChatToolArtifact[] = []
   for (const tc of toolCalls) {
+    if (isImageReadToolCall(tc)) continue
     const r = tc.round ?? 0
     if (r !== lastImageRound) continue
     for (const a of tc.artifacts ?? []) {
@@ -238,7 +254,7 @@ function GeneratedImageArtifacts({
   const total = imageArtifacts.length
 
   return (
-    <div className="mt-3 space-y-3">
+    <div className="mt-3 flex min-w-0 max-w-full flex-wrap content-start gap-2">
       {imageArtifacts.map((artifact, index) => (
         <ArtifactImage
           key={`${artifact.path || artifact.name || 'img'}-${index}`}
@@ -401,6 +417,55 @@ function isUserInjectedToolCall(toolCall: ToolCallRecord): boolean {
   return isUserSteerToolCall(toolCall) || isUserFollowUpToolCall(toolCall)
 }
 
+function ClusteredToolCalls({
+  toolCalls,
+  artifacts,
+  conversationId,
+  itemClassName,
+}: {
+  toolCalls: ToolCallRecord[]
+  artifacts: ChatToolArtifact[]
+  conversationId?: string | null
+  itemClassName?: string
+}) {
+  return (
+    <>
+      {clusterToolCallsForDisplay(toolCalls).map((item, index) => {
+        if (item.type === 'imageRead') {
+          const key = item.toolCalls.map((toolCall) => toolRecordId(toolCall)).filter(Boolean).join('-')
+            || `image-read-${index}`
+          return (
+            <div key={key} className={itemClassName}>
+              <ToolCallErrorBoundary>
+                <ImageReadCluster toolCalls={item.toolCalls} />
+              </ToolCallErrorBoundary>
+            </div>
+          )
+        }
+        const toolCall = item.toolCall
+        const key = toolRecordId(toolCall) || `tool-${index}`
+        return (
+          <div key={key} className={itemClassName}>
+            {isUserInjectedToolCall(toolCall) ? (
+              <UserSteerSegment toolCall={toolCall} />
+            ) : isArtifactPresentationToolCall(toolCall) ? (
+              <ArtifactPresentationBlock
+                toolCall={toolCall}
+                artifacts={artifacts}
+                conversationId={conversationId}
+              />
+            ) : (
+              <ToolCallErrorBoundary>
+                <ToolCallBlock toolCall={toolCall} />
+              </ToolCallErrorBoundary>
+            )}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
 function TimelineToolSegment({
   segment,
   toolCallById,
@@ -560,11 +625,82 @@ function workingGroupTitle(generating: boolean, durationMs: number | null): stri
   return 'Worked'
 }
 
+function renderProcessSegments({
+  segments,
+  toolCallById,
+  artifacts,
+  citations,
+  conversationId,
+  reasoningStreaming,
+  reasoningDurationMs,
+  reasoningDurationMsBySegmentId,
+  reasoningSegmentCount,
+}: {
+  segments: ChatMessageSegment[]
+  toolCallById: ReadonlyMap<string, ToolCallRecord>
+  artifacts: ChatToolArtifact[]
+  citations?: Map<number, CitationView>
+  conversationId?: string | null
+  reasoningStreaming: boolean
+  reasoningDurationMs?: number | null
+  reasoningDurationMsBySegmentId?: Record<string, number>
+  reasoningSegmentCount: number
+}) {
+  const nodes: ReactNode[] = []
+  const segmentCount = segments.length
+  for (let index = 0; index < segments.length; ) {
+    const segment = segments[index]
+    if (segment.kind === 'tool') {
+      const toolCall = toolCallById.get(segmentToolCallId(segment))
+      if (toolCall && isImageReadToolCall(toolCall)) {
+        const imageReads = [toolCall]
+        let end = index + 1
+        while (end < segments.length) {
+          const next = segments[end]
+          if (next.kind !== 'tool') break
+          const nextCall = toolCallById.get(segmentToolCallId(next))
+          if (!nextCall || !isImageReadToolCall(nextCall)) break
+          imageReads.push(nextCall)
+          end += 1
+        }
+        nodes.push(
+          <div key={segment.id}>
+            <ToolCallErrorBoundary>
+              <ImageReadCluster toolCalls={imageReads} />
+            </ToolCallErrorBoundary>
+          </div>,
+        )
+        index = end
+        continue
+      }
+    }
+    nodes.push(
+      <div key={segment.id}>
+        <TimelineSegmentNode
+          segment={segment}
+          index={index}
+          segmentCount={segmentCount}
+          toolCallById={toolCallById}
+          artifacts={artifacts}
+          citations={citations}
+          conversationId={conversationId}
+          reasoningStreaming={reasoningStreaming}
+          reasoningDurationMs={reasoningDurationMs}
+          reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
+          reasoningSegmentCount={reasoningSegmentCount}
+        />
+      </div>,
+    )
+    index += 1
+  }
+  return nodes
+}
+
 /**
  * 一轮过程 = 一个 Codex 式 Working 壳。
  * - 「生成中」= 这条消息还在流式、且这是末组：始终展开，避免抖动。
  * - 后面出现终稿/standalone（非末组）或流式结束 → 收成一行 Worked for Xs。
- * - 用户手动点过开关后以用户操作为准（userToggledRef）。
+ * - 用户手动点过开关后以用户操作为准。
  * - 折叠态只留 header，不挂组内 ReasoningBlock / ToolCallBlock / 过程旁白。
  */
 function TimelineGroupBlock({
@@ -604,31 +740,16 @@ function TimelineGroupBlock({
     [segments, toolCalls, toolCallById, reasoningDurationMs],
   )
   const title = workingGroupTitle(generating, durationMs)
-  const [open, setOpen] = useState(generating)
-  const userToggledRef = useRef(false)
-
-  // 自动折叠不能等 effect：生成结束后的第一次 render 仍可能带着旧的 open=true，
-  // 先把整棵 ToolCallBlock/Markdown 子树创建出来，effect 下一拍才卸载。用当前生成态
-  // 直接参与渲染，保证结束这一帧就不创建详情树；用户手动操作后再由 open 接管。
-  const renderDetails = userToggledRef.current ? open : generating
-
-  // 生成中默认展开、完成自动折叠；用户手动操作后不再覆盖。
-  useEffect(() => {
-    if (userToggledRef.current) return
-    setOpen(generating)
-  }, [generating])
-
-  const handleToggle = () => {
-    userToggledRef.current = true
-    setOpen((value) => !value)
-  }
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
+  const renderDetails = userOpen ?? generating
 
   return (
     <section aria-label="过程分组" className="not-prose">
       <button
         type="button"
-        onClick={handleToggle}
+        onClick={() => setUserOpen(current => !(current ?? generating))}
         aria-expanded={renderDetails}
+        data-chat-disclosure
         data-tauri-drag-region="false"
         className="mb-1 flex w-full items-center gap-1.5 text-left text-[12px] leading-relaxed font-medium text-neutral-400 transition-colors hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300"
       >
@@ -659,32 +780,25 @@ function TimelineGroupBlock({
           )}
         </div>
       </button>
-      {renderDetails && (
-        <div className="chat-motion-reveal is-open" aria-hidden={false}>
+      <ChatDisclosureBody open={renderDetails} animate={userOpen !== null}>
+        {() => (
           <div className="space-y-1.5">
-            {/* 段级淡入只在流式中播：历史消息被虚拟列表反复卸载/重挂载，无条件的
-                `both` fill 动画会让回翻时每个重进 DOM 的段落整批重播淡入——外层气泡
-                入场早已为此 gate（playEntranceAnimation），内层段落同理。 */}
-            {segments.map((segment, index) => (
-              <div key={segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-                <TimelineSegmentNode
-                  segment={segment}
-                  index={index}
-                  segmentCount={segments.length}
-                  toolCallById={toolCallById}
-                  artifacts={artifacts}
-                  citations={citations}
-                  conversationId={conversationId}
-                  reasoningStreaming={reasoningStreaming && isLastGroup}
-                  reasoningDurationMs={reasoningDurationMs}
-                  reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
-                  reasoningSegmentCount={reasoningSegmentCount}
-                />
-              </div>
-            ))}
+            {/* A new tool can move existing commentary into this group. Keep
+                those segments visible instead of replaying opacity from zero. */}
+            {renderProcessSegments({
+              segments,
+              toolCallById,
+              artifacts,
+              citations,
+              conversationId,
+              reasoningStreaming: reasoningStreaming && isLastGroup,
+              reasoningDurationMs,
+              reasoningDurationMsBySegmentId,
+              reasoningSegmentCount,
+            })}
           </div>
-        </div>
-      )}
+        )}
+      </ChatDisclosureBody>
     </section>
   )
 }
@@ -756,9 +870,10 @@ function TimelineSegments({
       {groupItems.map((item: TimelineGroupItem, index) => {
         if (item.type === 'text') {
           if (!segmentText(item.segment).trim()) return null
-          // 每个时间线分段单独淡入：流式中新分段顺次出现而非"啪"地弹出。
+          // Segments can be regrouped as tools arrive; entrance fades would
+          // briefly hide text the user has already read.
           return (
-            <div key={item.segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+            <div key={item.segment.id}>
               <TimelineTextSegment
                 segment={item.segment}
                 artifacts={artifacts}
@@ -774,7 +889,7 @@ function TimelineSegments({
           const toolCall = toolCallById.get(id)
           if (!toolCall) return null
           return (
-            <div key={item.segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+            <div key={item.segment.id}>
               {isUserInjectedToolCall(toolCall) ? (
                 <UserSteerSegment toolCall={toolCall} />
               ) : isArtifactPresentationToolCall(toolCall) ? (
@@ -793,7 +908,7 @@ function TimelineSegments({
         }
         const groupKey = item.segments[0]?.id ?? `group-${index}`
         return (
-          <div key={groupKey} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+          <div key={groupKey}>
             <TimelineGroupBlock
               segments={item.segments}
               toolCalls={toolCalls}
@@ -811,23 +926,11 @@ function TimelineSegments({
           </div>
         )
       })}
-      {orphanTools.map((toolCall, index) => (
-        <div key={toolRecordId(toolCall) || `orphan-tool-${index}`} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-          {isUserInjectedToolCall(toolCall) ? (
-            <UserSteerSegment toolCall={toolCall} />
-          ) : isArtifactPresentationToolCall(toolCall) ? (
-            <ArtifactPresentationBlock
-              toolCall={toolCall}
-              artifacts={artifacts}
-              conversationId={conversationId}
-            />
-          ) : (
-            <ToolCallErrorBoundary>
-              <ToolCallBlock toolCall={toolCall} />
-            </ToolCallErrorBoundary>
-          )}
-        </div>
-      ))}
+      <ClusteredToolCalls
+        toolCalls={orphanTools}
+        artifacts={artifacts}
+        conversationId={conversationId}
+      />
     </section>
   )
 }
@@ -840,6 +943,7 @@ function MessageBubbleComponent({
   reasoningDurationMsBySegmentId,
   reasoningStreaming = false,
   messageStreaming = false,
+  markdownStreaming = messageStreaming,
   sentModels,
   onUpdateMessage,
   onRegenerateMessage,
@@ -1076,31 +1180,8 @@ function MessageBubbleComponent({
     )
   }
 
-  const renderToolCall = (toolCall: ToolCallRecord, index: number) => {
-    const key = toolCall.id || toolCall.call_id || toolCall.callId || index
-    // 无时间线段的旧路径：插话卡照样不能退化成一张写着 user_steer 的工具卡。
-    if (isUserInjectedToolCall(toolCall)) {
-      return <UserSteerSegment key={key} toolCall={toolCall} />
-    }
-    if (isArtifactPresentationToolCall(toolCall)) {
-      return (
-        <ArtifactPresentationBlock
-          key={key}
-          toolCall={toolCall}
-          artifacts={renderArtifacts}
-          conversationId={conversationId}
-        />
-      )
-    }
-    return (
-      <ToolCallErrorBoundary key={key}>
-        <ToolCallBlock toolCall={toolCall} />
-      </ToolCallErrorBoundary>
-    )
-  }
-
   return (
-    <MarkdownStreamingContext.Provider value={messageStreaming}>
+    <MarkdownStreamingContext.Provider value={markdownStreaming}>
     <div
       {...hoverProps}
       className={`flex justify-start py-3 ${playEntranceAnimation ? 'chat-motion-bubble-in' : ''}`}
@@ -1117,6 +1198,7 @@ function MessageBubbleComponent({
                 onClick={() => setToolsExpanded((value) => !value)}
                 className="mb-1 flex w-full items-center gap-1 text-left text-[11px] font-medium text-neutral-400 transition-colors hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300"
                 aria-expanded={toolsExpanded}
+                data-chat-disclosure
                 data-tauri-drag-region="false"
               >
                 <span>
@@ -1128,18 +1210,28 @@ function MessageBubbleComponent({
                 工具调用
               </div>
             )}
-            {toolsCollapsible && toolsExpanded && (
-              <div className="chat-motion-reveal is-open">
-                <div>{toolCalls.map((toolCall, index) => renderToolCall(toolCall, index))}</div>
-              </div>
+            {toolsCollapsible && (
+              <ChatDisclosureBody open={toolsExpanded}>
+                <ClusteredToolCalls
+                  toolCalls={toolCalls}
+                  artifacts={renderArtifacts}
+                  conversationId={conversationId}
+                />
+              </ChatDisclosureBody>
             )}
-            {!toolsCollapsible && toolCalls.map((toolCall, index) => renderToolCall(toolCall, index))}
+            {!toolsCollapsible && (
+              <ClusteredToolCalls
+                toolCalls={toolCalls}
+                artifacts={renderArtifacts}
+                conversationId={conversationId}
+              />
+            )}
           </section>
         )}
 
-        {message.reasoning && !hasTimelineSegments && (
+        {Boolean((message.reasoning ?? '').trim()) && !hasTimelineSegments && (
           <ReasoningBlock
-            reasoning={message.reasoning}
+            reasoning={message.reasoning ?? ''}
             streaming={reasoningStreaming}
             durationMs={reasoningDurationMs}
           />

@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::{engine::general_purpose, Engine as _};
@@ -14,6 +16,9 @@ const DEFAULT_SIZE: &str = "auto";
 const DEFAULT_QUALITY: &str = "auto";
 const MAX_PROMPT_CHARS: usize = 8_000;
 const MAX_IMAGE_BYTES: usize = 24 * 1024 * 1024;
+const MAX_INPUT_IMAGES: usize = 4;
+/// xAI `/images/edits` 的 `images` 数组上限是 3。
+const XAI_MAX_EDIT_IMAGES: usize = 3;
 pub const IMAGE_GENERATION_TIMEOUT_MS: u64 = 300_000;
 const IMAGE_GENERATION_HTTP_TIMEOUT: Duration = Duration::from_millis(IMAGE_GENERATION_TIMEOUT_MS);
 
@@ -45,6 +50,13 @@ struct ImageGenerationRequest {
     size: String,
     quality: String,
     n: usize,
+    input_images: Vec<InputImage>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InputImage {
+    mime_type: String,
+    base64: String,
 }
 
 struct GeneratedImage {
@@ -60,16 +72,19 @@ pub async fn tool_generate_image(
     arguments: &Value,
 ) -> Result<McpToolCallResult, String> {
     let settings = state.settings_read().clone();
-    let session = conversation_id.and_then(|conversation_id| {
-        crate::chat::storage::load_conversation(app, conversation_id)
-            .ok()
-            .map(|conversation| (conversation.provider_id, conversation.model))
+    let conversation = conversation_id.and_then(|conversation_id| {
+        crate::chat::storage::load_conversation(app, conversation_id).ok()
     });
-    let session_ref = session
+    let drafts = conversation_id
+        .map(|conversation_id| {
+            crate::chat::draft_journal::latest_drafts_for(app, conversation_id)
+        })
+        .unwrap_or_default();
+    let session_ref = conversation
         .as_ref()
-        .map(|(provider_id, model)| crate::settings::SessionModel {
-            provider_id: provider_id.as_str(),
-            model: model.as_str(),
+        .map(|conversation| crate::settings::SessionModel {
+            provider_id: conversation.provider_id.as_str(),
+            model: conversation.model.as_str(),
         });
     let (provider_id, model) =
         crate::chat::model_metadata::image_generation_model_for_session(&settings, session_ref)
@@ -79,26 +94,32 @@ pub async fn tool_generate_image(
         .cloned()
         .ok_or_else(|| "Mixer image generation provider is missing".to_string())?;
     let retry_attempts = crate::api::effective_retry_attempts(&settings);
+    let input_images =
+        collect_mixer_input_images(app, conversation.as_ref(), &drafts, arguments)?;
     generate_image_with_provider(
         state,
         &provider,
         &model,
         arguments,
+        &input_images,
         retry_attempts,
         "Mixer image generation",
     )
     .await
 }
 
-pub async fn generate_image_with_provider(
+pub(crate) async fn generate_image_with_provider(
     state: &AppState,
     provider: &ModelProvider,
     model: &str,
     arguments: &Value,
+    input_images: &[InputImage],
     retry_attempts: usize,
     operation: &str,
 ) -> Result<McpToolCallResult, String> {
-    let request = parse_request(arguments)?;
+    let mut request = parse_request(arguments)?;
+    reject_excess_reference_images(provider, model, input_images.len())?;
+    request.input_images = input_images.to_vec();
     validate_provider(provider)?;
 
     // 端点选择：先查会话缓存（自愈学到的纠正结果），否则用单一解析器。
@@ -372,10 +393,14 @@ fn parse_request(arguments: &Value) -> Result<ImageGenerationRequest, String> {
         size: size.to_string(),
         quality: quality.to_string(),
         n,
+        input_images: Vec::new(),
     })
 }
 
 fn validate_provider(provider: &ModelProvider) -> Result<(), String> {
+    if provider.request.oauth.is_some() {
+        return Err("Account OAuth currently supports chat and vision input; choose an API Key provider for image generation".into());
+    }
     match provider.api_format_kind() {
         // Gemini 原生走 generateContent 出图路径；OpenAI 系走 images/chat 路径。
         // xAI 出图走 `/images/generations`（`uses_xai_images_api`），与 OpenAI 系同路。
@@ -387,7 +412,7 @@ fn validate_provider(provider: &ModelProvider) -> Result<(), String> {
             return Err("Mixer image generation requires an OpenAI-compatible provider".to_string())
         }
     }
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Err(format!(
             "Image generation provider `{}` has no API key configured",
             provider.name
@@ -404,10 +429,18 @@ async fn generate_with_images_api(
     retry_attempts: usize,
     operation: &str,
 ) -> Result<Vec<GeneratedImage>, String> {
-    let url = format!(
-        "{}/images/generations",
-        provider.base_url.trim_end_matches('/')
-    );
+    if !request.input_images.is_empty() {
+        return generate_with_images_edits(
+            state,
+            provider,
+            model,
+            request,
+            retry_attempts,
+            operation,
+        )
+        .await;
+    }
+    let url = images_api_url(&provider.base_url, false);
     let mut body = serde_json::json!({
         "model": model,
         "prompt": request.prompt.as_str(),
@@ -446,6 +479,97 @@ async fn generate_with_images_api(
         },
     )
     .await?;
+    read_images_api_response(state, provider, response).await
+}
+
+/// 有参考图时走 `/images/edits`：xAI 必须 JSON；官方 `api.openai.com` 必须 multipart；
+/// 其余兼容中转跟 `/images/generations` 一样发 JSON data URL。
+async fn generate_with_images_edits(
+    state: &AppState,
+    provider: &ModelProvider,
+    model: &str,
+    request: &ImageGenerationRequest,
+    retry_attempts: usize,
+    operation: &str,
+) -> Result<Vec<GeneratedImage>, String> {
+    let url = images_api_url(&provider.base_url, true);
+    let response = if uses_xai_images_api(provider, model) {
+        post_images_json(
+            state,
+            provider,
+            &url,
+            &xai_edits_body(model, request),
+            retry_attempts,
+            operation,
+        )
+        .await?
+    } else if is_official_openai_images(provider) {
+        let files = decoded_input_files(request)?;
+        send_with_failover(
+            state,
+            operation,
+            retry_attempts,
+            &provider.id,
+            &provider.api_keys,
+            |key| {
+                crate::provider_request::apply(
+                    state.client_for(provider).post(&url).bearer_auth(key),
+                    provider,
+                    None,
+                )
+                .timeout(IMAGE_GENERATION_HTTP_TIMEOUT)
+                .multipart(images_edits_form(model, request, &files))
+                .send()
+            },
+        )
+        .await?
+    } else {
+        post_images_json(
+            state,
+            provider,
+            &url,
+            &openai_compat_edits_json_body(model, request),
+            retry_attempts,
+            operation,
+        )
+        .await?
+    };
+    read_images_api_response(state, provider, response).await
+}
+
+async fn post_images_json(
+    state: &AppState,
+    provider: &ModelProvider,
+    url: &str,
+    body: &Value,
+    retry_attempts: usize,
+    operation: &str,
+) -> Result<reqwest::Response, String> {
+    send_with_failover(
+        state,
+        operation,
+        retry_attempts,
+        &provider.id,
+        &provider.api_keys,
+        |key| {
+            crate::provider_request::apply(
+                state.client_for(provider).post(url).bearer_auth(key),
+                provider,
+                None,
+            )
+            .timeout(IMAGE_GENERATION_HTTP_TIMEOUT)
+            .json(body)
+            .send()
+        },
+    )
+    .await
+}
+
+async fn read_images_api_response(
+    state: &AppState,
+    provider: &ModelProvider,
+    response: reqwest::Response,
+) -> Result<Vec<GeneratedImage>, String> {
     let raw = response
         .text()
         .await
@@ -530,7 +654,7 @@ async fn generate_with_openrouter_chat(
         "messages": [
             {
                 "role": "user",
-                "content": request.prompt.as_str(),
+                "content": chat_user_content(request),
             }
         ],
         "modalities": openrouter_modalities(model),
@@ -753,11 +877,24 @@ fn build_gemini_native_body(request: &ImageGenerationRequest) -> Value {
     if let Some(aspect_ratio) = size_aspect_ratio(&request.size) {
         generation_config["imageConfig"] = serde_json::json!({ "aspectRatio": aspect_ratio });
     }
+    let mut parts = request
+        .input_images
+        .iter()
+        .map(|image| {
+            serde_json::json!({
+                "inlineData": {
+                    "mimeType": image.mime_type,
+                    "data": image.base64,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    parts.push(serde_json::json!({ "text": request.prompt.as_str() }));
     serde_json::json!({
         "contents": [
             {
                 "role": "user",
-                "parts": [{ "text": request.prompt.as_str() }],
+                "parts": parts,
             }
         ],
         "generationConfig": generation_config,
@@ -973,6 +1110,405 @@ fn openrouter_modalities(model: &str) -> Value {
     } else {
         serde_json::json!(["image", "text"])
     }
+}
+
+fn images_api_url(base_url: &str, has_input_images: bool) -> String {
+    let path = if has_input_images {
+        "images/edits"
+    } else {
+        "images/generations"
+    };
+    format!("{}/{path}", base_url.trim_end_matches('/'))
+}
+
+fn data_url_for_input(image: &InputImage) -> String {
+    format!("data:{};base64,{}", image.mime_type, image.base64)
+}
+
+fn chat_user_content(request: &ImageGenerationRequest) -> Value {
+    if request.input_images.is_empty() {
+        return Value::String(request.prompt.clone());
+    }
+    let mut parts = vec![serde_json::json!({
+        "type": "text",
+        "text": request.prompt.as_str(),
+    })];
+    for image in &request.input_images {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": data_url_for_input(image) }
+        }));
+    }
+    Value::Array(parts)
+}
+
+fn is_official_openai_images(provider: &ModelProvider) -> bool {
+    provider
+        .base_url
+        .to_ascii_lowercase()
+        .contains("api.openai.com")
+}
+
+fn openai_compat_edits_json_body(model: &str, request: &ImageGenerationRequest) -> Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "prompt": request.prompt.as_str(),
+        "n": request.n,
+    });
+    if uses_gpt_image_api_model(model) || request.size != "auto" {
+        body["size"] = Value::String(request.size.clone());
+    }
+    if request.quality != "auto" {
+        body["quality"] = Value::String(request.quality.clone());
+    }
+    let urls = request
+        .input_images
+        .iter()
+        .map(|image| Value::String(data_url_for_input(image)))
+        .collect::<Vec<_>>();
+    body["image"] = if urls.len() == 1 {
+        urls.into_iter().next().unwrap_or(Value::Null)
+    } else {
+        Value::Array(urls)
+    };
+    body
+}
+
+fn xai_edits_body(model: &str, request: &ImageGenerationRequest) -> Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "prompt": request.prompt.as_str(),
+        "n": request.n,
+        "response_format": "b64_json",
+    });
+    if let Some(aspect_ratio) = size_aspect_ratio(&request.size) {
+        body["aspect_ratio"] = Value::String(aspect_ratio.to_string());
+    }
+    let refs = request
+        .input_images
+        .iter()
+        .map(|image| {
+            serde_json::json!({
+                "url": data_url_for_input(image),
+                "type": "image_url",
+            })
+        })
+        .collect::<Vec<_>>();
+    if refs.len() == 1 {
+        body["image"] = refs.into_iter().next().unwrap_or(Value::Null);
+    } else {
+        body["images"] = Value::Array(refs);
+    }
+    body
+}
+
+fn decoded_input_files(
+    request: &ImageGenerationRequest,
+) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+    request
+        .input_images
+        .iter()
+        .enumerate()
+        .map(|(idx, image)| {
+            let bytes = general_purpose::STANDARD
+                .decode(image.base64.as_bytes())
+                .map_err(|_| "Input image base64 is invalid".to_string())?;
+            if bytes.is_empty() {
+                return Err("Input image is empty".to_string());
+            }
+            Ok((
+                format!("image-{}.{}", idx + 1, extension_for_mime(&image.mime_type)),
+                image.mime_type.clone(),
+                bytes,
+            ))
+        })
+        .collect()
+}
+
+fn images_edits_form(
+    model: &str,
+    request: &ImageGenerationRequest,
+    files: &[(String, String, Vec<u8>)],
+) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", model.to_string())
+        .text("prompt", request.prompt.clone())
+        .text("n", request.n.to_string());
+    if uses_gpt_image_api_model(model) || request.size != "auto" {
+        form = form.text("size", request.size.clone());
+    }
+    if request.quality != "auto" {
+        form = form.text("quality", request.quality.clone());
+    }
+    let field = if uses_gpt_image_api_model(model) || files.len() > 1 {
+        "image[]"
+    } else {
+        "image"
+    };
+    for (name, mime, bytes) in files {
+        let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name(name.clone());
+        let part = part.mime_str(mime).unwrap_or_else(|_| {
+            reqwest::multipart::Part::bytes(bytes.clone()).file_name(name.clone())
+        });
+        form = form.part(field, part);
+    }
+    form
+}
+
+pub(crate) fn load_input_images_from_paths(paths: &[PathBuf]) -> Result<Vec<InputImage>, String> {
+    paths
+        .iter()
+        .map(|path| load_input_image_from_path(path))
+        .collect()
+}
+
+fn max_reference_images(provider: &ModelProvider, model: &str) -> usize {
+    if uses_xai_images_api(provider, model) {
+        XAI_MAX_EDIT_IMAGES
+    } else {
+        MAX_INPUT_IMAGES
+    }
+}
+
+fn reject_excess_reference_images(
+    provider: &ModelProvider,
+    model: &str,
+    count: usize,
+) -> Result<(), String> {
+    let max_refs = max_reference_images(provider, model);
+    if count > max_refs {
+        Err(format!(
+            "This image model accepts at most {max_refs} reference images (got {count})"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn load_input_image_from_path(path: &Path) -> Result<InputImage, String> {
+    let bytes = fs::read(path).map_err(|err| format!("Read input image failed: {err}"))?;
+    if bytes.is_empty() {
+        return Err("Input image is empty".to_string());
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err("Input image is too large".to_string());
+    }
+    let (bytes, mime_type) = match super::image_prep::prepare_image_bytes_for_model(&bytes) {
+        Some((prepared, mime)) => (prepared, mime.to_string()),
+        None => (bytes, mime_for_image_path(path).to_string()),
+    };
+    Ok(InputImage {
+        mime_type,
+        base64: general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+fn mime_for_image_path(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tiff" | "tif" => "image/tiff",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        _ => "image/png",
+    }
+}
+
+fn collect_mixer_input_images(
+    app: &AppHandle,
+    conversation: Option<&crate::chat::Conversation>,
+    drafts: &[crate::chat::ChatMessage],
+    arguments: &Value,
+) -> Result<Vec<InputImage>, String> {
+    let artifact_ids = string_list_arg(arguments, "artifact_ids");
+    let paths = string_list_arg(arguments, "paths");
+    let mut images = Vec::new();
+    let mut missing = Vec::new();
+
+    let artifacts = resolve_mixer_artifacts(conversation, drafts, &artifact_ids)?;
+    if let Some(conversation) = conversation {
+        for artifact in artifacts {
+            match input_image_from_artifact(app, &conversation.id, artifact) {
+                Ok(image) => push_input_image(&mut images, image),
+                Err(err) => missing.push(err),
+            }
+        }
+    }
+
+    for path in &paths {
+        match resolve_mixer_image_path(app, conversation, path)
+            .and_then(|resolved| load_input_image_from_path(&resolved))
+        {
+            Ok(image) => push_input_image(&mut images, image),
+            Err(err) => missing.push(err),
+        }
+    }
+
+    if !artifact_ids.is_empty() || !paths.is_empty() {
+        if !missing.is_empty() {
+            return Err(missing.join("; "));
+        }
+        return Ok(images);
+    }
+
+    let Some(conversation) = conversation else {
+        return Ok(Vec::new());
+    };
+    let Some(last_user) = conversation
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+    else {
+        return Ok(Vec::new());
+    };
+    let attachment_paths = crate::chat::attachments::stored_image_paths_for_attachments(
+        app,
+        &conversation.id,
+        &last_user.attachments,
+    )?;
+    load_input_images_from_paths(&attachment_paths)
+}
+
+fn string_list_arg(arguments: &Value, name: &str) -> Vec<String> {
+    let Some(values) = arguments.get(name).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for value in values {
+        let Some(item) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        else {
+            continue;
+        };
+        if !items.iter().any(|existing| existing == item) {
+            items.push(item.to_string());
+        }
+    }
+    items
+}
+
+fn push_input_image(images: &mut Vec<InputImage>, image: InputImage) {
+    if images
+        .iter()
+        .any(|existing| existing.base64 == image.base64)
+    {
+        return;
+    }
+    images.push(image);
+}
+
+fn resolve_mixer_artifacts<'a>(
+    conversation: Option<&'a crate::chat::Conversation>,
+    drafts: &'a [crate::chat::ChatMessage],
+    artifact_ids: &[String],
+) -> Result<Vec<&'a ChatToolArtifact>, String> {
+    if artifact_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(conversation) = conversation else {
+        return Err("artifact_ids require an active conversation".to_string());
+    };
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for id in artifact_ids {
+        match find_artifact_in_messages(drafts.iter().chain(conversation.messages.iter()), id) {
+            Some(artifact) => found.push(artifact),
+            None => missing.push(format!("Unknown artifact_id: {id}")),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(missing.join("; "));
+    }
+    Ok(found)
+}
+
+fn find_artifact_in_messages<'a, I>(messages: I, artifact_id: &str) -> Option<&'a ChatToolArtifact>
+where
+    I: IntoIterator<Item = &'a crate::chat::ChatMessage>,
+{
+    messages.into_iter().find_map(|message| {
+        message
+            .artifacts
+            .iter()
+            .chain(
+                message
+                    .tool_calls
+                    .iter()
+                    .flat_map(|call| call.artifacts.iter()),
+            )
+            .find(|artifact| artifact.id.as_deref() == Some(artifact_id))
+    })
+}
+
+fn input_image_from_artifact(
+    app: &AppHandle,
+    conversation_id: &str,
+    artifact: &ChatToolArtifact,
+) -> Result<InputImage, String> {
+    if !artifact.mime_type.starts_with("image/") && !artifact.mime_type.is_empty() {
+        return Err(format!(
+            "Artifact `{}` is not an image",
+            artifact.id.as_deref().unwrap_or(&artifact.name)
+        ));
+    }
+    if let Some(rel) = artifact.path.as_deref().filter(|path| !path.is_empty()) {
+        let candidate = Path::new(rel);
+        let path = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            crate::chat::storage::conversation_attachments_dir(app, conversation_id)?.join(rel)
+        };
+        if path.is_file() {
+            return load_input_image_from_path(&path);
+        }
+        return Err(format!(
+            "Artifact `{}` image file is missing: {}",
+            artifact.id.as_deref().unwrap_or(&artifact.name),
+            path.display()
+        ));
+    }
+    if artifact.data_url.starts_with("data:") {
+        let (mime_type, base64) = parse_image_data_url(&artifact.data_url)?;
+        return Ok(InputImage { mime_type, base64 });
+    }
+    Err(format!(
+        "Artifact `{}` has no readable image data",
+        artifact.id.as_deref().unwrap_or(&artifact.name)
+    ))
+}
+
+fn resolve_mixer_image_path(
+    app: &AppHandle,
+    conversation: Option<&crate::chat::Conversation>,
+    raw: &str,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if path.is_file() {
+        return Ok(path);
+    }
+    if let Some(conversation) = conversation {
+        if let Ok(dir) = crate::chat::storage::conversation_attachments_dir(app, &conversation.id) {
+            let name = Path::new(raw)
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.clone());
+            let joined = dir.join(name);
+            if joined.is_file() {
+                return Ok(joined);
+            }
+        }
+    }
+    Err(format!("Input image not found: {raw}"))
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -1346,6 +1882,7 @@ mod tests {
             size: "1024x1024".to_string(),
             quality: "auto".to_string(),
             n: 1,
+            input_images: Vec::new(),
         };
         let body = build_gemini_native_body(&request);
         assert_eq!(
@@ -1355,6 +1892,10 @@ mod tests {
         assert_eq!(
             body["generationConfig"]["imageConfig"]["aspectRatio"],
             serde_json::json!("1:1")
+        );
+        assert_eq!(
+            body["contents"][0]["parts"].as_array().map(|p| p.len()),
+            Some(1)
         );
         assert_eq!(body["contents"][0]["parts"][0]["text"], "draw a cat");
 
@@ -1420,5 +1961,285 @@ mod tests {
             ..gemini_provider()
         };
         assert!(validate_provider(&anthropic).is_err());
+    }
+
+    fn sample_input_image() -> InputImage {
+        InputImage {
+            mime_type: "image/png".to_string(),
+            base64: "aGVsbG8=".to_string(),
+        }
+    }
+
+    #[test]
+    fn images_api_switches_to_edits_when_input_images_present() {
+        assert_eq!(
+            images_api_url("https://api.openai.com/v1/", false),
+            "https://api.openai.com/v1/images/generations"
+        );
+        assert_eq!(
+            images_api_url("https://api.openai.com/v1", true),
+            "https://api.openai.com/v1/images/edits"
+        );
+    }
+
+    #[test]
+    fn chat_content_stays_plain_text_without_input_images() {
+        let request = ImageGenerationRequest {
+            prompt: "a red mug".to_string(),
+            size: "auto".to_string(),
+            quality: "auto".to_string(),
+            n: 1,
+            input_images: Vec::new(),
+        };
+        assert_eq!(
+            chat_user_content(&request),
+            Value::String("a red mug".to_string())
+        );
+    }
+
+    #[test]
+    fn chat_content_includes_input_images_as_data_urls() {
+        let request = ImageGenerationRequest {
+            prompt: "make it night".to_string(),
+            size: "auto".to_string(),
+            quality: "auto".to_string(),
+            n: 1,
+            input_images: vec![sample_input_image()],
+        };
+        let content = chat_user_content(&request);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "make it night");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn gemini_body_prepends_inline_input_images() {
+        let request = ImageGenerationRequest {
+            prompt: "make it night".to_string(),
+            size: "auto".to_string(),
+            quality: "auto".to_string(),
+            n: 1,
+            input_images: vec![sample_input_image()],
+        };
+        let body = build_gemini_native_body(&request);
+        assert_eq!(
+            body["contents"][0]["parts"][0]["inlineData"]["data"],
+            "aGVsbG8="
+        );
+        assert_eq!(body["contents"][0]["parts"][1]["text"], "make it night");
+    }
+
+    #[test]
+    fn xai_edits_json_uses_image_object_for_one_and_images_array_for_many() {
+        let one = ImageGenerationRequest {
+            prompt: "sketch".to_string(),
+            size: "1024x1024".to_string(),
+            quality: "auto".to_string(),
+            n: 1,
+            input_images: vec![sample_input_image()],
+        };
+        let body = xai_edits_body("grok-imagine-image", &one);
+        assert_eq!(body["image"]["type"], "image_url");
+        assert_eq!(body["image"]["url"], "data:image/png;base64,aGVsbG8=");
+        assert!(body.get("images").is_none());
+        assert_eq!(body["aspect_ratio"], "1:1");
+
+        let many = ImageGenerationRequest {
+            input_images: vec![sample_input_image(), sample_input_image()],
+            ..one
+        };
+        let body = xai_edits_body("grok-imagine-image", &many);
+        assert!(body.get("image").is_none());
+        assert_eq!(body["images"].as_array().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn openai_compat_edits_json_puts_data_urls_on_image() {
+        let request = ImageGenerationRequest {
+            prompt: "make it night".to_string(),
+            size: "1024x1024".to_string(),
+            quality: "high".to_string(),
+            n: 1,
+            input_images: vec![sample_input_image()],
+        };
+        let body = openai_compat_edits_json_body("gpt-image-1.5", &request);
+        assert_eq!(body["image"], "data:image/png;base64,aGVsbG8=");
+        assert_eq!(body["size"], "1024x1024");
+        assert_eq!(body["quality"], "high");
+
+        let many = ImageGenerationRequest {
+            input_images: vec![sample_input_image(), sample_input_image()],
+            ..request
+        };
+        let body = openai_compat_edits_json_body("gpt-image-1.5", &many);
+        assert_eq!(body["image"].as_array().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn loads_input_image_from_temp_file() {
+        let dir = std::env::temp_dir().join(format!("kivio-img-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("photo.jpg");
+        fs::write(&path, b"fake-jpeg-bytes").expect("write");
+        let image = load_input_image_from_path(&path).expect("load");
+        assert_eq!(image.mime_type, "image/jpeg");
+        assert_eq!(
+            general_purpose::STANDARD.decode(image.base64).expect("b64"),
+            b"fake-jpeg-bytes"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn conversation_from_messages(messages: Vec<Value>) -> crate::chat::Conversation {
+        serde_json::from_value(serde_json::json!({
+            "id": "conv_1",
+            "title": "t",
+            "provider_id": "p",
+            "model": "m",
+            "messages": messages,
+            "created_at": 0,
+            "updated_at": 0,
+        }))
+        .expect("conversation")
+    }
+
+    fn assistant_with_tool_artifact(artifact_id: &str, b64: &str) -> Value {
+        serde_json::json!({
+            "id": "msg_1",
+            "role": "assistant",
+            "content": "",
+            "timestamp": 0,
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "mixer_generate_image",
+                "status": "success",
+                "artifacts": [{
+                    "id": artifact_id,
+                    "name": "generated-image-1.png",
+                    "mime_type": "image/png",
+                    "data_url": format!("data:image/png;base64,{b64}"),
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn mixer_finds_same_turn_artifact_on_draft_not_main_json() {
+        let conversation = conversation_from_messages(vec![]);
+        let drafts: Vec<crate::chat::ChatMessage> = vec![serde_json::from_value(
+            assistant_with_tool_artifact("art_new", "aGVsbG8="),
+        )
+        .expect("draft")];
+        let found = resolve_mixer_artifacts(
+            Some(&conversation),
+            &drafts,
+            &["art_new".to_string()],
+        )
+        .expect("draft artifact");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id.as_deref(), Some("art_new"));
+    }
+
+    #[test]
+    fn mixer_unknown_artifact_errors_even_if_another_image_is_known() {
+        let conversation = conversation_from_messages(vec![assistant_with_tool_artifact(
+            "art_old",
+            "aGVsbG8=",
+        )]);
+        let err = resolve_mixer_artifacts(
+            Some(&conversation),
+            &[],
+            &["art_old".to_string(), "art_new".to_string()],
+        )
+        .expect_err("must not silently drop the missing id");
+        assert!(err.contains("art_new"), "{err}");
+        assert!(!err.contains("art_old") || err.contains("Unknown artifact_id: art_new"));
+    }
+
+    #[test]
+    fn mixer_artifact_ids_require_a_conversation() {
+        let err = resolve_mixer_artifacts(None, &[], &["art_new".to_string()])
+            .expect_err("no conversation");
+        assert!(err.contains("active conversation"), "{err}");
+    }
+
+    #[test]
+    fn string_list_arg_dedupes_and_skips_blanks() {
+        let arguments = serde_json::json!({
+            "paths": ["a.png", " ", "a.png", "b.png"],
+            "artifact_ids": "not-an-array",
+        });
+        assert_eq!(
+            string_list_arg(&arguments, "paths"),
+            vec!["a.png".to_string(), "b.png".to_string()]
+        );
+        assert!(string_list_arg(&arguments, "artifact_ids").is_empty());
+        assert!(string_list_arg(&arguments, "missing").is_empty());
+    }
+
+    #[test]
+    fn xai_reference_image_cap_is_three_and_does_not_silently_drop() {
+        let xai = ModelProvider {
+            id: "xai".to_string(),
+            name: "xAI".to_string(),
+            api_keys: vec!["k".to_string()],
+            api_key_legacy: None,
+            base_url: "https://api.x.ai/v1".to_string(),
+            available_models: Vec::new(),
+            enabled_models: Vec::new(),
+            enabled: true,
+            api_format: "xai_responses".to_string(),
+            model_overrides: std::collections::HashMap::new(),
+            compress_request_body: false,
+            request: Default::default(),
+            active_key_index: 0,
+        };
+        assert_eq!(max_reference_images(&xai, "grok-imagine-image"), 3);
+        assert_eq!(
+            max_reference_images(&gemini_provider(), "gemini-3.1-flash-image"),
+            4
+        );
+        let err = reject_excess_reference_images(&xai, "grok-imagine-image", 4)
+            .expect_err("xAI must refuse a 4th reference");
+        assert!(err.contains("at most 3"), "{err}");
+        assert!(err.contains("got 4"), "{err}");
+        assert!(reject_excess_reference_images(&xai, "grok-imagine-image", 3).is_ok());
+        assert!(
+            reject_excess_reference_images(&gemini_provider(), "gemini-3.1-flash-image", 4).is_ok()
+        );
+        assert!(
+            reject_excess_reference_images(&gemini_provider(), "gemini-3.1-flash-image", 5)
+                .is_err()
+        );
+
+        let four = vec![
+            sample_input_image(),
+            InputImage {
+                mime_type: "image/png".to_string(),
+                base64: "two".to_string(),
+            },
+            InputImage {
+                mime_type: "image/png".to_string(),
+                base64: "three".to_string(),
+            },
+            InputImage {
+                mime_type: "image/png".to_string(),
+                base64: "four".to_string(),
+            },
+        ];
+        let body = xai_edits_body(
+            "grok-imagine-image",
+            &ImageGenerationRequest {
+                prompt: "sketch".to_string(),
+                size: "auto".to_string(),
+                quality: "auto".to_string(),
+                n: 1,
+                input_images: four[..3].to_vec(),
+            },
+        );
+        assert_eq!(body["images"].as_array().map(|v| v.len()), Some(3));
     }
 }

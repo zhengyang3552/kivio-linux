@@ -219,14 +219,38 @@ fn work_style_prompt(available_builtin_tools: &[String]) -> String {
     let can_edit_files = available_builtin_tools
         .iter()
         .any(|tool| matches!(tool.as_str(), "write" | "edit" | "bash"));
+    let can_read_files = available_builtin_tools
+        .iter()
+        .any(|tool| tool.as_str() == "read");
+    let has_tools = !available_builtin_tools.is_empty();
     let file_clause = if can_edit_files {
         " after editing files you don't need to restate what changed (the user can see it)."
     } else {
         ""
     };
-    format!(
-        "How you work: address only the current request — no filler preamble, no wrap-up postamble, no \"here's what I'll do next\" narration;{file_clause} Match length to the task: answer simple questions in a sentence or two, and expand into structured output only for complex or report-style tasks — don't pad to look thorough. When the user only asks how to do something or whether it's possible, answer first; don't jump to making changes, and don't do work they didn't ask for."
-    )
+    // 曾经这里还禁「here's what I'll do next」式过程叙述——实测它把工具循环里的全部
+    // 阶段性正文一并杀掉（几十个 bash 之间一句话都没有，用户全程盲跑），而 Codex 的
+    // 合同反而要求简短 preamble。现在改成：最终回答不注水，但工具工作中要有简短的
+    // 阶段性播报；交付前必须用工具验证（生成图片逐张 read 质检），这是 skill 定义的
+    // 「生成→检查→重做」循环能真正执行的前提。
+    let mut prompt = format!(
+        "How you work: address only the current request — no filler preamble on simple answers, no wrap-up postamble;{file_clause} Match length to the task: answer simple questions in a sentence or two, and expand into structured output only for complex or report-style tasks — don't pad to look thorough. When the user only asks how to do something or whether it's possible, answer first; don't jump to making changes, and don't do work they didn't ask for."
+    );
+    if has_tools {
+        prompt.push_str(
+            " During multi-step tool work, keep the user oriented: before starting a new phase or changing course, say what you're doing in one short sentence — visible progress, not play-by-play; don't restate tool output. After waiting on a long job, report substance from the new output — what finished, failed, or was rate-limited — not that it is still running.",
+        );
+        prompt.push_str(
+            " Before declaring a deliverable done, verify it with your tools instead of assuming success: re-open what you produced and check it against the request",
+        );
+        if can_read_files {
+            prompt.push_str(
+                " — for generated or edited images, read each image file and confirm the visual content is actually correct",
+            );
+        }
+        prompt.push_str("; if it fails inspection, fix it and verify again.");
+    }
+    prompt
 }
 
 fn project_context_prompt(project: &ProjectPromptContext) -> String {
@@ -498,7 +522,7 @@ pub fn build_chat_system_prompt_with_segments(
             .iter()
             .any(|tool| tool.as_str() == "mixer_generate_image")
         {
-            action_examples.push("generating an image");
+            action_examples.push("generating or editing an image");
         }
         if action_examples.is_empty() {
             action_examples.push("using an enabled tool");
@@ -940,10 +964,10 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
             "Runtime environment: {os_name}; bash runs via {shell_name}. Match that shell's syntax ({shell_syntax_hint}). Each bash call is a fresh process — cwd does NOT persist across calls; switch directories with the `cwd` parameter, not a prior `cd`. To run multi-line or quoted code, write it to a file with write and run that — do not cram it into inline commands like `python -c \"...\"` (inline quotes are fragile across shells). When a tool returns a hard rejection, change strategy instead of retrying variants of the same action; never re-run a failed command unchanged; don't drop one-off probe or cleanup scripts into the project."
         ));
         bullets.push(
-            "bash runs on the host shell from the current default workbench; non-zero exit means failure. Paths with spaces must use the `cwd` parameter—never `cd path && command`; do not combine `cwd` with a leading `cd ... &&` prefix. Long-running dev commands such as `npm run dev`, `tauri dev`, and `vite` start in the background automatically and return a job_id immediately; do not start the same dev server twice. Explain and get confirmation before destructive, network, or environment-changing commands. Run a skill's bundled scripts with run_command; never use host pip unless the user explicitly asked for a host Python install.".to_string(),
+            "bash runs on the host shell from the current default workbench; non-zero exit means failure. Paths with spaces must use the `cwd` parameter—never `cd path && command`; do not combine `cwd` with a leading `cd ... &&` prefix. Finite commands (builds, tests, image-generation batches) stay in the foreground: bash waits until the process exits. Put parallel work inside one command (a script --concurrency flag, etc.), not as N bash jobs. Pass timeout_ms only if you want the process killed at that deadline. Never-ending servers such as `npm run dev`, `tauri dev`, and `vite` start in the background automatically and return a job_id immediately; do not start the same dev server twice. Explain and get confirmation before destructive, network, or environment-changing commands. Run a skill's bundled scripts with run_command; never use host pip unless the user explicitly asked for a host Python install.".to_string(),
         );
         bullets.push(
-            "Background commands (bash with background:true, or auto-detected dev servers): the call returns a job_id immediately and hands control back to you — keep working, do NOT poll right away. Read incremental output and exit status with bash_output (pass the job_id; use the returned next_offset for the next read), list all tracked jobs by calling bash_output with no job_id, and stop one with kill_background. Keep polling bounded (≤20 checks); status in history may be stale, so refresh once with bash_output before reporting a background command's result. Background commands survive across turns until you kill them or the app exits, so kill_background a dev server when you no longer need it.".to_string(),
+            "Background commands (bash with background:true, or auto-detected never-ending servers): the call returns a job_id immediately. Inspect with bash_output (pass the job_id; default wait ~30s; use next_offset for the next read). Do not background a command that will exit. List jobs with bash_output (no job_id), and stop one with kill_background. Status in history may be stale, so refresh once with bash_output before reporting a background command's result. Background commands survive across turns until you kill them or the app exits, so kill_background a dev server when you no longer need it.".to_string(),
         );
     }
     if has_web_search || has_web_fetch {
@@ -966,12 +990,12 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     }
     if has_present_artifacts {
         bullets.push(
-            "When the user asks to show, preview, attach, or send a local file or image in the chat, you MUST call present_artifacts at the exact display point. Use artifact_ids for generated files and paths for existing local files. Reading or analyzing a file does NOT display it.".to_string(),
+            "When the user asks to show, preview, attach, or send a local file or image in the chat, you MUST call present_artifacts at the exact display point. Copy art_ ids from tool results into artifact_ids, or pass paths for existing local files. Arguments are those short strings only — never file contents, base64, or data URLs. Reading or analyzing a file does NOT display it.".to_string(),
         );
     }
     if has_image_generation {
         bullets.push(
-            "When the user asks to create, generate, or draw an image, call mixer_generate_image; do not merely describe it.".to_string(),
+            "When the user asks to create, generate, draw, or edit an image, call mixer_generate_image; do not merely describe it. Pass paths or artifact_ids to edit existing images; this turn's attached images are used automatically if omitted.".to_string(),
         );
     }
     if has_advisor {
@@ -990,7 +1014,7 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     }
     if has_write || has_edit || has_bash {
         bullets.push(
-            "Before changing code, read neighboring files and existing conventions — mimic the current style, naming, and the libraries/frameworks already in use; never assume a library is available without confirming the project already uses it. Do not add code comments unless asked. After code changes, verify when you can (run existing tests, lint/typecheck); never git commit/push unless the user explicitly asks. Reference code locations as `file_path:line_number`. When several independent lookups or commands are needed, call multiple tools in parallel in one message instead of serially.".to_string(),
+            "Before changing code, read neighboring files and existing conventions — mimic the current style, naming, and the libraries/frameworks already in use; never assume a library is available without confirming the project already uses it. Do not add code comments unless asked. After code changes, verify when you can (run existing tests, lint/typecheck); never git commit/push unless the user explicitly asks. Reference code locations as `file_path:line_number`. When several independent lookups are needed, call multiple tools in parallel in one message instead of serially. Host-shell work that can run together belongs inside one bash command, not as N bash calls.".to_string(),
         );
     }
 
@@ -1005,6 +1029,29 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_style_prompt_adds_progress_and_verification_clauses_with_tools() {
+        let tools: Vec<String> = ["read", "write", "edit", "bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let prompt = work_style_prompt(&tools);
+        // 工具工作中的阶段性播报被允许（不再全盘禁叙述）。
+        assert!(prompt.contains("During multi-step tool work"), "{prompt}");
+        // 交付前验证合同 + 图片逐张 read 质检。
+        assert!(prompt.contains("verify it with your tools"), "{prompt}");
+        assert!(prompt.contains("read each image file"), "{prompt}");
+        // 旧的一刀切禁令不能回潮。
+        assert!(!prompt.contains("here's what I'll do next"), "{prompt}");
+    }
+
+    #[test]
+    fn work_style_prompt_stays_minimal_without_tools() {
+        let prompt = work_style_prompt(&[]);
+        assert!(!prompt.contains("During multi-step tool work"), "{prompt}");
+        assert!(!prompt.contains("verify it with your tools"), "{prompt}");
+    }
 
     fn test_assistant_snapshot(
         mcp_server_ids: Vec<&str>,
@@ -1296,6 +1343,7 @@ mod tests {
         );
 
         assert!(prompt.contains("MUST call present_artifacts"));
+        assert!(prompt.contains("Copy art_ ids from tool results into artifact_ids"));
         assert!(prompt.contains("paths for existing local files"));
         assert!(prompt.contains("Reading or analyzing a file does NOT display it"));
     }
@@ -1742,6 +1790,32 @@ mod tests {
     }
 
     #[test]
+    fn native_tools_prompt_keeps_finite_bash_in_foreground() {
+        let names = vec![
+            "bash".to_string(),
+            "bash_output".to_string(),
+            "read".to_string(),
+        ];
+        let prompt = native_tools_prompt(&names, false).expect("prompt");
+        assert!(
+            prompt.contains("stay in the foreground"),
+            "finite bash must wait in the foreground: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not background a command that will exit"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("start it once with background:true"),
+            "must not push finite jobs to background: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Pass a larger wait_ms"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn native_tools_prompt_gates_code_discipline_on_file_or_bash_tools() {
         // 代码工作纪律只在具备 write/edit/bash 时注入；纯只读/无这些工具时不出现，
         // 避免污染纯聊天场景。
@@ -1759,6 +1833,15 @@ mod tests {
             !p2.contains("file_path:line_number"),
             "read-only should omit discipline: {p2}"
         );
+    }
+
+    #[test]
+    fn native_tools_prompt_tells_model_to_edit_images_via_mixer() {
+        let prompt =
+            native_tools_prompt(&["mixer_generate_image".to_string()], false).expect("prompt");
+        assert!(prompt.contains("mixer_generate_image"), "{prompt}");
+        assert!(prompt.contains("edit"), "{prompt}");
+        assert!(prompt.contains("artifact_ids"), "{prompt}");
     }
 
     #[test]

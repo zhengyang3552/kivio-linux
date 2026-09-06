@@ -156,6 +156,7 @@ function defaultChatConfig(): NonNullable<SettingsData['chat']> {
     maxOutputTokens: 16384,
     defaultLanguage: '',
     systemPrompt: '',
+    promptOptimizePrompt: '',
     userDisplayName: '',
     userAvatar: '',
     defaultAgentRuntime: {
@@ -201,7 +202,7 @@ function resolveEffectiveChatModel(settings: SettingsData): { provider?: ModelPr
 function resolveEffectiveChatMaxOutput(settings: SettingsData, fallbackTokens: number) {
   const { provider, model } = resolveEffectiveChatModel(settings)
   const override = model ? provider?.modelOverrides?.[model]?.maxOutput : undefined
-  const modelInfo = model ? resolveModelInfo(model, provider?.modelOverrides) : {}
+  const modelInfo = model ? resolveModelInfo(model, provider?.modelOverrides, provider) : {}
   const maxOutput = override || modelInfo.maxOutput || fallbackTokens
   const source: 'override' | 'database' | 'fallback' = override
     ? 'override'
@@ -219,6 +220,7 @@ function defaultDefaultModels(chatProviderId = '', chatModel = ''): SettingsData
     titleSummary: { providerId: '', model: '' },
     compression: { providerId: '', model: '' },
     imageGeneration: { providerId: '', model: '' },
+    promptOptimize: { providerId: '', model: '' },
     advisor: { providerId: '', model: '' },
   }
 }
@@ -241,6 +243,9 @@ function clearDefaultModelProvider(
     imageGeneration: defaultModels.imageGeneration.providerId === providerId
       ? { providerId: '', model: '' }
       : defaultModels.imageGeneration,
+    promptOptimize: defaultModels.promptOptimize.providerId === providerId
+      ? { providerId: '', model: '' }
+      : defaultModels.promptOptimize,
     advisor: defaultModels.advisor.providerId === providerId
       ? { providerId: '', model: '' }
       : defaultModels.advisor,
@@ -268,6 +273,9 @@ function resolveDefaultModelsAfterModelRemoval(
     imageGeneration: defaultModels.imageGeneration.providerId === providerId
       ? { ...defaultModels.imageGeneration, model: resolveAfterRemoval(defaultModels.imageGeneration.model) }
       : defaultModels.imageGeneration,
+    promptOptimize: defaultModels.promptOptimize.providerId === providerId
+      ? { ...defaultModels.promptOptimize, model: resolveAfterRemoval(defaultModels.promptOptimize.model) }
+      : defaultModels.promptOptimize,
     advisor: defaultModels.advisor.providerId === providerId
       ? { ...defaultModels.advisor, model: resolveAfterRemoval(defaultModels.advisor.model) }
       : defaultModels.advisor,
@@ -1284,6 +1292,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       enabledModels: [],
       enabled: true,
       apiFormat: preset.apiFormat ?? 'openai_chat',
+      request: preset.oauth ? { oauth: { provider: preset.oauth } } : undefined,
     }
     setSettings({
       ...settings,
@@ -1502,6 +1511,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       }
     } catch (err) {
       console.error('Failed to fetch models:', err)
+      setSaveError(`${lang === 'zh' ? '获取模型失败：' : 'Could not fetch models: '}${String(err)}`)
     } finally {
       setFetchingProviderId(null)
     }
@@ -2189,8 +2199,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 lang={lang}
                 chatTools={chatTools}
                 hasChatProvider={Boolean(chatProvider)}
+                defaultPromptOptimize={defaultPrompts?.promptOptimizePrompts?.[lang] ?? ''}
                 onUpdateDefaultModel={updateDefaultModel}
                 onUpdateChatTools={updateChatTools}
+                onUpdateChat={updateChat}
               />
             )}
 
@@ -2408,6 +2420,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       {drawerModel && settings && (
         <ModelDetailDrawer
           modelName={drawerModel.model}
+          provider={settings.providers.find(p => p.id === drawerModel.providerId)}
           overrides={settings.providers.find(p => p.id === drawerModel.providerId)?.modelOverrides}
           lang={lang}
           onClose={() => setDrawerModel(null)}

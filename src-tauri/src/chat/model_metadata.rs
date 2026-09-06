@@ -238,6 +238,25 @@ fn model_database_entry(model: &str) -> Option<&'static Value> {
     best_contains.and_then(|(orig, _)| entries.get(orig))
 }
 
+/// Resolve Kimi Code aliases only for its own provider, without widening global matching.
+fn provider_model_database_id<'a>(provider: Option<&ModelProvider>, model: &'a str) -> &'a str {
+    let kimi = provider.is_some_and(|p| {
+        p.request.oauth.as_ref().is_some_and(|a| a.provider == "kimi")
+            || reqwest::Url::parse(&p.base_url).ok().is_some_and(|url| {
+                url.host_str() == Some("api.kimi.com")
+                    && (url.path() == "/coding" || url.path().starts_with("/coding/"))
+            })
+    });
+    if !kimi { return model; }
+    match model.trim().to_ascii_lowercase().as_str() {
+        "k3" => "kimi-code/k3",
+        "k3-256k" => "kimi-code/k3-256k",
+        "kimi-for-coding" => "kimi-code/kimi-for-coding",
+        "kimi-for-coding-highspeed" => "kimi-code/kimi-for-coding-highspeed",
+        _ => model,
+    }
+}
+
 fn model_database_context_window(model: &str) -> Option<usize> {
     context_window_from_database_entry(model_database_entry(model))
 }
@@ -295,13 +314,19 @@ fn model_database_image_generation(model: &str) -> Option<bool> {
 /// 适配器映射：4.5 及更早 → `budget_tokens`（Opus 4.5 另带 `output_config.effort`），
 /// 4.6+ → adaptive + effort。始终只保留已知合法值并去重，避免脏数据进入请求。
 pub fn reasoning_efforts_for_model(provider: Option<&ModelProvider>, model: &str) -> Vec<String> {
+    // Antigravity OAuth catalog variants already select the effort through the model ID.
+    if provider.is_some_and(crate::provider_oauth::antigravity::is_provider)
+        && crate::provider_oauth::antigravity::model_includes_effort(model)
+    {
+        return vec![];
+    }
     if let Some(list) = provider
         .and_then(|provider| override_model_info(provider, model))
         .and_then(|info| info.reasoning_efforts.as_deref())
     {
         return sanitize_efforts(list.iter().map(String::as_str));
     }
-    if let Some(list) = model_database_entry(model)
+    if let Some(list) = model_database_entry(provider_model_database_id(provider, model))
         .and_then(|entry| entry.get("reasoningEfforts"))
         .and_then(Value::as_array)
     {
@@ -590,7 +615,7 @@ fn model_database_pricing(model: &str) -> Option<ModelPricing> {
 pub(crate) fn model_supports_vision(provider: Option<&ModelProvider>, model: &str) -> Option<bool> {
     let provider = provider?;
     model_vision_from_model_info(provider.model_overrides.get(model))
-        .or_else(|| model_database_vision(model))
+        .or_else(|| model_database_vision(provider_model_database_id(Some(provider), model)))
 }
 
 /// 归一化模型名：小写 + 去 `models/` 前缀 + trim。出图路由 / override 生图能力判定 /
@@ -647,6 +672,9 @@ pub(crate) fn model_can_generate_images_directly(provider: &ModelProvider, model
 /// 的服务端 `web_search`（官方 Chat Completions 只收 `function` 工具）。
 /// 前端据此把「内置」选项置灰。
 pub(crate) fn builtin_web_search_supported(provider: &ModelProvider) -> bool {
+    if crate::provider_oauth::antigravity::is_provider(provider) {
+        return false;
+    }
     use crate::settings::ProviderApiFormat::{
         AnthropicMessages, Gemini, OpenAiChat, OpenAiResponses, XaiResponses,
     };
@@ -702,8 +730,17 @@ fn image_generation_model_name_heuristic(provider: &ModelProvider, model: &str) 
         "dall-e",
         "grok-imagine-image",
         "gemini-3.1-flash-image",
+        "gemini-3.1-flash-lite-image",
         "gemini-3-pro-image",
         "gemini-2.5-flash-image",
+        "nano-banana",
+        "qwen-image",
+        "glm-image",
+        "hy-image",
+        "seedream",
+        "krea",
+        "muse-image",
+        "mai-image",
         "flux",
         "recraft",
         "riverflow",
@@ -740,7 +777,7 @@ pub(crate) fn context_window_for_model(
     ) {
         return (tokens, false);
     }
-    if let Some(tokens) = model_database_context_window(model) {
+    if let Some(tokens) = model_database_context_window(provider_model_database_id(provider, model)) {
         return (tokens, false);
     }
 
@@ -784,7 +821,7 @@ pub(crate) fn chat_max_output_tokens_for_model(
     model: &str,
 ) -> Option<u32> {
     max_output_from_model_info(provider.and_then(|provider| provider.model_overrides.get(model)))
-        .or_else(|| model_database_max_output(model))
+        .or_else(|| model_database_max_output(provider_model_database_id(provider, model)))
 }
 
 /// 写入请求体的输出上限。有模型元数据就用；没有就用 `fallback`。
@@ -830,7 +867,7 @@ pub(crate) fn pricing_for_model(
     ) {
         return Some((pricing, "user_override".to_string()));
     }
-    model_database_pricing(model).map(|pricing| (pricing, "model_pricing".to_string()))
+    model_database_pricing(provider_model_database_id(provider, model)).map(|pricing| (pricing, "model_pricing".to_string()))
 }
 
 #[cfg(test)]
@@ -993,6 +1030,36 @@ mod tests {
 
         // 包含匹配路径：带 tag 的变体（`gemma4:31b`）靠前缀/包含吃到 `gemma4`
         assert_eq!(db_display_name("gemma4:31b").as_deref(), Some("Gemma 4"));
+
+        // 生图：Grok Imagine 各档必须是独立条目，不能前缀塌到 quality / 基线
+        assert_eq!(
+            db_display_name("grok-imagine-image").as_deref(),
+            Some("Grok Imagine Image")
+        );
+        assert_eq!(
+            db_display_name("grok-imagine-image-2.0").as_deref(),
+            Some("Grok Imagine Image 2.0")
+        );
+        assert_eq!(
+            db_display_name("x-ai/grok-imagine-image-2.0").as_deref(),
+            Some("Grok Imagine Image 2.0")
+        );
+        assert_eq!(
+            db_display_name("grok-imagine-image-quality").as_deref(),
+            Some("Grok Imagine Image Quality")
+        );
+        assert_eq!(
+            model_database_image_generation("grok-imagine-image"),
+            Some(true)
+        );
+        assert_eq!(
+            model_database_image_generation("gemini-3.1-flash-lite-image"),
+            Some(true)
+        );
+        assert_eq!(
+            db_display_name("qwen-image-3").as_deref(),
+            Some("Qwen Image 3")
+        );
 
         // 未知模型
         assert!(model_database_entry("totally-unknown-model-xyz-9999").is_none());
@@ -1349,6 +1416,62 @@ mod tests {
             !builtin_web_search_supported(&p),
             "relays must not inherit DeepSeek hosted search"
         );
+    }
+
+    #[test]
+    fn kimi_code_aliases_are_provider_scoped() {
+        let mut provider = test_provider_with_overrides(HashMap::new());
+        provider.base_url = "https://api.kimi.com/coding/v1".into();
+        assert_eq!(context_window_for_model(Some(&provider), "k3-256k"), (262144, false));
+        assert_eq!(reasoning_efforts_for_model(Some(&provider), "k3"), vec!["low", "high", "max"]);
+        assert!(pricing_for_model(Some(&provider), "k3").is_none());
+        assert_eq!(model_supports_vision(Some(&provider), "k3"), Some(true));
+        provider.base_url = "https://example.com/v1".into();
+        assert_eq!(provider_model_database_id(Some(&provider), "k3"), "k3");
+        assert!(model_database_entry("k3").is_none());
+    }
+
+    #[test]
+    fn antigravity_web_search_uses_third_party_and_preserves_off() {
+        use crate::chat::types::WebSearchMode;
+        let mut provider = test_provider_with_overrides(HashMap::new());
+        provider.api_format = "gemini".into();
+        assert!(builtin_web_search_supported(&provider));
+        assert_eq!(WebSearchMode::Builtin.for_provider(&provider), WebSearchMode::Builtin);
+        provider.request.oauth = Some(serde_json::from_value(serde_json::json!({
+            "provider": "antigravity"
+        })).unwrap());
+        assert!(!builtin_web_search_supported(&provider));
+        assert_eq!(WebSearchMode::Builtin.for_provider(&provider), WebSearchMode::ThirdParty);
+        assert_eq!(WebSearchMode::Off.for_provider(&provider), WebSearchMode::Off);
+        assert_eq!(WebSearchMode::ThirdParty.for_provider(&provider), WebSearchMode::ThirdParty);
+    }
+
+    #[test]
+    fn antigravity_oauth_effort_variants_hide_knob_and_ignore_request_overrides() {
+        use crate::provider_oauth::antigravity;
+        let mut provider = test_provider_with_overrides(HashMap::new());
+        provider.api_format = "gemini".into();
+        let model = "gemini-3.8-flash-low";
+        assert!(!reasoning_efforts_for_model(Some(&provider), model).is_empty());
+        provider.request.oauth = Some(serde_json::from_value(serde_json::json!({
+            "provider": "antigravity"
+        })).unwrap());
+        for model in ["gemini-3.8-flash-low", "gemini-3.8-flash-high", "gpt-oss-120b-medium"] {
+            assert!(reasoning_efforts_for_model(Some(&provider), model).is_empty());
+            let request = antigravity::wrap_request(&provider, model, serde_json::json!({
+                "generationConfig": {"thinkingConfig": {
+                    "includeThoughts": true, "thinkingLevel": "HIGH", "thinkingBudget": 8192
+                }}
+            }));
+            let thinking = &request["request"]["generationConfig"]["thinkingConfig"];
+            assert!(thinking.get("thinkingLevel").is_none());
+            assert!(thinking.get("thinkingBudget").is_none());
+            if model.starts_with("gemini") {
+                assert_eq!(thinking["includeThoughts"], true);
+            }
+        }
+        assert!(!reasoning_efforts_for_model(Some(&provider), "gemini-3.8-flash").is_empty());
     }
 
     #[test]

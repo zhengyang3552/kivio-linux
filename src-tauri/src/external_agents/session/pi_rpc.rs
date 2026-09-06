@@ -89,6 +89,63 @@ where
     Ok(rx)
 }
 
+fn pi_string_list(data: &Value, key: &str) -> Vec<String> {
+    data.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pi `clear_queue` 成功响应：`data.steering` + `data.followUp`（偶发 `follow_up`）。
+fn pi_cleared_queue_texts(value: &Value) -> Vec<String> {
+    let data = value.get("data").unwrap_or(value);
+    let mut texts = pi_string_list(data, "steering");
+    let follow_up = pi_string_list(data, "followUp");
+    texts.extend(if follow_up.is_empty() {
+        pi_string_list(data, "follow_up")
+    } else {
+        follow_up
+    });
+    texts
+}
+
+async fn abort_pi_turn<W>(
+    stdin: &SharedPiWriter<W>,
+    waiters: &PiControlWaiters,
+    next_control_id: &mut u64,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Pi 0.84.4：匹配 Esc 必须先 `clear_queue` 再 `abort`，否则已受理的立刻引导 /
+    // follow-up 会留在 Pi 队列里、下一轮 prompt 被悄悄注入。退回的原文由 drain
+    // 读 `clear_queue` 响应后发 `QueuedTextsRestored`，前端写回输入框。
+    let clear_id = format!("kivio-control-{next_control_id}");
+    *next_control_id = next_control_id.saturating_add(1);
+    let _ = issue_control_command(
+        stdin,
+        waiters,
+        clear_id,
+        None,
+        json!({ "type": "clear_queue" }),
+    )
+    .await;
+    let abort_id = format!("kivio-control-{next_control_id}");
+    *next_control_id = next_control_id.saturating_add(1);
+    issue_control_command(stdin, waiters, abort_id, None, json!({ "type": "abort" })).await?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PiRpcOutcome {
     Continue,
@@ -1062,6 +1119,12 @@ where
                 if let Some(waiter) = waiters.lock().await.remove(id) {
                     let succeeded = value.get("success").and_then(Value::as_bool) == Some(true);
                     if succeeded {
+                        if value.get("command").and_then(Value::as_str) == Some("clear_queue") {
+                            let texts = pi_cleared_queue_texts(&value);
+                            if !texts.is_empty() {
+                                sink(UnifiedAgentEvent::QueuedTextsRestored { texts });
+                            }
+                        }
                         if let Some((kind, id, text)) = waiter.injection {
                             match kind {
                                 MessageInjectionKind::Steer => {
@@ -1520,14 +1583,10 @@ pub fn spawn_pi_rpc_session_actor(
                                 match next {
                                     Some(SessionCommand::Cancel) => {
                                         cancelled.store(true, Ordering::Release);
-                                        let request_id = format!("kivio-control-{}", next_control_id);
-                                        next_control_id = next_control_id.saturating_add(1);
-                                        if issue_control_command(
+                                        if abort_pi_turn(
                                             &session.stdin,
                                             &pending_controls,
-                                            request_id,
-                                            None,
-                                            json!({ "type": "abort" }),
+                                            &mut next_control_id,
                                         )
                                         .await
                                         .is_err()
@@ -2605,6 +2664,96 @@ mod tests {
         .await;
         assert_eq!(result, Err("cancelled".to_string()));
         assert!(matches!(response.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn abort_sends_clear_queue_before_abort() {
+        let (mut output_reader, output_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(output_writer));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let mut next_control_id = 2_u64;
+        abort_pi_turn(&stdin, &waiters, &mut next_control_id)
+            .await
+            .expect("abort");
+        let mut lines = BufReader::new(&mut output_reader).lines();
+        let first: Value = serde_json::from_str(
+            &lines
+                .next_line()
+                .await
+                .expect("read")
+                .expect("clear_queue"),
+        )
+        .expect("json");
+        let second: Value = serde_json::from_str(
+            &lines.next_line().await.expect("read").expect("abort"),
+        )
+        .expect("json");
+        assert_eq!(first["type"], "clear_queue");
+        assert_eq!(second["type"], "abort");
+        assert_eq!(first["id"], "kivio-control-2");
+        assert_eq!(second["id"], "kivio-control-3");
+    }
+
+    #[test]
+    fn clear_queue_response_collects_steering_and_follow_up() {
+        let value = json!({
+            "type": "response",
+            "command": "clear_queue",
+            "success": true,
+            "data": {
+                "steering": ["Change direction", "  "],
+                "followUp": ["Summarize when finished"]
+            }
+        });
+        assert_eq!(
+            pi_cleared_queue_texts(&value),
+            vec![
+                "Change direction".to_string(),
+                "Summarize when finished".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_queue_response_emits_restored_texts() {
+        let (stdout_reader, mut stdout_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(sink()));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let response = issue_control_command(
+            &stdin,
+            &waiters,
+            "clear-1".to_string(),
+            None,
+            json!({ "type": "clear_queue" }),
+        )
+        .await
+        .expect("issue clear_queue");
+        stdout_writer
+            .write_all(
+                b"{\"id\":\"clear-1\",\"type\":\"response\",\"command\":\"clear_queue\",\"success\":true,\"data\":{\"steering\":[\"Change direction\"],\"followUp\":[\"Summarize\"]}}\n{\"type\":\"agent_settled\"}\n",
+            )
+            .await
+            .expect("events");
+        let mut events = Vec::new();
+        let result = drain_pi_rpc_lines(
+            &mut BufReader::new(stdout_reader).lines(),
+            &stdin,
+            &mut |event| events.push(event),
+            None,
+            Some(&waiters),
+            || false,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(matches!(response.await, Ok(Ok(()))));
+        assert!(matches!(
+            events.as_slice(),
+            [UnifiedAgentEvent::QueuedTextsRestored { texts }]
+                if texts == &["Change direction".to_string(), "Summarize".to_string()]
+        ));
     }
 
     #[tokio::test]

@@ -9,8 +9,10 @@ import { Button, IconButton } from '../../components/Button'
 import { ModelIcon } from '../../chat/ModelIcon'
 import { PROVIDER_PRESETS } from '../providerPresets'
 import { ProviderRequestPanel } from '../ProviderRequestPanel'
+import { ProviderOAuthPanel } from '../ProviderOAuthPanel'
+import { ProviderUsageCard } from '../ProviderUsageCard'
 import { resolveModelInfo } from '../../data/modelMatching'
-import { api, normalizeProviderApiFormat, clampedActiveKeyIndex, activeKeyIndexAfterRemove } from '../../api/tauri'
+import { api, isOpenCodeFree, normalizeProviderApiFormat, clampedActiveKeyIndex, activeKeyIndexAfterRemove } from '../../api/tauri'
 import type { I18n, Lang } from '../i18n'
 import type { ModelProvider } from '../../api/tauri'
 
@@ -74,12 +76,15 @@ export function ProviderDetail({
 
   return (
     <>
+    <ProviderUsageCard key={provider.id} provider={provider} lang={lang} />
     <SettingsGroup title={lang === 'zh' ? '配置' : 'Configuration'}>
+      <ProviderOAuthPanel key={provider.id} provider={provider} lang={lang} onUpdateProvider={onUpdateProvider} />
       <FieldBlock label={t.baseUrl}>
         <div className="kv-provider-endpoint-row">
           <Input
             className="min-w-0 flex-1"
             value={provider.baseUrl}
+            disabled={Boolean(provider.request?.oauth)}
             onChange={(v) => onUpdateProvider(provider.id, { baseUrl: v })}
             placeholder="https://api.openai.com/v1"
             mono
@@ -87,6 +92,7 @@ export function ProviderDetail({
           <Select
             className="w-[11.5rem] shrink-0"
             value={normalizeProviderApiFormat(provider.apiFormat)}
+            disabled={Boolean(provider.request?.oauth)}
             onChange={(apiFormat) => onUpdateProvider(provider.id, { apiFormat })}
             options={[
               { value: 'openai_chat', label: 'OpenAI Chat' },
@@ -99,7 +105,8 @@ export function ProviderDetail({
         </div>
       </FieldBlock>
 
-      <FieldBlock label={t.apiKey} description={t.apiKeysHint}>
+      {isOpenCodeFree(provider) && <p className="text-sm opacity-70">{lang === 'zh' ? '免费模型，无需账号、API Key 或安装 OpenCode。管理模型可刷新当前免费列表。' : 'Free models: no account, API key or OpenCode installation required. Manage models to refresh the free catalog.'}</p>}
+      {!provider.request?.oauth && !isOpenCodeFree(provider) && <FieldBlock label={t.apiKey} description={t.apiKeysHint}>
         <div className="space-y-1.5">
           {(() => {
             // 命中快速预设 baseUrl 时，给出「获取 API Key」外链引导用户申请。
@@ -193,7 +200,7 @@ export function ProviderDetail({
           <Plus size={11} />
           {t.addKey}
         </Button>
-      </FieldBlock>
+      </FieldBlock>}
 
       <div className="kv-row">
         <div className="kv-row-text">
@@ -262,7 +269,7 @@ export function ProviderDetail({
             </li>
           )}
           {provider.enabledModels.map(model => {
-            const caps = resolveModelInfo(model, provider.modelOverrides).capabilities
+            const caps = resolveModelInfo(model, provider.modelOverrides, provider).capabilities
             return (
               <li key={model} className="kv-enabled-model-row" onClick={() => onOpenModelDrawer({ providerId: provider.id, model })}>
                 <ModelIcon model={model} size={16} />

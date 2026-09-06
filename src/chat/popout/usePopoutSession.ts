@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../../api/tauri'
+import { withExternalModel } from '../externalModelEffort'
 import { syncChatProtocol } from '../../api/chatProtocol'
 import { getSettingsCached, refreshSettings, saveSettingsCached } from '../../api/settingsCache'
 import {
@@ -42,6 +43,7 @@ import {
 } from '../streamingStore'
 import type { MessageListProps } from '../MessageList'
 import type { AgentPlanState, AgentTodoState, Conversation, PendingAttachment, ThinkingLevel } from '../types'
+import { insertTextIntoComposer } from '../composerInsert'
 import { usePopoutComposer } from './usePopoutComposer'
 import type {
   ChatSessionConsentPayload,
@@ -304,6 +306,12 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
     setHookWarning(payload)
   }, [])
 
+  useTauriEvent(api.onChatQueuedTextsRestored, (payload) => {
+    if (payload.conversationId !== conversationIdRef.current) return
+    const text = payload.texts.map((item) => item.trim()).filter(Boolean).join('\n\n')
+    if (text) insertTextIntoComposer(text)
+  }, [])
+
   useTauriEvent(api.onChatStatusNote, (payload) => {
     if (payload.conversationId !== conversationIdRef.current) return
     if (hasActiveGroup(payload.conversationId)) {
@@ -463,12 +471,7 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
 
   const handleExternalModelChange = useCallback(async (model: string, reasoning?: string | null) => {
     const current = normalizeAgentRuntime(conversation)
-    await handleRuntimeChange({
-      ...current,
-      kind: 'external',
-      externalModel: model,
-      externalReasoning: reasoning ?? current.externalReasoning ?? null,
-    })
+    await handleRuntimeChange(withExternalModel(current, model, reasoning))
   }, [conversation, handleRuntimeChange])
 
   const handleApprovalPolicyChange = useCallback(async (nextApprovalPolicy: string) => {
