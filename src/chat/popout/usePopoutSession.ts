@@ -42,7 +42,7 @@ import {
   useStreamCoarse,
 } from '../streamingStore'
 import type { MessageListProps } from '../MessageList'
-import type { AgentPlanState, AgentTodoState, Conversation, PendingAttachment, ThinkingLevel } from '../types'
+import type { AgentPlanState, AgentTodoState, Conversation, GoalState, PendingAttachment, ThinkingLevel } from '../types'
 import { insertTextIntoComposer } from '../composerInsert'
 import { usePopoutComposer } from './usePopoutComposer'
 import type {
@@ -345,6 +345,14 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
       : current)
   }, [])
 
+  useTauriEvent(api.onChatGoal, (payload) => {
+    if (payload.conversationId !== conversationIdRef.current) return
+    const goal = payload.goalState as GoalState | null
+    setConversation((current) => current
+      ? { ...current, goal_state: goal ?? undefined, goalState: goal ?? undefined }
+      : current)
+  }, [])
+
   const handleSend = useCallback(async (
     content: string,
     attachments: PendingAttachment[] = [],
@@ -465,6 +473,10 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
 
   const handleRuntimeChange = useCallback(async (runtime: AgentRuntimeConfig) => {
     if (conversation && agentRuntimesEqual(normalizeAgentRuntime(conversation), runtime)) return
+    const goal = conversation?.goal_state ?? conversation?.goalState
+    if (goal && !['completed', 'cancelled', 'paused'].includes(goal.status)) {
+      setConversation(await chatApi.pauseGoal(conversationId))
+    }
     const next = await chatApi.setAgentRuntime(conversationId, runtime)
     setConversation(next)
   }, [conversation, conversationId])
@@ -494,6 +506,20 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
   const runtime = normalizeAgentRuntime(conversation)
   const usesChatRuntime = runtime.kind === 'chat'
   const usesExternalRuntime = runtime.kind === 'external'
+
+  const runGoalMutation = useCallback(async (
+    mutation: (id: string) => Promise<Conversation>,
+    continueWhenActive = false,
+  ) => {
+    const updated = await mutation(conversationId)
+    setConversation(updated)
+    const goal = updated.goal_state ?? updated.goalState
+    if (continueWhenActive && goal && (goal.status === 'active' || goal.status === 'verifying')) {
+      void chatApi.continueGoal(conversationId).then(setConversation).catch((error) => {
+        setStreamCoarse({ streamError: error instanceof Error ? error.message : String(error) })
+      })
+    }
+  }, [conversationId])
 
   const displayMessages = useMemo(() => {
     const messages = conversation?.messages ?? []
@@ -562,5 +588,9 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
     handleRuntimeChange,
     handleExternalModelChange,
     handleApprovalPolicyChange,
+    editGoal: (objective: string) => runGoalMutation((id) => chatApi.editGoal(id, objective), true),
+    pauseGoal: () => runGoalMutation(chatApi.pauseGoal),
+    resumeGoal: () => runGoalMutation(chatApi.resumeGoal, true),
+    cancelGoal: () => runGoalMutation(chatApi.cancelGoal),
   }
 }

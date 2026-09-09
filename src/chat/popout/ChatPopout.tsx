@@ -5,6 +5,8 @@ import { configureChatProtocolFilter } from '../../api/chatProtocol'
 import { ApprovalCard } from '../ApprovalCard'
 import { AskUserBlock } from '../AskUserBlock'
 import { InputBar } from '../InputBar'
+import { GoalCard } from '../GoalCard'
+import { composerGoal } from '../goalPresentation'
 import { ChatTitlebar } from '../ChatTitlebar'
 import { usesNativeTitlebar } from '../platform'
 import { IconButton } from '../../components/Button'
@@ -124,6 +126,8 @@ function ChatPopoutBody({
   lang: Lang
 }) {
   const session = usePopoutSession(conversationId, lang)
+  const visibleGoal = composerGoal(session.conversation?.goal_state ?? session.conversation?.goalState,
+    session.conversation?.messages ?? [])
   const titlebar = (
     <PopoutTitlebar
       conversation={session.conversation}
@@ -172,7 +176,15 @@ function ChatPopoutBody({
         <MessageList key={conversationId} {...session.messageListProps} />
       </Suspense>
       <PopoutPendingSlot session={session} />
-      <InputBar {...session.inputBarProps} />
+      <InputBar {...session.inputBarProps} goalSlot={visibleGoal && (
+        <GoalCard
+          goal={visibleGoal}
+          onEdit={session.editGoal}
+          onPause={session.pauseGoal}
+          onResume={session.resumeGoal}
+          onCancel={session.cancelGoal}
+        />
+      )} />
     </>
   )
 

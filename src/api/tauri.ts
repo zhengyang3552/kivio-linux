@@ -19,6 +19,7 @@ import type {
   ChatSegmentPayload as GeneratedChatSegmentPayload,
 } from '../generated/chatProtocol'
 import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRun, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
+import type { GoalState } from '../chat/types'
 
 // ========== 类型定义 ==========
 
@@ -211,6 +212,11 @@ export type ChatPlanState = {
 export type ChatPlanPayload = {
   conversationId: string
   planState: ChatPlanState
+}
+
+export type ChatGoalPayload = {
+  conversationId: string
+  goalState: GoalState | null
 }
 
 export type ChatToolStatus =
@@ -1102,7 +1108,7 @@ export type Settings = {
   launchMinimizedToTray: boolean
   /** 关闭聊天窗口时隐藏复用（默认 false = 销毁）。下次打开无需重新加载，占用更多内存。 */
   keepChatWindowAlive?: boolean
-  /** 回复完成时发送系统通知，默认开启；正在查看该对话时不提醒。 */
+  /** 回复完成时发送系统通知，默认关闭；开启后正在查看该对话时不提醒。 */
   chatCompletionNotifications?: boolean
   translatorProviderId: string
   translatorModel: string
@@ -1747,7 +1753,7 @@ export function normalizeSettings(settings: Settings): Settings {
     launchAtStartup: current.launchAtStartup ?? false,
     launchMinimizedToTray: current.launchMinimizedToTray ?? false,
     keepChatWindowAlive: current.keepChatWindowAlive ?? false,
-    chatCompletionNotifications: current.chatCompletionNotifications ?? true,
+    chatCompletionNotifications: current.chatCompletionNotifications ?? false,
     translatorProviderId: current.translatorProviderId ?? '',
     translatorModel: current.translatorModel ?? '',
     chatProviderId: effectiveChatModel.providerId,
@@ -2076,6 +2082,8 @@ export const api = {
   /** macOS 交通灯中心距内容顶缘的真实距离（CSS px）。取不到返回 null，前端退回默认值。 */
   chatTrafficLightCenterY: (): Promise<number | null> =>
     invoke('chat_traffic_light_center_y'),
+  chatReportNotificationView: (route: string, viewing: boolean): Promise<void> =>
+    invoke('chat_report_notification_view', { route, viewing }),
   resizeWindow: async (width: number, height: number) => {
     const win = getCurrentWindow()
     await win.setSize(new LogicalSize(width, height))
@@ -2174,6 +2182,13 @@ export const api = {
     return onChatProtocol((event) => {
       if (event.type !== 'plan_updated') return
       listener({ conversationId: event.conversationId, planState: event.planState as ChatPlanState })
+    })
+  },
+  onChatGoal: (listener: (payload: ChatGoalPayload) => void) => {
+    if (!isTauriRuntime()) return Promise.resolve(() => {})
+    return onChatProtocol((event) => {
+      if (event.type !== 'goal_updated' || event.scope !== 'conversation') return
+      listener({ conversationId: event.conversationId, goalState: (event.goalState as GoalState | null) ?? null })
     })
   },
   onChatTool: (listener: (payload: ChatToolProgressPayload) => void) => {

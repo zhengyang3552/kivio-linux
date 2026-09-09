@@ -1,7 +1,8 @@
-import { memo, useMemo, useState, type ReactNode } from 'react'
+import { memo, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import { Check, Columns2, Square } from 'lucide-react'
 import type { ChatMessage, ModelRef } from './types'
 import { MessageBubble } from './MessageBubble'
+import type { MarkdownOutlineSourceUpdate } from './ChatMarkdown'
 import { ModelIcon } from './ModelIcon'
 import { getActiveGroup, useGroupVersion, type GroupColumnSnapshot } from './groupStreamingStore'
 import { useMultiAnswerViewMode } from './multiAnswerViewMode'
@@ -14,7 +15,7 @@ import { useMultiAnswerViewMode } from './multiAnswerViewMode'
 //
 // 两种展示模式（全局偏好 useMultiAnswerViewMode，默认 'tabs'）：
 //  - 'tabs'（切换）：一次只整宽显示**当前选中条**（默认第一条），组末尾 footer 切换显示哪条。
-//  - 'columns'（并排）：N 列横向并排（原有实现，视觉/性能完全不变）。
+//  - 'columns'（并排）：N 列利用会话可用宽度并排，每列不超过单条消息的阅读宽度。
 // 组末尾 footer：视图切换控件 + 一排模型 chip（点 chip = 切显示条 +「续聊选中条」一举两用）。
 //
 // 性能降级（步骤 8 / R10）：N 列同时全量渲染 reasoning + markdown 是内存/CPU 大头。
@@ -37,6 +38,8 @@ interface MessageGroupProps {
   onForkMessage?: (messageId: string) => Promise<void>
   onDeleteMessage?: (messageId: string) => Promise<void>
   onSaveMessageToNote?: (messageId: string) => Promise<boolean>
+  outlineEligible?: boolean
+  onOutlineSourceChange?: (update: MarkdownOutlineSourceUpdate) => void
 }
 
 interface GroupColumn {
@@ -95,6 +98,8 @@ function GroupColumnView({
   onForkMessage,
   onDeleteMessage,
   onSaveMessageToNote,
+  outlineEligible = false,
+  onOutlineSourceChange,
 }: {
   column: GroupColumn
   conversationId?: string | null
@@ -113,10 +118,12 @@ function GroupColumnView({
   onForkMessage?: (messageId: string) => Promise<void>
   onDeleteMessage?: (messageId: string) => Promise<void>
   onSaveMessageToNote?: (messageId: string) => Promise<boolean>
+  outlineEligible?: boolean
+  onOutlineSourceChange?: (update: MarkdownOutlineSourceUpdate) => void
 }) {
   const { message, streaming } = column
   const wrapperClass = showColumnChrome
-    ? `chat-message-group-col flex max-h-[min(560px,70vh)] min-w-[280px] max-w-[420px] flex-1 flex-col rounded-2xl border px-3 py-2 ${
+    ? `chat-message-group-col flex max-h-[min(560px,70vh)] min-w-[280px] flex-1 flex-col rounded-2xl border px-3 py-2 ${
         isSelected
           ? 'border-emerald-400/70 bg-emerald-50/40 dark:border-emerald-500/50 dark:bg-emerald-950/20'
           : 'border-neutral-200/70 bg-neutral-50/40 dark:border-neutral-700/60 dark:bg-neutral-900/30'
@@ -126,7 +133,7 @@ function GroupColumnView({
     <div
       onMouseEnter={onMouseEnter}
       className={wrapperClass}
-      data-chat-message-group-focused={isFocused ? 'true' : undefined}
+      data-chat-message-group-focused={isFocused ? 'true' : 'false'}
     >
       {showColumnChrome && (
         <div className="mb-1 flex items-center justify-between gap-2">
@@ -176,6 +183,8 @@ function GroupColumnView({
             onForkMessage={!live ? onForkMessage : undefined}
             onDeleteMessage={!live ? onDeleteMessage : undefined}
             onSaveMessageToNote={!live ? onSaveMessageToNote : undefined}
+            outlineEligible={outlineEligible && !live}
+            onOutlineSourceChange={onOutlineSourceChange}
           />
         </ColumnScrollBody>
       ) : (
@@ -193,6 +202,8 @@ function GroupColumnView({
           onForkMessage={!live ? onForkMessage : undefined}
           onDeleteMessage={!live ? onDeleteMessage : undefined}
           onSaveMessageToNote={!live ? onSaveMessageToNote : undefined}
+          outlineEligible={outlineEligible && !live}
+          onOutlineSourceChange={onOutlineSourceChange}
         />
       )}
     </div>
@@ -286,6 +297,8 @@ function MessageGroupBase({
   onForkMessage,
   onDeleteMessage,
   onSaveMessageToNote,
+  outlineEligible = false,
+  onOutlineSourceChange,
 }: MessageGroupProps) {
   // 订阅 group store 版本号：流式列内容更新时驱动重渲。
   // 版本号还必须进下面 columns 的 memo deps —— store 是原地 mutate 列对象，
@@ -336,7 +349,11 @@ function MessageGroupBase({
   const footerActiveId = viewMode === 'tabs' ? tabColumn.message.id : (live ? null : effectiveSelectedId)
 
   return (
-    <div className="chat-message-group-wrap flex w-full flex-col py-2">
+    <div
+      className="chat-message-group-wrap chat-reading-content flex w-full flex-col py-2"
+      data-view-mode={viewMode}
+      style={{ '--chat-group-columns': columns.length } as CSSProperties}
+    >
       {viewMode === 'columns' ? (
         <div className="chat-message-group custom-scrollbar flex w-full gap-3 overflow-x-auto pb-1">
           {columns.map((column, index) => (
@@ -358,6 +375,8 @@ function MessageGroupBase({
               onForkMessage={onForkMessage}
               onDeleteMessage={onDeleteMessage}
               onSaveMessageToNote={onSaveMessageToNote}
+              outlineEligible={outlineEligible}
+              onOutlineSourceChange={onOutlineSourceChange}
             />
           ))}
         </div>
@@ -380,6 +399,8 @@ function MessageGroupBase({
           onForkMessage={onForkMessage}
           onDeleteMessage={onDeleteMessage}
           onSaveMessageToNote={onSaveMessageToNote}
+          outlineEligible={outlineEligible}
+          onOutlineSourceChange={onOutlineSourceChange}
         />
       )}
       <GroupFooter

@@ -30,6 +30,7 @@ import {
 } from './chatRoutes'
 import { ApprovalCard } from './ApprovalCard'
 import { AskUserBlock } from './AskUserBlock'
+import { AsyncQuestionsContext } from './asyncQuestionsContext'
 import { ChatTitlebar } from './ChatTitlebar'
 import { withExternalModel } from './externalModelEffort'
 import { ChatTitlebarActions } from './ChatTitlebarActions'
@@ -79,6 +80,7 @@ import type {
   AgentPlanMode,
   AgentPlanState,
   AgentTodoState,
+  GoalState,
   PendingAttachment,
   SkillMeta,
   ThinkingLevel,
@@ -165,6 +167,8 @@ import { applyLiveContextUsage } from './contextPanel'
 import { measureChatSurface, onChatPerfProfiler, useChatPerfLongTaskProbe, useChatPerfRenderProbe } from './chatPerformanceProbe'
 import { ChatRouteKeepAlive } from './ChatRouteKeepAlive'
 import { ChatConversationPane } from './ChatConversationPane'
+import { GoalCard } from './GoalCard'
+import { composerGoal } from './goalPresentation'
 import { PopoutOccupiedPlaceholder } from './popout/PopoutOccupiedPlaceholder'
 import { emptyPopoutConversation, stripConversationMessages } from './popout/conversationStub'
 import {
@@ -1013,6 +1017,12 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       : prev)
   }, [])
 
+  const patchGoalState = useCallback((nextState: GoalState | null) => {
+    setCurrentConversation((prev) => prev
+      ? { ...prev, goal_state: nextState ?? undefined, goalState: nextState ?? undefined }
+      : prev)
+  }, [])
+
   const clearStreamingPreview = useCallback(() => {
     // 取消挂起的合帧，避免旧快照在清空后又被刷回来产生空帧/串帧。
     cancelPendingFrame()
@@ -1179,14 +1189,18 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const activeAgentPlanMode = currentConversation?.agent_plan_state?.mode
     ?? currentConversation?.agentPlanState?.mode
     ?? 'act'
+  const currentGoal = currentConversation?.goal_state ?? currentConversation?.goalState
+  const visibleGoal = composerGoal(currentGoal, currentConversation?.messages ?? [])
+  const goalActive = !!currentGoal && !['completed', 'cancelled'].includes(currentGoal.status)
   const composerModes = useMemo(
     () => derivePermissionModes({
       target: 'composer',
       agentRuntime: activeAgentRuntime,
       agents: detectedExternalAgents,
       agentPlanMode: activeAgentPlanMode,
+      goalActive,
     }),
-    [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode],
+    [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode, goalActive],
   )
   const dshCustomPresets = useDshCustomPresets(activeAgentRuntime)
   const composerPresets = useMemo(
@@ -2324,6 +2338,12 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }
     patchAgentPlanState(payload.planState)
   }, [patchAgentPlanState])
+
+  useTauriEvent(api.onChatGoal, (payload) => {
+    const currentConversationId = currentConversationIdRef.current
+    if (!currentConversationId || payload.conversationId !== currentConversationId) return
+    patchGoalState(payload.goalState)
+  }, [patchGoalState])
 
   useTauriEvent(api.onChatHook, (payload) => {
     const currentConversationId = currentConversationIdRef.current
@@ -3541,6 +3561,9 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     onSendMessage: (content, attachments, options) =>
       handleSendMessageRef.current(content, attachments, options),
     onRestoreToComposer: (message) => insertTextIntoComposer(message.content),
+    onPendingChange: (conversationId, pending) => {
+      void chatApi.setGoalUserQueuePending(conversationId, pending)
+    },
   })
   const messageQueueRef = useRef(messageQueue)
   messageQueueRef.current = messageQueue
@@ -3569,11 +3592,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const canSteerCurrentConversation =
     (usesExternalRuntime ? activeExternalAgentSupportsSteering : true)
     && activeReplyModels.length < 2
-  // 自动 follow-up 只给原生支持「下一轮排队」的外部 CLI（Pi / dsh）。
-  // 内置循环不自动 follow-up：要留着可见队列和「立刻引导」。多模型一问多答同样不给。
+  // Goal 的用户输入必须先于自动续跑，因此复用原生 follow-up；普通内置循环仍保留
+  // 可见队列和「立刻引导」。外部 CLI 仅在协议原生支持时启用，多模型一问多答不给。
   const canFollowUpCurrentConversation =
-    usesExternalRuntime
-    && activeExternalAgentSupportsFollowUp
+    ((usesExternalRuntime && activeExternalAgentSupportsFollowUp) || goalActive)
     && activeReplyModels.length < 2
 
   const handleQueueMessage = useCallback((content: string, attachments: PendingAttachment[]) => {
@@ -3584,6 +3606,37 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       void messageQueueRef.current.followUp(conversation, message.id)
     }
   }, [canFollowUpCurrentConversation])
+
+  const [closedAsyncQuestions, setClosedAsyncQuestions] = useState<Record<string, string[]>>({})
+  const asyncQuestionsValue = useMemo(() => {
+    const conversationId = currentConversation?.id ?? ''
+    const closedIds = new Set(closedAsyncQuestions[conversationId] ?? [])
+    // A later user turn supersedes earlier questions, including after app restart.
+    let hasLaterUser = false
+    for (const message of [...(currentConversation?.messages ?? [])].reverse()) {
+      if (message.role === 'user') hasLaterUser = true
+      if (hasLaterUser) {
+        for (const tool of message.tool_calls ?? message.toolCalls ?? []) closedIds.add(tool.id)
+      }
+    }
+    return {
+      closedIds,
+      reply: async (toolId: string, text: string | null) => {
+        const conversation = currentConversationRef.current
+        if (!conversation || conversation.id !== conversationId) throw new Error('对话已切换，请重试')
+        if (text) {
+          const queued = messageQueueRef.current.enqueue(conversation.id, text, [])
+          if (!queued) throw new Error('答复未能加入消息队列，请重试')
+          if (!generatingConversationIdsRef.current.has(conversation.id)) {
+            void messageQueueRef.current.drain(conversation)
+          }
+        }
+        setClosedAsyncQuestions((previous) => ({
+          ...previous, [conversationId]: [...(previous[conversationId] ?? []), toolId],
+        }))
+      },
+    }
+  }, [closedAsyncQuestions, currentConversation])
 
   const handleSteerQueuedMessage = useCallback((messageId: string) => {
     const conversationId = currentConversationIdRef.current
@@ -4047,6 +4100,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     if (!currentConversation) return
     const conversationId = currentConversation.id
     try {
+      const goal = currentConversation.goal_state ?? currentConversation.goalState
+      if (goal && !['completed', 'cancelled', 'paused'].includes(goal.status)) {
+        const paused = await chatApi.pauseGoal(conversationId)
+        applyConversationIfCurrent(conversationId, paused)
+      }
       const updated = await chatApi.setAgentRuntime(conversationId, runtime)
       applyConversationIfCurrent(conversationId, updated)
     } catch (err) {
@@ -4114,8 +4172,53 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       await handleExternalSandboxChange(value)
       return
     }
+    if (value === 'goal') {
+      if (!goalActive) insertTextIntoComposer('/goal ')
+      return
+    }
+    if (goalActive) {
+      const conversationId = currentConversationIdRef.current
+      if (conversationId) {
+        const paused = await chatApi.pauseGoal(conversationId)
+        applyConversationIfCurrent(conversationId, paused)
+      }
+    }
     await handleAgentPlanModeChange(value as AgentPlanMode)
-  }, [handleAgentPlanModeChange, handleExternalSandboxChange, usesExternalRuntime])
+  }, [applyConversationIfCurrent, goalActive, handleAgentPlanModeChange, handleExternalSandboxChange, usesExternalRuntime])
+
+  const runGoalMutation = useCallback(async (
+    mutation: (conversationId: string) => Promise<Conversation>,
+    continueWhenActive = false,
+  ) => {
+    const conversationId = currentConversationIdRef.current
+    if (!conversationId) return
+    try {
+      const updated = await mutation(conversationId)
+      applyConversationIfCurrent(conversationId, updated)
+      const goal = updated.goal_state ?? updated.goalState
+      if (continueWhenActive && goal && (goal.status === 'active' || goal.status === 'verifying')) {
+        void chatApi.continueGoal(conversationId).then((result) => {
+          applyConversationIfCurrent(conversationId, result)
+        }).catch((error) => {
+          setStreamErrorForConversation(conversationId, error instanceof Error ? error.message : String(error))
+        })
+      }
+    } catch (error) {
+      setStreamErrorForConversation(
+        conversationId,
+        typeof error === 'string' ? error : (error as Error).message || 'Goal 操作失败',
+      )
+      throw error
+    }
+  }, [applyConversationIfCurrent, setStreamErrorForConversation])
+
+  const handleEditGoal = useCallback((objective: string) => runGoalMutation(
+    (conversationId) => chatApi.editGoal(conversationId, objective),
+    true,
+  ), [runGoalMutation])
+  const handlePauseGoal = useCallback(() => runGoalMutation(chatApi.pauseGoal), [runGoalMutation])
+  const handleResumeGoal = useCallback(() => runGoalMutation(chatApi.resumeGoal, true), [runGoalMutation])
+  const handleCancelGoal = useCallback(() => runGoalMutation(chatApi.cancelGoal), [runGoalMutation])
 
   const handleModelChange = useCallback(async (providerId: string, model: string) => {
     setDraftProviderId(providerId)
@@ -5245,6 +5348,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
 
   return (
     <LangContext.Provider value={uiLang}>
+    <AsyncQuestionsContext.Provider value={asyncQuestionsValue}>
     <Profiler id="ChatShell" onRender={onChatPerfProfiler}>
       <div
         className={`chat-window-shell${usesNativeTitlebar ? ' chat-window-shell--native-titlebar' : ''}`}
@@ -5423,6 +5527,15 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onSelectConversation={handleSelectConversation}
             importedHistoryStale={importedHistoryStale}
             pendingSlot={pendingSlot}
+            goalSlot={visibleGoal ? (
+              <GoalCard
+                goal={visibleGoal}
+                onEdit={handleEditGoal}
+                onPause={handlePauseGoal}
+                onResume={handleResumeGoal}
+                onCancel={handleCancelGoal}
+              />
+            ) : null}
             queuedMessages={currentQueuedMessages}
             canSteerQueuedMessages={canSteerCurrentConversation}
             onSteerQueuedMessage={handleSteerQueuedMessage}
@@ -5462,6 +5575,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       )}
       </div>
     </Profiler>
+    </AsyncQuestionsContext.Provider>
     </LangContext.Provider>
   )
 }

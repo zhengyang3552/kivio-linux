@@ -1,33 +1,58 @@
 //! Native system notification shared by unattended automations and chat completion.
 //! Failures are logged and never interrupt the originating task.
 
+#[cfg(target_os = "windows")]
 use std::process::Command;
 
+#[cfg(target_os = "macos")]
+#[path = "notify_macos.rs"]
+mod macos;
+
+/// One isolated, bounded worker: a stuck OS notification service must not
+/// consume Tokio workers, block the UI, or create a thread per reply.
+#[cfg(any(target_os = "macos", test))]
+fn start_notification_worker<T: Send + 'static>(
+    capacity: usize,
+    mut deliver: impl FnMut(T) + Send + 'static,
+) -> std::io::Result<std::sync::mpsc::SyncSender<T>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+    std::thread::Builder::new()
+        .name("kivio-notifications".into())
+        .spawn(move || {
+            while let Ok(message) = rx.recv() {
+                deliver(message);
+            }
+        })?;
+    Ok(tx)
+}
+
 pub(crate) fn show(app: &tauri::AppHandle, title: &str, body: &str) {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let _ = app;
     let title = sanitize_toast_text(title, 80);
     let body = sanitize_toast_text(body, 240);
     #[cfg(target_os = "macos")]
-    macos_notify(&title, &body);
+    macos::show(app, title, body);
     #[cfg(target_os = "windows")]
-    windows_notify(
-        &app.config().identifier,
-        app.config()
+    {
+        let app_id = app.config().identifier.clone();
+        let display_name = app
+            .config()
             .product_name
-            .as_deref()
-            .unwrap_or("Kivio Desktop"),
-        &title,
-        &body,
-    );
+            .clone()
+            .unwrap_or_else(|| "Kivio Desktop".into());
+        tauri::async_runtime::spawn_blocking(move || {
+            windows_notify(&app_id, &display_name, &title, &body);
+        });
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         eprintln!("system notification: {title}: {body}");
     }
 }
 
-/// Collapse control breaks so Windows PowerShell here-strings / AppleScript
-/// literals cannot be closed by interpolated node output.
+/// Collapse control breaks so Windows PowerShell here-strings cannot be closed
+/// by interpolated node output; keep previews single-line on every platform.
 fn sanitize_toast_text(s: &str, max: usize) -> String {
     let collapsed: String = s
         .chars()
@@ -46,23 +71,6 @@ fn truncate(s: &str, max: usize) -> String {
         out.push(ch);
     }
     out
-}
-
-#[cfg(target_os = "macos")]
-fn macos_notify(title: &str, body: &str) {
-    let script = format!(
-        "display notification \"{}\" with title \"{}\"",
-        applescript_escape(body),
-        applescript_escape(title)
-    );
-    if let Err(error) = Command::new("osascript").arg("-e").arg(script).spawn() {
-        eprintln!("system notification failed to start: {error}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(target_os = "windows")]
@@ -159,6 +167,38 @@ fn xml_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::sanitize_toast_text;
+
+    #[test]
+    fn stalled_notification_service_never_blocks_producers_and_queue_is_bounded() {
+        use std::sync::mpsc::{channel, TrySendError};
+        use std::time::Duration;
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (delivered_tx, delivered_rx) = channel();
+        let sender = super::start_notification_worker(1, move |value| {
+            if value == 1 {
+                entered_tx.send(()).unwrap();
+                // Simulate an OS service that does not return until released.
+                release_rx.recv().unwrap();
+            }
+            delivered_tx.send(value).unwrap();
+        })
+        .unwrap();
+        sender.try_send(1).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        sender.try_send(2).unwrap();
+        let overflow = sender.try_send(3);
+        release_tx.send(()).unwrap();
+        assert!(matches!(overflow, Err(TrySendError::Full(3))));
+        assert_eq!(
+            delivered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            1
+        );
+        assert_eq!(
+            delivered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            2
+        );
+    }
 
     #[cfg(target_os = "windows")]
     use super::windows_script;

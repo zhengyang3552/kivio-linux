@@ -12,7 +12,11 @@ import type { AgentPlanState, ChatMessage, ConversationContextState, DegradedAns
 import { MessageBubble } from './MessageBubble'
 import { DegradedAnswerCard } from './DegradedAnswerCard'
 import { MessageGroup } from './MessageGroup'
+import { useMultiAnswerViewMode } from './multiAnswerViewMode'
 import { MessageNavigator } from './ChatMessageNavigator'
+import { ChatHeadingOutline } from './ChatHeadingOutline'
+import type { MarkdownOutlineSourceUpdate } from './ChatMarkdown'
+import type { MarkdownHeadingOutlineItem } from './markdownHeadingOutline'
 import { MessageContextMenu, type MessageMenuAnchor } from './MessageContextMenu'
 import { AddSelectionToChat } from './AddSelectionToChat'
 import { copyToClipboard } from '../utils/clipboard'
@@ -67,6 +71,19 @@ export interface AssistantStreamStats {
   reasoningDurationMsBySegmentId?: Record<string, number>
 }
 
+type OutlineSourceRecord = {
+  ownerMessageId: string
+  sourceId: string
+  items: MarkdownHeadingOutlineItem[]
+}
+
+function sameOutlineItems(a: readonly MarkdownHeadingOutlineItem[], b: readonly MarkdownHeadingOutlineItem[]): boolean {
+  return a.length === b.length && a.every((item, index) => {
+    const other = b[index]
+    return item.anchorId === other.anchorId && item.title === other.title && item.depth === other.depth
+  })
+}
+
 export interface MessageListProps {
   conversationId?: string | null
   messages: ChatMessage[]
@@ -100,6 +117,7 @@ export interface MessageListProps {
 }
 
 const LIST_EDGE_PADDING_PX = 16
+const MESSAGE_NAVIGATOR_MIN_TURNS = 2
 
 // 导航器高亮同步的最小间隔。这趟同步是 querySelectorAll + 逐行 getBoundingClientRect，
 // 若 virtualizer 在同一帧里刚写过 DOM，第一下 gBCR 就是整文档强制 reflow——每帧跑一次
@@ -120,6 +138,7 @@ const NAVIGATOR_UNLOCK_FRAMES = 10
 // 只认 heavy island；data-chat-markdown-pending 从未写入，留着只会制造「假覆盖」。
 const NAVIGATOR_PENDING_SELECTOR = '[data-chat-heavy-hydrated="false"], [data-chat-async-pending="true"]'
 const NAVIGATOR_ALIGN_EPSILON_PX = 1
+const HEADING_NAVIGATOR_TOP_INSET_PX = 16
 // 会话切换遮罩：重内容一直晃也不能无限等，超时强制揭开。
 const OPEN_SETTLE_MAX_MS = 2_000
 
@@ -406,6 +425,9 @@ function MessageListBase({
   const prevMessageCountRef = useRef(0)
   const [activeNavigatorNodeId, setActiveNavigatorNodeId] = useState<string | null>(null)
   const [visibleNavigatorNodeIds, setVisibleNavigatorNodeIds] = useState<string[]>([])
+  const [outlineSources, setOutlineSources] = useState<Map<string, OutlineSourceRecord>>(() => new Map())
+  const [activeOutlineOwnerId, setActiveOutlineOwnerId] = useState<string | null>(null)
+  const [activeOutlineAnchorId, setActiveOutlineAnchorId] = useState<string | null>(null)
   const navigatorNodesRef = useRef<MessageNavigatorNode[]>([])
   const activeNavigatorNodeIdRef = useRef<string | null>(null)
   const visibleNavigatorNodeIdsRef = useRef<string[]>([])
@@ -414,6 +436,7 @@ function MessageListBase({
   // endNavigatorSession 的解锁 rAF 链；clear 时必须 cancel，避免卸载后 setState。
   const navigatorUnlockRafRef = useRef<number | null>(null)
   const navigatorUnlockGenerationRef = useRef(0)
+  const headingNavigationTargetRef = useRef<{ anchorId: string; targetIndex: number } | null>(null)
 
   // 导航「先渲染再跳」：在当前视口不动的前提下，把目标行附近强制挂进 DOM 测高。
   const [forceMountRenderIndex, setForceMountRenderIndex] = useState<number | null>(null)
@@ -715,7 +738,10 @@ function MessageListBase({
     return { kind: 'error', key: 'error', text: error, retryMessageId }
   }, [error, messages])
 
-  const layoutKey = `${conversationId ?? 'empty'}:${contentWidth}`
+  const [multiAnswerViewMode] = useMultiAnswerViewMode()
+  const hasWideGroups = multiAnswerViewMode === 'columns'
+    && (Boolean(liveGroup) || historyItems.some((item) => item.kind === 'group'))
+  const layoutKey = `${conversationId ?? 'empty'}:${contentWidth}:${multiAnswerViewMode}`
   const { liveRowRef, getLiveRowSize, measureRow } = useLiveRowMeasurement(layoutKey, liveRowKey)
   const measurementRevision = useMemo(
     () => historyItems.map(measurementKey).join('|'),
@@ -759,7 +785,8 @@ function MessageListBase({
         })
         height += estimateMessageRenderHeight({
           texts,
-          width: contentWidth,
+          // Ordinary replies keep their reading width even when a group widens the list.
+          width: Math.min(contentWidth, 848),
           toolCallCount: toolCalls.length,
           attachmentCount: (message.attachments ?? []).length,
           artifactCount,
@@ -937,14 +964,38 @@ function MessageListBase({
     const renderIndexByKey = new Map(historyItems.map((item, index) => [item.key, index]))
     return buildMessageNavigatorNodes({ folded, boundaries, clearBoundaries, renderIndexByKey })
   }, [boundaries, clearBoundaries, folded, historyItems])
+  const outlineItemsByOwner = useMemo(() => {
+    const byOwner = new Map<string, MarkdownHeadingOutlineItem[]>()
+    for (const source of outlineSources.values()) {
+      const current = byOwner.get(source.ownerMessageId) ?? []
+      current.push(...source.items)
+      byOwner.set(source.ownerMessageId, current)
+    }
+    return byOwner
+  }, [outlineSources])
+  const outlineRenderIndexByOwner = useMemo(() => {
+    const indexByOwner = new Map<string, number>()
+    historyItems.forEach((item, index) => {
+      if (item.kind === 'message' && item.message.role === 'assistant') {
+        indexByOwner.set(item.message.id, index)
+      }
+      if (item.kind === 'group') {
+        for (const message of item.messages) indexByOwner.set(message.id, index)
+      }
+    })
+    return indexByOwner
+  }, [historyItems])
+  const activeOutlineItems = activeOutlineOwnerId
+    ? outlineItemsByOwner.get(activeOutlineOwnerId) ?? []
+    : []
   navigatorNodesRef.current = navigatorNodes
   const navigatorTurnCount = navigatorNodes.reduce(
     (count, node) => count + (node.kind === 'turn' ? 1 : 0),
     0,
   )
-  // 滚动回调里读，走 ref：导航器没渲染（< 4 轮）就别做整列表测量。
+  // 标题目录在第一轮即可出现，也需要滚动同步；两个导航器都没有时才跳过测量。
   const navigatorEnabledRef = useRef(false)
-  navigatorEnabledRef.current = navigatorTurnCount >= 4
+  navigatorEnabledRef.current = navigatorTurnCount >= MESSAGE_NAVIGATOR_MIN_TURNS || outlineSources.size > 0
 
   const updateActiveNavigatorNode = useCallback((nodeId: string | null) => {
     if (activeNavigatorNodeIdRef.current === nodeId) return
@@ -957,6 +1008,32 @@ function MessageListBase({
     if (previous.length === nodeIds.length && previous.every((id, index) => id === nodeIds[index])) return
     visibleNavigatorNodeIdsRef.current = nodeIds
     setVisibleNavigatorNodeIds(nodeIds)
+  }, [])
+
+  const handleOutlineSourceChange = useCallback((update: MarkdownOutlineSourceUpdate) => {
+    setOutlineSources((current) => {
+      const existing = current.get(update.sourceId)
+      if (update.items == null) {
+        if (!existing) return current
+        const next = new Map(current)
+        next.delete(update.sourceId)
+        return next
+      }
+      if (
+        existing
+        && existing.ownerMessageId === update.ownerMessageId
+        && sameOutlineItems(existing.items, update.items)
+      ) {
+        return current
+      }
+      const next = new Map(current)
+      next.set(update.sourceId, {
+        ownerMessageId: update.ownerMessageId,
+        sourceId: update.sourceId,
+        items: update.items,
+      })
+      return next
+    })
   }, [])
 
   const cancelNavigatorSettle = useCallback(() => {
@@ -1019,6 +1096,7 @@ function MessageListBase({
     navigatorHoldRef.current = null
     bottomHoldRef.current = null
     navigatorFrozenScrollTopRef.current = null
+    headingNavigationTargetRef.current = null
     if (forceMountRenderIndexRef.current != null) {
       setForceMountRenderIndex(null)
     }
@@ -1043,6 +1121,30 @@ function MessageListBase({
     }
     return true
   }, [contentEl, followHandle])
+
+  const alignViewportToHeading = useCallback((anchorId: string) => {
+    const el = scrollRef.current
+    const heading = contentEl?.querySelector(`#${CSS.escape(anchorId)}`) as HTMLElement | null
+    if (!heading || !el) return false
+    const column = heading.closest<HTMLElement>('.chat-message-group-col-body')
+    if (column) {
+      column.scrollTop += heading.getBoundingClientRect().top - column.getBoundingClientRect().top - HEADING_NAVIGATOR_TOP_INSET_PX
+    }
+    const nextOffset = Math.max(
+      0,
+      heading.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop - HEADING_NAVIGATOR_TOP_INSET_PX,
+    )
+    if (Math.abs(el.scrollTop - nextOffset) > NAVIGATOR_ALIGN_EPSILON_PX) {
+      followHandle.scrollToOffset(nextOffset)
+    }
+    return true
+  }, [contentEl, followHandle])
+
+  const alignViewportToNavigationTarget = useCallback((targetRenderIndex: number) => {
+    const target = headingNavigationTargetRef.current
+    if (target?.targetIndex === targetRenderIndex && alignViewportToHeading(target.anchorId)) return true
+    return alignViewportToRowIndex(targetRenderIndex)
+  }, [alignViewportToHeading, alignViewportToRowIndex])
 
   const rowHasPendingMedia = useCallback((row: HTMLElement) => {
     if (row.querySelector(NAVIGATOR_PENDING_SELECTOR)) return true
@@ -1073,10 +1175,20 @@ function MessageListBase({
     if (!(height > 0)) {
       return { ready: false as const, height: 0, offsetPx: Number.POSITIVE_INFINITY }
     }
+    const headingTarget = headingNavigationTargetRef.current
+    const heading = headingTarget?.targetIndex === targetRenderIndex
+      ? row.querySelector<HTMLElement>(`#${CSS.escape(headingTarget.anchorId)}`)
+      : null
+    // Heading jumps settle at the heading, rather than waiting for the whole
+    // answer's top to align (which never happens for a heading midway down it).
+    const desiredOffset = heading
+      ? Math.max(0, Math.min(el.scrollHeight - el.clientHeight,
+        heading.getBoundingClientRect().top - viewportRect.top + el.scrollTop - HEADING_NAVIGATOR_TOP_INSET_PX))
+      : null
     return {
       ready: true as const,
       height,
-      offsetPx: Math.abs(rowRect.top - viewportRect.top),
+      offsetPx: desiredOffset == null ? Math.abs(rowRect.top - viewportRect.top) : Math.abs(el.scrollTop - desiredOffset),
     }
   }, [contentEl, rowHasPendingMedia])
 
@@ -1169,7 +1281,7 @@ function MessageListBase({
     }
 
     setNavigationLock(true)
-    alignViewportToRowIndex(hold.targetIndex)
+    alignViewportToNavigationTarget(hold.targetIndex)
     hold.jumped = true
     hold.frames += 1
 
@@ -1201,7 +1313,7 @@ function MessageListBase({
     })
     return () => cancelAnimationFrame(raf)
   }, [
-    alignViewportToRowIndex,
+    alignViewportToNavigationTarget,
     endNavigatorSession,
     navigatorHoldEpoch,
     readNavigatorTargetMetrics,
@@ -1214,6 +1326,7 @@ function MessageListBase({
   const navigateToNavigatorNode = useCallback((node: MessageNavigatorNode) => {
     // 跳到上方消息：先脱离跟随，否则跟随纠正器会把视口又钉回底部。
     followHandle.releaseFollow()
+    headingNavigationTargetRef.current = null
     updateActiveNavigatorNode(node.id)
 
     if (node.targetRenderIndex < 0 || node.targetRenderIndex >= historyItems.length) {
@@ -1236,6 +1349,26 @@ function MessageListBase({
     updateActiveNavigatorNode,
   ])
 
+  const navigateToOutlineHeading = useCallback((item: MarkdownHeadingOutlineItem) => {
+    const targetIndex = outlineRenderIndexByOwner.get(activeOutlineOwnerId ?? '')
+    if (targetIndex == null || targetIndex < 0 || targetIndex >= historyItems.length) return
+    followHandle.releaseFollow()
+    setActiveOutlineAnchorId(item.anchorId)
+    const generation = beginMessageNavigationHydrate()
+    navigatorSettleGenerationRef.current = generation
+    clearNavigatorPrepare()
+    headingNavigationTargetRef.current = { anchorId: item.anchorId, targetIndex }
+    setForceMountRenderIndex(targetIndex)
+    prepareThenJumpToNavigatorNode(generation, targetIndex)
+  }, [
+    activeOutlineOwnerId,
+    clearNavigatorPrepare,
+    followHandle,
+    historyItems.length,
+    outlineRenderIndexByOwner,
+    prepareThenJumpToNavigatorNode,
+  ])
+
 
   useEffect(() => () => {
     clearNavigatorPrepare()
@@ -1246,6 +1379,10 @@ function MessageListBase({
     // 切换会话时清掉上一会话未完成的 settle，避免 eager / force-mount 残留。
     clearNavigatorPrepare()
     resetMessageNavigationStore()
+    headingNavigationTargetRef.current = null
+    setOutlineSources(new Map())
+    setActiveOutlineOwnerId(null)
+    setActiveOutlineAnchorId(null)
   }, [clearNavigatorPrepare, conversationId])
 
   // 全局搜索：打开会话后滚到命中消息，并短暂闪一下高亮。
@@ -1442,6 +1579,44 @@ function MessageListBase({
   ])
 
 
+  const syncHeadingOutlineFromDom = useCallback((readingY: number, viewportTop: number, viewportBottom: number) => {
+    const el = scrollRef.current
+    if (!el) return
+    const roots = [...el.querySelectorAll<HTMLElement>('[data-chat-outline-owner]')]
+      .filter((root) => (outlineItemsByOwner.get(root.dataset.chatOutlineOwner ?? '')?.length ?? 0) >= 2)
+      .filter((root) => root.closest('[data-chat-message-group-focused]')?.getAttribute('data-chat-message-group-focused') !== 'false')
+    let target = roots.find((root) => {
+      const rect = root.getBoundingClientRect()
+      return rect.top <= readingY && rect.bottom >= readingY
+    })
+    if (!target) {
+      target = roots
+        .filter((root) => {
+          const rect = root.getBoundingClientRect()
+          return rect.top >= readingY && rect.top < viewportBottom && rect.bottom > viewportTop
+        })
+        .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)[0]
+    }
+    const ownerMessageId = target?.dataset.chatOutlineOwner ?? null
+    setActiveOutlineOwnerId((current) => current === ownerMessageId ? current : ownerMessageId)
+    if (!target || !ownerMessageId) {
+      setActiveOutlineAnchorId((current) => current == null ? current : null)
+      return
+    }
+    const items = outlineItemsByOwner.get(ownerMessageId) ?? []
+    const column = target.closest<HTMLElement>('.chat-message-group-col-body')
+    const headingReadingY = column
+      ? column.getBoundingClientRect().top + column.clientHeight * 0.3
+      : readingY
+    let active: MarkdownHeadingOutlineItem | null = null
+    for (const item of items) {
+      const heading = target.querySelector(`#${CSS.escape(item.anchorId)}`) as HTMLElement | null
+      if (heading && heading.getBoundingClientRect().top <= headingReadingY) active = item
+    }
+    active ??= items[0] ?? null
+    setActiveOutlineAnchorId((current) => current === active?.anchorId ? current : active?.anchorId ?? null)
+  }, [outlineItemsByOwner])
+
   // 滚动监听：用 DOM 行几何更新导航器（兼容「上方虚拟 + 底部实挂载」）。
   // 跟随钉底由 useScrollFollow 独立处理。
   const syncNavigatorFromDom = useCallback(() => {
@@ -1450,6 +1625,7 @@ function MessageListBase({
     const viewportTop = el.getBoundingClientRect().top
     const viewportBottom = viewportTop + el.clientHeight
     const readingY = viewportTop + el.clientHeight * 0.3
+    syncHeadingOutlineFromDom(readingY, viewportTop, viewportBottom)
     const rows = el.querySelectorAll<HTMLElement>('[data-chat-row-index]')
     let activeIndex: number | null = null
     let firstVisible = Number.POSITIVE_INFINITY
@@ -1481,7 +1657,7 @@ function MessageListBase({
         lastVisible,
       ))
     }
-  }, [updateActiveNavigatorNode, updateVisibleNavigatorNodes])
+  }, [syncHeadingOutlineFromDom, updateActiveNavigatorNode, updateVisibleNavigatorNodes])
 
   // 滚动回调只保留导航器的低频同步；虚拟窗口和尺寸补偿由同一个 virtualizer 管理。
   // 导航器同步是整列表测量（querySelectorAll + 逐行 gBCR，virtualizer 同帧写过 DOM 时
@@ -1515,6 +1691,12 @@ function MessageListBase({
     })
   }, [syncNavigatorFromDom])
 
+  useEffect(() => {
+    if (outlineSources.size === 0) return
+    const frame = requestAnimationFrame(syncNavigatorFromDom)
+    return () => cancelAnimationFrame(frame)
+  }, [outlineSources, syncNavigatorFromDom])
+
   const handleNavigatorScroll = useCallback(() => {
     // hold 期间硬钉：消息导航钉目标行；回到底部钉底。
     if (navigationLockRef.current) {
@@ -1524,12 +1706,12 @@ function MessageListBase({
       } else {
         const hold = navigatorHoldRef.current
         if (hold?.jumped) {
-          alignViewportToRowIndex(hold.targetIndex)
+          alignViewportToNavigationTarget(hold.targetIndex)
         }
       }
     }
     scheduleNavigatorSync()
-  }, [alignViewportToRowIndex, followHandle, scheduleNavigatorSync])
+  }, [alignViewportToNavigationTarget, followHandle, scheduleNavigatorSync])
 
   // 用户滚轮 = 用户接管视口。回底/导航 hold 期间若继续硬钉：wheel(up) 先解除跟随，
   // 下一个 scroll 事件又被 handleNavigatorScroll 的 jumpToBottom()（forceFollow）钉回，
@@ -1752,6 +1934,8 @@ function MessageListBase({
               onSaveMessageToNote={onSaveMessageToNote}
               agentPlanOverride={msg.id === legacyPlanMessageId ? agentPlanState : null}
               onExecuteAgentPlan={msg.role === 'assistant' ? onExecuteAgentPlan : undefined}
+              outlineEligible={msg.role === 'assistant' && !streamFrozen}
+              onOutlineSourceChange={handleOutlineSourceChange}
             />
           )
         }
@@ -1782,6 +1966,8 @@ function MessageListBase({
               onForkMessage={streaming || streamFrozen ? undefined : onForkMessage}
               onDeleteMessage={onDeleteMessage}
               onSaveMessageToNote={onSaveMessageToNote}
+              outlineEligible={!streamFrozen}
+              onOutlineSourceChange={handleOutlineSourceChange}
             />
           )
         }
@@ -1870,6 +2056,7 @@ function MessageListBase({
       messages,
       groupSelections,
       onSetGroupSelection,
+      handleOutlineSourceChange,
       streamingReasoningDurationMs,
       streamingReasoningDurationMsBySegmentId,
       lang,
@@ -1905,24 +2092,36 @@ function MessageListBase({
           className={virtualItem ? 'absolute left-0 top-0 w-full pb-0.5' : 'w-full pb-0.5'}
           style={virtualItem ? { transform: `translateY(${virtualItem.start}px)` } : undefined}
         >
-          {renderItem(item)}
+          {item.kind === 'group' || item.kind === 'live-group'
+            ? renderItem(item)
+            : <div className="chat-reading-content">{renderItem(item)}</div>}
         </div>
       ))}
       {errorItem && (
-        <div className="pb-0.5" data-chat-message-list-item={errorItem.kind}>
+        <div className="chat-reading-content pb-0.5" data-chat-message-list-item={errorItem.kind}>
           {renderItem(errorItem)}
         </div>
       )}
       {(messages.length > 0 || streaming) && (
-        <StreamStatusLine active={streaming && !streamFrozen && !liveGroup} />
+        <div className="chat-reading-content">
+          <StreamStatusLine active={streaming && !streamFrozen && !liveGroup} />
+        </div>
       )}
       <div ref={tailSpacerRef} aria-hidden="true" style={{ height: LIST_EDGE_PADDING_PX }} />
     </div>
   )
 
   return (
-    <div className={`relative flex min-h-0 flex-1 flex-col ${navigatorTurnCount >= 4 ? 'has-message-navigator' : ''}`}>
-      {navigatorTurnCount >= 4 && (
+    <div className={`relative flex min-h-0 flex-1 flex-col ${navigatorTurnCount >= MESSAGE_NAVIGATOR_MIN_TURNS ? 'has-message-navigator' : ''} ${activeOutlineItems.length >= 2 ? 'has-heading-navigator' : ''}`}>
+      {activeOutlineOwnerId && activeOutlineItems.length >= 2 && (
+        <ChatHeadingOutline
+          ownerMessageId={activeOutlineOwnerId}
+          items={activeOutlineItems}
+          activeAnchorId={activeOutlineAnchorId}
+          onNavigate={navigateToOutlineHeading}
+        />
+      )}
+      {navigatorTurnCount >= MESSAGE_NAVIGATOR_MIN_TURNS && (
         <MessageNavigator
           nodes={navigatorNodes}
           activeNodeId={activeNavigatorNodeId}
@@ -1936,11 +2135,17 @@ function MessageListBase({
         onContextMenu={handleContextMenu}
         onClickCapture={handleDisclosureClick}
         onScroll={handleNavigatorScroll}
+        onScrollCapture={(event) => {
+          if (event.target !== event.currentTarget) scheduleNavigatorSync()
+        }}
+        onMouseOverCapture={(event) => {
+          if (event.target instanceof Element && event.target.closest('.chat-message-group-col')) scheduleNavigatorSync()
+        }}
         className={`chat-scroll-viewport chat-motion-view-in custom-scrollbar flex-1 overflow-y-auto ${navigatorLockActive ? 'is-navigator-locking' : ''}`}
 
 
       >
-        <div ref={setContentEl} className="chat-message-list-inner mx-auto w-full max-w-4xl px-6">
+        <div ref={setContentEl} className={`chat-message-list-inner mx-auto w-full px-6 ${hasWideGroups ? 'chat-message-list-inner--wide' : 'max-w-4xl'}`}>
           <div data-chat-rows-root className="relative w-full">
             <div aria-hidden="true" style={{ height: virtualizer.getTotalSize() }} />
             <div data-chat-message-list-item="tail" className="w-full pb-0.5">
