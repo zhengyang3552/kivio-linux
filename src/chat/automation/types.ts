@@ -201,6 +201,31 @@ export interface AutomationRunStarted {
   runId: string
 }
 
+export interface AutomationRun extends AutomationRunSummary {
+  automationId: string
+  nodes: Array<{
+    nodeId: string
+    nodeType: string
+    status: string
+    input?: NodeOutput | null
+    result?: NodeOutput | null
+    output?: string | null
+    error?: string | null
+  }>
+}
+
+export interface NodeOutput {
+  text: string
+  json: unknown
+  sources?: Record<string, { text: string; json: unknown }>
+}
+
+export interface ValidationIssue {
+  nodeId?: string | null
+  severity: string
+  message: string
+}
+
 export function isTriggerType(type: string): type is AutomationNodeType {
   return type.startsWith('trigger.')
 }

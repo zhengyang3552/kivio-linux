@@ -31,9 +31,9 @@ import { rebaseDraftAgainstCache } from './rebaseSettingsDraft'
 import { i18n } from './i18n'
 import {
   GeneralIcon, HotkeysIcon, TranslateIcon, LensIcon, ChatIcon, MemoryIcon, MixerIcon,
-  AgentIcon, WebSearchIcon, ConnectorsIcon, PluginsIcon, SessionsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon,
+  AgentIcon, WebSearchIcon, PluginsIcon, SessionsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon,
 } from './NavIcons'
-import { PluginCenter } from '../chat/PluginCenter'
+import { PluginCenter, type PluginCenterSection } from '../chat/PluginCenter'
 import { SessionCenter, type SessionCenterProps } from '../chat/SessionCenter'
 import { buildHotkey, formatHotkeyError, getPlatform, isProviderEnabled, resolveSettingsSaveEcho, stableStringify } from './utils'
 import { type ProviderPreset } from './providerPresets'
@@ -294,12 +294,21 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const [initialSettingsSnapshot, setInitialSettingsSnapshot] = useState('')
   const [loading, setLoading] = useState(true)
   const [appVersion, setAppVersion] = useState('')
-  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab ?? 'general')
+  const [activeTab, setActiveTab] = useState<Exclude<SettingsTab, 'connectors'>>(initialTab === 'connectors' ? 'plugins' : initialTab ?? 'general')
+  const [pluginSection, setPluginSection] = useState<PluginCenterSection>(initialTab === 'connectors' ? 'connectors' : 'plugins')
+  const navigateToSettingsTab = useCallback((tab: SettingsTab) => {
+    if (tab === 'connectors') {
+      setPluginSection('connectors')
+      setActiveTab('plugins')
+    } else {
+      setActiveTab(tab)
+    }
+  }, [])
   // 用量统计页内的二级视图：用量统计 / 请求调试（请求调试原为独立导航项，现并入用量统计）
   const [usageView, setUsageView] = useState<'stats' | 'debug'>('stats')
   useEffect(() => {
-    if (initialTab) setActiveTab(initialTab)
-  }, [initialTab])
+    if (initialTab) navigateToSettingsTab(initialTab)
+  }, [initialTab, navigateToSettingsTab])
   const [saveError, setSaveError] = useState('')
   // 热键被占用未能注册的警告（保存已成功，只是提醒，不阻断）。
   const [saveWarning, setSaveWarning] = useState('')
@@ -1823,7 +1832,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     { id: 'mixer' as const, label: t.tabMixer, icon: MixerIcon },
     { id: 'externalAgents' as const, label: t.tabExternalAgents, icon: AgentIcon },
     { id: 'hooks' as const, label: t.tabHooks, icon: HooksIcon },
-    { id: 'connectors' as const, label: t.tabConnectors, icon: ConnectorsIcon },
     { id: 'plugins' as const, label: t.tabPlugins, icon: PluginsIcon },
     { id: 'sessions' as const, label: t.tabSessions, icon: SessionsIcon },
     { id: 'webSearch' as const, label: t.tabWebSearch, icon: WebSearchIcon },
@@ -1876,17 +1884,9 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       title: t.tabHooks,
       subtitle: t.hooksPageSubtitle,
     },
-    connectors: {
-      title: t.tabConnectors,
-      subtitle: lang === 'zh'
-        ? '连接外部数据源；凭据存本机。'
-        : 'Connect external data sources; credentials stay local.',
-    },
     plugins: {
-      title: t.tabPlugins,
-      subtitle: lang === 'zh'
-        ? '检测本机能力插件（OfficeCLI / Cua Driver / ego lite）；启用后自动注入 Skill / MCP。'
-        : 'Detect local capability plugins (OfficeCLI / Cua Driver / ego lite); enable to inject Skills / MCP.',
+      title: pluginSection === 'plugins' ? t.tabPlugins : pluginSection === 'apps' ? t.pluginCenterApps : t.tabConnectors,
+      subtitle: pluginSection === 'plugins' ? t.pluginCenterPluginsSubtitle : pluginSection === 'apps' ? t.pluginCenterAppsSubtitle : t.pluginCenterConnectorsSubtitle,
     },
     sessions: {
       title: t.tabSessions,
@@ -1921,7 +1921,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const categoryNav =
     variant === 'embedded' ? (
       <>
-        <nav className="settings-embedded-nav-list">
+        <nav className="settings-embedded-nav-list custom-scrollbar">
           {navItems.map((item) => {
             const Icon = item.icon
             return (
@@ -1995,7 +1995,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
 
           <div
             key={activeTab}
-            className={`kv-scroll settings-section-enter ${variant === 'embedded' ? 'settings-embedded-scroll' : ''}${activeTab === 'sessions' ? ' kv-scroll--fill' : ''}`}
+            className={`kv-scroll custom-scrollbar settings-section-enter ${variant === 'embedded' ? 'settings-embedded-scroll' : ''}${activeTab === 'sessions' ? ' kv-scroll--fill' : ''}`}
           >
             {/* ===== 基础设置标签页 ===== */}
             {activeTab === 'general' && (
@@ -2164,7 +2164,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 nativeBuiltinToolsEnabled={nativeBuiltinToolsEnabled}
                 onUpdateChat={updateChat}
                 onUpdateNativeTools={updateNativeTools}
-                onNavigateTab={setActiveTab}
+                onNavigateTab={navigateToSettingsTab}
               />
             )}
 
@@ -2223,33 +2223,34 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
               />
             )}
 
-            {/* ===== 连接器标签页 ===== */}
-            {activeTab === 'connectors' && (
-              <ConnectorsPanel
-                servers={chatTools.servers}
-                updateChatTools={updateChatTools}
-                obsidianVaultPath={settings?.obsidianVaultPath ?? ''}
-                onObsidianVaultPathChange={(path) => updateSettings({ obsidianVaultPath: path })}
-                lang={lang}
-                testServer={async (server) => {
-                  try {
-                    const result = await api.chatMcpTestServer(server, settings?.chatTools?.toolTimeoutMs)
-                    return {
-                      ok: result.success,
-                      message: result.error || '',
-                      tools: result.tools,
-                    }
-                  } catch {
-                    return null
-                  }
-                }}
-              />
-            )}
-
-            {/* ===== 插件标签页（原扩展 → 插件） ===== */}
+            {/* ===== 插件、第三方应用与连接器 ===== */}
             {activeTab === 'plugins' && (
               <PluginCenter
+                section={pluginSection}
+                onSectionChange={setPluginSection}
+                lang={lang}
                 onRequestAiInstall={onRequestPluginAiInstall}
+                connectors={
+                  <ConnectorsPanel
+                    servers={chatTools.servers}
+                    updateChatTools={updateChatTools}
+                    obsidianVaultPath={settings?.obsidianVaultPath ?? ''}
+                    onObsidianVaultPathChange={(path) => updateSettings({ obsidianVaultPath: path })}
+                    lang={lang}
+                    testServer={async (server) => {
+                      try {
+                        const result = await api.chatMcpTestServer(server, settings?.chatTools?.toolTimeoutMs)
+                        return {
+                          ok: result.success,
+                          message: result.error || '',
+                          tools: result.tools,
+                        }
+                      } catch {
+                        return null
+                      }
+                    }}
+                  />
+                }
               />
             )}
 

@@ -13,6 +13,7 @@ use crate::state::AppState;
 
 use super::commands;
 use super::history;
+use super::hotkeys::fingerprint as hotkey_fingerprint;
 use super::runner;
 use super::storage;
 use super::types::{
@@ -288,23 +289,6 @@ fn required_id(arguments: &Value) -> Result<String, String> {
     Ok(id.to_string())
 }
 
-fn hotkey_fingerprint(automation: &Automation) -> String {
-    let acc = automation
-        .nodes
-        .iter()
-        .find(|node| node.node_type == "trigger.hotkey")
-        .and_then(|node| {
-            node.data
-                .get("hotkey")
-                .and_then(|v| v.get("accelerator"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    format!("{}:{acc}", automation.enabled)
-}
-
 fn clip_run(run: &AutomationRun) -> Value {
     json!({
         "id": run.id,
@@ -560,6 +544,8 @@ mod tests {
             nodes: vec![
                 crate::automation::types::AutomationRunNode {
                     node_id: "t".into(),
+                    input: None,
+                    result: None,
                     node_type: "trigger.manual".into(),
                     status: "success".into(),
                     output: Some("agent".into()),
@@ -567,6 +553,8 @@ mod tests {
                 },
                 crate::automation::types::AutomationRunNode {
                     node_id: "n".into(),
+                    input: None,
+                    result: None,
                     node_type: "action.notify".into(),
                     status: "success".into(),
                     output: Some("done".into()),

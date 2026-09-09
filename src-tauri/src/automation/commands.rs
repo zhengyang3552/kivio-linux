@@ -1,6 +1,7 @@
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use super::history;
+use super::hotkeys::fingerprint as hotkey_fingerprint;
 use super::runner;
 use super::storage;
 use super::types::{
@@ -22,23 +23,6 @@ pub fn automation_list(app: AppHandle) -> Result<Vec<AutomationMeta>, String> {
 #[tauri::command]
 pub fn automation_get(app: AppHandle, id: String) -> Result<Automation, String> {
     storage::get(&app, &id)
-}
-
-fn hotkey_fingerprint(automation: &Automation) -> String {
-    let acc = automation
-        .nodes
-        .iter()
-        .find(|node| node.node_type == "trigger.hotkey")
-        .and_then(|node| {
-            node.data
-                .get("hotkey")
-                .and_then(|v| v.get("accelerator"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    format!("{}:{acc}", automation.enabled)
 }
 
 #[tauri::command]
@@ -84,8 +68,32 @@ pub fn automation_run(
 }
 
 #[tauri::command]
+pub fn automation_test_node(app: AppHandle, id: String, node_id: String, input: super::types::NodeOutput) -> Result<AutomationRunStarted, String> {
+    runner::test_node(app, id, node_id, input)
+}
+
+#[tauri::command]
+pub fn automation_validate(automation: Automation) -> Vec<super::types::ValidationIssue> {
+    super::validate::validate(&automation)
+}
+
+#[tauri::command]
 pub fn automation_cancel(app: AppHandle, id: String) -> Result<(), String> {
     runner::cancel(&app, &id)
+}
+
+#[tauri::command]
+pub fn automation_active_run(app: AppHandle, id: String) -> Result<Option<AutomationRun>, String> {
+    let run_id = app
+        .state::<crate::state::AppState>()
+        .automation_active_runs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned();
+    run_id
+        .map(|run_id| history::get(&app, &id, &run_id))
+        .transpose()
 }
 
 #[tauri::command]
@@ -100,7 +108,10 @@ pub fn automation_import(app: AppHandle, path: String) -> Result<Automation, Str
 }
 
 #[tauri::command]
-pub fn automation_runs_list(app: AppHandle, id: String) -> Result<Vec<AutomationRunSummary>, String> {
+pub fn automation_runs_list(
+    app: AppHandle,
+    id: String,
+) -> Result<Vec<AutomationRunSummary>, String> {
     history::list(&app, &id)
 }
 

@@ -18,7 +18,7 @@ import type {
   ChatRunEventEnvelope,
   ChatSegmentPayload as GeneratedChatSegmentPayload,
 } from '../generated/chatProtocol'
-import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
+import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRun, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
 
 // ========== 类型定义 ==========
 
@@ -1102,6 +1102,8 @@ export type Settings = {
   launchMinimizedToTray: boolean
   /** 关闭聊天窗口时隐藏复用（默认 false = 销毁）。下次打开无需重新加载，占用更多内存。 */
   keepChatWindowAlive?: boolean
+  /** 回复完成时发送系统通知，默认开启；正在查看该对话时不提醒。 */
+  chatCompletionNotifications?: boolean
   translatorProviderId: string
   translatorModel: string
   chatProviderId: string
@@ -1745,6 +1747,7 @@ export function normalizeSettings(settings: Settings): Settings {
     launchAtStartup: current.launchAtStartup ?? false,
     launchMinimizedToTray: current.launchMinimizedToTray ?? false,
     keepChatWindowAlive: current.keepChatWindowAlive ?? false,
+    chatCompletionNotifications: current.chatCompletionNotifications ?? true,
     translatorProviderId: current.translatorProviderId ?? '',
     translatorModel: current.translatorModel ?? '',
     chatProviderId: effectiveChatModel.providerId,
@@ -1928,6 +1931,7 @@ export const api = {
   providerOAuthDisconnect: (credentialId: string) => invoke<void>('provider_oauth_disconnect', { credentialId }),
   // 设置相关
   getSettings: async () => normalizeSettings(await invoke<Settings>('get_settings')),
+  onKivioConfigurationChanged: (listener: () => void) => on('kivio-configuration-changed', () => listener()),
   // 某模型可选的思考等级列表（用户覆盖 modelOverrides → 模型库 reasoningEfforts → 家族兜底）。
   reasoningEffortsForModel: (model: string, providerId?: string) =>
     invoke<string[]>('chat_reasoning_efforts_for_model', { model, providerId }),
@@ -2049,6 +2053,12 @@ export const api = {
     invoke<void>('automation_export', { id, path }),
   automationImport: (path: string) => invoke<Automation>('automation_import', { path }),
   automationRunsList: (id: string) => invoke<AutomationRunSummary[]>('automation_runs_list', { id }),
+  automationActiveRun: (id: string) => invoke<AutomationRun | null>('automation_active_run', { id }),
+  automationRunGet: (id: string, runId: string) => invoke<AutomationRun>('automation_run_get', { id, runId }),
+  automationTestNode: (id: string, nodeId: string, input: import('../chat/automation/types').NodeOutput) =>
+    invoke<AutomationRunStarted>('automation_test_node', { id, nodeId, input }),
+  automationValidate: (automation: Automation) =>
+    invoke<import('../chat/automation/types').ValidationIssue[]>('automation_validate', { automation }),
   onAutomationRun: (listener: (payload: AutomationRunEvent) => void) =>
     on<AutomationRunEvent>('automation-run', listener),
   onAutomationChanged: (listener: (payload: AutomationChangedEvent) => void) =>

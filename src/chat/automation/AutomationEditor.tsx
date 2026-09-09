@@ -8,6 +8,7 @@ import {
   ReactFlow,
   ReactFlowProvider,
   addEdge,
+  applyNodeChanges,
   useEdgesState,
   useNodesState,
   useReactFlow,
@@ -15,24 +16,31 @@ import {
   type Edge,
   type OnConnect,
   type OnConnectEnd,
+  type OnNodesChange,
   type Viewport,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import './automation.css'
 import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 import { ArrowLeft, Download, Play, Plus, Square } from 'lucide-react'
-import { api, isTauriRuntime } from '../../api/tauri'
+import { isTauriRuntime } from '../../api/tauri'
 import { Button } from '../../components/Button'
 import { Toggle } from '../../settings/components'
-import { useT } from '../../settings/i18n'
+import { useT, useLang } from '../../settings/i18n'
+import { WorkflowWorkbench } from './WorkflowWorkbench'
+import { localizeValidationIssue, workflowIssues } from './workflowData'
+import { ValidationContext } from './nodes/chrome'
+import type { ValidationIssue, NodeOutput } from './types'
 import { AddNodePicker } from './AddNodePicker'
 import { automationApi } from './api'
 import { NodeInspector } from './NodeInspector'
 import { RunStatusCapsule } from './RunStatusCapsule'
+import { useAutomationRunState } from './useAutomationRunState'
 import {
   canConnect,
   connectNodes,
   createFlowNode,
+  ensureNodeSpacing,
   flowEdgeFromConnection,
   nextNodePosition,
   nextTriggerPosition,
@@ -62,10 +70,7 @@ import {
   type AgentSlot,
   type Automation,
   type AutomationNodeType,
-  type AutomationRunEvent,
-  type AutomationRunSummary,
   type FlowNode as FlowNodeModel,
-  type NodeRunStatus,
 } from './types'
 
 const nodeTypes = {
@@ -123,7 +128,7 @@ type AddIntent =
   | { kind: 'edge', edgeId: string }
 
 function toRfNodes(nodes: FlowNodeModel[]): AutomationRfNode[] {
-  return nodes.map((node) => ({
+  return ensureNodeSpacing(nodes).map((node) => ({
     id: node.id,
     type: node.type,
     position: node.position,
@@ -172,19 +177,45 @@ function EditorInner({
   onFlushSave: () => Promise<void>
 }) {
   const t = useT()
-  const [nodes, setNodes, onNodesChange] = useNodesState<AutomationRfNode>(toRfNodes(automation.nodes))
+  const [nodes, setNodes] = useNodesState<AutomationRfNode>(toRfNodes(automation.nodes))
   const [edges, setEdges, onEdgesChange] = useEdgesState(toRfEdges(automation))
   const [selectedId, setSelectedId] = useState<string | null>(
     automation.nodes[0]?.id ?? null,
   )
   const [picker, setPicker] = useState<'trigger' | 'action' | null>(null)
-  const [running, setRunning] = useState(false)
-  const [runError, setRunError] = useState('')
-  const [nodeStatus, setNodeStatus] = useState<Record<string, NodeRunStatus>>({})
-  const [nodeOutput, setNodeOutput] = useState<Record<string, string>>({})
-  const [runs, setRuns] = useState<AutomationRunSummary[]>([])
-  const [liveStartedAt, setLiveStartedAt] = useState<string | null>(null)
-  const liveStartedAtRef = useRef<string | null>(null)
+  const { running, setRunning, runError, setRunError, nodeStatus, nodeOutput, runs, liveStartedAt, runData } = useAutomationRunState(automation.id)
+  const english = useLang() === 'en'
+  const localIssues = useMemo(() => workflowIssues(automation, english), [automation, english])
+  const [serverValidation, setServerValidation] = useState<{
+    automationId: string
+    issues: ValidationIssue[]
+  }>({ automationId: automation.id, issues: [] })
+  useEffect(() => {
+    let disposed = false
+    if (!isTauriRuntime()) return
+    const timer = window.setTimeout(() => {
+      void automationApi.validate(automation).then((issues) => {
+        if (!disposed) {
+          setServerValidation({
+            automationId: automation.id,
+            issues: issues
+              .filter((issue) => !automation.nodes.find((node) => node.id === issue.nodeId)?.data.disabled)
+              .map((issue) => localizeValidationIssue(issue, english)),
+          })
+        }
+      }).catch(() => {})
+    }, 300)
+    return () => { disposed = true; window.clearTimeout(timer) }
+  }, [automation, english])
+  const issues = useMemo(() => {
+    const serverIssues = serverValidation.automationId === automation.id
+      ? serverValidation.issues
+      : []
+    return [...localIssues, ...serverIssues.filter((issue) =>
+      !localIssues.some((local) => local.nodeId === issue.nodeId
+        && local.severity === issue.severity
+        && local.message === issue.message))]
+  }, [automation.id, localIssues, serverValidation])
   const viewportRef = useRef<Viewport>(automation.viewport)
   const pendingAddRef = useRef<AddIntent | null>(null)
   const nodesRef = useRef(nodes)
@@ -205,91 +236,32 @@ function EditorInner({
   }, [nodes, selectedId])
   const hasTrigger = nodes.some((node) => isTriggerType(node.type ?? ''))
 
-  const loadRuns = useCallback(async () => {
-    if (!isTauriRuntime()) return
-    try {
-      setRuns(await automationApi.listRuns(automation.id))
-    } catch {
-      // listing is best-effort; the canvas still works
-    }
-  }, [automation.id])
-
-  useEffect(() => {
-    void loadRuns()
-  }, [loadRuns])
-
   useEffect(() => {
     const exploded = explodeInlineAgents(automation.nodes, automation.edges)
-    if (!exploded.changed) return
-    setNodes(toRfNodes(exploded.nodes))
+    const spaced = ensureNodeSpacing(exploded.nodes)
+    if (!exploded.changed && spaced === exploded.nodes) return
+    setNodes(toRfNodes(spaced))
     setEdges(exploded.edges.map(withEdgeChrome))
-    onChange({ ...automation, nodes: exploded.nodes, edges: exploded.edges })
+    onChange({ ...automation, nodes: spaced, edges: exploded.edges })
     // Only rewrite when this automation is first opened.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [automation.id])
 
-  useEffect(() => {
-    if (!isTauriRuntime()) return
-    let cancelled = false
-    let unlisten: (() => void) | undefined
-    void api.onAutomationRun((event: AutomationRunEvent) => {
-      if (event.automationId !== automation.id) return
-      if (event.kind === 'run_started') {
-        const startedAt = new Date().toISOString()
-        liveStartedAtRef.current = startedAt
-        setRunning(true)
-        setLiveStartedAt(startedAt)
-        setRunError('')
-        setNodeStatus({})
-        setNodeOutput({})
-      }
-      if (event.kind === 'node_started' && event.nodeId) {
-        setNodeStatus((current) => ({ ...current, [event.nodeId!]: 'running' }))
-      }
-      if (event.kind === 'node_finished' && event.nodeId) {
-        const status: NodeRunStatus = event.status === 'error'
-          ? 'error'
-          : event.status === 'skipped' || event.status === 'cancelled'
-            ? 'skipped'
-            : 'success'
-        setNodeStatus((current) => ({ ...current, [event.nodeId!]: status }))
-        if (event.output) {
-          setNodeOutput((current) => ({ ...current, [event.nodeId!]: event.output! }))
-        }
-        if (event.error && event.status === 'error') setRunError(event.error)
-      }
-      if (event.kind === 'run_finished') {
-        const status = event.status ?? 'success'
-        setRuns((current) => [
-          {
-            id: event.runId,
-            origin: 'manual',
-            status,
-            startedAt: liveStartedAtRef.current ?? new Date().toISOString(),
-            error: event.error ?? null,
-          },
-          ...current.filter((run) => run.id !== event.runId),
-        ])
-        liveStartedAtRef.current = null
-        setRunning(false)
-        setLiveStartedAt(null)
-        if (status === 'error' && event.error) setRunError(event.error)
-        else setRunError('')
-        void loadRuns()
-      }
-    }).then((fn) => {
-      if (cancelled) fn()
-      else unlisten = fn
-    })
-    return () => {
-      cancelled = true
-      unlisten?.()
-    }
-  }, [automation.id, loadRuns])
-
   const commit = useCallback((nextNodes: AutomationRfNode[], nextEdges: Edge[]) => {
-    onChange(persist(automation, nextNodes, nextEdges, viewportRef.current))
-  }, [automation, onChange])
+    const spaced = ensureNodeSpacing(nextNodes)
+    nodesRef.current = spaced
+    edgesRef.current = nextEdges
+    setNodes(spaced)
+    onChange(persist(automation, spaced, nextEdges, viewportRef.current))
+  }, [automation, onChange, setNodes])
+
+  const onNodesChange: OnNodesChange<AutomationRfNode> = useCallback((changes) => {
+    const moving = new Set(changes.filter((change) => change.type === 'position').map((change) => change.id))
+    const next = applyNodeChanges(changes, nodesRef.current)
+    const spaced = moving.size ? ensureNodeSpacing(next, moving) : next
+    nodesRef.current = spaced
+    setNodes(spaced)
+  }, [setNodes])
 
   const onConnect: OnConnect = useCallback((connection: Connection) => {
     if (!connection.source || !connection.target) return
@@ -471,6 +443,12 @@ function EditorInner({
     if (!isTauriRuntime()) return
     setRunError('')
     try {
+      const problems = [...workflowIssues(automation, english), ...await automationApi.validate(automation)]
+        .filter((issue) => issue.severity === 'error' && !automation.nodes.find((node) => node.id === issue.nodeId)?.data.disabled)
+      if (problems.length) {
+        if (problems[0].nodeId) setSelectedId(problems[0].nodeId)
+        throw new Error(problems[0].message)
+      }
       await onFlushSave()
       setRunning(true)
       await automationApi.run(automation.id, untilNodeId)
@@ -478,7 +456,19 @@ function EditorInner({
       setRunning(false)
       setRunError(err instanceof Error ? err.message : String(err))
     }
-  }, [automation.id, onFlushSave])
+  }, [automation, english, onFlushSave, setRunError, setRunning])
+
+  const testSelected = async (input: NodeOutput) => {
+    if (!isTauriRuntime()) throw new Error(english ? 'Node tests require the desktop app' : '单节点测试需要在桌面应用中执行')
+    if (!selected) return
+    const problems = issues.filter((issue) => issue.nodeId === selected.id && issue.severity === 'error')
+    if (problems.length) throw new Error(problems[0].message)
+    await onFlushSave()
+    setRunError('')
+    setRunning(true)
+    try { await automationApi.testNode(automation.id, selected.id, input) }
+    catch (err) { setRunning(false); throw err }
+  }
 
   const cancelRun = useCallback(async () => {
     try {
@@ -486,7 +476,7 @@ function EditorInner({
     } catch (err) {
       setRunError(err instanceof Error ? err.message : String(err))
     }
-  }, [automation.id])
+  }, [automation.id, setRunError])
 
   const addAgentSlot = useCallback((agentId: string, slot: AgentSlot) => {
     const agent = nodesRef.current.find((node) => node.id === agentId)
@@ -629,6 +619,7 @@ function EditorInner({
       <div className="kv-automation-editor-body">
         <div className="kv-automation-canvas">
           <CanvasChromeContext.Provider value={canvasChrome}>
+          <ValidationContext.Provider value={issues}>
           <NodeRunStatusContext.Provider value={nodeStatus}>
             <ReactFlow
               nodes={nodes}
@@ -699,6 +690,7 @@ function EditorInner({
               <Controls showInteractive={false} />
             </ReactFlow>
           </NodeRunStatusContext.Provider>
+          </ValidationContext.Provider>
           </CanvasChromeContext.Provider>
           <div className="kv-automation-capsule-wrap">
             <div className="kv-automation-capsule">
@@ -757,6 +749,12 @@ function EditorInner({
           />
         </div>
         <div className="kv-automation-side">
+          {issues.length > 0 && <details className="kv-workbench-checks">
+            <summary>{english ? 'Configuration checks' : '配置检查'} · {issues.length}</summary>
+            {issues.map((issue, index) => <button type="button" className="kv-menu-item" key={index} onClick={() => { if (issue.nodeId) { setSelectedId(issue.nodeId); setPicker(null) } }}>
+              {automation.nodes.find((node) => node.id === issue.nodeId)?.data.label}: {issue.message}
+            </button>)}
+          </details>}
           {picker || !selected ? (
             <AddNodePicker
               kind={picker ?? (hasTrigger ? 'action' : 'trigger')}
@@ -768,6 +766,8 @@ function EditorInner({
               } : undefined}
             />
           ) : (
+            <WorkflowWorkbench key={selected.id} graph={automation} node={selected} run={runData} running={running}
+              issues={issues.filter((issue) => issue.nodeId === selected.id)} onChange={patchSelected} onTest={testSelected}>
             <NodeInspector
               node={selected}
               onChange={(next) => {
@@ -778,6 +778,7 @@ function EditorInner({
               running={running}
               lastOutput={nodeOutput[selected.id]}
             />
+            </WorkflowWorkbench>
           )}
         </div>
       </div>
