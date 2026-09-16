@@ -1,11 +1,13 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     AdditionalDirectory, ChatAssistant, ChatAssistantIndex, ChatAssistantSnapshot, ChatProject,
@@ -14,6 +16,10 @@ use super::{
 };
 
 const WRITE_RETRY_ATTEMPTS: usize = 3;
+
+#[cfg(test)]
+#[path = "storage_restart_tests.rs"]
+mod restart_goal_tests;
 
 fn temporary_write_path(path: &Path) -> PathBuf {
     path.parent()
@@ -115,65 +121,192 @@ pub(crate) fn read_conversation_file(path: &Path, id: &str) -> Result<Conversati
     serde_json::from_str(&content).map_err(|e| format!("对话文件已损坏，无法加载（{id}）：{e}"))
 }
 
-fn load_conversation_list_in_dir(dir: &Path) -> Result<Vec<ConversationListItem>, String> {
-    let entries = fs::read_dir(dir).map_err(|e| format!("read conversations dir: {e}"))?;
-    let mut conversations = Vec::new();
+/// Only the identity needed to recheck a restart candidate under its keyed lock.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct RestartGoal {
+    pub id: String,
+    pub version: u64,
+    pub status: super::GoalStatus,
+}
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                eprintln!("skip unreadable conversation dir entry: {e}");
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) == Some("index.json")
-            || path.extension().and_then(|ext| ext.to_str()) != Some("json")
-        {
-            continue;
+/// Stop as soon as goal_state is decoded. New files put it before messages;
+/// legacy files are streamed through IgnoredAny without allocating the history.
+/// This is candidate discovery, not full-file validation: candidates are loaded
+/// normally again under the repository lock before any change is persisted.
+fn read_restart_goal(reader: impl Read) -> Result<Option<RestartGoal>, String> {
+    struct GoalVisitor<'a>(&'a mut Option<Option<RestartGoal>>);
+    impl<'de> serde::de::Visitor<'de> for GoalVisitor<'_> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a conversation object")
         }
 
-        let id = match path.file_stem().and_then(|stem| stem.to_str()) {
-            Some(id) if validate_conversation_id(id).is_ok() => id,
-            _ => continue,
-        };
-
-        match read_conversation_file(&path, id) {
-            Ok(conversation) => conversations.push(ConversationListItem::from(&conversation)),
-            Err(e) => eprintln!("skip corrupt conversation file {id}: {e}"),
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "goal_state" {
+                    *self.0 = Some(map.next_value()?);
+                    // Returning Ok here would make serde_json expect the closing
+                    // brace. This private sentinel intentionally cancels parsing;
+                    // only a successfully decoded goal_state enables the fast exit.
+                    return Err(serde::de::Error::custom("Goal header decoded"));
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
         }
     }
 
-    Ok(conversations)
+    let mut found = None;
+    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(reader));
+    let result = serde::Deserializer::deserialize_map(&mut deserializer, GoalVisitor(&mut found));
+    match found {
+        Some(goal) => Ok(goal),
+        None => result.map(|()| None).map_err(|error| error.to_string()),
+    }
+}
+
+pub(crate) fn restart_goal_candidates(
+    app: &AppHandle,
+) -> Result<Vec<(String, RestartGoal)>, String> {
+    restart_goal_candidates_in_dir(&conversations_dir(app)?)
+}
+
+fn restart_goal_candidates_in_dir(dir: &Path) -> Result<Vec<(String, RestartGoal)>, String> {
+    // Read the actual files, not index.json: a crash between the conversation
+    // write and the index write must not conceal a running Goal.
+    let mut candidates = Vec::new();
+    for id in conversation_file_ids_in_dir(dir)? {
+        let path = dir.join(format!("{id}.json"));
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("skip unreadable Goal recovery file {id}: {error}");
+                continue;
+            }
+        };
+        match read_restart_goal(file) {
+            Ok(Some(goal)) if super::goal::is_running(goal.status) => candidates.push((id, goal)),
+            Ok(_) => {}
+            Err(error) => eprintln!("skip invalid Goal recovery file {id}: {error}"),
+        }
+    }
+    Ok(candidates)
+}
+
+struct ConversationIndexCacheEntry {
+    index: ConversationIndex,
+    needs_persist: bool,
+}
+
+fn conversation_index_cache() -> &'static Mutex<HashMap<PathBuf, ConversationIndexCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ConversationIndexCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_conversation_index_cache(dir: PathBuf, index: ConversationIndex, needs_persist: bool) {
+    conversation_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            dir,
+            ConversationIndexCacheEntry {
+                index,
+                needs_persist,
+            },
+        );
+}
+
+pub(crate) fn conversation_index_needs_persist(app: &AppHandle) -> bool {
+    let Ok(dir) = conversations_dir(app) else {
+        return false;
+    };
+    conversation_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&dir)
+        .is_some_and(|entry| entry.needs_persist)
+}
+
+/// 把内存里补齐的索引写回 `index.json`。调用方必须持有 `index_lock`。
+pub(crate) fn persist_healed_conversation_index(app: &AppHandle) -> Result<(), String> {
+    if !conversation_index_needs_persist(app) {
+        return Ok(());
+    }
+    let index = load_index_or_scan(app)?;
+    save_index(app, &index)
+}
+
+/// 索引缺的会话才读正文；已在 index 里的条目原样保留，绝不整目录重扫。
+fn merge_missing_conversations(
+    dir: &Path,
+    mut index: ConversationIndex,
+    file_ids: &[String],
+) -> ConversationIndex {
+    let indexed: HashSet<String> = index
+        .conversations
+        .iter()
+        .map(|item| item.id.clone())
+        .collect();
+    for id in file_ids {
+        if indexed.contains(id) {
+            continue;
+        }
+        let path = dir.join(format!("{id}.json"));
+        match read_conversation_file(&path, id) {
+            Ok(conversation) => index
+                .conversations
+                .push(ConversationListItem::from(&conversation)),
+            Err(e) => eprintln!("skip corrupt conversation file {id}: {e}"),
+        }
+    }
+    index
 }
 
 pub(crate) fn load_index_or_scan(app: &AppHandle) -> Result<ConversationIndex, String> {
-    load_index_or_scan_in_dir(&conversations_dir(app)?)
+    let dir = conversations_dir(app)?;
+    let file_ids = conversation_file_ids_in_dir(&dir).unwrap_or_default();
+    let mut cache = conversation_index_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&dir) {
+        if index_covers_files(&entry.index, &file_ids) {
+            return Ok(entry.index.clone());
+        }
+    }
+    let (index, healed) = load_index_or_scan_in_dir(&dir)?;
+    let needs_persist = healed || cache.get(&dir).is_some_and(|entry| entry.needs_persist);
+    cache.insert(
+        dir,
+        ConversationIndexCacheEntry {
+            index: index.clone(),
+            needs_persist,
+        },
+    );
+    Ok(index)
 }
 
 /// index.json 只是缓存；conv_<id>.json 才是真相源。
 ///
-/// 对账口径必须**廉价**：一次 readdir 只比文件名，不读也不反序列化任何对话正文。曾经改成
-/// "全量读所有 conv_*.json 再逐条比 revision"，于是 500 个会话的用户每次刷侧栏都要把几百 MB
-/// JSON 同步解析一遍，index.json 这层缓存等于作废。索引里缺任一磁盘文件（索引残缺/缺失/写坏）
-/// 才退化成全量重扫；多余的幽灵条目无害，按 updated_at 排序时会被过滤掉。
+/// 对账口径必须**廉价**：一次 readdir 只比文件名，不读也不反序列化任何对话正文。
+/// 索引缺文件时只读缺的那几份，补进现有条目——不要把已索引的会话整本再 parse 一遍。
+/// 多余的幽灵条目无害，按 updated_at 排序时会被过滤掉。
 ///
-/// **只读不写**：自愈落盘统一交给持有 `index_lock` 的写路径（`repository::persist_locked` /
-/// `bulk_mutate_loaded` / `delete_conversation`）。这里顺手 `save_index` 会绕开那把锁，
-/// 和并发的持久化 lost update——刚存的会话会在侧栏短暂消失。
-fn load_index_or_scan_in_dir(dir: &Path) -> Result<ConversationIndex, String> {
+/// **只读不写**：自愈落盘统一交给持有 `index_lock` 的写路径（`persist_healed_conversation_index`
+/// / `repository::persist_locked` / `bulk_mutate_loaded` / `delete_conversation`）。这里顺手
+/// `save_index` 会绕开那把锁，和并发的持久化 lost update——刚存的会话会在侧栏短暂消失。
+fn load_index_or_scan_in_dir(dir: &Path) -> Result<(ConversationIndex, bool), String> {
     let file_ids = conversation_file_ids_in_dir(dir).unwrap_or_default();
     match load_index_in_dir(dir) {
-        Ok(index) if index_covers_files(&index, &file_ids) => Ok(index),
-        Ok(_) => Ok(ConversationIndex {
-            conversations: load_conversation_list_in_dir(dir)?,
-        }),
+        Ok(index) if index_covers_files(&index, &file_ids) => Ok((index, false)),
+        Ok(index) => Ok((merge_missing_conversations(dir, index, &file_ids), true)),
         Err(e) => {
             eprintln!("conversation index unavailable, rebuilding list from files: {e}");
-            Ok(ConversationIndex {
-                conversations: load_conversation_list_in_dir(dir)?,
-            })
+            Ok((
+                merge_missing_conversations(dir, ConversationIndex::default(), &file_ids),
+                true,
+            ))
         }
     }
 }
@@ -274,7 +407,11 @@ fn load_index_in_dir(dir: &Path) -> Result<ConversationIndex, String> {
 pub(crate) fn save_index(app: &AppHandle, index: &ConversationIndex) -> Result<(), String> {
     let path = index_file_path(app)?;
     let content = serde_json::to_string(index).map_err(|e| format!("serialize index: {e}"))?;
-    atomic_write(&path, &content, "index")
+    atomic_write(&path, &content, "index")?;
+    if let Some(dir) = path.parent() {
+        remember_conversation_index_cache(dir.to_path_buf(), index.clone(), false);
+    }
+    Ok(())
 }
 
 pub fn load_project_index(app: &AppHandle) -> Result<ChatProjectIndex, String> {
@@ -993,8 +1130,8 @@ fn compare_library_items(
 
 /// 全量索引搜索：在所有对话（不止侧栏默认加载的前 N 个）的标题/预览/文件夹里做大小写
 /// 不敏感子串匹配，按更新时间倒序返回前 limit 个。让侧栏搜索能找到已掉出"最近"列表的老对话。
-/// 元数据命中只读 index.json（轻量）；没命中的才逐个读对话正文做全文匹配——所以这个函数的
-/// 成本与对话总数成正比，别放在任何全局写锁里。
+/// 元数据命中只读 index.json（轻量）；没命中的才读对话正文。先按 `updated_at` 排再扫，
+/// 凑够 limit 就停——结果集与「扫完全部再截断」相同，不必为了第 31 条去解析更旧的整本 JSON。
 ///
 /// 每条命中附带首个匹配位置（`match_field` / `match_message_id` / `match_snippet`），
 /// 供全局搜索高亮片段与「点进结果跳到那条消息」。
@@ -1004,23 +1141,28 @@ pub fn search_conversations(
     limit: usize,
 ) -> Result<Vec<ConversationSearchHit>, String> {
     let needle = query.trim().to_lowercase();
-    if needle.is_empty() {
+    if needle.is_empty() || limit == 0 {
         return Ok(vec![]);
     }
     let index = load_index_or_scan(app)?;
     let mut hits: Vec<ConversationSearchHit> = Vec::new();
-    for c in index.conversations {
-        // 侧栏搜索不包含归档
-        if c.archived {
-            continue;
-        }
+    for c in rank_conversations_for_search(index.conversations) {
         if let Some(hit) = match_conversation_for_search(app, c, &needle) {
             hits.push(hit);
+            if hits.len() >= limit {
+                break;
+            }
         }
     }
-    hits.sort_by(|a, b| b.item.updated_at.cmp(&a.item.updated_at));
-    hits.truncate(limit);
     Ok(hits)
+}
+
+fn rank_conversations_for_search(
+    mut items: Vec<ConversationListItem>,
+) -> Vec<ConversationListItem> {
+    items.retain(|item| !item.archived);
+    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    items
 }
 
 /// 构造一条搜索命中：优先标题 → 预览 → 文件夹 → 助手/模型 → 正文/思考（首条消息）。
@@ -1082,9 +1224,7 @@ fn match_conversation_for_search(
         });
     }
 
-    let Ok(conv) = load_conversation(app, &item.id) else {
-        return None;
-    };
+    let conv = load_conversation_for_search(app, &item.id, needle)?;
     first_message_match(&conv, needle).map(|(field, message_id, snippet)| ConversationSearchHit {
         item,
         match_field: field,
@@ -1093,13 +1233,42 @@ fn match_conversation_for_search(
     })
 }
 
-/// 全文匹配：读会话文件，扫所有消息的 content 与 reasoning（大小写不敏感）。
-/// 读/解析失败按不匹配处理，不让单个坏文件毁掉整次搜索。
+/// 全文匹配：原文里连关键词都没有就跳过 serde；读/解析失败按不匹配处理。
 fn conversation_content_matches(app: &AppHandle, id: &str, needle: &str) -> bool {
-    let Ok(conv) = load_conversation(app, id) else {
+    load_conversation_for_search(app, id, needle).is_some_and(|conv| messages_match(&conv, needle))
+}
+
+fn load_conversation_for_search(
+    app: &AppHandle,
+    id: &str,
+    needle_lower: &str,
+) -> Option<Conversation> {
+    let path = conversation_file_path(app, id).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    if !conversation_raw_might_contain(&raw, needle_lower) {
+        return None;
+    }
+    serde_json::from_str(&raw).ok()
+}
+
+/// 保守预筛：只有确定解码后的正文也不可能匹配时，才跳过反序列化。
+/// 转义可能打断查询文本，也可能改变非 ASCII 字母的上下文大小写转换。
+fn conversation_raw_might_contain(raw: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
         return false;
-    };
-    messages_match(&conv, needle)
+    }
+    if raw.contains('\\')
+        && (raw.contains(r"\u")
+            || needle_lower.chars().any(|c| {
+                matches!(c, '"' | '\\' | '/')
+                    || c.is_control()
+                    || (!c.is_ascii() && (c.is_lowercase() || c.is_uppercase()))
+            }))
+    {
+        return true;
+    }
+    // 与 first_message_match 一样保留 Unicode 大小写语义。
+    raw.contains(needle_lower) || raw.to_lowercase().contains(needle_lower)
 }
 
 fn messages_match(conv: &Conversation, needle: &str) -> bool {
@@ -2762,7 +2931,7 @@ mod index_self_heal_tests {
         };
         // 索引覆盖全部文件(还多一个幽灵条目 conv_b)→ 信任
         assert!(index_covers_files(&index, &["conv_a".to_string()]));
-        // 有文件(conv_c)不在索引 → 需重建
+        // 有文件(conv_c)不在索引 → 需补缺
         assert!(!index_covers_files(
             &index,
             &["conv_a".to_string(), "conv_c".to_string()]
@@ -2773,7 +2942,7 @@ mod index_self_heal_tests {
     ///
     /// 这条挂了就意味着"侧栏刷新退化成全量扫盘"那个性能回退回来了——500 个会话的用户每点
     /// 一次侧栏就要同步解析几百 MB JSON。这里用"文件名合法但正文是坏 JSON"的会话当探针:
-    /// 只要还有人去读正文,它就会被判为损坏并从列表里消失。
+    /// 已在索引里的条目只要有人去读正文,就会被判损坏并从列表里消失。
     #[test]
     fn cheap_reconciliation_trusts_index_without_reading_conversation_bodies() {
         let dir = temp_dir();
@@ -2787,20 +2956,190 @@ mod index_self_heal_tests {
         .unwrap();
         fs::write(dir.join("conv_a.json"), "{ not json at all").unwrap();
 
-        let index = load_index_or_scan_in_dir(&dir).unwrap();
+        let (index, healed) = load_index_or_scan_in_dir(&dir).unwrap();
+        assert!(!healed);
         assert_eq!(index.conversations.len(), 1);
         assert_eq!(index.conversations[0].id, "conv_a");
 
-        // 出现索引没覆盖的文件才允许退化成全量重扫。
+        // 索引没覆盖的新文件只读那一份；已在索引里的会话仍然不读正文。
         fs::write(dir.join("conv_b.json"), "{ also broken").unwrap();
-        assert!(load_index_or_scan_in_dir(&dir)
-            .unwrap()
-            .conversations
-            .is_empty());
+        let (index, healed) = load_index_or_scan_in_dir(&dir).unwrap();
+        assert!(healed);
+        assert_eq!(index.conversations.len(), 1);
+        assert_eq!(index.conversations[0].id, "conv_a");
 
-        // 且重扫只读不写:自愈落盘归持有 index_lock 的写路径,这里写回就会 lost update。
+        // 且补缺只读不写:自愈落盘归持有 index_lock 的写路径,这里写回就会 lost update。
         assert_eq!(load_index_in_dir(&dir).unwrap().conversations.len(), 1);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_index_entries_are_merged_without_rereading_indexed_bodies() {
+        let dir = temp_dir();
+        fs::write(
+            dir.join("index.json"),
+            serde_json::to_string(&ConversationIndex {
+                conversations: vec![list_item("conv_a", Some(1))],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // 已索引会话正文损坏：如果补缺时整目录重扫，conv_a 会被当成坏文件丢掉。
+        fs::write(dir.join("conv_a.json"), "{ not json at all").unwrap();
+        fs::write(
+            dir.join("conv_b.json"),
+            serde_json::json!({
+                "id": "conv_b",
+                "title": "new",
+                "provider_id": "provider",
+                "model": "model",
+                "created_at": 2,
+                "updated_at": 2,
+                "messages": [{
+                    "id": "msg_1",
+                    "role": "user",
+                    "content": "hello from the new conversation",
+                    "timestamp": 2
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (index, healed) = load_index_or_scan_in_dir(&dir).unwrap();
+        assert!(healed);
+        let mut ids: Vec<_> = index
+            .conversations
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["conv_a", "conv_b"]);
+        let added = index
+            .conversations
+            .iter()
+            .find(|item| item.id == "conv_b")
+            .expect("merged missing conversation");
+        assert_eq!(added.title, "new");
+        assert_eq!(added.preview, "hello from the new conversation");
+
+        assert_eq!(load_index_in_dir(&dir).unwrap().conversations.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn search_item(id: &str, updated_at: i64, archived: bool) -> ConversationListItem {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "revision": 1,
+            "title": id,
+            "preview": "",
+            "provider_id": "provider",
+            "model": "model",
+            "message_count": 0,
+            "created_at": 1,
+            "updated_at": updated_at,
+            "archived": archived
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn search_ranks_unarchived_newest_first() {
+        let ranked = rank_conversations_for_search(vec![
+            search_item("conv_old", 1, false),
+            search_item("conv_archived", 9, true),
+            search_item("conv_new", 5, false),
+        ]);
+        let ids: Vec<_> = ranked.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["conv_new", "conv_old"]);
+    }
+
+    #[test]
+    fn search_raw_prefilter_skips_serde_when_needle_absent() {
+        let raw = r#"{"id":"conv_a","messages":[{"content":"你好世界"}]}"#;
+        assert!(conversation_raw_might_contain(raw, "你好"));
+        assert!(!conversation_raw_might_contain(raw, "不存在的词"));
+        assert!(!conversation_raw_might_contain(raw, "hello"));
+        assert!(conversation_raw_might_contain(
+            r#"{"content":"HELLO WORLD"}"#,
+            "hello"
+        ));
+        assert!(!conversation_raw_might_contain(
+            r#"{"content":"HELLO WORLD"}"#,
+            "missing"
+        ));
+        assert!(!conversation_raw_might_contain(raw, ""));
+        assert!(!conversation_raw_might_contain(
+            r#"{"content":"first line\nsecond line"}"#,
+            "missing"
+        ));
+    }
+
+    fn assert_search_prefilter_preserves_match(encoded_text: &str, needle: &str) {
+        for field in ["content", "reasoning"] {
+            let mut value = serde_json::json!({
+                "id": "conv_search",
+                "title": "Search regression",
+                "provider_id": "provider",
+                "model": "model",
+                "created_at": 1,
+                "updated_at": 1,
+                "messages": [{
+                    "id": "msg_search",
+                    "role": "assistant",
+                    "content": "",
+                    "timestamp": 1
+                }]
+            });
+            value["messages"][0][field] = serde_json::json!("__search_text__");
+            // 保留输入的 JSON 转义写法，覆盖导入文件中非规范但合法的编码。
+            let raw = value
+                .to_string()
+                .replace(r#""__search_text__""#, encoded_text);
+            let conversation: Conversation = serde_json::from_str(&raw).unwrap();
+            let needle_lower = needle.to_lowercase();
+            assert!(
+                messages_match(&conversation, &needle_lower),
+                "fixture must match {field}: {encoded_text} / {needle:?}"
+            );
+            assert!(
+                conversation_raw_might_contain(&raw, &needle_lower),
+                "prefilter rejected {field}: {encoded_text} / {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_raw_prefilter_preserves_json_escaped_matches() {
+        for (encoded, needle) in [
+            (r#""C:\\Users\\alice""#, r"c:\users\alice"),
+            (r#""say \"hello\"""#, "\"hello\""),
+            (r#""first\nsecond""#, "first\nsecond"),
+            (r#""first\tsecond""#, "first\tsecond"),
+            (r#""first\rsecond""#, "first\rsecond"),
+            (r#""first\bsecond""#, "first\u{0008}second"),
+            (r#""first\fsecond""#, "first\u{000c}second"),
+            (r#""foo\/bar""#, "foo/bar"),
+            (r#""\u4f60\u597d""#, "你好"),
+            (r#""fo\u006fbar""#, "foobar"),
+            (r#""\uD83D\uDE00""#, "😀"),
+        ] {
+            assert_search_prefilter_preserves_match(encoded, needle);
+        }
+    }
+
+    #[test]
+    fn search_raw_prefilter_preserves_unicode_case_matches() {
+        for (encoded, needle) in [
+            (r#""ПРИВЕТ""#, "привет"),
+            (r#""É""#, "é"),
+            (r#""ΟΣ""#, "ος"),
+            (r#""\nΣ""#, "σ"),
+            (r#""İ""#, "i\u{0307}"),
+            (r#""\u00c9""#, "é"),
+        ] {
+            assert_search_prefilter_preserves_match(encoded, needle);
+        }
     }
 }
 

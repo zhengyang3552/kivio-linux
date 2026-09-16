@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -199,6 +199,10 @@ pub struct ConversationRepository {
     barrier: RwLock<()>,
     conversation_locks: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
     index_lock: Mutex<()>,
+    /// Goal mutations made by this process while startup recovery is pending.
+    /// Ordinary message/context writes do not enter this set. Drop it when
+    /// recovery finishes so it never becomes a lifetime-long conversation cache.
+    restart_goal_changes: StdMutex<Option<HashSet<String>>>,
 }
 
 impl Default for ConversationRepository {
@@ -207,11 +211,111 @@ impl Default for ConversationRepository {
             barrier: RwLock::new(()),
             conversation_locks: StdMutex::new(HashMap::new()),
             index_lock: Mutex::new(()),
+            restart_goal_changes: StdMutex::new(Some(HashSet::new())),
         }
     }
 }
 
 impl ConversationRepository {
+    fn note_goal_change(
+        &self,
+        id: &str,
+        before: Option<&super::GoalState>,
+        after: Option<&super::GoalState>,
+    ) {
+        if before == after {
+            return;
+        }
+        if let Some(changes) = self
+            .restart_goal_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            changes.insert(id.to_string());
+        }
+    }
+
+    fn goal_changed_since_start(&self, id: &str) -> bool {
+        self.restart_goal_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|changes| changes.contains(id))
+    }
+
+    pub async fn pause_unfinished_goals_after_restart(
+        &self,
+        app: &AppHandle,
+    ) -> RepositoryResult<usize> {
+        let result = self.pause_unfinished_goals_after_restart_inner(app).await;
+        *self
+            .restart_goal_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        result
+    }
+
+    async fn pause_unfinished_goals_after_restart_inner(
+        &self,
+        app: &AppHandle,
+    ) -> RepositoryResult<usize> {
+        let candidates = {
+            let _barrier = self.barrier.read().await;
+            let app = app.clone();
+            Self::spawn_storage(
+                move || super::storage::restart_goal_candidates(&app),
+                "find Goals interrupted by restart",
+            )
+            .await?
+        };
+        let mut changed = 0;
+        for (id, candidate) in candidates {
+            let _barrier = self.barrier.read().await;
+            let lock = self.conversation_lock(&id);
+            let _conversation = lock.lock().await;
+            // A new/resumed/claimed Goal from this launch must survive even if
+            // its file was observed by the background startup scan.
+            if self.goal_changed_since_start(&id) {
+                continue;
+            }
+            let app_for_read = app.clone();
+            let id_for_read = id.clone();
+            let latest = Self::spawn_storage(
+                move || {
+                    let path = super::storage::conversation_file_path(&app_for_read, &id_for_read)?;
+                    if !path.exists() {
+                        return Ok(None);
+                    }
+                    super::storage::read_conversation_file(&path, &id_for_read).map(Some)
+                },
+                "load interrupted Goal conversation",
+            )
+            .await;
+            let mut latest = match latest {
+                Ok(Some(latest)) => latest,
+                Ok(None) => continue,
+                Err(error) => {
+                    // One damaged conversation must not prevent other Goals
+                    // from being paused. The original file remains untouched.
+                    eprintln!("skip interrupted Goal {id}: {error}");
+                    continue;
+                }
+            };
+            if !super::goal::pause_interrupted_goal(&mut latest, &candidate)? {
+                continue;
+            }
+            increment_revision(&mut latest)?;
+            latest.updated_at = chrono::Local::now().timestamp();
+            let persisted = self.persist_locked(app, latest).await?;
+            // Reads can proceed during the scan. A window that already showed
+            // this Goal must observe its recovered state without reopening.
+            super::goal::emit_goal_state(app, &persisted);
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
     fn conversation_lock(&self, id: &str) -> Arc<Mutex<()>> {
         let mut locks = self
             .conversation_locks
@@ -230,16 +334,23 @@ impl ConversationRepository {
         let _barrier = self.barrier.read().await;
         let lock = self.conversation_lock(id);
         let _conversation = lock.lock().await;
-        super::storage::load_conversation(app, id).map_err(Into::into)
+        let app = app.clone();
+        let id = id.to_string();
+        Self::spawn_storage(
+            move || super::storage::load_conversation(&app, &id),
+            "load conversation",
+        )
+        .await
     }
 
-    /// 以下三个纯读操作只拿共享 barrier，且**不拿 `index_lock`**。
+    /// 以下纯读操作只拿共享 barrier。索引完整时**不拿 `index_lock`**。
     ///
     /// `index_lock` 存在的意义是串行化 index.json 的 read-modify-write（`persist_locked` /
-    /// `bulk_mutate_loaded` / `delete_conversation`）；纯读方不改任何东西，而 `atomic_write`
-    /// 是 write-temp + rename，读者只会看到完整的旧版本或完整的新版本，撕不了。以前这几个
-    /// 读操作既拿独占 barrier 又拿 index_lock，于是"流式回答中途在侧栏搜一下"会让 agent 每轮
-    /// 的 `persist_partial_assistant` 排队等一次全量文件扫描，反之亦然。
+    /// `bulk_mutate_loaded` / `delete_conversation` / 残缺索引的补缺落盘）；纯读方不改任何
+    /// 东西，而 `atomic_write` 是 write-temp + rename，读者只会看到完整的旧版本或完整的新
+    /// 版本，撕不了。以前这几个读操作既拿独占 barrier 又拿 index_lock，于是"流式回答中途在
+    /// 侧栏搜一下"会让 agent 每轮的 `persist_partial_assistant` 排队等一次全量文件扫描，
+    /// 反之亦然。索引缺条目时会在读完后补缺并持 `index_lock` 写回一次，避免下次开窗再读正文。
     ///
     /// 共享 barrier 依然挡住 `bulk_mutate_loaded`（它拿独占），所以"批量迁移期间读到半套数据"
     /// 这条不变式没变。加锁顺序仍是 barrier → conversation → index，没有新的环。
@@ -253,8 +364,23 @@ impl ConversationRepository {
         set_id: Option<String>,
     ) -> RepositoryResult<Vec<ConversationListItem>> {
         let _barrier = self.barrier.read().await;
-        super::storage::get_conversations(app, offset, limit, folder, project_id, set_id)
-            .map_err(Into::into)
+        let app_for_read = app.clone();
+        let conversations = Self::spawn_storage(
+            move || {
+                super::storage::get_conversations(
+                    &app_for_read,
+                    offset,
+                    limit,
+                    folder,
+                    project_id,
+                    set_id,
+                )
+            },
+            "list conversations",
+        )
+        .await?;
+        self.persist_healed_index_if_needed(app).await;
+        Ok(conversations)
     }
 
     pub async fn search(
@@ -264,7 +390,15 @@ impl ConversationRepository {
         limit: usize,
     ) -> RepositoryResult<Vec<super::ConversationSearchHit>> {
         let _barrier = self.barrier.read().await;
-        super::storage::search_conversations(app, query, limit).map_err(Into::into)
+        let app_for_read = app.clone();
+        let query = query.to_string();
+        let hits = Self::spawn_storage(
+            move || super::storage::search_conversations(&app_for_read, &query, limit),
+            "search conversations",
+        )
+        .await?;
+        self.persist_healed_index_if_needed(app).await;
+        Ok(hits)
     }
 
     /// 对话库查询（筛选/排序/分页 + total）。共享 barrier，不挡单会话写。
@@ -274,7 +408,43 @@ impl ConversationRepository {
         query: super::storage::ConversationLibraryQuery,
     ) -> RepositoryResult<super::storage::ConversationLibraryPage> {
         let _barrier = self.barrier.read().await;
-        super::storage::query_conversations(app, query).map_err(Into::into)
+        let app_for_read = app.clone();
+        let page = Self::spawn_storage(
+            move || super::storage::query_conversations(&app_for_read, query),
+            "query conversation library",
+        )
+        .await?;
+        self.persist_healed_index_if_needed(app).await;
+        Ok(page)
+    }
+
+    async fn spawn_storage<T, F>(op: F, label: &'static str) -> RepositoryResult<T>
+    where
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        tauri::async_runtime::spawn_blocking(op)
+            .await
+            .map_err(|error| {
+                ConversationRepositoryError::Storage(format!("{label} join: {error}"))
+            })?
+            .map_err(Into::into)
+    }
+
+    async fn persist_healed_index_if_needed(&self, app: &AppHandle) {
+        if !super::storage::conversation_index_needs_persist(app) {
+            return;
+        }
+        let _index = self.index_lock.lock().await;
+        let app = app.clone();
+        if let Err(error) = Self::spawn_storage(
+            move || super::storage::persist_healed_conversation_index(&app),
+            "persist healed conversation index",
+        )
+        .await
+        {
+            eprintln!("{error}");
+        }
     }
 
     /// 只读探查，不写。"同一个空对话被两个新建请求同时复用"这条不变式由调用方的
@@ -292,16 +462,30 @@ impl ConversationRepository {
         assistant_id: Option<&str>,
     ) -> RepositoryResult<Option<Conversation>> {
         let _barrier = self.barrier.read().await;
-        super::storage::find_reusable_blank_conversation(
-            app,
-            provider_id,
-            model,
-            folder,
-            project_id,
-            set_id,
-            assistant_id,
+        let app_for_read = app.clone();
+        let provider_id = provider_id.to_string();
+        let model = model.to_string();
+        let folder = folder.map(str::to_string);
+        let project_id = project_id.map(str::to_string);
+        let set_id = set_id.map(str::to_string);
+        let assistant_id = assistant_id.map(str::to_string);
+        let found = Self::spawn_storage(
+            move || {
+                super::storage::find_reusable_blank_conversation(
+                    &app_for_read,
+                    &provider_id,
+                    &model,
+                    folder.as_deref(),
+                    project_id.as_deref(),
+                    set_id.as_deref(),
+                    assistant_id.as_deref(),
+                )
+            },
+            "find reusable blank conversation",
         )
-        .map_err(Into::into)
+        .await?;
+        self.persist_healed_index_if_needed(app).await;
+        Ok(found)
     }
 
     pub async fn delete(&self, app: &AppHandle, id: &str) -> RepositoryResult<Vec<String>> {
@@ -401,33 +585,35 @@ impl ConversationRepository {
         self.persist_locked(app, latest).await
     }
 
-    /// 存量迁移：把落盘 `model_messages` 里残留的图片 base64 外置成附件文件引用。
+    /// 打开会话：一次读盘。老会话 `model_messages` 里若还躺着图片 base64，顺手外置后写回
+    /// （新写入天然会外置，所以只覆盖「打开过但再也没发消息」的存量）。
     ///
-    /// 新写入天然会外置（`write_conversation_file` 每次落盘都跑），所以这里只为一种情况
-    /// 存在：**老会话被打开、但用户没再发消息**——那份几十 MB 的 JSON 会一直躺在盘上，
-    /// 每次打开都要全量 parse。谓词是廉价扫描，绝大多数会话直接返回 `None`、零开销。
-    ///
-    /// **不 bump `updated_at`**（同 `update_context` 的理由：迁移不是用户编辑，不该把会话
-    /// 顶到"最近更新"最前面）。revision 照常推进，并发写方的 CAS 语义不变。
-    /// 返回 `None` = 无需迁移。
+    /// **不 bump `updated_at`**（同 `update_context`：迁移不是用户编辑，不该顶到最近）。
+    /// revision 照常推进。无图时直接返回刚读到的会话，不再二次 `get`。
     pub async fn externalize_stored_images(
         &self,
         app: &AppHandle,
         id: &str,
-    ) -> RepositoryResult<Option<Conversation>> {
+    ) -> RepositoryResult<Conversation> {
         let _barrier = self.barrier.read().await;
         let lock = self.conversation_lock(id);
         let _conversation = lock.lock().await;
-        let mut latest = super::storage::load_conversation(app, id)?;
+        let app_for_read = app.clone();
+        let id_owned = id.to_string();
+        let mut latest = Self::spawn_storage(
+            move || super::storage::load_conversation(&app_for_read, &id_owned),
+            "load conversation",
+        )
+        .await?;
         if !latest.messages.iter().any(|message| {
             super::attachments::message_has_model_message_image_to_externalize(message)
                 || super::attachments::message_has_api_message_image_to_externalize(message)
         }) {
-            return Ok(None);
+            return Ok(latest);
         }
         increment_revision(&mut latest)?;
         // 真正的外置发生在 write_conversation_file 里（唯一的落盘出口）。
-        self.persist_locked(app, latest).await.map(Some)
+        self.persist_locked(app, latest).await
     }
 
     pub async fn prepare_ordinary_workspace(
@@ -484,6 +670,7 @@ impl ConversationRepository {
             )));
         }
         conversation.revision = 1;
+        self.note_goal_change(&conversation.id, None, conversation.goal_state.as_ref());
         self.persist_locked(app, conversation).await
     }
 
@@ -526,7 +713,16 @@ impl ConversationRepository {
             })??
         };
         validate_expected_revision(id, latest.revision, expected_revision)?;
+        let previous_goal = self
+            .restart_goal_changes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|_| latest.goal_state.clone());
         mutation(&mut latest)?;
+        if let Some(previous_goal) = previous_goal {
+            self.note_goal_change(id, previous_goal.as_ref(), latest.goal_state.as_ref());
+        }
         increment_revision(&mut latest)?;
         latest.updated_at = chrono::Local::now().timestamp();
         self.persist_locked(app, latest).await
@@ -852,6 +1048,30 @@ mod tests {
         let other = repository.conversation_lock("conv_b");
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn restart_goal_tracking_distinguishes_current_run_from_ordinary_writes() {
+        let repository = ConversationRepository::default();
+        let mut current = conversation();
+        super::super::goal::start(&mut current, "finish the fixture").unwrap();
+        let previous = current.goal_state.clone();
+
+        // Draft/context/message persistence preserves the Goal and must not
+        // prevent the abandoned Goal from being paused after a restart.
+        repository.note_goal_change(&current.id, previous.as_ref(), current.goal_state.as_ref());
+        assert!(!repository.goal_changed_since_start(&current.id));
+
+        // Claiming a run can leave the same id and version. Version CAS alone
+        // would miss this race and pause work started by the current process.
+        current.goal_state.as_mut().unwrap().active_run_id = Some("this-process-run".into());
+        repository.note_goal_change(&current.id, previous.as_ref(), current.goal_state.as_ref());
+        assert!(repository.goal_changed_since_start(&current.id));
+        assert!(!repository.goal_changed_since_start("conv_other"));
+
+        *repository.restart_goal_changes.lock().unwrap() = None;
+        repository.note_goal_change("conv_after_startup", None, current.goal_state.as_ref());
+        assert!(repository.restart_goal_changes.lock().unwrap().is_none());
     }
 
     fn context_state(tokens: usize) -> ConversationContextState {

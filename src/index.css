@@ -1032,6 +1032,10 @@ html.windows body {
   color: var(--text-faint);
 }
 
+.chat-composer-status:empty {
+  display: none;
+}
+
 .dark .chat-composer-status {
   background: rgba(255, 255, 255, 0.035);
 }

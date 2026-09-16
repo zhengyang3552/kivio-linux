@@ -604,19 +604,6 @@ fn chat_mode_tool_filter_respects_config_toggles() {
 }
 
 #[test]
-fn orchestrate_budget_bump_raises_rounds_but_keeps_unlimited() {
-    use crate::settings::ORCHESTRATE_MIN_TOOL_ROUNDS;
-    let bump =
-        |configured: Option<u32>| configured.map(|rounds| rounds.max(ORCHESTRATE_MIN_TOOL_ROUNDS));
-    // Configured below the floor -> raised to the floor.
-    assert_eq!(bump(Some(20)), Some(ORCHESTRATE_MIN_TOOL_ROUNDS));
-    // Configured above the floor -> preserved.
-    assert_eq!(bump(Some(80)), Some(80));
-    // Unlimited (None) stays unlimited.
-    assert_eq!(bump(None), None);
-}
-
-#[test]
 fn inline_code_request_ignores_attachment_safe_copy_paths() {
     let content = compose_user_content_for_api(
             "用 ```html 包起来给我",
@@ -2024,6 +2011,28 @@ fn token_split_returns_none_when_recent_window_covers_all() {
         crate::chat::agent::compaction::RECENT_KEEP_TOKENS,
     );
     assert!(split.is_none());
+}
+
+#[test]
+fn build_chat_api_messages_replays_saved_child_report_as_external_input() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state = Default::default();
+    conversation.messages = vec![test_chat_message(
+        "subagent-result-execution",
+        "assistant",
+        "[Sub-agent: A · Completed]\nSaved output: React",
+        1,
+    )];
+    let messages = build_chat_api_messages(None, "system", &conversation, None, None, &[]).unwrap();
+    assert_eq!(messages[1]["role"], "user");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Sub-agent"));
+    assert_eq!(
+        conversation.messages[0].role, "assistant",
+        "UI provenance remains unchanged"
+    );
 }
 
 #[test]

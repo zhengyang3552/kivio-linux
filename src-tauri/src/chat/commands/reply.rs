@@ -42,7 +42,8 @@ use super::resolve_thinking;
 use super::tooling::{
     append_agent_ask_user_tools, append_agent_todo_tools, append_goal_tools, apply_agent_plan_tool_filter,
     apply_chat_mode_tool_filter, apply_inline_code_request_tool_filter,
-    apply_web_search_mode_tool_filter, list_tools_for_chat, resolve_request_skill,
+    apply_web_search_mode_tool_filter, await_chat_tool_discovery, list_tools_for_chat,
+    resolve_request_skill,
 };
 
 pub(super) async fn complete_assistant_reply(
@@ -195,6 +196,19 @@ pub(super) async fn complete_assistant_reply_inner(
     }
 
     let last_user_idx = conversation.messages.iter().rposition(|m| m.role == "user");
+    let has_video = conversation.messages.iter()
+        .skip(super::context::context_replay_start_index(conversation))
+        .filter(|message| message.role == "user")
+        .flat_map(|message| &message.attachments)
+        .any(|attachment| crate::chat::video::mime_for_name(&attachment.name).is_some());
+    let auxiliary_video_model = crate::chat::video_analysis::select_model(
+        &settings, &provider, &resolved_model, has_video,
+    )?;
+    if has_video {
+        if model_can_generate_images_directly(&provider, &resolved_model) {
+            return Err("视频输入请选择视频理解模型，直接生图模式暂不支持视频。".into());
+        }
+    }
     let language = crate::settings::resolve_chat_language(&settings);
     // 思考：每对话等级覆盖全局开关。None=跟随全局（现状）；"off"=强制关；low/medium/high=按家族注入。
     let (thinking_enabled, thinking_level) = resolve_thinking(
@@ -457,13 +471,33 @@ pub(super) async fn complete_assistant_reply_inner(
             Some(session_model_for_conversation(conversation)),
         ),
     );
-    let tool_list = list_tools_for_chat(
-        app,
+    let tool_list = await_chat_tool_discovery(
         state.inner(),
-        &settings,
-        Some(session_model_for_conversation(conversation)),
+        &conversation.id,
+        run_generation,
+        list_tools_for_chat(
+            app,
+            state.inner(),
+            &settings,
+            Some(session_model_for_conversation(conversation)),
+        ),
     )
     .await;
+    let tool_list = match tool_list {
+        Ok(tools) => tools,
+        Err(error) => {
+            return finish_reply_failure(
+                app,
+                conversation,
+                &assistant_message_id,
+                &run_id,
+                arm.is_some(),
+                &mut protocol_guard,
+                error,
+            )
+            .await;
+        }
+    };
     let unavailable_mcp_servers = tool_list.unavailable_mcp_servers;
     let mut tools = tool_list.tools;
     agent_prepare::apply_assistant_mcp_restrictions(
@@ -525,15 +559,6 @@ pub(super) async fn complete_assistant_reply_inner(
             .map(std::path::Path::new);
         let agent_defs = crate::agents::load_agent_definitions(app, project_root);
         crate::chat::sub_agent::append_tool_definitions(&mut tools, true, &agent_defs);
-    }
-    // Orchestrate mode raises the autonomy budget: a single user message may
-    // need more tool rounds to plan, fan out sub-agents, and aggregate. We lift
-    // max_tool_rounds to max(configured, ORCHESTRATE_MIN_TOOL_ROUNDS) but keep
-    // unlimited (None) as-is rather than forcing a cap.
-    if orchestrate_mode {
-        effective_chat_tools.max_tool_rounds = effective_chat_tools
-            .max_tool_rounds
-            .map(|rounds| rounds.max(crate::settings::ORCHESTRATE_MIN_TOOL_ROUNDS));
     }
     let runtime_tools_available = !tools.is_empty();
     let available_builtin_tools = agent_prepare::available_builtin_tool_names(&tools);
@@ -606,7 +631,7 @@ pub(super) async fn complete_assistant_reply_inner(
         _ => system_prompt,
     };
 
-    let runtime_messages = match build_chat_api_messages(
+    let mut runtime_messages = match build_chat_api_messages(
         Some(app),
         &system_prompt,
         conversation,
@@ -627,6 +652,55 @@ pub(super) async fn complete_assistant_reply_inner(
             return Err(error);
         }
     };
+    if let Some(video_model) = auxiliary_video_model {
+        let mut record = crate::chat::video_analysis::tool_record(
+            &settings, &video_model, crate::chat::video_analysis::video_count(&runtime_messages),
+        );
+        let started = Instant::now();
+        emit_chat_stream_delta(app, &run_id, "", None, Some(&tool_segment_for_record(&record, 100, None)));
+        emit_chat_tool_record(app, &run_id, &record);
+        let analysis = tokio::select! {
+            result = crate::chat::video_analysis::analyze(
+                state.inner(), &settings, &video_model, &runtime_messages,
+                &conversation.id, &assistant_message_id, retry_attempts, &language,
+            ) => result,
+            _ = wait_for_chat_cancel(state.inner(), &conversation.id, run_generation) => {
+                finish_auxiliary_vision_tool_record(
+                    &mut record, ToolCallStatus::Cancelled, started, None,
+                    Some("Mixer video analysis cancelled".into()),
+                );
+                emit_chat_tool_record(app, &run_id, &record);
+                if arm.is_some() {
+                    protocol_guard.defer_terminal();
+                    return Ok(ArmReplyOutcome { message: None, run_id: Some(run_id), error: Some("cancelled".into()) });
+                }
+                crate::chat::protocol::finish_run(app, &run_id, "cancelled", "", conversation.revision);
+                return Err("cancelled".into());
+            }
+        };
+        match analysis {
+            Ok(content) => {
+                finish_auxiliary_vision_tool_record(
+                    &mut record, ToolCallStatus::Success, started,
+                    Some(truncate_chars(content.trim(), 1000)), None,
+                );
+                emit_chat_tool_record(app, &run_id, &record);
+                auxiliary_tool_records.push(record);
+                crate::chat::video_analysis::apply_analysis(&mut runtime_messages, &content, &language);
+            }
+            Err(error) => {
+                finish_auxiliary_vision_tool_record(
+                    &mut record, ToolCallStatus::Error, started, None, Some(error.clone()),
+                );
+                emit_chat_tool_record(app, &run_id, &record);
+                if arm.is_some() {
+                    protocol_guard.defer_terminal();
+                    return Ok(ArmReplyOutcome { message: None, run_id: Some(run_id), error: Some(error) });
+                }
+                return Err(error);
+            }
+        }
+    }
     let mut fallback_chat_tools = effective_chat_tools.clone();
     if skill_id.is_some() && fallback_chat_tools.skill_fallback_mode == "progressive" {
         fallback_chat_tools.skill_fallback_mode = "skill_md_only".to_string();
@@ -708,6 +782,7 @@ pub(super) async fn complete_assistant_reply_inner(
     // 否则模型调用敏感工具或 ask_user 会 await GUI 应答而永久挂起。
     #[cfg(debug_assertions)]
     let probe_host = ProbeAgentHost {
+        run_id: run_id.clone(),
         app: app.clone(),
         state: state.inner(),
     };
@@ -774,44 +849,16 @@ pub(super) async fn complete_assistant_reply_inner(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            if arm.is_some() {
-                protocol_guard.defer_terminal();
-                return Ok(ArmReplyOutcome {
-                    message: None,
-                    run_id: Some(run_id),
-                    error: Some(error),
-                });
-            }
-            let (terminal_content, terminal_revision) =
-                match crate::chat::repository::repository(app)
-                    .get(app, &conversation.id)
-                    .await
-                {
-                    Ok(latest) => {
-                        let content = latest
-                            .messages
-                            .iter()
-                            .find(|message| message.id == assistant_message_id)
-                            .map(|message| message.content.clone())
-                            .unwrap_or_default();
-                        let revision = latest.revision;
-                        *conversation = latest;
-                        (content, revision)
-                    }
-                    Err(_) => (String::new(), conversation.revision),
-                };
-            crate::chat::protocol::finish_run(
+            return finish_reply_failure(
                 app,
+                conversation,
+                &assistant_message_id,
                 &run_id,
-                if error == "cancelled" {
-                    "cancelled"
-                } else {
-                    "error"
-                },
-                &terminal_content,
-                terminal_revision,
-            );
-            return Err(error);
+                arm.is_some(),
+                &mut protocol_guard,
+                error,
+            )
+            .await;
         }
     };
 
@@ -978,6 +1025,56 @@ pub(super) async fn complete_assistant_reply_inner(
         run_id: None,
         error: None,
     })
+}
+
+/// Preparation cancellation and agent-loop failures share the same terminal
+/// protocol and latest persisted conversation, including a concurrently paused Goal.
+async fn finish_reply_failure(
+    app: &AppHandle,
+    conversation: &mut Conversation,
+    assistant_message_id: &str,
+    run_id: &str,
+    is_arm: bool,
+    protocol_guard: &mut crate::chat::protocol::RegisteredRunGuard,
+    error: String,
+) -> Result<ArmReplyOutcome, String> {
+    if is_arm {
+        protocol_guard.defer_terminal();
+        return Ok(ArmReplyOutcome {
+            message: None,
+            run_id: Some(run_id.to_string()),
+            error: Some(error),
+        });
+    }
+    let (terminal_content, terminal_revision) = match crate::chat::repository::repository(app)
+        .get(app, &conversation.id)
+        .await
+    {
+        Ok(latest) => {
+            let content = latest
+                .messages
+                .iter()
+                .find(|message| message.id == assistant_message_id)
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let revision = latest.revision;
+            *conversation = latest;
+            (content, revision)
+        }
+        Err(_) => (String::new(), conversation.revision),
+    };
+    crate::chat::protocol::finish_run(
+        app,
+        run_id,
+        if error == "cancelled" {
+            "cancelled"
+        } else {
+            "error"
+        },
+        &terminal_content,
+        terminal_revision,
+    );
+    Err(error)
 }
 
 pub(super) fn agent_run_entry_label(entry: crate::chat::agent::AgentRunEntry) -> &'static str {

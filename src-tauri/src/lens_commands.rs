@@ -2219,14 +2219,9 @@ pub(crate) async fn lens_replace_translate(
     // 盖板填充 + PNG 编码是 CPU 密集路径，必须 spawn_blocking，
     // 否则 tokio::join! 无法真正让本地擦除与云端翻译并行。
     let cleaning_future = async move {
-        tokio::task::spawn_blocking(move || {
-            crate::replace_translation::encode_rgb_png(plate_fill(
-                &source_for_cleaning,
-                &plate_blocks,
-            ))
-        })
-        .await
-        .map_err(|error| format!("plate fill worker failed: {error}"))?
+        tokio::task::spawn_blocking(move || plate_fill(&source_for_cleaning, &plate_blocks))
+            .await
+            .map_err(|error| format!("plate fill worker failed: {error}"))
     };
     let (translation_result, cleaned_result) = tokio::join!(translation_future, cleaning_future);
 
@@ -2263,9 +2258,25 @@ pub(crate) async fn lens_replace_translate(
             group.translated = translated.clone();
         }
     }
-    let cleaned_png = match cleaned_result {
-        Ok(png) => png,
+    let mut cleaned = match cleaned_result {
+        Ok(image) => image,
         Err(error) => return fail(&error),
+    };
+    let groups_for_restore = geometry.groups.clone();
+    let cleaned_png = match tokio::task::spawn_blocking(move || {
+        crate::replace_translation::mask::restore_unchanged_groups(
+            &source_image,
+            &mut cleaned,
+            &groups_for_restore,
+            &replace_spans,
+        );
+        crate::replace_translation::encode_rgb_png(cleaned)
+    })
+    .await
+    {
+        Ok(Ok(png)) => png,
+        Ok(Err(error)) => return fail(&error),
+        Err(error) => return fail(&format!("plate encode worker failed: {error}")),
     };
     let cleaned_image = format!(
         "data:image/png;base64,{}",

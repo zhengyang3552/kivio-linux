@@ -230,7 +230,7 @@ export function isStandaloneToolCard(toolCall: ToolCallRecord): boolean {
   const structured = toolCall.structured_content ?? toolCall.structuredContent
   if (structured && typeof structured === 'object') {
     const type = (structured as { type?: unknown }).type
-    if (type === 'subagent' || type === 'advisor') return true
+    if (type === 'subagent' || type === 'subagent_started' || type === 'advisor') return true
     // 问用户：载荷里是 `askUser`（没有 `type` 字段）。它记的是「问了什么 + 你选了什么」，
     // 折进「调用 N 次工具」里等于把一次人为决定藏起来 —— 那是这条对话里最该看见的东西。
     if (hasAskUserStructuredContent(structured)) return true
@@ -398,67 +398,51 @@ function segmentHasContent(segment: ChatMessageSegment): boolean {
 
 export type TimelineGroupItem =
   | { type: 'text'; segment: ChatMessageSegment }
+  | { type: 'presentation'; segment: ChatMessageSegment }
   | { type: 'group'; segments: ChatMessageSegment[] }
-  | { type: 'standaloneTool'; segment: ChatMessageSegment }
 
-/** Codex commentary：工具循环旁白，进 Working 壳，不是终稿。 */
-export function isProcessCommentaryText(segment: ChatMessageSegment): boolean {
-  return segment.kind === 'text' && (segment.phase === 'tool_loop' || segment.phase === 'auxiliary')
-}
-
-function isGroupableProcess(
-  segment: ChatMessageSegment,
-  isStandalone?: (segment: ChatMessageSegment) => boolean,
-): boolean {
-  if (segment.kind === 'reasoning') return true
-  if (segment.kind === 'tool') return !isStandalone?.(segment)
-  return isProcessCommentaryText(segment)
-}
-
-/**
- * 把一轮里的过程收进 Working 组，终稿留在外面（对标 Codex App 的 Working / Worked for）。
- * - 过程：reasoning、非 standalone 的 tool、`tool_loop`/`auxiliary` 正文，以及后面还有过程的
- *   `plain`/`synthesis` 旁白（模型在工具之间写的话）。
- * - 终稿：最后一个过程之后的 `plain`/`synthesis` 正文，始终展开。
- * - `isStandalone` 命中的 tool（ask_user / subagent / 产物卡）常驻打断，不进壳。
- * - 空白 reasoning/text 先过滤，避免空组或假分隔。
+/** 一条主代理答复只有一个过程容器，卡片和进度不再切断它。
+ * 正文投影与过程归属分开：正常结束保留末尾答复，异常结束保留已有正文。
+ * 这里只改变展示，不改存储正文、复制或模型回放。
  */
 export function groupTimelineSegments(
   orderedSegments: ChatMessageSegment[],
-  isStandalone?: (segment: ChatMessageSegment) => boolean,
+  state: 'running' | 'completed' | 'stopped' = 'completed',
+  isPresentation?: (segment: ChatMessageSegment) => boolean,
 ): TimelineGroupItem[] {
+  // 交付卡属于结果，不应切分 Work，也不应成为隐藏前面正文的过程边界。
+  const presentations = new Set(orderedSegments.filter(segment =>
+    segment.kind === 'tool' && isPresentation?.(segment)))
   let lastProcessIndex = -1
-  for (let index = 0; index < orderedSegments.length; index++) {
-    const segment = orderedSegments[index]
-    if (!segmentHasContent(segment)) continue
-    if (isGroupableProcess(segment, isStandalone)) lastProcessIndex = index
-  }
-
-  const items: TimelineGroupItem[] = []
-  let current: ChatMessageSegment[] | null = null
-  for (let index = 0; index < orderedSegments.length; index++) {
-    const segment = orderedSegments[index]
-    if (!segmentHasContent(segment)) continue
-    if (segment.kind === 'tool' && isStandalone?.(segment)) {
-      current = null
-      items.push({ type: 'standaloneTool', segment })
-      continue
+  orderedSegments.forEach((segment, index) => {
+    if (presentations.has(segment)) return
+    if (segmentHasContent(segment) && (segment.kind !== 'text'
+      || segment.phase === 'tool_loop' || segment.phase === 'auxiliary')) {
+      lastProcessIndex = index
     }
-    const foldText =
-      segment.kind === 'text' &&
-      (isProcessCommentaryText(segment) || index < lastProcessIndex)
+  })
+  const hasFinalAnswer = orderedSegments.some((segment, index) =>
+    index > lastProcessIndex && segment.kind === 'text' && segmentHasContent(segment)
+    && !/^seg_\d+_cancelled_synthesis$/.test(segment.id)
+    && (segment.phase === 'plain' || segment.phase === 'synthesis'))
+  const process: ChatMessageSegment[] = []
+  const body: TimelineGroupItem[] = []
+  orderedSegments.forEach((segment, index) => {
+    if (!segmentHasContent(segment)) return
+    if (presentations.has(segment)) {
+      body.push({ type: 'presentation', segment })
+      return
+    }
+    const foldText = state === 'running'
+      ? index <= lastProcessIndex
+      : state === 'completed' && hasFinalAnswer && index <= lastProcessIndex
     if (segment.kind === 'text' && !foldText) {
-      current = null
-      items.push({ type: 'text', segment })
-      continue
+      body.push({ type: 'text', segment })
+    } else {
+      process.push(segment)
     }
-    if (!current) {
-      current = []
-      items.push({ type: 'group', segments: current })
-    }
-    current.push(segment)
-  }
-  return items
+  })
+  return process.length ? [{ type: 'group', segments: process }, ...body] : body
 }
 
 /** 后端 `started_at` 是 unix 秒；个别路径会写毫秒。 */

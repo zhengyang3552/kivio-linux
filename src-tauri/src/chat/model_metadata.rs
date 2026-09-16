@@ -618,6 +618,15 @@ pub(crate) fn model_supports_vision(provider: Option<&ModelProvider>, model: &st
         .or_else(|| model_database_vision(provider_model_database_id(Some(provider), model)))
 }
 
+pub(crate) fn model_supports_video(provider: &ModelProvider, model: &str) -> Option<bool> {
+    provider.model_overrides.get(model)
+        .and_then(|info| info.capabilities.as_ref())
+        .and_then(|caps| caps.video_input)
+        .or_else(|| provider.model_overrides.get(model)?.advertised_video_input)
+        .or_else(|| model_database_entry(provider_model_database_id(Some(provider), model))?
+            .get("capabilities")?.get("videoInput")?.as_bool())
+}
+
 /// 归一化模型名：小写 + 去 `models/` 前缀 + trim。出图路由 / override 生图能力判定 /
 /// `is_image_output_model` / 名字启发式统一走这里，消除「换大小写/加 `models/` 前缀就路由错、
 /// override 精确匹配静默失效」三类脆弱。
@@ -878,6 +887,30 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn imported_video_models_use_database_defaults() {
+        let provider = test_provider_with_overrides(HashMap::new());
+        for model in [
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "moonshotai/kimi-k2.7-code",
+            "gemini-3-pro-preview",
+            "models/gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.8-flash",
+        ] {
+            assert_eq!(model_supports_video(&provider, model), Some(true), "{model}");
+        }
+        for model in [
+            "gemini-3-pro-image-preview",
+            "gemini-embedding-001",
+            "kimi-k2",
+            "kimi-k2.7",
+        ] {
+            assert_ne!(model_supports_video(&provider, model), Some(true), "{model}");
+        }
+    }
+
     fn db_display_name(model: &str) -> Option<String> {
         model_database_entry(model)
             .and_then(|entry| entry.get("displayName"))
@@ -1021,7 +1054,7 @@ mod tests {
         );
         assert_eq!(
             db_display_name("deepseek-v4-flash-vision-exp").as_deref(),
-            Some("DeepSeek V4 Flash Vision Exp")
+            Some("DeepSeek V4.1 Flash (Legacy Vision Alias)")
         );
         assert_eq!(
             db_display_name("qwen3.5-plus").as_deref(),

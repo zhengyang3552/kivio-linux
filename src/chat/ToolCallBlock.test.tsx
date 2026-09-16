@@ -193,7 +193,7 @@ describe('ToolCallBlock', () => {
     expect(within(button).queryByText(/exit_code/)).not.toBeInTheDocument()
   })
 
-  it('renders a subagent record as a SUBAGENT consult card, expandable to the task', async () => {
+  it('renders a legacy native subagent result in the current card without losing its task', async () => {
     const user = userEvent.setup()
     render(
       <ToolCallBlock
@@ -206,10 +206,9 @@ describe('ToolCallBlock', () => {
         })}
       />,
     )
-    expect(screen.getByText('SUBAGENT')).toBeInTheDocument()
-    expect(screen.getByText('researcher')).toBeInTheDocument()
+    expect(screen.queryByText('SUBAGENT')).toBeNull()
+    expect(screen.getByText('子代理 · researcher')).toBeInTheDocument()
     await user.click(screen.getByRole('button'))
-    expect(screen.getByText('Task')).toBeInTheDocument()
     expect(screen.getByText('去调查一下这个问题')).toBeInTheDocument()
     expect(screen.getByText('调查结论')).toBeInTheDocument()
   })

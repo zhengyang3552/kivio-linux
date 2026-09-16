@@ -20,6 +20,7 @@ import type {
 } from '../generated/chatProtocol'
 import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRun, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
 import type { GoalState } from '../chat/types'
+import { normalizeGitDiffStat, normalizeGitRepoState, type GitSnapshot } from '../chat/dock/types'
 
 // ========== 类型定义 ==========
 
@@ -72,7 +73,7 @@ export type ChatStreamPayload = Extract<
 
 export type ChatExternalSendAttachment = {
   id: string
-  type: 'image' | 'file'
+  type: 'image' | 'file' | 'video'
   name: string
   path: string
 }
@@ -862,6 +863,8 @@ export type LensWindowInfo = {
 // 模型能力与定价信息（来自内置数据库或用户自定义）
 export type ModelInfo = {
   displayName?: string
+  /** Latest upstream capability, separate from the user's explicit override. */
+  advertisedVideoInput?: boolean
   contextWindow?: number
   maxOutput?: number
   /** 模型级采样温度；未设置时请求不发送 temperature。 */
@@ -870,6 +873,7 @@ export type ModelInfo = {
   omitTemperature?: boolean
   capabilities?: {
     vision?: boolean
+    videoInput?: boolean
     functionCalling?: boolean
     reasoning?: boolean
     streaming?: boolean
@@ -977,6 +981,7 @@ export type DefaultModelSelection = {
 export type DefaultModelsConfig = {
   chat: DefaultModelSelection
   vision: DefaultModelSelection
+  videoAnalysis: DefaultModelSelection
   titleSummary: DefaultModelSelection
   compression: DefaultModelSelection
   imageGeneration: DefaultModelSelection
@@ -1676,6 +1681,7 @@ function normalizeDefaultModels(
   return {
     chat: normalizeDefaultModelSelection(config?.chat ?? legacyChat),
     vision: normalizeDefaultModelSelection(config?.vision),
+    videoAnalysis: normalizeDefaultModelSelection(config?.videoAnalysis),
     titleSummary: normalizeDefaultModelSelection(config?.titleSummary),
     compression: normalizeDefaultModelSelection(config?.compression),
     imageGeneration: normalizeDefaultModelSelection(config?.imageGeneration),
@@ -1927,7 +1933,42 @@ async function onChatProtocol(
 
 // ========== API 导出 ==========
 
+export type SubAgentExecution = {
+  startedAt?: number | null; finishedAt?: number | null
+  id: string; status: string; prompt: string; result?: string; error?: string; usage?: unknown
+  outputAvailable?: boolean
+  recovery?: { outcome?: string; degraded?: { kind?: string; reason?: string; detail?: string } | null } | null
+}
+export type SubAgentRecord = {
+  id: string; name: string; sequence: number
+  profile: { model: string; agentType: string }
+  runs: SubAgentExecution[]
+  messages: { id: string; sender: string; text: string; consumedBy?: string }[]
+  history: unknown[]; tools: unknown[]; preview?: string; steps?: string[]
+}
+export type SubAgentSnapshot = { sequence: number; agents: SubAgentRecord[] }
+export type SubAgentListRequest = { operation: 'list' | 'wait'; id?: string; cursor?: number; timeout_ms?: number }
+export type SubAgentRecordRequest =
+  | { operation: 'get' | 'message' | 'continue' | 'stop'; id: string; execution_id?: string; message_id?: string; message?: string }
+export type SubAgentControlRequest = SubAgentListRequest | SubAgentRecordRequest
+function chatSubagentControl(conversationId: string, args: SubAgentListRequest): Promise<SubAgentSnapshot>
+function chatSubagentControl(conversationId: string, args: SubAgentRecordRequest): Promise<SubAgentRecord>
+function chatSubagentControl(conversationId: string, args: SubAgentControlRequest): Promise<SubAgentSnapshot | SubAgentRecord>
+function chatSubagentControl(conversationId: string, args: SubAgentControlRequest): Promise<SubAgentSnapshot | SubAgentRecord> {
+  return invoke('chat_subagent_control', { conversationId, arguments: args })
+}
+
 export const api = {
+  chatSubagentControl,
+  /** 一次状态扫描可选附带行数统计，供同工作目录的 Git 徽标共享。 */
+  async dockGitSnapshot(workdir: string, includeDiffStat = false): Promise<GitSnapshot> {
+    const raw = await invoke<{ state: unknown; diffStat?: unknown }>('dock_git_snapshot', { workdir, includeDiffStat })
+    return {
+      state: normalizeGitRepoState(raw.state),
+      diffStat: raw.diffStat == null ? null : normalizeGitDiffStat(raw.diffStat),
+    }
+  },
+
   providerOAuthStart: (provider: ProviderOAuthConfig['provider'], useSystemProxy = true) =>
     invoke<ProviderOAuthLogin>('provider_oauth_start', { provider, useSystemProxy }),
   providerOAuthPoll: (loginId: string) => invoke<ProviderOAuthPoll>('provider_oauth_poll', { loginId }),
@@ -1964,6 +2005,8 @@ export const api = {
   // 提供商相关
   fetchModels: (providerId: string, provider?: ProviderConnectionInput) =>
     invoke<string[]>('fetch_models', { providerId, provider }),
+  fetchModelCatalog: (providerId: string, provider?: ProviderConnectionInput) =>
+    invoke<{ models: string[]; capabilities: Record<string, NonNullable<ModelInfo['capabilities']>> }>('fetch_models', { providerId, provider, includeCapabilities: true }),
   testProviderConnection: (providerId: string, provider?: ProviderConnectionInput) =>
     invoke<{ success: boolean; error?: string }>('test_provider_connection', { providerId, provider }),
 
@@ -2361,8 +2404,8 @@ export const api = {
     }
     return invoke<{ success: boolean; requests: ChatExternalSendRequest[]; error?: string | null }>('chat_take_external_sends')
   },
-  chatMcpListTools: () =>
-    invoke<{ success: boolean; tools: ChatToolDefinition[]; error?: string | null }>('chat_mcp_list_tools'),
+  chatMcpListTools: (cachedOnly = false) =>
+    invoke<{ success: boolean; tools: ChatToolDefinition[]; error?: string | null; discoveryPending?: boolean }>('chat_mcp_list_tools', { cachedOnly }),
   chatMcpTestServer: (server: ChatMcpServer, timeoutMs?: number) =>
     invoke<{ success: boolean; tools: ChatToolDefinition[]; error?: string | null }>(
       'chat_mcp_test_server',

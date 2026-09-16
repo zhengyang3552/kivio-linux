@@ -793,15 +793,28 @@ mod tests {
 
     #[test]
     fn auto_auxiliary_vision_picks_enabled_vision_model_when_main_is_text_only() {
+        use crate::settings::{ModelCapabilities, ModelInfo};
+
         let mut settings = Settings::default();
-        let main_provider = test_provider("main", "Main", vec!["deepseek-v4-flash"]);
+        let mut main_provider = test_provider("main", "Main", vec!["text-only-model"]);
+        // Keep this routing fixture independent of changing catalog capabilities.
+        main_provider.model_overrides.insert(
+            "text-only-model".to_string(),
+            ModelInfo {
+                capabilities: Some(ModelCapabilities {
+                    vision: Some(false),
+                    ..ModelCapabilities::default()
+                }),
+                ..ModelInfo::default()
+            },
+        );
         let vision_provider = test_provider("vision", "Vision", vec!["gpt-4o"]);
         settings.providers = vec![main_provider.clone(), vision_provider];
 
         let selected = auxiliary_vision_model_for_images(
             &settings,
             Some(&main_provider),
-            "deepseek-v4-flash",
+            "text-only-model",
             &[PathBuf::from("image.png")],
             None,
         )

@@ -45,6 +45,11 @@ describe('DegradedAnswerCard', () => {
     }
   })
 
+  it('does not render obsolete collaboration verdicts from history', () => {
+    const { container } = render(<DegradedAnswerCard degraded={makeDegraded({ kind: 'collaboration_incomplete' })} />)
+    expect(container).toBeEmptyDOMElement()
+  })
+
   it('未知 kind 回落到通用标签而非崩溃', () => {
     render(<DegradedAnswerCard degraded={makeDegraded({ kind: 'something_new' })} />)
     expect(screen.getByText('调用失败')).toBeTruthy()

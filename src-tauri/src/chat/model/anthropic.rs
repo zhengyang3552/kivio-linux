@@ -125,6 +125,7 @@ impl LanguageModelProvider for AnthropicMessagesProvider<'_> {
 
 impl AnthropicMessagesProvider<'_> {
     async fn generate_inner(&self, request: GenerateRequest) -> Result<GenerateOutput, ModelError> {
+        crate::chat::video::reject_unimplemented_transport(&request, "Anthropic Messages")?;
         let label = request_label(&request, "Anthropic Messages API");
         let started_at = chrono::Local::now().timestamp();
         let started = std::time::Instant::now();
@@ -214,6 +215,7 @@ impl AnthropicMessagesProvider<'_> {
         sink: &mut (dyn StreamSink + Send),
     ) -> Result<GenerateOutput, ModelError> {
         let label = request_label(&request, "Anthropic stream");
+        crate::chat::video::reject_unimplemented_transport(&request, "Anthropic Messages")?;
         let started_at = chrono::Local::now().timestamp();
         let started = std::time::Instant::now();
         let mut measured_sink = FirstTokenStreamSink::new(sink, started);
@@ -1305,6 +1307,7 @@ fn anthropic_content_blocks(message: &ModelMessage, role: ModelRole) -> Vec<Valu
     let mut blocks = Vec::new();
     for part in &message.content {
         match part {
+            MessagePart::Video { .. } => blocks.push(serde_json::json!({"type":"text", "text":"[视频输入不受此协议支持]"})),
             MessagePart::Text { text } => blocks.push(serde_json::json!({
                 "type": "text",
                 "text": text,

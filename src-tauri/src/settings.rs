@@ -257,6 +257,8 @@ impl CacheRetention {
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelInfo {
     pub display_name: Option<String>,
+    /// Latest upstream capability; never takes precedence over an explicit override.
+    pub advertised_video_input: Option<bool>,
     pub context_window: Option<u64>,
     pub max_output: Option<u64>,
     /// 模型级采样温度；None 表示请求默认不发送 temperature。
@@ -281,6 +283,7 @@ pub struct ModelInfo {
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelCapabilities {
     pub vision: Option<bool>,
+    pub video_input: Option<bool>,
     pub function_calling: Option<bool>,
     pub reasoning: Option<bool>,
     pub streaming: Option<bool>,
@@ -954,7 +957,7 @@ impl Default for DefaultModelSelection {
 }
 
 impl DefaultModelSelection {
-    fn is_configured(&self) -> bool {
+    pub(crate) fn is_configured(&self) -> bool {
         !self.provider_id.trim().is_empty()
     }
 }
@@ -1005,6 +1008,9 @@ pub struct DefaultModelsConfig {
     pub chat: DefaultModelSelection,
     #[serde(default)]
     pub vision: DefaultModelSelection,
+    /// Video-capable auxiliary model; empty selects an enabled capable model automatically.
+    #[serde(default)]
+    pub video_analysis: DefaultModelSelection,
     #[serde(default)]
     pub title_summary: DefaultModelSelection,
     #[serde(default)]
@@ -1022,6 +1028,7 @@ impl Default for DefaultModelsConfig {
         Self {
             chat: DefaultModelSelection::default(),
             vision: DefaultModelSelection::default(),
+            video_analysis: DefaultModelSelection::default(),
             title_summary: DefaultModelSelection::default(),
             compression: DefaultModelSelection::default(),
             image_generation: DefaultModelSelection::default(),
@@ -1215,9 +1222,6 @@ pub const CHAT_TOOL_MIN_OUTPUT_CHARS: usize = 2_000;
 pub const CHAT_TOOL_MAX_OUTPUT_CHARS: usize = 200_000;
 /// 默认单条工具结果字符上限 ≈ 6K token（头 1/2 + 尾 1/4 保留约 3/4）。
 pub const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 24_000;
-/// Orchestrate 模式下的最低工具轮次预算：编排者主动 fan-out 子 agent + 先规划再分派，
-/// 单条用户消息内可能需要更多轮次，因此抬到 max(用户配置, 此值)，但不放开为无限。
-pub const ORCHESTRATE_MIN_TOOL_ROUNDS: u32 = 40;
 /// MCP 持久连接空闲超时下限：太小会让长连接频繁回收失去意义。
 pub const MCP_IDLE_TIMEOUT_MIN_MS: u64 = 60_000;
 /// MCP 持久连接空闲超时上限：避免死连接长期占用子进程。
@@ -2196,6 +2200,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         for selection in [
             &mut settings.default_models.chat,
             &mut settings.default_models.vision,
+            &mut settings.default_models.video_analysis,
             &mut settings.default_models.title_summary,
             &mut settings.default_models.compression,
             &mut settings.default_models.image_generation,
@@ -2285,6 +2290,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
 
         sanitize_default_model_selection(&mut settings.default_models.chat, &settings.providers);
         sanitize_default_model_selection(&mut settings.default_models.vision, &settings.providers);
+        sanitize_default_model_selection(&mut settings.default_models.video_analysis, &settings.providers);
         sanitize_default_model_selection(
             &mut settings.default_models.title_summary,
             &settings.providers,

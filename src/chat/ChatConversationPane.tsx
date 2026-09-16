@@ -97,6 +97,7 @@ export interface ChatConversationPaneProps {
   importedHistoryStale: boolean
   pendingSlot: ReactNode
   goalSlot?: ReactNode
+  subAgentSlot?: ReactNode
   queuedMessages: QueuedMessage[]
   canSteerQueuedMessages: boolean
   onSteerQueuedMessage: (messageId: string) => void
@@ -137,6 +138,7 @@ export const ChatConversationPane = memo(function ChatConversationPane({
   importedHistoryStale,
   pendingSlot,
   goalSlot,
+  subAgentSlot,
   queuedMessages,
   canSteerQueuedMessages,
   onSteerQueuedMessage,
@@ -194,7 +196,7 @@ export const ChatConversationPane = memo(function ChatConversationPane({
                 active={showEmptyHero}
               />
               <div className="chat-motion-fade-up" style={{ ['--chat-motion-delay' as string]: '120ms' }}>
-                <InputBar {...inputBarProps} goalSlot={goalSlot} layout="inline" />
+                <InputBar {...inputBarProps} goalSlot={goalSlot} subAgentSlot={subAgentSlot} layout="inline" />
               </div>
             </div>
           </div>
@@ -269,7 +271,7 @@ export const ChatConversationPane = memo(function ChatConversationPane({
               </div>
             )}
 
-            <InputBar {...inputBarProps} goalSlot={goalSlot} />
+            <InputBar {...inputBarProps} goalSlot={goalSlot} subAgentSlot={subAgentSlot} />
           </>
         )}
         {conversationLoading && (

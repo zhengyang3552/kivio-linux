@@ -307,7 +307,7 @@ pub(crate) fn assemble_results_from_tool_records(
 ///
 /// ponytail: 只认 `" Error: "` 一个前缀分隔符、只解一次 JSON。解不动就原样出，
 /// 显示得丑一点也好过把真报错吞掉。
-fn extract_error_detail(raw: &str) -> Option<String> {
+pub(crate) fn extract_error_detail(raw: &str) -> Option<String> {
     const MAX_DETAIL_CHARS: usize = 240;
     let mut detail = raw.trim();
     if detail.is_empty() {

@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { Button, IconButton } from '../components/Button'
 import { copyToClipboard } from '../utils/clipboard'
+import { messageBodySegments, messageBodyText } from './messageBody'
 import { AssistantMessageMeta } from './AssistantMessageMeta'
 import { ChatAttachments } from './ChatAttachments'
 import { ChatDotGridBackground } from './ChatDotGridBackground'
@@ -33,14 +34,11 @@ import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
 import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ModelRef, ToolCallRecord } from './types'
 import { buildCitationMap, type CitationView } from './citations'
 import {
-  compareTimelineSegments,
   clusterToolCallsForDisplay,
   formatWorkDuration,
   groupTimelineSegments,
   groupWorkDurationMs,
   isImageReadToolCall,
-  isProcessCommentaryText,
-  isStandaloneToolCard,
   isUserFollowUpToolCall,
   isUserSteerToolCall,
   segmentToolCallId,
@@ -58,6 +56,7 @@ const handleChatImageClick = (src: string, alt: string, name?: string) =>
   openChatImageViewer({ src, alt, name })
 
 interface MessageBubbleProps {
+  readOnly?: boolean
   message: ChatMessage
   conversationId?: string | null
   tokensPerSec?: number
@@ -378,10 +377,6 @@ function AgentPlanAction({
   )
 }
 
-function orderedSegments(segments?: ChatMessageSegment[]): ChatMessageSegment[] {
-  return [...(segments ?? [])].sort(compareTimelineSegments)
-}
-
 function segmentText(segment: ChatMessageSegment): string {
   return segment.text ?? ''
 }
@@ -521,9 +516,8 @@ function TimelineTextSegment({
 }) {
   const text = segmentText(segment).trim()
   if (!text) return null
-  const isProcessText = process || isProcessCommentaryText(segment)
   return (
-    <div className={isProcessText ? 'text-neutral-600 dark:text-neutral-300' : undefined}>
+    <div className={process ? 'text-neutral-600 dark:text-neutral-300' : undefined}>
       <ChatMarkdown
         content={text}
         artifacts={artifacts}
@@ -704,8 +698,8 @@ function renderProcessSegments({
 
 /**
  * 一轮过程 = 一个 Codex 式 Working 壳。
- * - 「生成中」= 这条消息还在流式、且这是末组：始终展开，避免抖动。
- * - 后面出现终稿/standalone（非末组）或流式结束 → 收成一行 Worked for Xs。
+ * - 整轮生成中默认展开，工具完成、子代理等待不创建新的壳。
+ * - 流式结束后默认收起，最终答复始终是容器外的独立正文。
  * - 用户手动点过开关后以用户操作为准。
  * - 折叠态只留 header，不挂组内 ReasoningBlock / ToolCallBlock / 过程旁白。
  */
@@ -716,7 +710,6 @@ function TimelineGroupBlock({
   artifacts,
   citations,
   conversationId,
-  isLastGroup,
   messageStreaming,
   reasoningStreaming,
   reasoningDurationMs,
@@ -729,14 +722,13 @@ function TimelineGroupBlock({
   artifacts: ChatToolArtifact[]
   citations?: Map<number, CitationView>
   conversationId?: string | null
-  isLastGroup: boolean
   messageStreaming: boolean
   reasoningStreaming: boolean
   reasoningDurationMs?: number | null
   reasoningDurationMsBySegmentId?: Record<string, number>
   reasoningSegmentCount: number
 }) {
-  const generating = messageStreaming && isLastGroup
+  const generating = messageStreaming
   const summary = useMemo(
     () => summarizeToolGroup(segments, toolCalls, toolCallById),
     [segments, toolCalls, toolCallById],
@@ -797,7 +789,7 @@ function TimelineGroupBlock({
               artifacts,
               citations,
               conversationId,
-              reasoningStreaming: reasoningStreaming && isLastGroup,
+              reasoningStreaming: reasoningStreaming,
               reasoningDurationMs,
               reasoningDurationMsBySegmentId,
               reasoningSegmentCount,
@@ -815,6 +807,7 @@ function TimelineSegments({
   artifacts,
   conversationId,
   messageStreaming,
+  completed,
   reasoningStreaming,
   reasoningDurationMs,
   reasoningDurationMsBySegmentId,
@@ -827,6 +820,7 @@ function TimelineSegments({
   artifacts: ChatToolArtifact[]
   conversationId?: string | null
   messageStreaming: boolean
+  completed: boolean
   reasoningStreaming: boolean
   reasoningDurationMs?: number | null
   reasoningDurationMsBySegmentId?: Record<string, number>
@@ -835,7 +829,7 @@ function TimelineSegments({
   onOutlineSourceChange?: (update: MarkdownOutlineSourceUpdate) => void
 }) {
   const prepared = useMemo(() => {
-    const ordered = orderedSegments(segments)
+    const ordered = segments
     const toolCallById = new Map<string, ToolCallRecord>()
     for (const toolCall of toolCalls) {
       const id = toolRecordId(toolCall)
@@ -861,25 +855,36 @@ function TimelineSegments({
         return leftStarted - rightStarted
       })
 
-    const groupItems = groupTimelineSegments(ordered, (segment) => {
-      const id = segmentToolCallId(segment)
-      if (!id) return false
-      const toolCall = toolCallById.get(id)
-      return toolCall ? isStandaloneToolCard(toolCall) : false
-    })
+    // Older histories can contain tool records without timeline segments.
+    // They still belong to this Work, never a second tool list after the answer.
+    const orphanSegments: ChatMessageSegment[] = orphanTools.map((tool, index) => ({
+      id: `orphan-tool-${toolRecordId(tool)}`, kind: 'tool', phase: 'tool_loop',
+      order: index, tool_call_id: toolRecordId(tool),
+    }))
+    const groupItems = groupTimelineSegments(
+      [...orphanSegments, ...ordered],
+      messageStreaming ? 'running' : completed ? 'completed' : 'stopped',
+      segment => {
+        const tool = toolCallById.get(segmentToolCallId(segment))
+        return Boolean(tool && isArtifactPresentationToolCall(tool))
+      },
+    )
+    return { toolCallById, citations, reasoningSegmentCount, groupItems }
+  }, [segments, toolCalls, completed, messageStreaming])
 
-    return { toolCallById, citations, reasoningSegmentCount, orphanTools, groupItems }
-  }, [segments, toolCalls])
-
-  const { toolCallById, citations, reasoningSegmentCount, orphanTools, groupItems } = prepared
-  const lastGroupIndex = groupItems.reduce(
-    (last, item, index) => (item.type === 'group' ? index : last),
-    -1,
-  )
-
+  const { toolCallById, citations, reasoningSegmentCount, groupItems } = prepared
   return (
     <section aria-label="回答时间线" className="space-y-1.5">
-      {groupItems.map((item: TimelineGroupItem, index) => {
+      {groupItems.map((item: TimelineGroupItem) => {
+        if (item.type === 'presentation') {
+          return <TimelineToolSegment
+            key={item.segment.id}
+            segment={item.segment}
+            toolCallById={toolCallById}
+            artifacts={artifacts}
+            conversationId={conversationId}
+          />
+        }
         if (item.type === 'text') {
           if (!segmentText(item.segment).trim()) return null
           // Segments can be regrouped as tools arrive; entrance fades would
@@ -895,7 +900,8 @@ function TimelineSegments({
                   outlineEligible && onOutlineSourceChange
                     ? {
                       ownerMessageId,
-                      sourceId: item.segment.id,
+                      // Segment ids are only unique within their owning message.
+                      sourceId: JSON.stringify([ownerMessageId, item.segment.id]),
                       onChange: onOutlineSourceChange,
                     }
                     : undefined
@@ -904,30 +910,7 @@ function TimelineSegments({
             </div>
           )
         }
-        if (item.type === 'standaloneTool') {
-          // advisor / subagent：专属卡片常驻渲染，不折叠进「调用 N 次工具」组。
-          const id = segmentToolCallId(item.segment)
-          const toolCall = toolCallById.get(id)
-          if (!toolCall) return null
-          return (
-            <div key={item.segment.id}>
-              {isUserInjectedToolCall(toolCall) ? (
-                <UserSteerSegment toolCall={toolCall} />
-              ) : isArtifactPresentationToolCall(toolCall) ? (
-                <ArtifactPresentationBlock
-                  toolCall={toolCall}
-                  artifacts={artifacts}
-                  conversationId={conversationId}
-                />
-              ) : (
-                <ToolCallErrorBoundary>
-                  <ToolCallBlock toolCall={toolCall} />
-                </ToolCallErrorBoundary>
-              )}
-            </div>
-          )
-        }
-        const groupKey = item.segments[0]?.id ?? `group-${index}`
+        const groupKey = `work-${ownerMessageId}`
         return (
           <div key={groupKey}>
             <TimelineGroupBlock
@@ -937,7 +920,6 @@ function TimelineSegments({
               artifacts={artifacts}
               citations={citations}
               conversationId={conversationId}
-              isLastGroup={index === lastGroupIndex}
               messageStreaming={messageStreaming}
               reasoningStreaming={reasoningStreaming}
               reasoningDurationMs={reasoningDurationMs}
@@ -947,16 +929,12 @@ function TimelineSegments({
           </div>
         )
       })}
-      <ClusteredToolCalls
-        toolCalls={orphanTools}
-        artifacts={artifacts}
-        conversationId={conversationId}
-      />
     </section>
   )
 }
 
 function MessageBubbleComponent({
+  readOnly = false,
   message,
   conversationId,
   tokensPerSec,
@@ -980,6 +958,10 @@ function MessageBubbleComponent({
   onOutlineSourceChange,
 }: MessageBubbleProps) {
   const isUser = message.role === 'user'
+  const streamOutcome = message.stream_outcome ?? message.streamOutcome
+  // 停止出字不一定是成功完成；取消、错误和中断后保留已有正文。
+  const completed = !messageStreaming && (!streamOutcome || streamOutcome === 'completed')
+  const bodyText = useMemo(() => messageBodyText(message), [message])
   // 历史消息会被虚拟列表反复卸载/挂载；只让真正的流式预览播放进入动画，
   // 否则滚动时每个重新进入 DOM 的旧气泡都会淡入并上移，看起来像刷新且阻滞滚动。
   const playEntranceAnimation = messageStreaming
@@ -995,10 +977,23 @@ function MessageBubbleComponent({
     // 降级文案同时走三条路：content、时间线 text 分段、以及这张卡片。卡片已完整表达，
     // 另外两条都要按文本相等剔掉，否则同一段话在气泡里出现两遍（正是用户看到的样子）。
     const degradedText = degraded?.text.trim() ?? ''
-    const timelineSegments = orderedSegments(message.segments).filter(
+    const timelineSegments = messageBodySegments(message).filter(
       (segment) =>
         !degradedText || segment.kind !== 'text' || segmentText(segment).trim() !== degradedText,
     )
+    // 旧消息只有 reasoning/tool_calls/content 时也投影为同一个 Work。
+    if (!isUser && !timelineSegments.length && (message.reasoning?.trim() || toolCalls.length)) {
+      if (message.reasoning?.trim()) timelineSegments.push({
+        id: 'legacy-reasoning', kind: 'reasoning', phase: 'tool_loop', order: 0, text: message.reasoning,
+      })
+      toolCalls.forEach((tool, index) => timelineSegments.push({
+        id: `legacy-tool-${toolRecordId(tool) || index}`, kind: 'tool', phase: 'tool_loop',
+        order: index + 1, tool_call_id: toolRecordId(tool),
+      }))
+      if (message.content.trim() && message.content.trim() !== degradedText) timelineSegments.push({
+        id: 'legacy-answer', kind: 'text', phase: 'plain', order: toolCalls.length + 1, text: message.content,
+      })
+    }
     const hasTimelineSegments = timelineSegments.length > 0
     const messageArtifacts = message.artifacts ?? []
     const toolArtifacts = toolCalls.flatMap((toolCall) => toolCall.artifacts ?? [])
@@ -1066,7 +1061,7 @@ function MessageBubbleComponent({
     if (!outlineEligible || messageStreaming || !onOutlineSourceChange) return undefined
     return {
       ownerMessageId: message.id,
-      sourceId: message.id,
+      sourceId: JSON.stringify([message.id]),
       onChange: onOutlineSourceChange,
     }
   }, [message.id, messageStreaming, onOutlineSourceChange, outlineEligible])
@@ -1279,6 +1274,7 @@ function MessageBubbleComponent({
               artifacts={renderArtifacts}
               conversationId={conversationId}
               messageStreaming={messageStreaming}
+              completed={completed}
               reasoningStreaming={reasoningStreaming}
               reasoningDurationMs={reasoningDurationMs}
               reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
@@ -1334,9 +1330,10 @@ function MessageBubbleComponent({
           />
         )}
 
-        {message.content.trim().length > 0 && !isDirectImageGenerationPending && (
+        {bodyText.trim().length > 0 && !isDirectImageGenerationPending && (
           <AssistantMessageMeta
-            content={message.content}
+            readOnly={readOnly}
+            content={bodyText}
             reasoning={message.reasoning}
             timestamp={message.timestamp}
             tokensPerSec={tokensPerSec}

@@ -51,7 +51,7 @@ pub fn builtin_agent_definitions() -> Vec<AgentDefinition> {
             id: "researcher".to_string(),
             name: "researcher".to_string(),
             description: "Read-only research agent: searches the web and reads files to gather and synthesize information. Cannot modify files.".to_string(),
-            system_prompt: "You are a research sub-agent. Investigate thoroughly using read-only tools, then return a concise, well-organized synthesis of your findings with concrete references. Do not attempt to modify files or run commands.".to_string(),
+            system_prompt: "You are a research sub-agent. Focus on the assigned question, follow the relevant evidence, and batch related searches. Return concise findings with useful references once you can answer; mention remaining uncertainty. Do not modify files or run commands.".to_string(),
             model: None,
             tools: vec![
                 "read".to_string(),

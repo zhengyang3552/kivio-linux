@@ -555,24 +555,11 @@ pub fn build_chat_system_prompt_with_segments(
                 &native_prompt,
             );
         }
-        // Sub-agent delegation rules — only when the `agent` spawn tool is
-        // available. The `agent` call is BLOCKING + single-result (Claude Code
-        // Task model); to run sub-agents in parallel, emit MULTIPLE `agent` calls
-        // in ONE message — they execute concurrently and each returns its result.
-        // No polling/collection tool exists. Concise on purpose.
+        // Runtime control semantics are described by the sub-agent tools.
         if available_builtin_tools
             .iter()
             .any(|tool| tool.as_str() == crate::chat::sub_agent::AGENT_TOOL_NAME)
         {
-            let background_prompt =
-                "Delegating to sub-agents: each agent call BLOCKS, waits for the sub-agent to finish, and returns its full result directly. To run sub-agents in PARALLEL, emit MULTIPLE agent tool calls in a SINGLE message — they execute concurrently and each returns its own result. There is no polling or collection tool; do not look for one.";
-            append_context_segment(
-                &mut prompt,
-                &mut segments,
-                "native_tools",
-                "Native tools",
-                background_prompt,
-            );
             // Roles are data, not code: the available ones are listed in the
             // `agent` tool's `subagent_type` description, and a new permanent
             // role is just a `.md` file the model can write with its own tools.
@@ -825,6 +812,7 @@ pub(crate) fn estimate_value_tokens(value: &Value) -> usize {
         Value::Array(items) => items.iter().map(estimate_value_tokens).sum(),
         Value::Object(map) => {
             if let Some(kind) = map.get("type").and_then(Value::as_str) {
+                if kind == "video_url" { return 0; }
                 if IMAGE_PART_TYPES.contains(&kind) {
                     return 0;
                 }
@@ -1796,6 +1784,49 @@ mod tests {
     }
 
     #[test]
+    fn orchestrate_system_prompt_supports_main_work_and_targeted_followups() {
+        let state = crate::chat::plan::with_mode(
+            &crate::chat::types::AgentPlanState::default(),
+            crate::chat::types::AgentPlanMode::Orchestrate,
+        );
+        let sources = resolve_runtime_prompt_sources(false, "", "", &state);
+        let prompt = build_chat_system_prompt(
+            "zh-CN",
+            false,
+            true,
+            &skills::SkillRegistry::default(),
+            &crate::settings::ChatToolsConfig::default(),
+            true,
+            &[
+                "agent".to_string(),
+                "agent_control".to_string(),
+                "read_file".to_string(),
+            ],
+            None,
+            None,
+            None,
+            None,
+            &sources.custom_system_prompt,
+            sources.is_chat_runtime,
+            None,
+            sources.agent_plan_prompt.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert!(prompt.contains("advance the main task yourself"));
+        assert!(prompt.contains("specific results you need"));
+        assert!(prompt.contains("Sub-agent roles:"));
+        assert!(!prompt.contains("each agent call BLOCKS"));
+        assert!(!prompt.contains("There is no polling or collection tool"));
+        assert!(!prompt.contains("Required flow"));
+    }
+
+    #[test]
     fn native_tools_prompt_keeps_finite_bash_in_foreground() {
         let names = vec![
             "bash".to_string(),
@@ -1815,10 +1846,7 @@ mod tests {
             !prompt.contains("start it once with background:true"),
             "must not push finite jobs to background: {prompt}"
         );
-        assert!(
-            !prompt.contains("Pass a larger wait_ms"),
-            "{prompt}"
-        );
+        assert!(!prompt.contains("Pass a larger wait_ms"), "{prompt}");
     }
 
     #[test]

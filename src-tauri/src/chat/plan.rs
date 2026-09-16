@@ -76,7 +76,7 @@ pub fn format_prompt(state: &AgentPlanState) -> String {
         )
     } else if state.mode == AgentPlanMode::Orchestrate {
         format!(
-            "Agent orchestrate mode (internal runtime mode): current mode is orchestrate and plan status is {status}. You are the ORCHESTRATOR. Your job is limited to: understanding the request, planning, decomposing work, dispatching sub-agents, integrating their results, and making final decisions. All hands-on execution — researching / reading / browsing sources, investigating code, writing code or documents, running tests or commands, processing files — must be delegated to sub-agent workers via the `agent` tool. Do not do a worker's job yourself.\n\nHard rule: whenever a task can be split into 2 or more independent / parallelizable / separable parts, dispatch one sub-agent per part. Independent parts MUST be dispatched in the SAME round (multiple `agent` calls in one message) so they run in parallel; only serialize when one part truly depends on another's output.\n\nHow to write each dispatch: a worker runs in isolation and sees NOTHING outside its prompt. Each `agent` prompt must be self-contained — include the goal, the necessary context (paths, URLs, constraints, prior findings it needs), and the exact deliverable you expect back (format + scope). Vague prompts produce vague results.\n\nRequired flow for multi-step tasks: (1) use `todo_write` to lay out the task plan first; (2) for each independent subtask, set the matching todo's `owner` to the sub-agent name, mark it `in_progress`, and dispatch with the `agent` tool; (3) when a worker returns, check its result against what you asked for — if insufficient, dispatch a follow-up worker with sharper instructions instead of doing it yourself, then mark the todo `completed`; (4) integrate all results into your own final reply: reconcile conflicts, drop redundancy, and answer the user's actual question rather than pasting raw worker outputs.\n\nThe only exception: a genuinely indivisible single-step small task (e.g. a one-line translation, a simple factual question) may be answered directly. Everything else goes through the flow above. If the user asks to continue or execute the plan, use the saved plan below.\n\nCurrent saved plan:\n{current_plan}"
+            "Agent orchestrate mode: proactively delegate useful independent work to sub-agents in parallel while you advance the main task yourself. Keep dispatches concise: goal, necessary context, and scope; avoid duplicate investigation or concurrent edits to the same files. Steer agents as work develops, reuse the relevant agent for follow-ups, and read or wait for the specific results you need. Use their actual outputs as information, distinguish sources and uncertainties, and decide the next steps and final answer yourself. Handle simple or tightly coupled work directly. If a branch encounters a runtime issue, adjust that branch and keep independent work moving. Follow the user's latest request; use the saved plan as context when relevant.\n\nCurrent saved plan:\n{current_plan}"
         )
     } else {
         format!(
@@ -315,12 +315,22 @@ mod tests {
     }
 
     #[test]
-    fn format_prompt_emits_orchestrate_section() {
-        let mut state = AgentPlanState::default();
-        state.mode = AgentPlanMode::Orchestrate;
-        let en = format_prompt(&state);
-        assert!(en.contains("orchestrate mode"));
-        assert!(en.contains("sub-agents"));
+    fn orchestrate_keeps_saved_plan_as_context_without_plan_mode_restrictions() {
+        let draft = capture_draft_from_reply(
+            &AgentPlanState::default(),
+            "## Plan\n1. Read the entry point.\n2. Update the handler.",
+        );
+        let state = with_mode(&draft, AgentPlanMode::Orchestrate);
+        assert_eq!(state.plan, draft.plan);
+        let prompt = format_prompt(&state);
+        assert!(prompt.contains(current_plan_text(&draft).unwrap()));
+        assert!(prompt.contains("advance the main task yourself"));
+        assert!(prompt.contains("reuse the relevant agent"));
+        assert!(!prompt.contains("Plan mode is read-only"));
+        assert!(!prompt.contains("Required flow"));
+        assert!(!prompt.contains("todo_write"));
+        assert!(!prompt.contains("must be delegated"));
+        assert_eq!(with_mode(&state, AgentPlanMode::Act).plan, draft.plan);
     }
 
     #[test]

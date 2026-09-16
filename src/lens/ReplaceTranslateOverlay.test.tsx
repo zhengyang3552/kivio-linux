@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { ReplaceTranslateOverlay } from './ReplaceTranslateOverlay'
-import { selectedGroupsText } from './replaceTextLayout'
+import { layoutReplaceTextFlow, replaceSlotTextBounds, selectedGroupsText } from './replaceTextLayout'
 
 const labelProps = {
   interactHint: '单击切换原文 · 拖拽框选复制 · Esc 关闭',
@@ -11,6 +11,62 @@ const labelProps = {
 }
 
 describe('ReplaceTranslateOverlay status', () => {
+  it('draws an oversized translation directly at its final font size', () => {
+    const fonts: string[] = []
+    const context = {
+      clearRect: vi.fn(), drawImage: vi.fn(), save: vi.fn(), beginPath: vi.fn(),
+      rect: vi.fn(), clip: vi.fn(), restore: vi.fn(), font: '',
+      measureText(text: string) { return { width: text.length * parseFloat(this.font) } },
+      fillText() { fonts.push(this.font) },
+    }
+    const getContext = vi.spyOn(HTMLCanvasElement.prototype, 'getContext')
+      .mockReturnValue(context as unknown as CanvasRenderingContext2D)
+    class FixtureImage {
+      naturalWidth = 320
+      naturalHeight = 180
+      onload: (() => void) | null = null
+      set src(_value: string) { this.onload?.() }
+    }
+    vi.stubGlobal('Image', FixtureImage)
+    try {
+      render(<ReplaceTranslateOverlay
+        frame={{ x: 0, y: 0, width: 320, height: 180, label: 'fixture' }}
+        cleanedImage="data:image/png;base64,fixture"
+        groups={[{ id: 'g', leafIds: ['l'], sourceText: 'source', translated: '完整译文'.repeat(20) }]}
+        slots={[{
+          id: 's', groupId: 'g', leafIds: ['l'],
+          bounds: { x: 10, y: 10, width: 60, height: 20 },
+          anchor: { x: 12, y: 12, baselineY: 28 },
+          flow: 'exact_line', kind: 'line', align: 'left', verticalAlign: 'top',
+          sourceFontPx: 16, sourceColor: '#111827',
+        }]}
+        phase="done" statusLabel="完成" escHint="按 Esc 关闭" {...labelProps}
+      />)
+      expect(fonts.length).toBeGreaterThan(0)
+      expect(fonts.every(font => parseFloat(font) < 7)).toBe(true)
+      // Only the cleaned source image is rasterized; text is not downsampled.
+      expect(context.drawImage).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.unstubAllGlobals()
+      getContext.mockRestore()
+    }
+  })
+
+  it('fits text in the space remaining after the measured ink anchor', () => {
+    const available = replaceSlotTextBounds({
+      id: 's', groupId: 'g', leafIds: ['l'],
+      bounds: { x: 10, y: 10, width: 100, height: 30 },
+      anchor: { x: 35, y: 20, baselineY: 36 },
+      flow: 'exact_line', kind: 'line', align: 'left', verticalAlign: 'top',
+      sourceFontPx: 16, sourceColor: '#111827',
+    }, 2)
+    expect(available).toEqual({ width: 73, height: 20, maxLines: 1 })
+    const layout = layoutReplaceTextFlow('这是一段完整译文', [available], 16, (text, size) => text.length * size)
+    expect(layout.complete).toBe(true)
+    expect(layout.slots[0].contentWidth * layout.safeScale + 35).toBeLessThanOrEqual(108)
+    expect(layout.slots[0].contentHeight * layout.safeScale + 20).toBeLessThanOrEqual(40)
+  })
+
   it('renders the localized status label instead of an internal error code', () => {
     render(
       <ReplaceTranslateOverlay
@@ -72,7 +128,7 @@ describe('ReplaceTranslateOverlay status', () => {
     const context = {
       clearRect: vi.fn(),
       drawImage: vi.fn(),
-      measureText: (text: string) => ({ width: text.length * 8 }),
+      measureText: (text: string) => ({ width: text.length * 8, actualBoundingBoxAscent: 12 }),
       save: vi.fn(),
       beginPath: vi.fn(),
       rect: vi.fn(),
@@ -121,7 +177,8 @@ describe('ReplaceTranslateOverlay status', () => {
       />,
     )
 
-    expect(fillText).toHaveBeenCalledWith('短译文', 12, 20)
+    // The alphabetic baseline is 12px below the visible ink's top anchor.
+    expect(fillText).toHaveBeenCalledWith('短译文', 12, 32)
     globalThis.Image = originalImage
     getContext.mockRestore()
   })

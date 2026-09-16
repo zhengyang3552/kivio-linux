@@ -116,6 +116,9 @@ struct RegionDraft {
 pub(crate) struct Separators {
     pub(crate) horizontal: Vec<f32>,
     pub(crate) vertical: Vec<f32>,
+    // Local rectangles, verified on all four sides. A short table divider must
+    // not become an imaginary column extending through the entire screenshot.
+    pub(crate) cells: Vec<ReplaceBounds>,
 }
 
 fn build_translation_layout_drafts(
@@ -127,18 +130,13 @@ fn build_translation_layout_drafts(
     }
     let separators = detect_separators(image);
     let mut assigned = vec![false; spans.len()];
-    let mut drafts = table_cell_regions(spans, &separators, &mut assigned);
+    let mut drafts = table_cell_regions(image, spans, &separators, &mut assigned);
     let remaining: Vec<RapidOcrLine> = spans
         .iter()
         .zip(assigned)
         .filter_map(|(span, assigned)| (!assigned).then_some(span.clone()))
         .collect();
-    drafts.extend(fallback_regions(
-        image.width(),
-        image.height(),
-        &remaining,
-        &separators,
-    ));
+    drafts.extend(fallback_regions(image, &remaining, &separators));
     drafts.sort_by(|a, b| cmp_f32(a.bounds.y, b.bounds.y).then(cmp_f32(a.bounds.x, b.bounds.x)));
     drafts.into_iter().map(finalize_region).collect()
 }
@@ -170,17 +168,40 @@ pub fn build_replace_geometry(image: &RgbImage, leaves: &[OcrLeaf]) -> ReplaceGe
                 source_text: region.source_text.clone(),
                 translated: region.source_text.clone(),
             });
-            geometry.slots.push(render_slot(
-                image,
-                &group_id,
-                0,
-                region_leaves,
-                region.bounds,
-                ReplaceRegionKind::Cell,
-                RenderFlow::CellFlow,
-                region.align,
-                RenderVerticalAlign::Center,
-            ));
+            let lines = visual_lines(&region_leaves);
+            if lines.len() > 1 {
+                for (index, line) in lines.into_iter().enumerate() {
+                    let mut bounds = line_slot_bounds(&line, region.bounds);
+                    bounds.width = (region.bounds.x + region.bounds.width - bounds.x).max(1.0);
+                    bounds.height = bounds
+                        .height
+                        .min(region.bounds.y + region.bounds.height - bounds.y)
+                        .max(1.0);
+                    geometry.slots.push(render_slot(
+                        image,
+                        &group_id,
+                        index,
+                        line,
+                        bounds,
+                        ReplaceRegionKind::Cell,
+                        RenderFlow::ParagraphFlow,
+                        ReplaceTextAlign::Left,
+                        RenderVerticalAlign::Top,
+                    ));
+                }
+            } else {
+                geometry.slots.push(render_slot(
+                    image,
+                    &group_id,
+                    0,
+                    region_leaves,
+                    region.bounds,
+                    ReplaceRegionKind::Cell,
+                    RenderFlow::ExactLine,
+                    region.align,
+                    RenderVerticalAlign::Top,
+                ));
+            }
         } else if region.kind == ReplaceRegionKind::Paragraph {
             // 段落整段成组：全文一次翻译（跨行语义连贯，逐行翻译会把一句话
             // 拦腰截成碎片），译文由前端 layoutReplaceTextFlow 依次流过每行
@@ -435,10 +456,79 @@ pub(crate) fn detect_separators(image: &RgbImage) -> Separators {
             vertical.push(x as f32);
         }
     }
+    let horizontal = merge_nearby_lines(horizontal);
+    let cells = detect_table_cells(&gray, width, height, &horizontal);
     Separators {
-        horizontal: merge_nearby_lines(horizontal),
+        horizontal,
         vertical: merge_nearby_lines(vertical),
+        cells,
     }
+}
+
+fn detect_table_cells(
+    gray: &[u8],
+    width: usize,
+    height: usize,
+    horizontal: &[f32],
+) -> Vec<ReplaceBounds> {
+    let mut cells = Vec::new();
+    let vertical_edge = |x: usize, y: usize| {
+        (gray[y * width + x + 1] as i16 - gray[y * width + x - 1] as i16).abs() >= 10
+    };
+    let horizontal_edge = |x: usize, y: usize| {
+        (gray[(y + 1) * width + x] as i16 - gray[(y - 1) * width + x] as i16).abs() >= 10
+    };
+    for row in horizontal.windows(2) {
+        let top = row[0].round() as usize;
+        let bottom = (row[1].round() as usize).min(height - 2);
+        if bottom <= top + 12 {
+            continue;
+        }
+        let edges = merge_nearby_lines(
+            (1..width - 1)
+                .filter(|&x| {
+                    let count = (top + 2..bottom - 1)
+                        .filter(|&y| vertical_edge(x, y))
+                        .count();
+                    count as f32 >= (bottom - top - 3) as f32 * 0.9
+                })
+                .map(|x| x as f32)
+                .collect(),
+        );
+        // A page/code-block border alone is not a table.
+        if edges.len() < 3 {
+            continue;
+        }
+        let mut row_cells = Vec::new();
+        for column in edges.windows(2) {
+            let left = column[0].round() as usize;
+            let right = column[1].round() as usize;
+            if right <= left + 12 {
+                continue;
+            }
+            let connected = [top, bottom].iter().all(|&y| {
+                let count = (left + 2..right - 1)
+                    .filter(|&x| {
+                        (y.saturating_sub(1).max(1)..=(y + 1).min(height - 2))
+                            .any(|near_y| horizontal_edge(x, near_y))
+                    })
+                    .count();
+                count as f32 >= (right - left - 3) as f32 * 0.9
+            });
+            if connected {
+                row_cells.push(ReplaceBounds {
+                    x: column[0],
+                    y: row[0],
+                    width: column[1] - column[0],
+                    height: row[1] - row[0],
+                });
+            }
+        }
+        if row_cells.len() >= 2 {
+            cells.extend(row_cells);
+        }
+    }
+    cells
 }
 
 fn longest_run_with_gaps(values: impl Iterator<Item = bool>, max_gap: usize) -> usize {
@@ -481,76 +571,55 @@ fn merge_nearby_lines(mut values: Vec<f32>) -> Vec<f32> {
 }
 
 fn table_cell_regions(
+    image: &RgbImage,
     spans: &[RapidOcrLine],
     separators: &Separators,
     assigned: &mut [bool],
 ) -> Vec<RegionDraft> {
-    // Two vertical edges only describe one column and are commonly produced by
-    // a page border or a code block. Requiring an internal divider prevents a
-    // document page from being mistaken for a one-column table.
-    if separators.horizontal.len() < 2 || separators.vertical.len() < 3 {
-        return Vec::new();
-    }
-    let mut cells: HashMap<(usize, usize), Vec<(usize, RapidOcrLine)>> = HashMap::new();
+    let mut cells: HashMap<usize, Vec<RapidOcrLine>> = HashMap::new();
     for (index, span) in spans.iter().enumerate() {
-        let center_x = span.x + span.width / 2.0;
-        let center_y = span.y + span.height / 2.0;
-        let Some(column) = containing_interval(&separators.vertical, center_x) else {
+        // OCR boxes are slightly expanded, but a leaf really crossing a cell
+        // boundary must not be assigned just because its centre is inside.
+        let Some(cell) = separators.cells.iter().position(|cell| {
+            span.x >= cell.x - 2.0
+                && span.y >= cell.y - 2.0
+                && span.x + span.width <= cell.x + cell.width + 2.0
+                && span.y + span.height <= cell.y + cell.height + 2.0
+        }) else {
             continue;
         };
-        let Some(row) = containing_interval(&separators.horizontal, center_y) else {
-            continue;
-        };
-        let left = separators.vertical[column];
-        let right = separators.vertical[column + 1];
-        let top = separators.horizontal[row];
-        let bottom = separators.horizontal[row + 1];
-        let overlap_x = (right.min(span.x + span.width) - left.max(span.x)).max(0.0);
-        let overlap_y = (bottom.min(span.y + span.height) - top.max(span.y)).max(0.0);
-        let overlap = overlap_x * overlap_y;
-        if overlap < span.width * span.height * 0.45 {
-            continue;
-        }
         assigned[index] = true;
-        cells
-            .entry((row, column))
-            .or_default()
-            .push((index, span.clone()));
+        cells.entry(cell).or_default().push(span.clone());
     }
 
     let mut drafts = Vec::new();
-    for ((row, column), entries) in cells {
+    for (cell_index, entries) in cells {
         let inset = 4.0;
-        drafts.push(RegionDraft {
-            spans: entries.into_iter().map(|(_, span)| span).collect(),
-            bounds: ReplaceBounds {
-                x: separators.vertical[column] + inset,
-                y: separators.horizontal[row] + inset,
-                width: (separators.vertical[column + 1]
-                    - separators.vertical[column]
-                    - inset * 2.0)
-                    .max(1.0),
-                height: (separators.horizontal[row + 1] - separators.horizontal[row] - inset * 2.0)
-                    .max(1.0),
-            },
-            kind: ReplaceRegionKind::Cell,
-        });
+        let cell = separators.cells[cell_index];
+        // A container is a hard boundary, not a single semantic paragraph.
+        // Illustrated cards contain independent headings, captions and icons.
+        for mut region in fallback_regions(image, &entries, separators) {
+            let top = region.bounds.y.max(cell.y + inset);
+            let bottom = (region.bounds.y + region.bounds.height).min(cell.y + cell.height - inset);
+            region.bounds = ReplaceBounds {
+                x: cell.x + inset,
+                y: top,
+                width: (cell.width - inset * 2.0).max(1.0),
+                height: (bottom - top).max(1.0),
+            };
+            region.kind = ReplaceRegionKind::Cell;
+            drafts.push(region);
+        }
     }
     drafts
 }
 
-fn containing_interval(lines: &[f32], value: f32) -> Option<usize> {
-    lines
-        .windows(2)
-        .position(|pair| value > pair[0] && value < pair[1])
-}
-
 fn fallback_regions(
-    image_width: u32,
-    image_height: u32,
+    image: &RgbImage,
     spans: &[RapidOcrLine],
     separators: &Separators,
 ) -> Vec<RegionDraft> {
+    let (image_width, image_height) = image.dimensions();
     if spans.is_empty() {
         return Vec::new();
     }
@@ -584,6 +653,7 @@ fn fallback_regions(
                         let previous = paragraph.last().expect("paragraph has a line");
                         !looks_like_code_line(previous)
                             && lines_belong_to_paragraph(previous, &line, median_height, separators)
+                            && compatible_line_styles(image, previous, &line)
                     })
                     .max_by(|(_, a), (_, b)| {
                         let a_bounds = spans_bounds(a.last().expect("paragraph line"));
@@ -661,6 +731,30 @@ fn fallback_regions(
         .collect()
 }
 
+fn compatible_line_styles(image: &RgbImage, a: &[RapidOcrLine], b: &[RapidOcrLine]) -> bool {
+    // A compact isolated detection (often an arrow read as a digit) must not
+    // join the sentence or set its font. Numeric table cells remain intact.
+    if [a, b]
+        .iter()
+        .any(|line| line.len() == 1 && line[0].text.trim().chars().count() <= 1)
+    {
+        return false;
+    }
+    let color = |line: &[RapidOcrLine]| {
+        let hex = estimate_source_color(image, line);
+        u32::from_str_radix(&hex[1..], 16).unwrap_or(0)
+    };
+    let (ca, cb) = (color(a), color(b));
+    let distance: u32 = [0, 8, 16]
+        .iter()
+        .map(|shift| {
+            let delta = ((ca >> shift) & 255) as i32 - ((cb >> shift) & 255) as i32;
+            (delta * delta) as u32
+        })
+        .sum();
+    distance <= 40 * 40
+}
+
 /// 与 rapidocr 的 `span_belongs_to_line` 相似但阈值刻意不同：这里聚合的是排版区域，
 /// 横向间隔上限收得更紧（3× 行高 vs 8×），避免同基线但相距很远的控件被合并；
 /// 垂直判定也更严格（overlap ≥ 0.45 或中心差 ≤ 0.35× 行高）。不要与 OCR 行分组统一。
@@ -693,6 +787,11 @@ fn lines_belong_to_paragraph(
         return false;
     }
     if (a.x - b.x).abs() > median_height * 1.5 {
+        return false;
+    }
+    // OCR can miss the next bullet. A new row at the bullet margin is not a
+    // hanging-indent continuation, even if its box nearly touches this row.
+    if starts_list_item(previous) && b.x - a.x < median_height * 0.4 && gap > median_height * 0.15 {
         return false;
     }
     if (median(previous.iter().map(|span| span.height).collect()).unwrap_or(median_height)
@@ -1036,6 +1135,148 @@ mod tests {
             .expect("right cell");
         assert_eq!(first_row_right.span_ids, vec!["s1", "s2"]);
         assert!(first_row_right.bounds.x >= 70.0);
+    }
+
+    #[test]
+    fn short_table_in_document_keeps_logo_out_of_body() {
+        let mut image = RgbImage::from_pixel(1257, 571, image::Rgb([255, 255, 255]));
+        for y in 50..571 {
+            for x in [69, 1191] {
+                image.put_pixel(x, y, image::Rgb([70, 100, 255]));
+            }
+        }
+        for x in 69..1192 {
+            image.put_pixel(x, 50, image::Rgb([70, 100, 255]));
+        }
+        for x in 108..1121 {
+            for y in [189, 298] {
+                image.put_pixel(x, y, image::Rgb([216, 222, 228]));
+            }
+        }
+        for y in 189..299 {
+            for x in [108, 289, 1120] {
+                image.put_pixel(x, y, image::Rgb([216, 222, 228]));
+            }
+        }
+        let spans = vec![
+            span("before", "Click to collapse", 104.0, 165.0, 136.0, 24.0),
+            span("first", "Thanks to our sponsor", 299.0, 198.0, 778.0, 21.0),
+            span("body", "Claude and other models", 297.0, 222.0, 801.0, 21.0),
+            span("logo", "Hezubus", 158.0, 225.0, 117.0, 31.0),
+            span("last", "Register here", 295.0, 268.0, 106.0, 26.0),
+            span("after", "Text below the table", 104.0, 379.0, 1007.0, 21.0),
+        ];
+        let geometry = build_replace_geometry(&image, &spans);
+        let logo = geometry
+            .groups
+            .iter()
+            .find(|g| g.leaf_ids.contains(&"logo".into()))
+            .unwrap();
+        assert_eq!(logo.leaf_ids, vec!["logo"]);
+        let body = geometry
+            .groups
+            .iter()
+            .find(|g| g.leaf_ids.contains(&"body".into()))
+            .unwrap();
+        assert_eq!(body.leaf_ids, vec!["first", "body"]);
+        assert!(geometry
+            .slots
+            .iter()
+            .filter(|s| s.group_id == body.id)
+            .all(|s| s.bounds.x >= 289.0 && s.bounds.x + s.bounds.width <= 1120.0));
+        let body_slots: Vec<_> = geometry
+            .slots
+            .iter()
+            .filter(|s| s.group_id == body.id)
+            .collect();
+        assert_eq!(body_slots.len(), 2);
+        assert!(body_slots
+            .iter()
+            .all(|s| s.flow == RenderFlow::ParagraphFlow
+                && s.vertical_align == RenderVerticalAlign::Top));
+        for id in ["before", "after"] {
+            assert!(geometry
+                .slots
+                .iter()
+                .filter(|s| s.leaf_ids.contains(&id.into()))
+                .all(|s| s.kind != ReplaceRegionKind::Cell));
+        }
+    }
+
+    #[test]
+    fn illustrated_cells_keep_heading_captions_and_icon_in_separate_groups() {
+        let mut image = RgbImage::from_pixel(640, 320, image::Rgb([255, 255, 255]));
+        for x in 10..631 {
+            for y in [10, 310] {
+                image.put_pixel(x, y, image::Rgb([180, 180, 180]));
+            }
+        }
+        for y in 10..311 {
+            for x in [10, 215, 420, 630] {
+                image.put_pixel(x, y, image::Rgb([180, 180, 180]));
+            }
+        }
+        let spans = vec![
+            span("icon", "1", 70.0, 30.0, 8.0, 8.0),
+            span("title", "Cua Driver", 25.0, 130.0, 100.0, 23.0),
+            span("tag1", "Give your agent", 25.0, 160.0, 110.0, 18.0),
+            span("tag2", "desktop tools", 25.0, 180.0, 100.0, 18.0),
+            span(
+                "body1",
+                "Inspect and operate apps",
+                25.0,
+                216.0,
+                170.0,
+                16.0,
+            ),
+            span("body2", "on macOS and Linux", 25.0, 236.0, 150.0, 16.0),
+            span("arrow", "7", 190.0, 280.0, 8.0, 8.0),
+        ];
+        let geometry = build_replace_geometry(&image, &spans);
+        let groups: Vec<_> = geometry.groups.iter().map(|g| g.leaf_ids.clone()).collect();
+        for expected in [
+            vec!["icon"],
+            vec!["title"],
+            vec!["tag1", "tag2"],
+            vec!["body1", "body2"],
+            vec!["arrow"],
+        ] {
+            assert!(
+                groups.iter().any(
+                    |actual| actual.iter().map(String::as_str).collect::<Vec<_>>() == expected
+                ),
+                "{groups:?}"
+            );
+        }
+        let title = geometry
+            .slots
+            .iter()
+            .find(|s| s.leaf_ids == vec!["title"])
+            .unwrap();
+        assert_eq!(title.flow, RenderFlow::ExactLine);
+        assert_eq!(title.anchor.y, 130.0);
+        assert!(title.bounds.height < 30.0);
+    }
+
+    #[test]
+    fn a_missed_bullet_does_not_merge_the_next_list_item() {
+        let image = RgbImage::from_pixel(2600, 1800, image::Rgb([255, 255, 255]));
+        let spans = vec![
+            span("first", "• Lume: Create a VM", 654.0, 1142.0, 320.0, 17.0),
+            span(
+                "next",
+                "Cua Bench: Verify a task",
+                659.0,
+                1167.0,
+                310.0,
+                17.0,
+            ),
+            span("heading", "A tall heading", 640.0, 700.0, 200.0, 30.0),
+            span("text", "Other text", 640.0, 760.0, 200.0, 23.0),
+        ];
+        let geometry = build_replace_geometry(&image, &spans);
+        assert!(geometry.groups.iter().any(|g| g.leaf_ids == vec!["first"]));
+        assert!(geometry.groups.iter().any(|g| g.leaf_ids == vec!["next"]));
     }
 
     #[test]

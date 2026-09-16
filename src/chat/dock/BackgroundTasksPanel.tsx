@@ -1,12 +1,11 @@
 // Background tasks 面板：内置 run_command 后台作业 + 外部 CLI（claude）自报的后台任务。
 // Running（可停止）/ Finished（可清空）两段，2.5s 轮询；inactive 时停轮询（同兄弟面板惯例）。
-import { useEffect, useRef, useState } from 'react'
+import { useRef } from 'react'
 import { Bot, Square, TerminalSquare } from 'lucide-react'
 import { api, type BackgroundTaskInfo } from '../../api/tauri'
 import { i18n, type Lang } from '../../settings/i18n'
 import { partitionTasks } from '../backgroundTasks'
-
-const POLL_MS = 2500
+import { updateBackgroundTasks, useBackgroundTasks } from '../useBackgroundTasks'
 
 function formatElapsed(secs: number): string {
   if (secs < 60) return `${secs}s`
@@ -22,43 +21,22 @@ function TaskGlyph({ kind }: { kind: string }) {
 }
 
 type BackgroundTasksPanelProps = {
+  hideEmpty?: boolean
   active: boolean
   lang: Lang
   /** 面板按对话隔离：只展示当前对话自己的任务。null = 还没有对话（新建未发送）。 */
   conversationId: string | null
 }
 
-export function BackgroundTasksPanel({ active, lang, conversationId }: BackgroundTasksPanelProps) {
+export function BackgroundTasksPanel({ active, lang, conversationId, hideEmpty = false }: BackgroundTasksPanelProps) {
   const t = i18n[lang]
-  const [tasks, setTasks] = useState<BackgroundTaskInfo[]>([])
+  const tasks = useBackgroundTasks(conversationId, active)
   const stopping = useRef<Set<string>>(new Set())
-
-  useEffect(() => {
-    // 换对话立刻清掉上一个对话的列表，别等下一次轮询。
-    setTasks([])
-    if (!active || !conversationId) return
-    let cancelled = false
-    const tick = async () => {
-      if (document.hidden) return
-      try {
-        const next = await api.chatListBackgroundTasks(conversationId)
-        if (!cancelled) setTasks(next)
-      } catch {
-        if (!cancelled) setTasks([])
-      }
-    }
-    void tick()
-    const timer = window.setInterval(tick, POLL_MS)
-    return () => {
-      cancelled = true
-      window.clearInterval(timer)
-    }
-  }, [active, conversationId])
 
   const { running, finished } = partitionTasks(tasks)
 
   const stop = async (task: BackgroundTaskInfo) => {
-    if (stopping.current.has(task.id)) return
+    if (!conversationId || stopping.current.has(task.id)) return
     stopping.current.add(task.id)
     try {
       if (task.source === 'builtin') {
@@ -66,7 +44,7 @@ export function BackgroundTasksPanel({ active, lang, conversationId }: Backgroun
       } else {
         await api.chatStopExternalBackgroundTask(task.conversationId ?? '', task.id)
       }
-      setTasks((prev) =>
+      updateBackgroundTasks(conversationId, (prev) =>
         prev.map((item) => (item.id === task.id ? { ...item, status: 'stopped' as const } : item)),
       )
     } catch {
@@ -80,7 +58,7 @@ export function BackgroundTasksPanel({ active, lang, conversationId }: Backgroun
     if (!conversationId) return
     try {
       await api.chatClearFinishedBackgroundTasks(conversationId)
-      setTasks((prev) => prev.filter((item) => item.status === 'running'))
+      updateBackgroundTasks(conversationId, (prev) => prev.filter((item) => item.status === 'running'))
     } catch {
       // next poll reflects the real state
     }
@@ -94,6 +72,7 @@ export function BackgroundTasksPanel({ active, lang, conversationId }: Backgroun
         : t.chatBgStatusStopped
 
   if (tasks.length === 0) {
+    if (hideEmpty) return null
     return (
       <div className="grid flex-1 place-items-center px-6 text-center text-[12.5px] text-neutral-400 dark:text-neutral-500">
         {t.chatBgEmpty}
@@ -102,7 +81,7 @@ export function BackgroundTasksPanel({ active, lang, conversationId }: Backgroun
   }
 
   return (
-    <div className="chat-popover-scroll min-h-0 flex-1 overflow-y-auto px-2 py-2">
+    <div className="shrink-0 px-2 py-2">
       {running.length > 0 && (
         <div className="px-1 py-1.5 text-[12px] font-medium text-neutral-500 dark:text-neutral-400">
           {t.chatBgRunning} · {running.length}

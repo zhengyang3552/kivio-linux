@@ -73,7 +73,57 @@ function tool(partial: Partial<ToolCallRecord> & Pick<ToolCallRecord, 'id'>): To
 }
 
 describe('groupTimelineSegments', () => {
-  it('keeps present_artifacts outside collapsed process groups', () => {
+  it('keeps deliveries in answer order without splitting the one process', () => {
+    const items = groupTimelineSegments([
+      toolSegment('read', 0, 'read'),
+      segment({ id: 'note', kind: 'text', phase: 'tool_loop', order: 1, text: 'Working' }),
+      toolSegment('present-a', 2, 'present-a'),
+      toolSegment('check', 3, 'check'),
+      segment({ id: 'answer', kind: 'text', phase: 'plain', order: 4, text: 'Done' }),
+      toolSegment('present-b', 5, 'present-b'),
+    ], 'completed', s => s.id.startsWith('present-'))
+    expect(items.map(item => item.type)).toEqual(['group', 'presentation', 'text', 'presentation'])
+    expect(items[0].type === 'group' && items[0].segments.map(s => s.id)).toEqual(['read', 'note', 'check'])
+  })
+
+  it('folds progress and CLI agent cards into the same process', () => {
+    const items = groupTimelineSegments([
+      segment({ id: 'note', kind: 'text', phase: 'plain', order: 1, text: 'Delegating a check' }),
+      toolSegment('agent', 2, 'agent-call'),
+      segment({ id: 'final', kind: 'text', phase: 'synthesis', order: 3, text: 'Final answer' }),
+    ], 'completed')
+    expect(items.map(item => item.type)).toEqual(['group', 'text'])
+  })
+
+  it('does not treat a persisted cancellation notice as a final answer', () => {
+    const items = groupTimelineSegments([
+      segment({ id: 'note', kind: 'text', phase: 'tool_loop', order: 1, text: 'Partial findings' }),
+      toolSegment('t', 2, 'call'),
+      segment({ id: 'seg_3_cancelled_synthesis', kind: 'text', phase: 'synthesis', order: 3, text: '已停止生成。' }),
+    ], 'completed')
+    expect(items.map(item => item.type)).toEqual(['group', 'text', 'text'])
+  })
+
+  it('preserves all body text when a stopped run has no final answer', () => {
+    const items = groupTimelineSegments([
+      segment({ id: 'note', kind: 'text', phase: 'tool_loop', order: 1, text: 'Progress so far' }),
+      toolSegment('t', 2, 'call'),
+    ], 'completed')
+    expect(items.map(item => item.type)).toEqual(['group', 'text'])
+  })
+
+  it('keeps every trailing final-answer segment and folds earlier commentary', () => {
+    const items = groupTimelineSegments([
+      segment({ id: 'note', kind: 'text', phase: 'tool_loop', order: 1, text: 'Searching' }),
+      toolSegment('t', 2, 'call'),
+      segment({ id: 'a', kind: 'text', phase: 'plain', order: 3, text: 'Answer one' }),
+      segment({ id: 'b', kind: 'text', phase: 'synthesis', order: 4, text: 'Answer two' }),
+    ], 'completed')
+    expect(items.map(item => item.type)).toEqual(['group', 'text', 'text'])
+    expect(items[0].type === 'group' && items[0].segments.map(s => s.id)).toEqual(['note', 't'])
+  })
+
+  it('keeps presentation cards inside the single process', () => {
     const present = tool({
       id: 'present-1',
       name: 'present_artifacts',
@@ -88,10 +138,9 @@ describe('groupTimelineSegments', () => {
         toolSegment('present-segment', 2, 'present-1'),
         toolSegment('write-segment', 3, 'write-1'),
       ],
-      (item) => item.kind === 'tool' && item.tool_call_id === present.id,
     )
 
-    expect(items.map((item) => item.type)).toEqual(['group', 'standaloneTool', 'group'])
+    expect(items.map((item) => item.type)).toEqual(['group'])
   })
 
   it('keeps image reads inside the process group so they do not split Worked', () => {
@@ -284,14 +333,14 @@ describe('groupTimelineSegments', () => {
     expect(items[0].type === 'group' && items[0].segments.map((s) => s.id)).toEqual(['r', 't1', 't2'])
   })
 
-  it('folds commentary that still has tools after it into one process group', () => {
+  it('preserves partial text outside one process when no final answer exists', () => {
     const items = groupTimelineSegments([
       toolSegment('t1', 1, 'call-1'),
       segment({ id: 'txt', kind: 'text', order: 2, text: 'between' }),
       toolSegment('t2', 3, 'call-2'),
     ])
-    expect(items).toHaveLength(1)
-    expect(items[0].type === 'group' && items[0].segments.map((s) => s.id)).toEqual(['t1', 'txt', 't2'])
+    expect(items.map(item => item.type)).toEqual(['group', 'text'])
+    expect(items[1].type === 'text' && items[1].segment.id).toBe('txt')
   })
 
   it('keeps trailing synthesis/plain text outside the process group', () => {
@@ -303,25 +352,24 @@ describe('groupTimelineSegments', () => {
     expect(items[1].type === 'text' && items[1].segment.id).toBe('txt')
   })
 
-  it('folds tool_loop commentary into the group and leaves the final answer out', () => {
+  it('folds tool-loop text and leaves the final answer outside', () => {
     const items = groupTimelineSegments([
       toolSegment('t1', 1, 'call-1'),
       segment({ id: 'note', kind: 'text', order: 2, phase: 'tool_loop', text: 'looking around' }),
       segment({ id: 'ans', kind: 'text', order: 3, phase: 'synthesis', text: 'done' }),
     ])
-    expect(items).toHaveLength(2)
-    expect(items[0].type === 'group' && items[0].segments.map((s) => s.id)).toEqual(['t1', 'note'])
+    expect(items.map(item => item.type)).toEqual(['group', 'text'])
     expect(items[1].type === 'text' && items[1].segment.id).toBe('ans')
   })
 
-  it('folds leading plain text that is followed by tools into the process group', () => {
+  it('folds leading plain text once a final answer exists', () => {
     const items = groupTimelineSegments([
       segment({ id: 'intro', kind: 'text', order: 1, text: 'I will read the file' }),
       toolSegment('t1', 2, 'call-1'),
       segment({ id: 'ans', kind: 'text', order: 3, phase: 'synthesis', text: 'done' }),
     ])
-    expect(items).toHaveLength(2)
-    expect(items[0].type === 'group' && items[0].segments.map((s) => s.id)).toEqual(['intro', 't1'])
+    expect(items.map(item => item.type)).toEqual(['group', 'text'])
+    expect(items[0].type === 'group' && items[0].segments[0].id).toBe('intro')
     expect(items[1].type === 'text' && items[1].segment.id).toBe('ans')
   })
 

@@ -8,6 +8,7 @@ import { FileTreePanel } from './FileTreePanel'
 import { GitPanel } from './GitPanel'
 import { TerminalPanel } from './TerminalPanel'
 import { BackgroundTasksPanel } from './BackgroundTasksPanel'
+import { SubAgentPanel } from '../SubAgentPanel'
 
 export type DockTab = 'files' | 'git' | 'terminal' | 'tasks'
 
@@ -36,6 +37,7 @@ type RightDockProps = {
   lang: Lang
   /** 当前对话 id（任务页按对话隔离）。null = 还没有对话。 */
   conversationId: string | null
+  subAgentRequest?: { conversationId: string; agentId: string; nonce: number } | null
   treeExpanded: string[]
   revealRequest: DockRevealRequest
   previewRequest: DockPreviewRequest
@@ -54,6 +56,7 @@ export const RightDock = memo(function RightDock({
   workdir,
   lang,
   conversationId,
+  subAgentRequest,
   treeExpanded,
   revealRequest,
   previewRequest,
@@ -111,9 +114,9 @@ export const RightDock = memo(function RightDock({
   const filesActive = open && activeTab === 'files'
   const gitActive = open && activeTab === 'git'
   const terminalActive = open && activeTab === 'terminal'
-  // 终端面板一挂载就建 PTY + xterm/WebGL（约 25MB PowerShell + GPU 画布），
-  // 且切 tab 不断会话。没点过「终端」就不要挂，避免每个会话窗口白送一份常驻壳。
-  const [terminalMounted, setTerminalMounted] = useState(() => activeTab === 'terminal')
+  // 代码提前加载，PTY 和画布只在首次真正打开终端时创建，之后切标签保留会话。
+  // Dock 折叠时即使记住了终端标签，也不能提前启动 shell。
+  const [terminalMounted, setTerminalMounted] = useState(() => terminalActive)
   useEffect(() => {
     if (terminalActive) setTerminalMounted(true)
   }, [terminalActive])
@@ -160,7 +163,7 @@ export const RightDock = memo(function RightDock({
         </IconButton>
       </div>
 
-      {/* 文件 / Git / 终端 / 任务常驻挂载，inactive 只 hidden。 */}
+      {/* 文件 / Git / 终端保留面板；子代理详情仅在任务页可见时读取。 */}
       <div className="flex min-h-0 flex-1 flex-col" hidden={activeTab !== 'files'}>
         <FileTreePanel
           workdir={workdir}
@@ -182,12 +185,16 @@ export const RightDock = memo(function RightDock({
           <TerminalPanel workdir={workdir} active={terminalActive} lang={lang} />
         )}
       </div>
-      <div className="flex min-h-0 flex-1 flex-col" hidden={activeTab !== 'tasks'}>
-        <BackgroundTasksPanel
+      <div data-task-scroll className="flex min-h-0 flex-1 flex-col overflow-y-auto custom-scrollbar" hidden={activeTab !== 'tasks'}>
+        {open && activeTab === 'tasks' && conversationId && (
+          <SubAgentPanel key={conversationId} conversationId={conversationId} lang={lang} revealAgent={subAgentRequest?.conversationId === conversationId ? subAgentRequest : null}
+            listFooter={<BackgroundTasksPanel hideEmpty active lang={lang} conversationId={conversationId} />} />
+        )}
+        {!conversationId && <BackgroundTasksPanel
           active={open && activeTab === 'tasks'}
           lang={lang}
           conversationId={conversationId}
-        />
+        />}
       </div>
     </aside>
   )

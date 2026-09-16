@@ -167,14 +167,23 @@ pub fn is_tools_unsupported_error(err: &str) -> bool {
         return false;
     }
     let lower = err.to_ascii_lowercase();
-    lower.contains("tools")
-        || lower.contains("tool_choice")
-        || lower.contains("tool_calls")
-        || lower.contains("function calling")
-        || lower.contains("function_call")
-        || lower.contains("function call")
-        || lower.contains("not support")
-        || (code == 400 && lower.contains("tool"))
+    // The stage prefix itself contains "tools". A 400 mentioning malformed
+    // history/schema/reasoning is not a capability rejection.
+    [
+        "tools",
+        "tool_choice",
+        "function calling",
+        "function_call",
+        "function call",
+    ]
+    .iter()
+    .any(|feature| {
+        lower.contains(&format!("{feature} not supported"))
+            || lower.contains(&format!("{feature} is not supported"))
+            || lower.contains(&format!("{feature} are not supported"))
+            || lower.contains(&format!("does not support {feature}"))
+            || lower.contains(&format!("unsupported {feature}"))
+    }) || (lower.contains("tools[") && lower.contains("unknown variant `function`"))
 }
 
 pub fn patch_system_message(messages: &mut [Value], prompt: &str) {
@@ -236,7 +245,7 @@ mod tests {
         assert!(is_tools_unsupported_error(
             "Chat tools planning Error: 400 Bad Request - tools not supported (attempt 1/3)"
         ));
-        assert!(is_tools_unsupported_error(
+        assert!(!is_tools_unsupported_error(
             "Chat tools planning Error: 422 Unprocessable Entity - invalid tool_choice (attempt 1/1)"
         ));
         assert!(is_tools_unsupported_error(
@@ -249,6 +258,20 @@ mod tests {
             "Chat tools planning Error: 429 Too Many Requests - rate limited (attempt 1/3)"
         ));
         assert!(!is_tools_unsupported_error("network timeout"));
+    }
+
+    #[test]
+    fn malformed_tool_history_is_not_an_unsupported_tools_capability() {
+        for error in [
+            "Chat tools planning Error: 400 Bad Request - An assistant message with tool_calls must be followed by tool messages",
+            "Chat tools planning Error: 400 Bad Request - Missing reasoning_content in assistant tool call message",
+            "Chat tools planning Error: 422 - Invalid tools[0].parameters: schema is not valid",
+            "Chat tools planning Error: 400 - This model does not support images",
+            "Chat tools planning Error: 400 - The `reasoning_text` in the thinking mode must be passed back to the API.",
+        ] {
+            assert!(extract_status_code(error).is_some(), "fixture must exercise HTTP classification");
+            assert!(!is_tools_unsupported_error(error), "{error}");
+        }
     }
 
     #[test]

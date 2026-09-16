@@ -1,5 +1,6 @@
 import { type ComponentType, type ReactNode, memo, useEffect, useMemo, useRef, useState } from 'react'
 import { ChatDisclosureBody } from './ChatDisclosureBody'
+import { SubAgentToolCard } from './SubAgentToolCard'
 import {
   AlertCircle,
   Bot,
@@ -11,6 +12,7 @@ import {
   Download,
   ExternalLink,
   Eye,
+  Film,
   FilePen,
   FilePlus2,
   FileSearch,
@@ -205,6 +207,8 @@ function toolGlyph(toolCall: ToolCallRecord): LucideIcon | ComponentType<{ size?
       return Save
     case 'mixer_vision':
       return Eye
+    case 'mixer_video_analysis':
+      return Film
     case 'mixer_generate_image':
       return ImagePlus
     case 'agent':
@@ -388,6 +392,7 @@ function structuredSubagent(toolCall: ToolCallRecord): SubagentView | null {
 }
 
 function isSubAgentRecord(toolCall: ToolCallRecord): boolean {
+  if (objectValue(toolCall.structured_content ?? toolCall.structuredContent)?.type === 'subagent_started') return true
   if (structuredSubagent(toolCall)) return true
   // 外部 CLI 的子代理（claude 的 Agent/Task）没有 structured content，
   // 按 source+名字认，与内置 agent 同一张 SUBAGENT 卡。
@@ -562,6 +567,11 @@ function SubAgentCard({ toolCall }: ToolCallBlockProps) {
   const status = subagentDisplayStatus(toolCall, normalizeToolCallStatus(toolCall.status))
   const view = useMemo(() => structuredSubagent(toolCall), [toolCall])
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
+
+  const receipt = objectValue(toolCall.structured_content ?? toolCall.structuredContent)
+  if (receipt?.type === 'subagent_started') {
+    return <SubAgentToolCard toolCall={toolCall} />
+  }
 
   const agentType = subagentAgentType(view, args)
   const name = subagentName(view, args)
@@ -1477,6 +1487,7 @@ function getToolName(toolCall: ToolCallRecord): string {
   if (raw === 'automation_runs') return 'Automation runs'
   if (raw === 'automation_delete') return 'Delete automation'
   if (raw === 'mixer_vision') return 'Vision'
+  if (raw === 'mixer_video_analysis') return 'Video analysis'
   if (raw === 'mixer_generate_image') return 'Generate image'
   if (raw === 'todo_write' || raw === 'todo_update') return 'Update todos'
   if (structuredTodoState(toolCall)) return 'Update todos'
@@ -1603,6 +1614,10 @@ function getToolTarget(toolCall: ToolCallRecord): string {
       case 'mixer_vision': {
         const count = numberValue(args?.images)
         return count > 0 ? `${count} image${count > 1 ? 's' : ''}` : ''
+      }
+      case 'mixer_video_analysis': {
+        const count = numberValue(args?.videos)
+        return count > 0 ? `${count} video${count > 1 ? 's' : ''}` : ''
       }
       case 'mixer_generate_image':
         return compactText(firstString(args?.prompt), 140)
@@ -2077,6 +2092,9 @@ export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] })
 }
 
 function ToolCallBlockComponent(props: ToolCallBlockProps) {
+  if ((props.toolCall.source === 'native' && ['agent', 'agent_control'].includes(toolRawName(props.toolCall))) || objectValue(props.toolCall.structured_content ?? props.toolCall.structuredContent)?.type === 'subagent_control') {
+    return <SubAgentToolCard toolCall={props.toolCall} />
+  }
   if (isAskUserTool(props.toolCall)) {
     return <AskUserBlock toolCall={props.toolCall} />
   }

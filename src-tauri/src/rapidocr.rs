@@ -286,7 +286,7 @@ fn run_worker_body(
 ) -> Result<WorkerResponse, String> {
     init_ort_from_model_dir(model_dir)?;
     let (det_path, rec_path, keys_path) = model_paths(model_dir, tier);
-    let pipeline = build_pipeline(tier, det_path, rec_path, keys_path)?;
+    let pipeline = build_pipeline(tier, det_path, rec_path, keys_path, mode)?;
     let image =
         oar_ocr::utils::load_image(image_path).map_err(|error| format!("load_image: {error}"))?;
     let results = pipeline
@@ -318,6 +318,7 @@ fn build_pipeline(
     det_path: PathBuf,
     rec_path: PathBuf,
     keys_path: PathBuf,
+    mode: WorkerMode,
 ) -> Result<OAROCR, String> {
     let mut builder = OAROCRBuilder::new(
         det_path.to_string_lossy().into_owned(),
@@ -331,6 +332,15 @@ fn build_pipeline(
             score_threshold: 0.2,
             box_threshold: 0.45,
             unclip_ratio: 1.4,
+            // The default detector shrinks the entire screenshot to 960px.
+            // Layout OCR needs small UI text and tight boxes even on a large
+            // capture. Max limiting does not upscale smaller input images.
+            limit_side_len: matches!(mode, WorkerMode::Lines).then_some(2560),
+            ..Default::default()
+        });
+    } else if matches!(mode, WorkerMode::Lines) {
+        builder = builder.text_detection_config(oar_ocr::domain::TextDetectionConfig {
+            limit_side_len: Some(2560),
             ..Default::default()
         });
     }
