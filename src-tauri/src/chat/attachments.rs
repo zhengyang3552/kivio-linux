@@ -151,23 +151,30 @@ pub(crate) fn resolve_attachment_file_path(
         return Err("附件路径为空".to_string());
     }
 
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        if candidate.is_file() || candidate.is_dir() {
+            return Ok(candidate);
+        }
+        return Err(format!("附件不存在: {path}"));
+    }
+
     if let Some(conversation_id) = conversation_id {
         if path.contains('/') || path.contains('\\') {
             return Err("无效的附件路径".to_string());
         }
         let dir = conversation_attachments_dir(app, conversation_id)?;
         let full = dir.join(path);
-        if !full.is_file() {
+        if !full.is_file() && !full.is_dir() {
             return Err(format!("附件不存在: {path}"));
         }
         return Ok(full);
     }
 
-    let full = PathBuf::from(path);
-    if !full.is_file() {
+    if !candidate.is_file() && !candidate.is_dir() {
         return Err(format!("文件不存在: {path}"));
     }
-    Ok(full)
+    Ok(candidate)
 }
 
 fn normalize_pasted_image_mime(mime_type: &str) -> Result<&'static str, String> {
@@ -309,7 +316,12 @@ fn externalize_model_message_images_in_dir(
                 mime_type,
                 data,
                 path,
-            } | MessagePart::Video { mime_type, data, path }) = part
+            }
+            | MessagePart::Video {
+                mime_type,
+                data,
+                path,
+            }) = part
             else {
                 continue;
             };
@@ -381,7 +393,9 @@ fn rehydrate_model_message_images_in_dir(
 ) {
     for model_message in messages.iter_mut() {
         for part in model_message.content.iter_mut() {
-            let (MessagePart::Image { data, path, .. } | MessagePart::Video { data, path, .. }) = part else {
+            let (MessagePart::Image { data, path, .. } | MessagePart::Video { data, path, .. }) =
+                part
+            else {
                 continue;
             };
             if !data.is_empty() {
@@ -483,7 +497,9 @@ pub(crate) fn message_has_api_message_image_to_externalize(message: &ChatMessage
             .any(|slot| {
                 slot.as_str()
                     .and_then(|url| parse_data_url(url.trim()))
-                    .is_some_and(|(mime, _)| mime.starts_with("image/") || mime.starts_with("video/"))
+                    .is_some_and(|(mime, _)| {
+                        mime.starts_with("image/") || mime.starts_with("video/")
+                    })
             })
     })
 }
@@ -591,7 +607,11 @@ fn api_message_image_url_slots(message: &mut serde_json::Value) -> Vec<&mut serd
         if !is_image {
             continue;
         }
-        let key = if part.get("type").and_then(serde_json::Value::as_str) == Some("video_url") { "video_url" } else { "image_url" };
+        let key = if part.get("type").and_then(serde_json::Value::as_str) == Some("video_url") {
+            "video_url"
+        } else {
+            "image_url"
+        };
         let Some(image_url) = part.get_mut(key) else {
             continue;
         };
@@ -616,9 +636,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn extension_for_media_mime(mime: &str) -> &str {
     match mime {
-        "video/mp4" => "mp4", "video/mpeg" => "mpeg", "video/mov" => "mov",
-        "video/avi" => "avi", "video/x-flv" => "flv", "video/webm" => "webm",
-        "video/wmv" => "wmv", "video/3gpp" => "3gpp",
+        "video/mp4" => "mp4",
+        "video/mpeg" => "mpeg",
+        "video/mov" => "mov",
+        "video/avi" => "avi",
+        "video/x-flv" => "flv",
+        "video/webm" => "webm",
+        "video/wmv" => "wmv",
+        "video/3gpp" => "3gpp",
         _ => extension_for_image_mime(mime),
     }
 }
@@ -639,14 +664,12 @@ fn normalize_stored_image_mime(mime_type: &str) -> String {
 /// 会同时带 path 和整图 data_url（曾让 10 条消息的会话膨胀到 54MB），
 /// 有 path 只影响外置方式（免写盘、只缩 data_url），不影响是否需要外置。
 pub(crate) fn message_has_inline_image_to_externalize(message: &ChatMessage) -> bool {
-    let needs = |artifact: &ChatToolArtifact| {
-        match parse_data_url(artifact.data_url.trim()) {
-            Some((mime, payload)) => {
-                mime.starts_with("image/")
-                    && decoded_base64_len(payload) > ARTIFACT_INLINE_THRESHOLD_BYTES
-            }
-            None => false,
+    let needs = |artifact: &ChatToolArtifact| match parse_data_url(artifact.data_url.trim()) {
+        Some((mime, payload)) => {
+            mime.starts_with("image/")
+                && decoded_base64_len(payload) > ARTIFACT_INLINE_THRESHOLD_BYTES
         }
+        None => false,
     };
     message.artifacts.iter().any(needs)
         || message
@@ -705,10 +728,10 @@ fn externalize_image_artifact_in_dir(dir: &Path, artifact: &mut ChatToolArtifact
 
     let file_name = format!(
         "artifact-{}.{}",
-        Uuid::new_v4(),
+        sha256_hex(&bytes),
         extension_for_image_mime(&mime)
     );
-    if fs::write(dir.join(&file_name), &bytes).is_err() {
+    if !dir.join(&file_name).is_file() && fs::write(dir.join(&file_name), &bytes).is_err() {
         return false;
     }
 
@@ -749,6 +772,89 @@ pub(crate) fn make_thumbnail_data_url(bytes: &[u8]) -> Option<String> {
     ))
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InspectedAttachment {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub attachment_type: String,
+}
+
+pub(crate) fn inspect_attachment_sources<I, S>(paths: I) -> Vec<InspectedAttachment>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    paths
+        .into_iter()
+        .filter_map(|source| inspect_attachment_source(Path::new(source.as_ref())))
+        .collect()
+}
+
+fn inspect_attachment_source(source_path: &Path) -> Option<InspectedAttachment> {
+    let original_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment")
+        .to_string();
+    let attachment_type = if source_path.is_dir() {
+        "folder".to_string()
+    } else if source_path.is_file() {
+        if !is_attachable_file_name(&original_name) {
+            return None;
+        }
+        attachment_type_for_name(&original_name).to_string()
+    } else {
+        return None;
+    };
+    Some(InspectedAttachment {
+        path: source_path.to_string_lossy().into_owned(),
+        name: original_name,
+        attachment_type,
+    })
+}
+
+/// Persist one dropped/picked path. Files are copied into the conversation
+/// attachments dir; folders stay at their native path (no tree copy).
+fn persist_source_attachment(source_path: &Path, dest_dir: &Path) -> Result<Attachment, String> {
+    let source = source_path.display().to_string();
+    if source_path.is_dir() {
+        let original_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment");
+        return Ok(Attachment {
+            id: format!("att_{}", Uuid::new_v4()),
+            attachment_type: "folder".to_string(),
+            name: original_name.to_string(),
+            path: source,
+            content: None,
+        });
+    }
+    if !source_path.is_file() {
+        return Err(format!("附件不存在或不是文件: {source}"));
+    }
+
+    let id = format!("att_{}", Uuid::new_v4());
+    let original_name = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("attachment");
+    let safe_name = sanitize_attachment_name(original_name);
+    let stored_name = format!("{}-{}", id, safe_name);
+    let dest = dest_dir.join(&stored_name);
+    fs::copy(source_path, &dest).map_err(|e| format!("保存附件失败: {e}"))?;
+
+    Ok(Attachment {
+        id,
+        attachment_type: attachment_type_for_name(original_name).to_string(),
+        name: original_name.to_string(),
+        path: stored_name,
+        content: None,
+    })
+}
+
 pub(crate) fn save_message_attachments(
     app: &AppHandle,
     conversation_id: &str,
@@ -761,28 +867,7 @@ pub(crate) fn save_message_attachments(
 
     let dir = conversation_attachments_dir(app, conversation_id)?;
     for source in attachment_paths {
-        let source_path = Path::new(&source);
-        if !source_path.is_file() {
-            return Err(format!("附件不存在或不是文件: {source}"));
-        }
-
-        let id = format!("att_{}", Uuid::new_v4());
-        let original_name = source_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment");
-        let safe_name = sanitize_attachment_name(original_name);
-        let stored_name = format!("{}-{}", id, safe_name);
-        let dest = dir.join(&stored_name);
-        fs::copy(source_path, &dest).map_err(|e| format!("保存附件失败: {e}"))?;
-
-        attachments.push(Attachment {
-            id,
-            attachment_type: attachment_type_for_name(original_name).to_string(),
-            name: original_name.to_string(),
-            path: stored_name,
-            content: None,
-        });
+        attachments.push(persist_source_attachment(Path::new(&source), &dir)?);
     }
 
     Ok(attachments)
@@ -831,8 +916,13 @@ fn attachment_type_label(attachment_type: &str) -> &'static str {
     match attachment_type {
         "image" => "图片",
         "video" => "视频",
+        "folder" => "文件夹",
         _ => "文件",
     }
+}
+
+fn is_folder_attachment(attachment: &Attachment) -> bool {
+    attachment.attachment_type == "folder"
 }
 
 fn attachment_extension(name: &str) -> String {
@@ -856,6 +946,9 @@ fn attachment_format_label(attachment: &Attachment) -> &'static str {
     if attachment.attachment_type == "image" {
         return "图片";
     }
+    if is_folder_attachment(attachment) {
+        return "文件夹";
+    }
 
     match attachment_extension(&attachment.name).as_str() {
         "pdf" => "PDF",
@@ -872,12 +965,19 @@ fn stored_attachment_path_for_prompt(
     attachment: &Attachment,
     attachment_dir: Option<&Path>,
 ) -> String {
+    let stored = Path::new(&attachment.path);
+    if stored.is_absolute() || is_folder_attachment(attachment) {
+        return attachment.path.clone();
+    }
     attachment_dir
-        .map(|dir| dir.join(&attachment.path).display().to_string())
+        .map(|dir| dir.join(stored).display().to_string())
         .unwrap_or_else(|| attachment.path.clone())
 }
 
 fn attachment_processing_hint(attachment: &Attachment) -> String {
+    if is_folder_attachment(attachment) {
+        return "此文件夹按本机路径附加，未复制。用 glob/read/grep 等工具按该绝对路径查看内容，不要仅凭文件夹名臆测。".to_string();
+    }
     if attachment.attachment_type == "video" {
         return "内置运行时会将视频内容发送给支持视频输入的模型。".to_string();
     }
@@ -945,9 +1045,14 @@ pub(crate) fn compose_user_content_for_api(
         "[已添加附件]\n{}\n\n注意：{}",
         attachment_lines, capability_note
     );
-    let attachment_note = if real_attachments.iter().any(|a| a.attachment_type == "video") {
+    let attachment_note = if real_attachments
+        .iter()
+        .any(|a| a.attachment_type == "video")
+    {
         format!("{attachment_note}\n视频附件随内置运行时请求发送；外部 CLI 代理仅收到文件路径。")
-    } else { attachment_note };
+    } else {
+        attachment_note
+    };
 
     if trimmed.is_empty() {
         attachment_note
@@ -1078,11 +1183,15 @@ pub(crate) fn stored_file_paths_for_attachments(
             continue;
         }
         let stored = Path::new(&attachment.path);
-        if stored.components().count() != 1 {
-            return Err(format!("Invalid attachment path: {}", attachment.path));
-        }
-        let path = dir.join(stored);
-        if path.is_file() {
+        let path = if stored.is_absolute() || is_folder_attachment(attachment) {
+            stored.to_path_buf()
+        } else {
+            if stored.components().count() != 1 {
+                return Err(format!("Invalid attachment path: {}", attachment.path));
+            }
+            dir.join(stored)
+        };
+        if path.is_file() || path.is_dir() {
             paths.push(path);
         }
     }
@@ -1110,6 +1219,71 @@ mod tests {
         assert!(is_attachable_file_name("archive.zip"));
         assert!(is_attachable_file_name("main.rs"));
         assert!(!is_attachable_file_name("   "));
+    }
+
+    #[test]
+    fn persist_attachment_keeps_directory_at_native_path() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("testend");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.txt"), "hi").unwrap();
+        let dest = root.path().join("attachments");
+        fs::create_dir_all(&dest).unwrap();
+
+        let attachment = persist_source_attachment(&folder, &dest).unwrap();
+        assert_eq!(attachment.attachment_type, "folder");
+        assert_eq!(attachment.name, "testend");
+        assert_eq!(Path::new(&attachment.path), folder.as_path());
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn persist_attachment_still_rejects_missing_path() {
+        let dest = tempfile::tempdir().unwrap();
+        let missing = dest.path().join("gone");
+        let err = persist_source_attachment(&missing, dest.path()).unwrap_err();
+        assert!(err.contains("附件不存在或不是文件"));
+    }
+
+    #[test]
+    fn inspect_attachment_sources_marks_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("testend");
+        let file = root.path().join("notes.pdf");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(&file, "x").unwrap();
+        let inspected = inspect_attachment_sources([
+            folder.to_string_lossy(),
+            file.to_string_lossy(),
+            root.path().join("missing").to_string_lossy(),
+        ]);
+        assert_eq!(inspected.len(), 2);
+        assert_eq!(inspected[0].attachment_type, "folder");
+        assert_eq!(inspected[0].name, "testend");
+        assert_eq!(inspected[1].attachment_type, "file");
+    }
+
+    #[test]
+    fn compose_user_content_for_api_keeps_folder_native_path() {
+        let folder = r"E:\ZM database\testend";
+        let content = compose_user_content_for_api(
+            "看看这个",
+            &[Attachment {
+                id: "att_1".to_string(),
+                attachment_type: "folder".to_string(),
+                name: "testend".to_string(),
+                path: folder.to_string(),
+                content: None,
+            }],
+            Some(Path::new("/attachments")),
+        );
+
+        assert!(content.contains("看看这个"));
+        assert!(content.contains("testend"));
+        assert!(content.contains("文件夹"));
+        assert!(content.contains(folder));
+        assert!(!content.contains("/attachments"));
+        assert!(content.contains("按本机路径附加"));
     }
 
     #[test]
@@ -1320,8 +1494,14 @@ mod tests {
     /// 造一张 >32KB 阈值、可被 image crate 解码的噪声 PNG。
     fn big_png_bytes() -> Vec<u8> {
         let img = image::RgbImage::from_fn(512, 512, |x, y| {
-            let v = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503));
-            image::Rgb([(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8])
+            let v = x
+                .wrapping_mul(2654435761)
+                .wrapping_add(y.wrapping_mul(40503));
+            image::Rgb([
+                (v & 0xff) as u8,
+                ((v >> 8) & 0xff) as u8,
+                ((v >> 16) & 0xff) as u8,
+            ])
         });
         let mut buf = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
@@ -1342,6 +1522,30 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn repeated_draft_snapshots_share_one_original_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = artifact_with(
+            format!(
+                "data:image/png;base64,{}",
+                general_purpose::STANDARD.encode(big_png_bytes())
+            ),
+            None,
+        );
+        let mut paths = std::collections::HashSet::new();
+        for _ in 0..10 {
+            let mut snapshot = original.clone();
+            assert!(externalize_image_artifact_in_dir(dir.path(), &mut snapshot));
+            paths.insert(snapshot.path.unwrap());
+        }
+        assert_eq!(
+            paths.len(),
+            1,
+            "saving a fresh draft clone must not duplicate the original"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     /// present_artifacts 的成果卡：文件已在盘上 ⇒ 只缩 data_url，不写第二份字节，path 不动。
     #[test]
     fn externalize_shrinks_oversized_inline_when_path_file_exists() {
@@ -1358,7 +1562,10 @@ mod tests {
         );
         let original_str = original.to_string_lossy().into_owned();
         let mut artifact = artifact_with(data_url, Some(original_str.clone()));
-        assert!(externalize_image_artifact_in_dir(&attachments_dir, &mut artifact));
+        assert!(externalize_image_artifact_in_dir(
+            &attachments_dir,
+            &mut artifact
+        ));
 
         // path 原样保留（前端按它懒加载原图），附件目录没有多写一份字节
         assert_eq!(artifact.path.as_deref(), Some(original_str.as_str()));
@@ -1386,10 +1593,16 @@ mod tests {
         );
         let missing = root.join("gone.png").to_string_lossy().into_owned();
         let mut artifact = artifact_with(data_url, Some(missing));
-        assert!(externalize_image_artifact_in_dir(&attachments_dir, &mut artifact));
+        assert!(externalize_image_artifact_in_dir(
+            &attachments_dir,
+            &mut artifact
+        ));
 
         let new_path = artifact.path.expect("path");
-        assert!(!new_path.contains('/') && !new_path.contains('\\'), "{new_path}");
+        assert!(
+            !new_path.contains('/') && !new_path.contains('\\'),
+            "{new_path}"
+        );
         assert_eq!(
             fs::read(attachments_dir.join(&new_path)).unwrap(),
             bytes,

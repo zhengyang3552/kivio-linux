@@ -73,7 +73,7 @@ describe('InputBar 底栏模式胶囊', () => {
     expect(items.map((item) => item.textContent)).toEqual([
       'Act普通模式 · Normal',
       'Goal持续执行一个目标 · Persistent execution',
-      'Plan计划模式 · Enter plan mode',
+      'Plan生成计划文档 · Plan document',
       'Orchestrate主代理统筹并行协作 · Parallel collaboration',
     ])
     expect(items[0]).toHaveAttribute('aria-checked', 'true')

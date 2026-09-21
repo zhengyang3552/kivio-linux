@@ -15,7 +15,7 @@ export type ChatToolArtifactPayload = { id: string | null, name: string, mimeTyp
 
 export type ChatToolPayload = { id: string, name: string, source: string, serverId: string | null, status: string, argumentsPreview: string, resultPreview: string | null, error: string | null, startedAt: number | null, completedAt: number | null, durationMs: number | null, round: number, sensitive: boolean, artifacts: Array<ChatToolArtifactPayload>, traceId: string | null, spanId: string | null, structuredContent: unknown, };
 
-export type ChatContextUsagePayload = { usedTokens: number, contextWindowTokens: number | null, };
+export type ChatContextUsagePayload = { usedTokens: number, contextWindowTokens: number | null, tokenCountSource: string | null, };
 
 export type ChatRunRecoveryMetadata = { groupId: string, groupSize: number, armIndex: number, providerId: string, model: string, };
 
@@ -29,7 +29,7 @@ export type ChatPlanMode = "act" | "plan" | "orchestrate";
 
 export type ChatPlanStatus = "empty" | "draft" | "approved";
 
-export type ChatPlanStatePayload = { mode: ChatPlanMode, status: ChatPlanStatus, plan: string | null, updatedAt: number, };
+export type ChatPlanStatePayload = { document?: { id: string, title: string, path: string, }, mode: ChatPlanMode, status: ChatPlanStatus, plan: string | null, updatedAt: number, };
 
 export type ChatGoalStatus = "active" | "verifying" | "waiting" | "paused" | "blocked" | "completed" | "cancelled";
 
@@ -51,7 +51,7 @@ export type ChatContextStatePayload = { estimatedInputTokens: number, contextWin
 
 export type ChatAskUserOptionPayload = { id: string, label: string, description: string | null, };
 
-export type ChatAskUserQuestionPayload = { id: string, prompt: string, options: Array<ChatAskUserOptionPayload>, allowMultiple: boolean, allowCustom: boolean, };
+export type ChatAskUserQuestionPayload = { id: string, prompt: string, options: Array<ChatAskUserOptionPayload>, allowMultiple: boolean, allowCustom: boolean, required?: boolean, valueSchema?: Record<string, unknown>, };
 
 export type ChatAskUserPromptPayload = { title: string | null, questions: Array<ChatAskUserQuestionPayload>, };
 
@@ -59,9 +59,9 @@ export type ChatRunEvent = { "type": "run_started", recovery: ChatRunRecoveryMet
 
 export type ChatRunEventEnvelope = { protocolVersion: typeof CHAT_PROTOCOL_VERSION, scope: "run", conversationId: string, runId: string, messageId: string, seq: number, baseRevision: number, } & ({ "type": "run_started", recovery: ChatRunRecoveryMetadata | null, } | { "type": "text_delta", delta: string, segment: ChatSegmentPayload | null, } | { "type": "reasoning_delta", delta: string, segment: ChatSegmentPayload | null, } | { "type": "tool_updated", tool: ChatToolPayload, } | { "type": "subagent_updated", parentToolCallId: string, taskId: string, name: string, model: string | null, depth: number, status: string, preview: string | null, steps: Array<string>, } | { "type": "context_usage_updated", usage: ChatContextUsagePayload, } | { "type": "compaction_updated", phase: string, trigger: string | null, boundary: ChatCompactionBoundaryPayload | null, } | { "type": "todo_updated", todoState: ChatTodoStatePayload, } | { "type": "plan_updated", planState: ChatPlanStatePayload, } | { "type": "session_consent_requested" } | { "type": "tool_approval_requested", toolCallId: string, name: string, source: string, serverId: string | null, target: string | null, argumentsPreview: string, sensitivity: string, } | { "type": "tool_approval_withdrawn", toolCallId: string, } | { "type": "user_prompt_requested", toolCallId: string, name: string, source: string, prompt: ChatAskUserPromptPayload, structuredContent: unknown, } | { "type": "hook_failed", hookName: string, event: string, message: string, } | { "type": "status_note_updated", note: string | null, } | { "type": "queued_texts_restored", texts: Array<string>, } | { "type": "run_completed", full: string, conversationRevision: number, } | { "type": "run_failed", error: string, full: string, conversationRevision: number, } | { "type": "run_cancelled", full: string, conversationRevision: number, });
 
-export type ChatConversationEvent = { "type": "context_updated", contextState: ChatContextStatePayload, } | { "type": "todo_updated", todoState: ChatTodoStatePayload, } | { "type": "plan_updated", planState: ChatPlanStatePayload, } | { "type": "goal_updated", goalState: ChatGoalStatePayload | null, };
+export type ChatConversationEvent = { "type": "title_updated", title: string, } | { "type": "context_updated", contextState: ChatContextStatePayload, } | { "type": "todo_updated", todoState: ChatTodoStatePayload, } | { "type": "plan_updated", planState: ChatPlanStatePayload, } | { "type": "goal_updated", goalState: ChatGoalStatePayload | null, };
 
-export type ChatConversationEventEnvelope = { protocolVersion: typeof CHAT_PROTOCOL_VERSION, scope: "conversation", conversationId: string, revision: number, } & ({ "type": "context_updated", contextState: ChatContextStatePayload, } | { "type": "todo_updated", todoState: ChatTodoStatePayload, } | { "type": "plan_updated", planState: ChatPlanStatePayload, } | { "type": "goal_updated", goalState: ChatGoalStatePayload | null, });
+export type ChatConversationEventEnvelope = { protocolVersion: typeof CHAT_PROTOCOL_VERSION, scope: "conversation", conversationId: string, revision: number, } & ({ "type": "title_updated", title: string, } | { "type": "context_updated", contextState: ChatContextStatePayload, } | { "type": "todo_updated", todoState: ChatTodoStatePayload, } | { "type": "plan_updated", planState: ChatPlanStatePayload, } | { "type": "goal_updated", goalState: ChatGoalStatePayload | null, });
 
 export type ChatProtocolEvent = ChatRunEventEnvelope | ChatConversationEventEnvelope;
 

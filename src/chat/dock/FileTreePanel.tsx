@@ -30,7 +30,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
-import { i18n, type Lang } from '../../settings/i18n'
+import { i18n, type Lang } from '../../components/i18n'
 import { IconButton } from '../../components/Button'
 import { ConfirmDialog } from './ConfirmDialog'
 import { DockContextMenu, type DockMenuAnchor, type DockMenuItem } from './DockContextMenu'
@@ -49,7 +49,7 @@ import { useFileTree } from './useFileTree'
 import { FileViewer } from './FileViewer'
 import { DiffView } from './DiffView'
 import { ChatMarkdown } from '../ChatMarkdown'
-import type { DockFsEntry } from './types'
+import type { DockFsEntry } from '../../api/dockContracts'
 import type { DockPreviewRequest } from './RightDock'
 
 const ROW_HEIGHT = 28

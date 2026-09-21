@@ -53,7 +53,10 @@ fn prune(app: &AppHandle, automation_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn list(app: &AppHandle, automation_id: &str) -> Result<Vec<AutomationRunSummary>, String> {
+pub(crate) fn list(
+    app: &AppHandle,
+    automation_id: &str,
+) -> Result<Vec<AutomationRunSummary>, String> {
     let dir = runs_dir(app, automation_id)?;
     let mut items = Vec::new();
     let entries = fs::read_dir(&dir).map_err(|err| format!("list runs failed: {err}"))?;
@@ -78,7 +81,11 @@ pub(crate) fn list(app: &AppHandle, automation_id: &str) -> Result<Vec<Automatio
     Ok(items)
 }
 
-pub(crate) fn get(app: &AppHandle, automation_id: &str, run_id: &str) -> Result<AutomationRun, String> {
+pub(crate) fn get(
+    app: &AppHandle,
+    automation_id: &str,
+    run_id: &str,
+) -> Result<AutomationRun, String> {
     read_run_file(&run_path(app, automation_id, run_id)?)
 }
 

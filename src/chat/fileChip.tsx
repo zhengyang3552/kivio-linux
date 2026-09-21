@@ -7,8 +7,12 @@ import {
   FilePlay,
   FileSpreadsheet,
   FileText,
+  Folder,
   Presentation,
+  FolderOpen,
 } from 'lucide-react'
+import { useState } from 'react'
+import { DockContextMenu, type DockMenuAnchor } from './dock/DockContextMenu'
 
 type FileKindVisual = {
   Icon: typeof File
@@ -30,6 +34,15 @@ function extensionOf(name: string): string {
   const dot = base.lastIndexOf('.')
   if (dot <= 0 || dot === base.length - 1) return ''
   return base.slice(dot + 1).toLowerCase()
+}
+
+function folderKindVisual(): FileKindVisual {
+  return {
+    Icon: Folder,
+    label: 'FOLDER',
+    iconClass: 'text-amber-600 dark:text-amber-400',
+    wellClass: 'bg-amber-500/10 dark:bg-amber-400/15',
+  }
 }
 
 function fileKindVisual(name: string): FileKindVisual {
@@ -68,22 +81,64 @@ function fileKindVisual(name: string): FileKindVisual {
   return { Icon: File, label, iconClass: 'text-neutral-500 dark:text-neutral-300', wellClass: 'bg-neutral-500/10 dark:bg-white/10' }
 }
 
-/** 输入框 / 用户气泡 / 助手产物共用的 64px 文件芯片。 */
+/** 上传附件使用卡片，正文产物使用跟随文字行高的链接。 */
 export function FileChip({
   name,
+  kind,
   onClick,
   ariaLabel,
+  variant = 'card',
+  onRevealLocation,
 }: {
   name: string
+  kind?: 'folder'
   onClick: () => void
   ariaLabel?: string
+  variant?: 'card' | 'inline'
+  onRevealLocation?: () => Promise<void>
 }) {
-  const visual = fileKindVisual(name)
+  const [menuAnchor, setMenuAnchor] = useState<DockMenuAnchor | null>(null)
+  const [locationError, setLocationError] = useState(false)
+  const visual = kind === 'folder' ? folderKindVisual() : fileKindVisual(name)
   const Icon = visual.Icon
+  const contextMenu = onRevealLocation ? (event: React.MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    setLocationError(false)
+    setMenuAnchor({ left: event.clientX, top: event.clientY })
+  } : undefined
+  const menu = <>
+    {menuAnchor && onRevealLocation && <DockContextMenu anchor={menuAnchor} onClose={() => setMenuAnchor(null)} items={[{
+      key: 'reveal', label: '打开所在位置', icon: <FolderOpen size={16} strokeWidth={1.75} />,
+      onSelect: () => { void onRevealLocation().catch(() => setLocationError(true)) },
+    }]} />}
+    {locationError && <span role="status" className="ml-1 text-xs text-neutral-500">无法打开所在位置，请检查文件是否仍存在。</span>}
+  </>
+  if (variant === 'inline') {
+    return (
+      <>
+      <button
+        type="button"
+        onClick={onClick}
+        onContextMenu={contextMenu}
+        className="inline max-w-full cursor-pointer rounded-sm border-0 bg-transparent p-0 text-left align-baseline text-blue-600 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500 dark:text-blue-400"
+        style={{ font: 'inherit', overflowWrap: 'anywhere' }}
+        title={name}
+        aria-label={ariaLabel ?? name}
+      >
+        <Icon aria-hidden="true" size="1em" strokeWidth={1.8} className={`mr-1 inline-block align-[-0.125em] ${visual.iconClass}`} />
+        {name}
+      </button>
+      {menu}
+      </>
+    )
+  }
   return (
+    <>
     <button
       type="button"
       onClick={onClick}
+      onContextMenu={contextMenu}
       className="flex h-16 w-[9.5rem] shrink-0 items-center gap-2 rounded-lg border border-neutral-200/90 bg-neutral-50 px-1.5 text-left hover:bg-neutral-100 dark:border-neutral-700 dark:bg-neutral-800 dark:hover:bg-neutral-700/80"
       title={name}
       aria-label={ariaLabel ?? name}
@@ -100,5 +155,7 @@ export function FileChip({
         </span>
       </span>
     </button>
+    {menu}
+    </>
   )
 }

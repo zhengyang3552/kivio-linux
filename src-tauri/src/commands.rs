@@ -19,18 +19,19 @@ use crate::prompts::{
 };
 use crate::rapidocr;
 use crate::settings::{
-    default_chat_system_prompt, default_lens_system_prompt, default_question_prompt,
-    persist_settings, sanitize_settings, ProviderApiFormat, Settings,
+    commit_settings, default_chat_system_prompt, default_lens_system_prompt,
+    default_question_prompt, persist_settings, sanitize_settings, settings_snapshot,
+    update_settings, ProviderApiFormat, Settings, SettingsError, SettingsSnapshot, SettingsVersion,
 };
 #[cfg(target_os = "macos")]
 use crate::shortcuts::{check_accessibility, check_screen_recording_permission};
 use crate::shortcuts::{
-    open_chat_settings_window as open_settings_window_impl, register_hotkeys,
+    open_chat_settings_window as open_settings_window_impl, register_hotkeys_for_settings,
     restore_runtime_settings, send_paste_shortcut, setup_tray,
 };
 use crate::state::AppState;
 use crate::utils::{language_name, resolve_target_lang};
-use crate::windows::get_main_window;
+use crate::windows::get_translator_window;
 
 pub(crate) fn apply_launch_at_startup(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let auto_launch = app.autolaunch();
@@ -42,6 +43,28 @@ pub(crate) fn apply_launch_at_startup(app: &AppHandle, enabled: bool) -> Result<
         auto_launch.disable().map_err(|e| e.to_string())?;
     }
 
+    Ok(())
+}
+
+/// Windows owns the effective startup state (including Task Manager overrides).
+/// Only an explicit preference change may write it; unrelated saves must not
+/// undo the user's OS-level choice. Other platforms retain their existing policy.
+pub(crate) fn should_apply_launch_at_startup(previous: Option<bool>, enabled: bool) -> bool {
+    !cfg!(target_os = "windows") || previous.is_some_and(|previous| previous != enabled)
+}
+
+pub(crate) fn initialize_launch_at_startup(
+    app: &AppHandle,
+    settings: &mut Settings,
+) -> Result<(), String> {
+    if should_apply_launch_at_startup(None, settings.launch_at_startup) {
+        return apply_launch_at_startup(app, settings.launch_at_startup);
+    }
+    let enabled = app.autolaunch().is_enabled().map_err(|e| e.to_string())?;
+    if settings.launch_at_startup != enabled {
+        settings.launch_at_startup = enabled;
+        persist_settings(app, settings)?;
+    }
     Ok(())
 }
 
@@ -70,9 +93,11 @@ pub(crate) fn list_gnome_system_shortcuts() -> Vec<crate::linux_portal::SystemSh
 
 /// 获取当前应用设置
 #[tauri::command]
-pub(crate) fn get_settings(app: AppHandle, state: State<AppState>) -> Settings {
+pub(crate) fn get_settings(app: AppHandle, state: State<AppState>) -> SettingsSnapshot {
     crate::plugins::heal_and_persist_disabled_plugin_mcp(&app, &state);
-    state.settings_read().clone()
+    let mut snapshot = settings_snapshot(&state);
+    snapshot.settings = sanitize_settings(snapshot.settings);
+    snapshot
 }
 
 /// 获取默认提示词模板
@@ -115,8 +140,9 @@ pub(crate) async fn save_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     settings: Settings,
-) -> Result<Settings, String> {
-    apply_settings(&app, &state, settings, true).await
+    expected_version: SettingsVersion,
+) -> Result<SettingsSnapshot, SettingsError> {
+    apply_settings(&app, &state, settings, expected_version, true).await
 }
 
 /// trim + 去空 + 去重（保序）。
@@ -143,14 +169,12 @@ pub(crate) fn set_favorite_models(
     app: AppHandle,
     state: State<AppState>,
     models: Vec<String>,
-) -> Result<(), String> {
+) -> Result<SettingsSnapshot, SettingsError> {
     let cleaned = dedup_preserve_order(models);
-    let snapshot = {
-        let mut guard = state.settings_write();
-        guard.favorite_models = cleaned;
-        guard.clone()
-    };
-    persist_settings(&app, &snapshot)
+    update_settings(&app, &state, move |settings| {
+        settings.favorite_models = cleaned;
+        Ok(())
+    })
 }
 
 /// 轻量持久化快速翻译卡宽度（拖拽缩放的记忆；高度始终自动不持久化）。
@@ -161,17 +185,15 @@ pub(crate) fn set_translate_card_size(
     app: AppHandle,
     state: State<AppState>,
     width: u32,
-) -> Result<(), String> {
+) -> Result<SettingsSnapshot, SettingsError> {
     let clamped = width.clamp(360, 720);
-    let snapshot = {
-        let mut guard = state.settings_write();
-        guard.screenshot_translation.card_width = clamped;
-        guard.clone()
-    };
-    persist_settings(&app, &snapshot)?;
+    let canonical = update_settings(&app, &state, |settings| {
+        settings.screenshot_translation.card_width = clamped;
+        Ok(())
+    })?;
     // 通知可能开着的设置页同步草稿里的宽度，避免其随后 save_settings 用陈旧草稿覆盖掉这次拖拽。
     let _ = tauri::Emitter::emit_to(&app, "chat", "translate-card-width", clamped);
-    Ok(())
+    Ok(canonical)
 }
 
 /// sanitize → 应用运行时（自启/热键/托盘）→ 持久化，失败回滚。save_settings 与 import_settings 共用。
@@ -179,73 +201,110 @@ async fn apply_settings(
     app: &AppHandle,
     state: &State<'_, AppState>,
     settings: Settings,
+    expected_version: SettingsVersion,
     preserve_oauth: bool,
-) -> Result<Settings, String> {
-    let previous_settings = state.settings_read().clone();
+) -> Result<SettingsSnapshot, SettingsError> {
+    // Only one full save may own workspace migration at a time. This async lock deliberately does
+    // not cover lightweight writers; their revision bump makes this save fail its final CAS.
+    let _full_save = state.begin_settings_save().await;
+    let snapshot = settings_snapshot(state);
+    if snapshot.version != expected_version {
+        return Err(SettingsError::version_conflict(
+            expected_version,
+            snapshot.version,
+        ));
+    }
+    let previous_settings = snapshot.settings.clone();
     let mut sanitized = sanitize_settings(settings);
     if preserve_oauth {
         crate::mcp::manager::preserve_live_oauth(&mut sanitized, &previous_settings);
     }
-    apply_launch_at_startup(app, sanitized.launch_at_startup)?;
-    {
-        let mut guard = state.settings_write();
-        *guard = sanitized.clone();
+    if should_apply_launch_at_startup(
+        Some(previous_settings.launch_at_startup),
+        sanitized.launch_at_startup,
+    ) {
+        apply_launch_at_startup(app, sanitized.launch_at_startup)?;
     }
     state
         .sub_agents
         .set_concurrency(sanitized.chat_tools.sub_agent_concurrency);
 
-    if let Err(err) = register_hotkeys(app) {
-        // 热键被系统/其他应用占用不该阻断保存——能注册的已注册,失败的作为警告推给前端,
-        // 设置照常落盘(否则用户连"删掉这个冲突热键"的改动都存不下)。
-        let _ = tauri::Emitter::emit(app, "hotkey-warning", err);
+    if crate::shortcuts::hotkey_bindings_changed(&previous_settings, &sanitized) {
+        if let Err(err) = register_hotkeys_for_settings(app, &sanitized) {
+            // 热键被系统/其他应用占用不该阻断保存——能注册的已注册,失败的作为警告推给前端,
+            // 设置照常落盘(否则用户连"删掉这个冲突热键"的改动都存不下)。
+            let _ = tauri::Emitter::emit(app, "hotkey-warning", err);
+        }
     }
 
-    let old_working_directory = &previous_settings.chat_tools.native_tools.working_directory;
-    let new_working_directory = &sanitized.chat_tools.native_tools.working_directory;
+    let old_working_directory = previous_settings
+        .chat_tools
+        .native_tools
+        .working_directory
+        .clone();
+    let new_working_directory = sanitized.chat_tools.native_tools.working_directory.clone();
     let workspace_root_changed = old_working_directory.trim() != new_working_directory.trim();
     if workspace_root_changed {
         if let Err(err) = crate::chat::storage::migrate_ordinary_conversation_workspaces(
             app,
-            old_working_directory,
-            new_working_directory,
+            &old_working_directory,
+            &new_working_directory,
         )
         .await
         {
-            restore_runtime_settings(app, state, &previous_settings);
-            return Err(format!("Failed to migrate conversation workspaces: {err}"));
+            restore_runtime_settings(app, state);
+            return Err(format!("Failed to migrate conversation workspaces: {err}").into());
         }
     }
 
-    if let Err(err) = persist_settings(app, &sanitized) {
-        eprintln!("Failed to save settings: {err}");
-        if workspace_root_changed {
-            if let Err(rollback_err) =
-                crate::chat::storage::migrate_ordinary_conversation_workspaces(
-                    app,
-                    new_working_directory,
-                    old_working_directory,
-                )
-                .await
-            {
-                eprintln!("Failed to roll back conversation workspace migration: {rollback_err}");
+    let committed = match commit_settings(app, state, snapshot.version, sanitized) {
+        Ok(committed) => committed,
+        Err(err) => {
+            eprintln!("Failed to save settings: {err}");
+            if workspace_root_changed {
+                // A conflicting writer may itself have changed the configured workspace. Roll
+                // toward the value that actually won the commit, not this stale save's snapshot.
+                let committed_working_directory = state
+                    .settings_read()
+                    .chat_tools
+                    .native_tools
+                    .working_directory
+                    .clone();
+                if let Err(rollback_err) =
+                    crate::chat::storage::migrate_ordinary_conversation_workspaces(
+                        app,
+                        &new_working_directory,
+                        &committed_working_directory,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "Failed to roll back conversation workspace migration: {rollback_err}"
+                    );
+                }
             }
+            restore_runtime_settings(app, state);
+            return Err(err);
         }
-        restore_runtime_settings(app, state, &previous_settings);
-        return Err(err);
-    }
+    };
 
-    state.sync_preferred_api_keys(&previous_settings, &sanitized);
+    state
+        .provider_runtime()
+        .sync_preferred_api_keys(&previous_settings, &committed.settings);
 
-    if previous_settings.keep_chat_window_alive && !sanitized.keep_chat_window_alive {
+    if previous_settings.keep_chat_window_alive && !committed.settings.keep_chat_window_alive {
         crate::shortcuts::destroy_hidden_chat_window(app);
     }
 
-    if let Err(err) = setup_tray(app) {
-        eprintln!("Failed to update tray: {err}");
+    if previous_settings.settings_language != committed.settings.settings_language
+        || app.tray_by_id("main").is_none()
+    {
+        if let Err(err) = setup_tray(app) {
+            eprintln!("Failed to update tray: {err}");
+        }
     }
 
-    Ok(sanitized)
+    Ok(committed)
 }
 
 /// 设置备份文件格式版本。结构变化不兼容时递增。
@@ -254,7 +313,7 @@ const SETTINGS_BACKUP_VERSION: u32 = 1;
 /// 导出全部设置（含供应商/模型配置与 API Key）到指定路径的 JSON 备份文件。
 #[tauri::command]
 pub(crate) fn export_settings(state: State<AppState>, path: String) -> Result<(), String> {
-    let settings = state.settings_read().clone();
+    let settings = sanitize_settings(state.settings_read().clone());
     let backup = serde_json::json!({
         "app": "kivio",
         "type": "settings-backup",
@@ -272,19 +331,20 @@ pub(crate) async fn import_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<Settings, String> {
+    expected_version: SettingsVersion,
+) -> Result<SettingsSnapshot, SettingsError> {
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|_| "文件不是有效的 JSON".to_string())?;
     if value.get("type").and_then(|v| v.as_str()) != Some("settings-backup") {
-        return Err("这不是 Kivio 设置备份文件".to_string());
+        return Err("这不是 Kivio 设置备份文件".into());
     }
     let settings_value = value
         .get("settings")
         .ok_or_else(|| "备份文件缺少 settings 字段".to_string())?;
     let settings: Settings = serde_json::from_value(settings_value.clone())
         .map_err(|e| format!("备份内容无法解析: {e}"))?;
-    apply_settings(&app, &state, settings, false).await
+    apply_settings(&app, &state, settings, expected_version, false).await
 }
 
 #[tauri::command]
@@ -293,12 +353,15 @@ pub(crate) fn open_settings_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn close_translator_window(app: AppHandle, state: State<'_, AppState>) {
-    if let Some(window) = get_main_window(&app) {
+pub(crate) fn close_translator_window(app: AppHandle, _state: State<'_, AppState>) {
+    if let Some(window) = get_translator_window(&app) {
         #[cfg(target_os = "macos")]
         {
             crate::windows::destroy_overlay_window(&window);
-            crate::windows::restore_previous_frontmost_app(&app, &state.prev_frontmost_pid_main);
+            crate::windows::restore_previous_frontmost_app(
+                &app,
+                _state.frontmost_apps().translator(),
+            );
         }
         #[cfg(not(target_os = "macos"))]
         let _ = window.close();
@@ -368,18 +431,18 @@ pub(crate) async fn commit_translation(
     // commit 用下面的 [NSApp hide:] 把前台让回原 App（成熟路径）。先清掉翻译窗的前台快照，
     // 避免后续窗口事件再次驱动焦点交还。
     #[cfg(target_os = "macos")]
-    crate::windows::forget_frontmost_app(&state.prev_frontmost_pid_main);
+    crate::windows::forget_frontmost_app(state.frontmost_apps().translator());
 
     // macOS 输入翻译窗口被重分类为 KivioOverlayPanel；必须先换回 TaoWindow 再 destroy，
     // 否则 WebKit 清理 contentLayoutRect KVO observer 时会抛 ObjC 异常并让 Rust abort。
     #[cfg(target_os = "macos")]
-    if let Some(window) = get_main_window(&app) {
+    if let Some(window) = get_translator_window(&app) {
         crate::windows::destroy_overlay_window(&window);
     }
 
     // 其他平台没有 macOS TSM/IMK 的销毁问题，保持原有的关闭释放行为。
     #[cfg(not(target_os = "macos"))]
-    if let Some(window) = get_main_window(&app) {
+    if let Some(window) = get_translator_window(&app) {
         let _ = window.close();
     }
 
@@ -403,10 +466,7 @@ pub(crate) async fn commit_translation(
 /// None），所以读不清除不会产生跨次 stale：当前这次打开读到的始终是这次的值。
 #[tauri::command]
 pub(crate) fn take_lens_selection(state: State<'_, AppState>) -> Result<String, String> {
-    match state.pending_selection.lock() {
-        Ok(guard) => Ok(guard.clone().unwrap_or_default()),
-        Err(_) => Ok(String::new()),
-    }
+    Ok(state.lens().selection().unwrap_or_default())
 }
 
 /// 使用系统默认浏览器打开外部链接（仅限 http/https）
@@ -742,7 +802,9 @@ fn apply_provider_auth(
     api_format: ProviderApiFormat,
     api_key: &str,
 ) -> reqwest::RequestBuilder {
-    if api_key.is_empty() { return request; }
+    if api_key.is_empty() {
+        return request;
+    }
     match api_format {
         ProviderApiFormat::AnthropicMessages => request
             .header("x-api-key", api_key)
@@ -863,17 +925,31 @@ pub(crate) async fn fetch_models(
     include_capabilities: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let settings = state.settings_read().clone();
-    let mut oauth_provider = effective_request_provider(&settings, &provider_id, provider.as_ref().and_then(|p| p.request.clone()));
+    let mut oauth_provider = effective_request_provider(
+        &settings,
+        &provider_id,
+        provider.as_ref().and_then(|p| p.request.clone()),
+    );
     if let Some(input) = provider.as_ref() {
-        if input.id.as_deref().is_some_and(|id| !id.is_empty() && id != provider_id) {
+        if input
+            .id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id != provider_id)
+        {
             return Err("Provider ID mismatch".into());
         }
         oauth_provider.base_url = input.base_url.clone();
-        if let Some(format) = &input.api_format { oauth_provider.api_format = format.clone(); }
+        if let Some(format) = &input.api_format {
+            oauth_provider.api_format = format.clone();
+        }
     }
     if oauth_provider.request.oauth.is_some() {
         let ids = crate::provider_oauth::models(&state, &oauth_provider).await?;
-        return Ok(if include_capabilities == Some(true) { serde_json::json!({"models":ids,"capabilities":{}}) } else { serde_json::json!(ids) });
+        return Ok(if include_capabilities == Some(true) {
+            serde_json::json!({"models":ids,"capabilities":{}})
+        } else {
+            serde_json::json!(ids)
+        });
     }
 
     let api_format = resolve_api_format(&settings, &provider_id, provider.as_ref());
@@ -883,7 +959,9 @@ pub(crate) async fn fetch_models(
     let anonymous = api_format == ProviderApiFormat::OpenAiChat
         && crate::opencode_free::is_endpoint(&base_url)
         && api_keys.iter().all(|key| key.trim().is_empty());
-    if anonymous { api_keys = vec![String::new()]; }
+    if anonymous {
+        api_keys = vec![String::new()];
+    }
     let retry_attempts = effective_retry_attempts(&settings);
     let effective = effective_request_provider(&settings, &provider_id, request_override);
 
@@ -891,7 +969,9 @@ pub(crate) async fn fetch_models(
         return Err("Missing API Key".to_string());
     }
     if let Some(idx) = preferred_idx {
-        state.prefer_key(&provider_id, idx.min(api_keys.len() - 1));
+        state
+            .provider_runtime()
+            .prefer_key(&provider_id, idx.min(api_keys.len() - 1));
     }
 
     let base = base_url.trim_end_matches('/');
@@ -929,14 +1009,21 @@ pub(crate) async fn fetch_models(
         .map_err(|e| format!("Failed to parse models response JSON: {e}"))?;
 
     let mut ids = parse_model_list_ids(&value)?;
-    if anonymous { ids.retain(|id| crate::opencode_free::is_free_model(id)); }
+    if anonymous {
+        ids.retain(|id| crate::opencode_free::is_free_model(id));
+    }
     if include_capabilities == Some(true) {
         let mut capabilities = serde_json::Map::new();
         if let Some(items) = value.get("data").and_then(serde_json::Value::as_array) {
             for item in items {
-                if let (Some(id), Some(video)) = (item.get("id").and_then(serde_json::Value::as_str), item.get("supports_video_in").and_then(serde_json::Value::as_bool)) {
+                if let (Some(id), Some(video)) = (
+                    item.get("id").and_then(serde_json::Value::as_str),
+                    item.get("supports_video_in")
+                        .and_then(serde_json::Value::as_bool),
+                ) {
                     if ids.iter().any(|known| known == id) {
-                        capabilities.insert(id.to_string(), serde_json::json!({"videoInput":video}));
+                        capabilities
+                            .insert(id.to_string(), serde_json::json!({"videoInput":video}));
                     }
                 }
             }
@@ -960,16 +1047,29 @@ pub(crate) async fn test_provider_connection(
     provider: Option<ProviderConnectionInput>,
 ) -> Result<serde_json::Value, String> {
     let settings = state.settings_read().clone();
-    let mut oauth_provider = effective_request_provider(&settings, &provider_id, provider.as_ref().and_then(|p| p.request.clone()));
+    let mut oauth_provider = effective_request_provider(
+        &settings,
+        &provider_id,
+        provider.as_ref().and_then(|p| p.request.clone()),
+    );
     if let Some(input) = provider.as_ref() {
-        if input.id.as_deref().is_some_and(|id| !id.is_empty() && id != provider_id) {
+        if input
+            .id
+            .as_deref()
+            .is_some_and(|id| !id.is_empty() && id != provider_id)
+        {
             return Err("Provider ID mismatch".into());
         }
         oauth_provider.base_url = input.base_url.clone();
-        if let Some(format) = &input.api_format { oauth_provider.api_format = format.clone(); }
+        if let Some(format) = &input.api_format {
+            oauth_provider.api_format = format.clone();
+        }
     }
     if oauth_provider.request.oauth.is_some() {
-        let model = provider.as_ref().and_then(|p| p.model.as_deref()).filter(|m| !m.trim().is_empty());
+        let model = provider
+            .as_ref()
+            .and_then(|p| p.model.as_deref())
+            .filter(|m| !m.trim().is_empty());
         let result = crate::provider_oauth::test_connection(&state, &oauth_provider, model).await;
         return Ok(match result {
             Ok(()) => serde_json::json!({"success": true}),
@@ -994,9 +1094,15 @@ pub(crate) async fn test_provider_connection(
     let anonymous = api_format == ProviderApiFormat::OpenAiChat
         && crate::opencode_free::is_endpoint(&base_url)
         && api_keys.iter().all(|key| key.trim().is_empty());
-    if anonymous { api_keys = vec![String::new()]; }
+    if anonymous {
+        api_keys = vec![String::new()];
+    }
 
-    let api_key = match if anonymous { Some(String::new()) } else { crate::api::pick_key_at(&api_keys, preferred_idx) } {
+    let api_key = match if anonymous {
+        Some(String::new())
+    } else {
+        crate::api::pick_key_at(&api_keys, preferred_idx)
+    } {
         Some(k) => k,
         None => {
             return Ok(serde_json::json!({
@@ -1020,7 +1126,9 @@ pub(crate) async fn test_provider_connection(
     let result = match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         Some(model) => {
             if anonymous && !crate::opencode_free::is_free_model(model) {
-                return Ok(serde_json::json!({"success": false, "error": "OpenCode Free only supports free models"}));
+                return Ok(
+                    serde_json::json!({"success": false, "error": "OpenCode Free only supports free models"}),
+                );
             }
             let (url, body) = connection_test_url_and_body(api_format, base, model);
             send_with_retry("Provider API", retry_attempts, || {
@@ -1223,6 +1331,22 @@ pub(crate) fn open_permission_settings(kind: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_at_startup_policy_respects_system_overrides() {
+        use super::should_apply_launch_at_startup;
+        for enabled in [false, true] {
+            assert_eq!(
+                should_apply_launch_at_startup(None, enabled),
+                !cfg!(target_os = "windows")
+            );
+            assert_eq!(
+                should_apply_launch_at_startup(Some(enabled), enabled),
+                !cfg!(target_os = "windows")
+            );
+            assert!(should_apply_launch_at_startup(Some(!enabled), enabled));
+        }
+    }
+
     use super::connection_test_url_and_body;
     use super::dedup_preserve_order;
     use super::local_file_path_from_href;

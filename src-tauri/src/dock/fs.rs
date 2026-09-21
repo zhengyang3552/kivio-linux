@@ -702,11 +702,21 @@ fn spawn_open_command(target: &Path, kind: &str, mode: &str) -> Result<(), Strin
 
 #[cfg(target_os = "windows")]
 fn spawn_open_command(target: &Path, kind: &str, mode: &str) -> Result<(), String> {
+    // Explorer does not accept Rust's canonical verbatim path prefix.
+    let target_text = target.to_string_lossy();
+    let target_text = if let Some(unc) = target_text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        target_text
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&target_text)
+            .to_string()
+    };
     let mut command = Command::new("explorer.exe");
     if mode == "reveal" && kind == "file" {
-        command.arg(format!("/select,{}", target.display()));
+        command.arg(format!("/select,{target_text}"));
     } else {
-        command.arg(target);
+        command.arg(target_text);
     }
     command
         .spawn()
@@ -726,6 +736,11 @@ fn spawn_open_command(target: &Path, kind: &str, mode: &str) -> Result<(), Strin
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("系统打开失败（xdg-open）：{e}"))
+}
+
+/// The caller must resolve and validate the file before revealing it.
+pub(crate) fn reveal_file_in_manager(target: &Path) -> Result<(), String> {
+    spawn_open_command(target, "file", "reveal")
 }
 
 fn fs_open_path_impl(

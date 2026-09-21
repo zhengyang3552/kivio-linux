@@ -1,5 +1,7 @@
 import { useCallback, useState } from 'react'
 import { ChatImageContextMenu, type ChatImageMenuAnchor } from './ChatImageContextMenu'
+import { useConversationTransition } from './conversationTransitionStore'
+import { fileLocationAction } from './fileLocation'
 
 /** 聊天区预览磁贴的最长边。点开查看器仍是原图。 */
 export const CHAT_IMAGE_TILE_MAX_PX = 128
@@ -43,16 +45,21 @@ export function ChatInlineImage({
   src,
   alt,
   name,
+  path,
+  conversationId,
   onOpenViewer,
   className = '',
 }: {
   src: string
   alt: string
   name?: string
+  path?: string | null
+  conversationId?: string | null
   onOpenViewer?: () => void
   /** 外层按钮的附加类（如 markdown 图的外边距）。 */
   className?: string
 }) {
+  const { loading: conversationOpening } = useConversationTransition()
   const [menuAnchor, setMenuAnchor] = useState<ChatImageMenuAnchor | null>(null)
   const [ratio, setRatio] = useState<number>(() => ratioCache.get(ratioKey(src)) ?? 1)
 
@@ -91,7 +98,7 @@ export function ChatInlineImage({
           src={src}
           alt={alt}
           onLoad={handleLoad}
-          loading={src.startsWith('data:') ? undefined : 'lazy'}
+          loading={src.startsWith('data:') ? undefined : conversationOpening ? 'eager' : 'lazy'}
           className={`h-full w-full min-w-0 max-w-full ${IMAGE_CLASS}`}
         />
       </button>
@@ -100,6 +107,7 @@ export function ChatInlineImage({
           anchor={menuAnchor}
           src={src}
           name={name}
+          onRevealLocation={fileLocationAction(path, conversationId)}
           onOpenViewer={onOpenViewer}
           onClose={() => setMenuAnchor(null)}
         />

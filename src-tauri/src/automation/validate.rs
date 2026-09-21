@@ -30,10 +30,7 @@ pub fn validate(automation: &Automation) -> Vec<ValidationIssue> {
     let mut ids = HashSet::new();
     for node in &automation.nodes {
         if node.id.trim().is_empty() {
-            issues.push(ValidationIssue::error(
-                None,
-                "a node is missing an id",
-            ));
+            issues.push(ValidationIssue::error(None, "a node is missing an id"));
             continue;
         }
         if !ids.insert(node.id.as_str()) {
@@ -373,10 +370,16 @@ fn lint_node_data(issues: &mut Vec<ValidationIssue>, automation: &Automation, no
                 let hour = json_u64(&schedule, "hour").unwrap_or(9);
                 let minute = json_u64(&schedule, "minute").unwrap_or(0);
                 if hour > 23 {
-                    issues.push(ValidationIssue::error(id.clone(), "schedule.hour must be 0–23"));
+                    issues.push(ValidationIssue::error(
+                        id.clone(),
+                        "schedule.hour must be 0–23",
+                    ));
                 }
                 if minute > 59 {
-                    issues.push(ValidationIssue::error(id.clone(), "schedule.minute must be 0–59"));
+                    issues.push(ValidationIssue::error(
+                        id.clone(),
+                        "schedule.minute must be 0–59",
+                    ));
                 }
             } else {
                 let minutes = json_u64(&schedule, "intervalMinutes").unwrap_or(0);
@@ -413,13 +416,17 @@ fn lint_node_data(issues: &mut Vec<ValidationIssue>, automation: &Automation, no
             if !HTTP_METHODS.contains(&method.as_str()) {
                 issues.push(ValidationIssue::error(
                     id.clone(),
-                    format!("http.method must be one of GET/POST/PUT/PATCH/DELETE (got '{method}')"),
+                    format!(
+                        "http.method must be one of GET/POST/PUT/PATCH/DELETE (got '{method}')"
+                    ),
                 ));
             }
             let url = http.get("url").and_then(Value::as_str).unwrap_or("").trim();
             if url.is_empty() {
                 issues.push(ValidationIssue::error(id.clone(), "http.url is empty"));
-            } else if !url.starts_with("http://") && !url.starts_with("https://") && !url.contains("{{")
+            } else if !url.starts_with("http://")
+                && !url.starts_with("https://")
+                && !url.contains("{{")
             {
                 issues.push(ValidationIssue::warning(
                     id,
@@ -448,7 +455,11 @@ fn lint_node_data(issues: &mut Vec<ValidationIssue>, automation: &Automation, no
                     format!("file.op must be read or write (got '{op}')"),
                 ));
             }
-            let path = file.get("path").and_then(Value::as_str).unwrap_or("").trim();
+            let path = file
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
             if path.is_empty() {
                 issues.push(ValidationIssue::error(id, "file.path is empty"));
             }
@@ -545,8 +556,8 @@ fn lint_node_data(issues: &mut Vec<ValidationIssue>, automation: &Automation, no
             }
         }
         "logic.delay" => {
-            let seconds = json_u64(node.data.get("delay").unwrap_or(&Value::Null), "seconds")
-                .unwrap_or(0);
+            let seconds =
+                json_u64(node.data.get("delay").unwrap_or(&Value::Null), "seconds").unwrap_or(0);
             if seconds == 0 || seconds > 600 {
                 issues.push(ValidationIssue::error(
                     id,
@@ -580,14 +591,17 @@ fn json_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(|v| {
         v.as_u64()
             .or_else(|| v.as_i64().and_then(|n| u64::try_from(n).ok()))
-            .or_else(|| v.as_f64().and_then(|n| if n >= 0.0 { Some(n as u64) } else { None }))
+            .or_else(|| {
+                v.as_f64()
+                    .and_then(|n| if n >= 0.0 { Some(n as u64) } else { None })
+            })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation::types::{FlowEdge, SCHEMA_VERSION, Viewport};
+    use crate::automation::types::{FlowEdge, Viewport, SCHEMA_VERSION};
     use serde_json::json;
 
     fn node(id: &str, node_type: &str) -> FlowNode {
@@ -711,9 +725,7 @@ mod tests {
                 edge("b", "a", None),
             ],
         );
-        assert!(errors_of(&automation)
-            .iter()
-            .any(|m| m.contains("cycle")));
+        assert!(errors_of(&automation).iter().any(|m| m.contains("cycle")));
     }
 
     #[test]
@@ -785,7 +797,9 @@ mod tests {
         let messages = errors_of(&automation);
         assert!(messages.iter().any(|m| m.contains("http.method")));
         assert!(messages.iter().any(|m| m.contains("http.url is empty")));
-        assert!(messages.iter().any(|m| m.contains("command.command is empty")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("command.command is empty")));
     }
 
     #[test]
@@ -806,10 +820,7 @@ mod tests {
         delay.data = json!({ "delay": { "seconds": 0 } });
         let mut file = node("f", "action.file");
         file.data = json!({ "file": { "op": "write", "path": "" } });
-        let automation = graph(
-            vec![node("t", "trigger.manual"), delay, file],
-            vec![],
-        );
+        let automation = graph(vec![node("t", "trigger.manual"), delay, file], vec![]);
         let messages = errors_of(&automation);
         assert!(messages.iter().any(|m| m.contains("delay.seconds")));
         assert!(messages.iter().any(|m| m.contains("file.path is empty")));
@@ -823,7 +834,9 @@ mod tests {
         );
         let issues = validate(&automation);
         assert!(!has_errors(&issues));
-        assert!(issues.iter().any(|i| i.severity == "warning" && i.message.contains("prompt")));
+        assert!(issues
+            .iter()
+            .any(|i| i.severity == "warning" && i.message.contains("prompt")));
     }
 
     #[test]

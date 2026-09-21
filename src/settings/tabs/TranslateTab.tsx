@@ -1,7 +1,7 @@
 import { Select, SettingRow, SettingsGroup } from '../components'
 import { ModelPairSelect } from '../ModelPairSelect'
 import { PromptField } from '../ScreenshotTranslationSettings'
-import type { I18n, Lang } from '../i18n'
+import type { I18n, Lang } from '../../components/i18n'
 import type { Settings as SettingsData, DefaultPromptTemplates } from '../../api/tauri'
 
 interface TranslateTabProps {
@@ -33,7 +33,7 @@ export function TranslateTab({
         <SettingRow label={t.targetLang}>
           <Select
             className="w-40"
-            value={settings.targetLang || 'auto'}
+            value={settings.targetLang}
             onChange={(v) => onUpdateSettings({ targetLang: v })}
             options={[
               { value: 'auto', label: t.langAuto },

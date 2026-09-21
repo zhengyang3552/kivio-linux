@@ -35,7 +35,9 @@ use crate::external_agents::spawn::{
     drain_stderr, kill_agent_process_tree, resolve_binary, spawn_agent, tail_chars,
 };
 use crate::external_agents::types::{
-    RuntimeBuildOptions, RuntimeContext, StreamFormat, UnifiedAgentEvent,
+    AdditionalDirsStrategy, ApprovalStrategy, ModelSelectionStrategy, RegenerateStrategy,
+    RetryStrategy, RuntimeAgentDef, RuntimeBuildOptions, RuntimeContext, StreamFormat,
+    UnifiedAgentEvent,
 };
 use crate::external_agents::workspace::{ensure_effective_cwd, extra_allowed_dirs_for_agent};
 use crate::skills::read_skill_detail_in;
@@ -131,8 +133,16 @@ pub async fn run_external_cli_reply(
     entry: AgentRunEntry,
 ) -> Result<(), String> {
     run_external_cli_reply_in(
-        app, state, conversation, title_from_first_user, latest_user_message,
-        image_paths, file_paths, active_skill_id, entry, None,
+        app,
+        state,
+        conversation,
+        title_from_first_user,
+        latest_user_message,
+        image_paths,
+        file_paths,
+        active_skill_id,
+        entry,
+        None,
     )
     .await
 }
@@ -235,7 +245,7 @@ pub(crate) async fn run_external_cli_reply_in(
     // `skip_instructions`（内容没变就不重发）保证了**永远不会补发** ⇒ 长会话跑一阵子后
     // 用户配置的系统提示与 Memory 静默失效，没有任何可观测信号。
     // 启动 flag 每次进程启动都重新注入，与对话历史无关，压缩影响不到。
-    let instructions_via_flag = instructions_via_launch_flag(def.id);
+    let instructions_via_flag = instructions_via_launch_flag(def);
     let system_prompt_file = if instructions_via_flag && !is_slash {
         match write_system_prompt_file(&conversation.id, daemon_instructions.trim()) {
             Ok(path) => Some(path),
@@ -287,6 +297,26 @@ pub(crate) async fn run_external_cli_reply_in(
         )
     };
     let mut composed = composed;
+    // Pi's native `fork` excludes the selected user message. When regenerating the very first
+    // turn, that leaves a blank native session, so the resubmitted prompt must carry the session
+    // instructions again. Non-root forks already retain the original first-turn instruction
+    // wrapper and use the ordinary resume prompt.
+    let mut pi_regenerate_root_prompt = (matches!(def.run.regenerate, RegenerateStrategy::PiRpc)
+        && matches!(entry, AgentRunEntry::Regenerate))
+    .then(|| {
+        if is_slash {
+            compose_external_prompt_passthrough(latest_user_message)
+        } else {
+            compose_external_prompt(
+                &daemon_instructions,
+                skill_body.as_deref(),
+                skill_dir.as_deref(),
+                skill_folder.as_deref(),
+                false,
+                latest_user_message,
+            )
+        }
+    });
 
     // 附件（slash 命令不带附件，保持 passthrough 语义）。图片：支持原生图片块的协议按白名单
     // 加载为 base64 块，其余（不支持 / 超白名单 / 读失败）降级为路径文本；文件：一律路径说明块。
@@ -304,18 +334,20 @@ pub(crate) async fn run_external_cli_reply_in(
         (Vec::new(), image_paths.to_vec())
     };
     if !is_slash {
-        composed
-            .full_prompt
-            .push_str(&crate::external_agents::attachments::image_paths_note_for(
-                Some(&resolved_bin),
-                &degraded_image_paths,
-            ));
-        composed.full_prompt.push_str(
-            &crate::external_agents::attachments::file_attachments_note_for(
-                Some(&resolved_bin),
-                file_paths,
-            ),
+        let image_note = crate::external_agents::attachments::image_paths_note_for(
+            Some(&resolved_bin),
+            &degraded_image_paths,
         );
+        let file_note = crate::external_agents::attachments::file_attachments_note_for(
+            Some(&resolved_bin),
+            file_paths,
+        );
+        composed.full_prompt.push_str(&image_note);
+        composed.full_prompt.push_str(&file_note);
+        if let Some(root_prompt) = pi_regenerate_root_prompt.as_mut() {
+            root_prompt.full_prompt.push_str(&image_note);
+            root_prompt.full_prompt.push_str(&file_note);
+        }
     }
 
     let mut extra_dirs = extra_allowed_dirs_for_agent(def, &settings.chat_tools.skill_scan_paths);
@@ -323,6 +355,11 @@ pub(crate) async fn run_external_cli_reply_in(
     if !is_slash && (!degraded_image_paths.is_empty() || !file_paths.is_empty()) {
         if let Ok(dir) = crate::chat::storage::conversation_attachments_dir(app, &conversation.id) {
             extra_dirs.push(dir.to_string_lossy().to_string());
+        }
+        for path in file_paths {
+            if path.is_dir() {
+                extra_dirs.push(path.to_string_lossy().into_owned());
+            }
         }
     }
     for directory in &conversation.additional_directories {
@@ -355,10 +392,9 @@ pub(crate) async fn run_external_cli_reply_in(
             .filter(|path| !path.trim().is_empty())
             .collect(),
     );
-    let additional_dirs_key = if agent_id == "antigravity" {
-        extra_dirs.join("\n")
-    } else {
-        additional_cli_dirs.join("\n")
+    let additional_dirs_key = match def.run.additional_dirs {
+        AdditionalDirsStrategy::Effective => extra_dirs.join("\n"),
+        AdditionalDirsStrategy::ConversationOnly => additional_cli_dirs.join("\n"),
     };
     let runtime_ctx = RuntimeContext {
         extra_allowed_dirs: extra_dirs,
@@ -369,16 +405,17 @@ pub(crate) async fn run_external_cli_reply_in(
 
     // Claude: external_model is catalog id (picker); wire value is settings-mapped runtime.
     // Resolve once at the boundary so launch argv and mid-session set_model share one id space.
-    let wire_model = if agent_id == "claude" {
-        crate::external_agents::session::claude_init::claude_wire_model(
-            conversation.agent_runtime.external_model.as_deref(),
-        )
-    } else {
-        conversation
+    let wire_model = match def.run.model_selection {
+        ModelSelectionStrategy::ClaudeWire => {
+            crate::external_agents::session::claude_init::claude_wire_model(
+                conversation.agent_runtime.external_model.as_deref(),
+            )
+        }
+        ModelSelectionStrategy::Direct => conversation
             .agent_runtime
             .external_model
             .clone()
-            .filter(|m| !m.is_empty() && m != "default")
+            .filter(|m| !m.is_empty() && m != "default"),
     };
     let build_options = RuntimeBuildOptions {
         model: wire_model.clone(),
@@ -417,7 +454,27 @@ pub(crate) async fn run_external_cli_reply_in(
 
     let extra_env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    let run_generation = state.next_chat_generation(&conversation.id);
+    let pi_regenerate = (matches!(def.run.regenerate, RegenerateStrategy::PiRpc)
+        && matches!(entry, AgentRunEntry::Regenerate))
+    .then(|| PiRegenerateRequest {
+        visible_users: conversation
+            .messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(
+                |message| crate::external_agents::session::pi_rpc::PiRegenerateUserMessage {
+                    content: message.content.clone(),
+                    timestamp: message.timestamp,
+                },
+            )
+            .collect(),
+        root_prompt: pi_regenerate_root_prompt
+            .as_ref()
+            .map(|prompt| prompt.full_prompt.clone())
+            .unwrap_or_else(|| composed.full_prompt.clone()),
+    });
+
+    let run_generation = state.chat_runtime().begin_generation(&conversation.id);
     let run_id = format!("ext-run-{}-{}", run_generation, Uuid::new_v4());
     let assistant_message_id = format!("msg_{}", Uuid::new_v4());
     crate::chat::protocol::register_run(
@@ -497,7 +554,9 @@ pub(crate) async fn run_external_cli_reply_in(
 
     let mut emit_event = |event: UnifiedAgentEvent| {
         if let Some(commands) = slash::slash_commands_from_event(&event) {
-            state.set_cached_external_slash_commands(slash_cache_key.clone(), commands);
+            state
+                .external_discovery()
+                .set_cached_external_slash_commands(slash_cache_key.clone(), commands);
         }
         apply_unified_event(
             app,
@@ -520,13 +579,17 @@ pub(crate) async fn run_external_cli_reply_in(
         );
     };
 
-    let cancel_check = || !state.is_chat_generation_active(&conversation_id, run_generation);
+    let cancel_check = || {
+        !state
+            .chat_runtime()
+            .is_generation_active(&conversation_id, run_generation)
+    };
 
     // 本轮接不接工具审批 / 问用户。claude 的判据取自即将启动的 argv 本身
     // （`--permission-prompt-tool stdio`），从 argv 读回来就不可能与 `build_args` 分叉。
     // 没有这条 flag 的 CLI（dsh 的 `session/ask`）靠 `ask_user::needs_host` 开通道，
     // 否则问用户会卡在 `NO_PROVIDER`。
-    let approval_host = turn_needs_approval_host(&args, &agent_id).then(|| ApprovalHost {
+    let approval_host = turn_needs_approval_host(&args, def).then(|| ApprovalHost {
         app,
         state,
         conversation_id: &conversation_id,
@@ -536,7 +599,8 @@ pub(crate) async fn run_external_cli_reply_in(
         auto_allow_tools: std::sync::atomic::AtomicBool::new(
             permission_mode_from_args(&args)
                 .is_some_and(crate::external_agents::defs::claude::claude_mode_auto_allows_tools)
-                || (agent_id == "grok" && args.iter().any(|arg| arg == "--always-approve"))
+                || (matches!(def.run.approval, ApprovalStrategy::GrokAlwaysApprove)
+                    && args.iter().any(|arg| arg == "--always-approve"))
                 || crate::external_agents::ask_user::auto_allow_ordinary_tools(&agent_id),
         ),
     });
@@ -589,6 +653,7 @@ pub(crate) async fn run_external_cli_reply_in(
             &image_blocks,
             &extra_writable_roots,
             &additional_cli_dirs,
+            pi_regenerate.as_ref(),
             &mut emit_event,
             &cancel_check,
             approval_host.as_ref(),
@@ -866,6 +931,11 @@ impl StreamSegmentTracker {
     }
 }
 
+struct PiRegenerateRequest {
+    visible_users: Vec<crate::external_agents::session::pi_rpc::PiRegenerateUserMessage>,
+    root_prompt: String,
+}
+
 /// Phase 2: run one turn against a persistent live session, reusing the conversation's existing
 /// session, resuming a persisted one after a restart, or connecting fresh. The CLI process is kept
 /// alive in the registry between turns, so a reused/resumed session sends only the latest user
@@ -891,6 +961,7 @@ async fn run_persistent_turn<E, C>(
     images: &[crate::external_agents::attachments::ImageBlock],
     extra_writable_roots: &[String],
     additional_directories: &[String],
+    pi_regenerate: Option<&PiRegenerateRequest>,
     emit: &mut E,
     cancel: &C,
     // 本轮的工具审批出口。`None` = 不接（协议不支持 / 用户没选会询问的权限档位）——
@@ -929,129 +1000,192 @@ where
     // 复用判据里含 `launch_config`：模型 / reasoning / sandbox / 系统指令任一变化 ⇒ 不可复用
     // ⇒ 丢弃条目（actor 自行关停旧进程）并走下面的连接分支**带原生 resume**，于是新 flag
     // 生效而上下文不丢（spec 第 8 条：UI 所见必须与会话实际配置一致）。
-    let previous_control = state.external_live_session_control_any(conversation_id);
-    let reusable_control =
-        state.external_live_session_control(conversation_id, agent_id, &cwd_str, launch_config);
+    let force_pi_fork = matches!(protocol, StreamFormat::PiRpc) && pi_regenerate.is_some();
+    let previous_control = state.external_live_sessions().control_any(conversation_id);
+    let reusable_control = if force_pi_fork {
+        None
+    } else {
+        state.external_live_sessions().reusable_control(
+            conversation_id,
+            agent_id,
+            &cwd_str,
+            launch_config,
+        )
+    };
     if reusable_control.is_none() {
         if let Some(stale) = previous_control {
             // A new dsh process must not resume while the old process can still write the same
             // native session log. Close the actor and wait for its receiver to disappear first.
-            let _ = stale
-                .send(crate::external_agents::session::live::SessionCommand::Close)
-                .await;
-            if tokio::time::timeout(std::time::Duration::from_secs(5), stale.closed())
-                .await
-                .is_err()
-            {
-                return Err("旧外部 CLI 会话关闭超时，请重试".to_string());
-            }
+            close_live_control(&stale).await?;
+        }
+        if force_pi_fork {
+            state.external_live_sessions().remove(conversation_id);
         }
     }
-    let (mut control, mut prompt) = match reusable_control {
-        Some(control) => (control, reuse_prompt.to_string()),
-        None => {
-            let resume_native = resumable_native.clone();
-            // We intended to continue an existing native session iff a matching handle was
-            // persisted. If the resume then fails and we fall back to fresh, the prior context
-            // is lost and the user must be told (R4) rather than silently getting a blank slate.
-            let intended_resume = resume_native.is_some();
-            let connected = match connect_persistent_session(
-                protocol,
-                resolved_bin,
-                &turn_args,
-                cwd,
-                model.as_deref(),
-                reasoning.as_deref(),
-                sandbox.as_deref(),
-                preset.as_deref(),
-                &mcp_servers,
-                resume_native.clone(),
-                additional_directories,
-                Some(background_task_sink(app, conversation_id)),
-                Some(dsh_idle_sink(app, conversation_id)),
-                dsh_idle_approvals_for(protocol, app, conversation_id),
-            )
-            .await
-            {
-                Ok(connected) => connected,
-                // Resume can fail during connect before the first turn: Claude reports a missing
-                // conversation on stderr; dsh returns `session \"...\" not found` from session/open.
-                // Clear the stale handle and retry fresh exactly once, with the normal reset notice.
-                Err(err) if !dropped_resume && is_missing_resume_target(&err, agent_id) => {
-                    dropped_resume = true;
-                    turn_args = drop_resume_for_fresh_session(
-                        app,
-                        conversation_id,
-                        agent_id,
-                        protocol,
-                        &turn_args,
-                    );
-                    connect_persistent_session(
-                        protocol,
-                        resolved_bin,
-                        &turn_args,
-                        cwd,
-                        model.as_deref(),
-                        reasoning.as_deref(),
-                        sandbox.as_deref(),
-                        preset.as_deref(),
-                        &mcp_servers,
-                        None,
-                        additional_directories,
-                        Some(background_task_sink(app, conversation_id)),
-                        Some(dsh_idle_sink(app, conversation_id)),
-                        dsh_idle_approvals_for(protocol, app, conversation_id),
-                    )
-                    .await?
-                }
-                Err(err) => return Err(err),
-            };
-            let PersistentConnection {
-                control,
-                native_id,
-                resumed,
-                child_pid,
-            } = connected;
-            // 轮内重连要续的是**这个**会话，不是 handle 里那个（首连开了新会话时两者不同）。
-            resumable_native = Some(native_id.clone()).filter(|id| !id.trim().is_empty());
-            let _ = save_live_handle(
-                app,
-                conversation_id,
-                &LiveSessionHandle {
-                    agent_id: agent_id.to_string(),
-                    protocol: protocol_tag.to_string(),
-                    native_id,
-                    native_path: None,
-                    cwd: cwd_str.clone(),
-                },
-            );
-            state.register_external_live_session(
-                conversation_id.to_string(),
-                LiveSession {
-                    control: control.clone(),
-                    agent_id: agent_id.to_string(),
-                    cwd: cwd_str.clone(),
-                    launch_config: launch_config.clone(),
-                    last_activity: std::time::Instant::now(),
-                    child_pid,
-                    turns_served: 1,
-                    busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                },
-            );
-            // A resumed session already holds history → send only the latest message.
-            let prompt = if resumed {
-                reuse_prompt.to_string()
-            } else {
-                first_prompt.to_string()
-            };
-            // Intended to resume but ended up fresh → warn about the lost context.
-            // `dropped_resume` 走的也是这一条：resume 的目标会话被 claude 清理掉了，我们换了个
-            // 新会话继续 —— 用户该看到的正是这条**已有的**「上下文已重置」提示，
-            // 而不是 claude 那句英文原文（别为它新写一条文案，spec 第 2 条）。
-            if !resumed && (intended_resume || dropped_resume) {
-                emit(context_reset_notice_event());
+    let (mut control, mut prompt) = if let Some(regenerate) =
+        pi_regenerate.filter(|_| matches!(protocol, StreamFormat::PiRpc))
+    {
+        let mut session = crate::external_agents::session::pi_rpc::PiRpcSession::connect(
+            resolved_bin,
+            &turn_args,
+            cwd,
+            resumable_native.as_deref(),
+        )
+        .await?;
+        let forked = match session.fork_for_regenerate(&regenerate.visible_users).await {
+            Ok(forked) => forked,
+            Err(error) => {
+                session.close().await;
+                return Err(format!("Pi 重新生成前无法回退原生会话：{error}"));
             }
-            (control, prompt)
+        };
+        let native_id = forked.session_id.clone();
+        let child_pid = session.child_pid();
+        let control = crate::external_agents::session::pi_rpc::spawn_pi_rpc_session_actor(session);
+        save_live_handle(
+            app,
+            conversation_id,
+            &LiveSessionHandle {
+                agent_id: agent_id.to_string(),
+                protocol: protocol_tag.to_string(),
+                native_id: native_id.clone(),
+                native_path: forked.session_path,
+                cwd: cwd_str.clone(),
+            },
+        )?;
+        let _ = crate::external_agents::session::update_stored_session_id(
+            app,
+            conversation_id,
+            agent_id,
+            &native_id,
+        );
+        resumable_native = Some(native_id);
+        state.external_live_sessions().register(
+            conversation_id.to_string(),
+            LiveSession {
+                control: control.clone(),
+                agent_id: agent_id.to_string(),
+                cwd: cwd_str.clone(),
+                launch_config: launch_config.clone(),
+                last_activity: std::time::Instant::now(),
+                child_pid,
+                turns_served: 1,
+                busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+        let prompt = if forked.needs_root_prompt {
+            regenerate.root_prompt.clone()
+        } else {
+            reuse_prompt.to_string()
+        };
+        (control, prompt)
+    } else {
+        match reusable_control {
+            Some(control) => (control, reuse_prompt.to_string()),
+            None => {
+                let resume_native = resumable_native.clone();
+                // We intended to continue an existing native session iff a matching handle was
+                // persisted. If the resume then fails and we fall back to fresh, the prior context
+                // is lost and the user must be told (R4) rather than silently getting a blank slate.
+                let intended_resume = resume_native.is_some();
+                let connected = match connect_persistent_session(
+                    protocol,
+                    resolved_bin,
+                    &turn_args,
+                    cwd,
+                    model.as_deref(),
+                    reasoning.as_deref(),
+                    sandbox.as_deref(),
+                    preset.as_deref(),
+                    &mcp_servers,
+                    resume_native.clone(),
+                    additional_directories,
+                    Some(background_task_sink(app, conversation_id)),
+                    Some(dsh_idle_sink(app, conversation_id)),
+                    dsh_idle_approvals_for(protocol, app, conversation_id),
+                )
+                .await
+                {
+                    Ok(connected) => connected,
+                    // Resume can fail during connect before the first turn: Claude reports a missing
+                    // conversation on stderr; dsh returns `session \"...\" not found` from session/open.
+                    // Clear the stale handle and retry fresh exactly once, with the normal reset notice.
+                    Err(err) if !dropped_resume && is_missing_resume_target(&err, agent_id) => {
+                        dropped_resume = true;
+                        turn_args = drop_resume_for_fresh_session(
+                            app,
+                            conversation_id,
+                            agent_id,
+                            protocol,
+                            &turn_args,
+                        );
+                        connect_persistent_session(
+                            protocol,
+                            resolved_bin,
+                            &turn_args,
+                            cwd,
+                            model.as_deref(),
+                            reasoning.as_deref(),
+                            sandbox.as_deref(),
+                            preset.as_deref(),
+                            &mcp_servers,
+                            None,
+                            additional_directories,
+                            Some(background_task_sink(app, conversation_id)),
+                            Some(dsh_idle_sink(app, conversation_id)),
+                            dsh_idle_approvals_for(protocol, app, conversation_id),
+                        )
+                        .await?
+                    }
+                    Err(err) => return Err(err),
+                };
+                let PersistentConnection {
+                    control,
+                    native_id,
+                    resumed,
+                    child_pid,
+                } = connected;
+                // 轮内重连要续的是**这个**会话，不是 handle 里那个（首连开了新会话时两者不同）。
+                resumable_native = Some(native_id.clone()).filter(|id| !id.trim().is_empty());
+                let _ = save_live_handle(
+                    app,
+                    conversation_id,
+                    &LiveSessionHandle {
+                        agent_id: agent_id.to_string(),
+                        protocol: protocol_tag.to_string(),
+                        native_id,
+                        native_path: None,
+                        cwd: cwd_str.clone(),
+                    },
+                );
+                state.external_live_sessions().register(
+                    conversation_id.to_string(),
+                    LiveSession {
+                        control: control.clone(),
+                        agent_id: agent_id.to_string(),
+                        cwd: cwd_str.clone(),
+                        launch_config: launch_config.clone(),
+                        last_activity: std::time::Instant::now(),
+                        child_pid,
+                        turns_served: 1,
+                        busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    },
+                );
+                // A resumed session already holds history → send only the latest message.
+                let prompt = if resumed {
+                    reuse_prompt.to_string()
+                } else {
+                    first_prompt.to_string()
+                };
+                // Intended to resume but ended up fresh → warn about the lost context.
+                // `dropped_resume` 走的也是这一条：resume 的目标会话被 claude 清理掉了，我们换了个
+                // 新会话继续 —— 用户该看到的正是这条**已有的**「上下文已重置」提示，
+                // 而不是 claude 那句英文原文（别为它新写一条文案，spec 第 2 条）。
+                if !resumed && (intended_resume || dropped_resume) {
+                    emit(context_reset_notice_event());
+                }
+                (control, prompt)
+            }
         }
     };
 
@@ -1063,7 +1197,7 @@ where
     // 会往注册表塞一条全新的 `LiveSession`（`busy: false`），旧 guard 还指着旧会话的 Arc
     // —— 不重挂的话，恰好是刚付过冷启动的那条路反而不受保护。
     // 下划线名字是必要的：这个值只靠 Drop 起作用，没有任何读取点。
-    let mut _busy = state.mark_external_live_session_busy(conversation_id);
+    let mut _busy = state.external_live_sessions().mark_busy(conversation_id);
 
     // At most one automatic fresh reconnect after a non-cancel / non-auth failure (R3), plus one
     // reconnect for a config change that only a relaunch can apply (R4 NeedsReconnect). Each is
@@ -1093,7 +1227,7 @@ where
         // 子进程）；只有「协议级取消之后会话仍可用」的协议例外 —— 否则用户点一次「停止」
         // 就把常驻进程连带杀掉，上下文延续与 0.1s 冷启动全部作废（见 `cancel_keeps_live_session`）。
         if !cancel_keeps_live_session(&err, protocol) {
-            state.remove_external_live_session(conversation_id);
+            state.external_live_sessions().remove(conversation_id);
         }
 
         match persistent_failure_action(
@@ -1141,6 +1275,10 @@ where
             }
         }
 
+        // Removing the registry entry does not close the actor while this local sender still
+        // exists. dsh now enforces one writer per native session, so wait for the old process
+        // before reopening that same id after a failed turn.
+        close_live_control(&control).await?;
         let (next_control, resumed, reconnect_native) = reconnect_fresh(
             app,
             state,
@@ -1165,7 +1303,7 @@ where
         // 又重连一次时续的是这条会话（续接成功 ⇒ 同一个 id；失败降级成新会话 ⇒ 新 id）。
         resumable_native = reconnect_native.filter(|id| !id.trim().is_empty());
         // 新会话进了注册表 ⇒ 旧 guard 已经指不到它了，重挂一个（旧的在赋值时落地）。
-        _busy = state.mark_external_live_session_busy(conversation_id);
+        _busy = state.external_live_sessions().mark_busy(conversation_id);
         control = next_control;
         prompt = if resumed {
             reuse_prompt.to_string()
@@ -1180,6 +1318,22 @@ where
             emit(context_reset_notice_event());
         }
     }
+}
+
+async fn close_live_control(
+    control: &tokio::sync::mpsc::Sender<crate::external_agents::session::live::SessionCommand>,
+) -> Result<(), String> {
+    use crate::external_agents::session::live::SessionCommand;
+
+    let close = async {
+        if !control.is_closed() {
+            let _ = control.send(SessionCommand::Close).await;
+            control.closed().await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), close)
+        .await
+        .map_err(|_| "旧外部 CLI 会话关闭超时，请重试".to_string())
 }
 
 /// Connect a persistent session for the reconnect paths, persist its handle, and register it.
@@ -1254,7 +1408,7 @@ async fn reconnect_fresh(
             cwd: cwd_str.to_string(),
         },
     );
-    state.register_external_live_session(
+    state.external_live_sessions().register(
         conversation_id.to_string(),
         LiveSession {
             control: control.clone(),
@@ -1497,14 +1651,17 @@ fn persistent_failure_action(
     }
     // agy has no request ids or prompt acknowledgement. Replaying a failed in-flight
     // turn could execute tools twice. Preserve the binding and let the user retry.
-    if agent_id == "antigravity" {
+    if matches!(
+        get_agent_def(agent_id).map(|def| def.run.retry),
+        Some(RetryStrategy::NeverReplay)
+    ) {
         return PersistentFailureAction::Fatal;
     }
     // Auth is never auto-retried (a doomed retry could trigger a login storm).
     if crate::external_agents::errors::is_auth_error(err, agent_id) {
         return PersistentFailureAction::Fatal;
     }
-    if crate::external_agents::errors::is_non_retryable_codex_error(err, agent_id) {
+    if crate::external_agents::errors::is_non_retryable_error(err, agent_id) {
         return PersistentFailureAction::Fatal;
     }
     if retried_after_failure {
@@ -1600,10 +1757,10 @@ fn turn_asks_for_permission(args: &[String]) -> bool {
 /// 本轮要不要建审批 / 问用户宿主。claude 看 argv 上的 `--permission-prompt-tool`；
 /// 没有这条 flag 的 CLI（dsh 的 `session/ask`）靠 `ask_user::needs_host` —— 加了
 /// codec 就会开通道。
-fn turn_needs_approval_host(args: &[String], agent_id: &str) -> bool {
+fn turn_needs_approval_host(args: &[String], def: &RuntimeAgentDef) -> bool {
     turn_asks_for_permission(args)
-        || agent_id == "grok"
-        || crate::external_agents::ask_user::needs_host(agent_id)
+        || matches!(def.run.approval, ApprovalStrategy::GrokAlwaysApprove)
+        || crate::external_agents::ask_user::needs_host(def.id)
 }
 
 /// 本轮 argv 里的权限档位（`--permission-mode` 的值）。
@@ -1983,10 +2140,8 @@ impl ApprovalHost<'_> {
         );
         if let Some(content) = answered_record.structured_content.clone() {
             self.state
-                .answered_ask_user_content
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .insert(answered_record.id.clone(), content);
+                .chat_interactions()
+                .remember_answered_ask_user(answered_record.id.clone(), content);
         }
         let approved = answered.phase == crate::chat::ask_user::ASK_USER_PHASE_ANSWERED;
         crate::external_agents::session::live::ApprovalDecision {
@@ -2007,26 +2162,9 @@ impl ApprovalHost<'_> {
         if tool_call_ids.is_empty() {
             return;
         }
-        {
-            let mut pending = self
-                .state
-                .pending_chat_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for id in tool_call_ids {
-                pending.remove(id);
-            }
-        }
-        {
-            let mut pending = self
-                .state
-                .pending_chat_user_prompts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for id in tool_call_ids {
-                pending.remove(id);
-            }
-        }
+        self.state
+            .chat_interactions()
+            .forget_tool_interactions(tool_call_ids);
         for id in tool_call_ids {
             crate::chat::commands::interaction::withdraw_tool_confirm(self.app, id);
             crate::chat::protocol::resolve_user_prompt(self.app, self.run_id, id);
@@ -2074,14 +2212,16 @@ fn background_task_sink(
             description,
             summary,
         }) => {
-            app.state::<AppState>().upsert_external_background_task(
-                &conversation_id,
-                &task_id,
-                &status,
-                kind.as_deref(),
-                description.as_deref(),
-                summary.as_deref(),
-            );
+            app.state::<AppState>()
+                .external_background_tasks()
+                .upsert_external_background_task(
+                    &conversation_id,
+                    &task_id,
+                    &status,
+                    kind.as_deref(),
+                    description.as_deref(),
+                    summary.as_deref(),
+                );
         }
         IdleSideEffect::Task(_) => {}
         // sink 是同步闭包，持久化是 async —— 甩给运行时，失败只打日志（唤醒消息
@@ -2156,7 +2296,7 @@ async fn present_dsh_idle_ask(
     ask: crate::external_agents::session::live::ApprovalAsk,
 ) -> crate::external_agents::session::live::ApprovalDecision {
     let state = app.state::<AppState>();
-    let generation = state.next_chat_generation(&conversation_id);
+    let generation = state.chat_runtime().begin_generation(&conversation_id);
     let run_id = format!("dsh-ask-{}", Uuid::new_v4());
     let message_id = format!("msg_{}", Uuid::new_v4());
     let arguments = serde_json::to_string(&ask.input).unwrap_or_else(|_| "{}".to_string());
@@ -2188,7 +2328,9 @@ async fn present_dsh_idle_ask(
         auto_allow_tools: std::sync::atomic::AtomicBool::new(true),
     };
     let decision = host.ask(ask).await;
-    state.end_chat_generation(&conversation_id, generation);
+    state
+        .chat_runtime()
+        .end_generation(&conversation_id, generation);
     if let Some(revision) = persisted {
         crate::chat::protocol::finish_run(&app, &run_id, "done", "", revision);
     }
@@ -2245,14 +2387,16 @@ fn apply_idle_dsh_event(app: &AppHandle, conversation_id: &str, event: UnifiedAg
             description,
             summary,
         } => {
-            app.state::<AppState>().upsert_external_background_task(
-                conversation_id,
-                &task_id,
-                &status,
-                kind.as_deref(),
-                description.as_deref(),
-                summary.as_deref(),
-            );
+            app.state::<AppState>()
+                .external_background_tasks()
+                .upsert_external_background_task(
+                    conversation_id,
+                    &task_id,
+                    &status,
+                    kind.as_deref(),
+                    description.as_deref(),
+                    summary.as_deref(),
+                );
             if status == "running" && summary.is_none() {
                 return;
             }
@@ -2307,6 +2451,7 @@ fn apply_idle_dsh_event(app: &AppHandle, conversation_id: &str, event: UnifiedAg
             .map(|cwd| slash::cache_key("dsh", &cwd.to_string_lossy()))
             .unwrap_or_else(|_| slash::cache_key("dsh", conversation_id));
             app.state::<AppState>()
+                .external_discovery()
                 .set_cached_external_slash_commands(key, commands);
         }
         _ => {}
@@ -2944,10 +3089,8 @@ fn apply_unified_event(
                     // 覆盖流解析层塞的原始入参 —— 否则消息流里那块刷新一次就只剩一行灰字。
                     if let Some(answered) = app
                         .state::<AppState>()
-                        .answered_ask_user_content
-                        .lock()
-                        .unwrap_or_else(|err| err.into_inner())
-                        .remove(&tool_use_id)
+                        .chat_interactions()
+                        .take_answered_ask_user(&tool_use_id)
                     {
                         record.structured_content = Some(answered);
                     }
@@ -3100,14 +3243,16 @@ fn apply_unified_event(
             description,
             summary,
         } => {
-            app.state::<AppState>().upsert_external_background_task(
-                conversation_id,
-                &task_id,
-                &status,
-                kind.as_deref(),
-                description.as_deref(),
-                summary.as_deref(),
-            );
+            app.state::<AppState>()
+                .external_background_tasks()
+                .upsert_external_background_task(
+                    conversation_id,
+                    &task_id,
+                    &status,
+                    kind.as_deref(),
+                    description.as_deref(),
+                    summary.as_deref(),
+                );
             // dsh 后台子代理的 tool/result 只是派出回执。终态走 BackgroundTask，
             // 同一轮里把对应工具卡从 Running 收掉（跨轮要靠空闲读，目前 dsh 没有）。
             if status != "running" {
@@ -4003,12 +4148,18 @@ mod tests {
         // 值出现在别处（比如某个 prompt 里）不算 —— 判据只认 flag 本身。
         assert!(!turn_asks_for_permission(&["stdio".to_string()]));
         // dsh 没有 `--permission-prompt-tool`：问用户靠 codec 开通道。
-        assert!(turn_needs_approval_host(&[], "dsh"));
-        assert!(turn_needs_approval_host(&[], "codex"));
-        assert!(turn_needs_approval_host(&[], "grok"));
-        assert!(turn_needs_approval_host(&[], "cursor-agent"));
-        assert!(!turn_needs_approval_host(&[], "cursor"));
-        assert!(!turn_needs_approval_host(&[], "claude"));
+        let needs_host = |id| {
+            turn_needs_approval_host(
+                &[],
+                get_agent_def(id).expect("test agent must be registered"),
+            )
+        };
+        assert!(needs_host("dsh"));
+        assert!(needs_host("codex"));
+        assert!(needs_host("grok"));
+        assert!(needs_host("cursor-agent"));
+        assert!(get_agent_def("cursor").is_none());
+        assert!(!needs_host("claude"));
     }
 
     /// 「完全」档接上询问通道之后**用户感知不到差别**：普通工具原地放行，只有问用户卡会弹。
@@ -4255,6 +4406,20 @@ mod tests {
             persistent_failure_action(NEEDS_RECONNECT, "grok", false, true, false),
             PersistentFailureAction::Fatal
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_waits_for_old_session_actor_to_close() {
+        use crate::external_agents::session::live::SessionCommand;
+
+        let (control, mut commands) = tokio::sync::mpsc::channel(1);
+        let actor = tokio::spawn(async move {
+            assert!(matches!(commands.recv().await, Some(SessionCommand::Close)));
+        });
+
+        close_live_control(&control).await.unwrap();
+        actor.await.unwrap();
+        assert!(control.is_closed());
     }
 
     // ---- resume 失效必须降级，而不是把 CLI 的英文原句甩给用户 ----
@@ -4537,9 +4702,17 @@ mod tests {
     /// model/reasoning/sandbox/provider; Codex fingerprints sandbox only; ACP stays default.
     #[test]
     fn launch_config_fingerprints_process_bound_protocols() {
-        let grok = |sandbox| launch_config_for_turn(
-            StreamFormat::AcpJsonRpc, None, None, sandbox, None, None, "",
-        );
+        let grok = |sandbox| {
+            launch_config_for_turn(
+                StreamFormat::AcpJsonRpc,
+                None,
+                None,
+                sandbox,
+                None,
+                None,
+                "",
+            )
+        };
         assert_eq!(grok(None), grok(Some("full")));
         assert!(!grok(None).accepts(&grok(Some("ask"))));
         assert!(!grok(Some("ask")).accepts(&grok(Some("full"))));

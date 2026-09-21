@@ -32,7 +32,10 @@ pub fn apply_assistant_mcp_restrictions(
             return true;
         }
         match tool.server_id.as_deref() {
-            Some(server_id) => assistant.mcp_server_ids.iter().any(|id| id == server_id),
+            Some(server_id) => assistant
+                .mcp_server_ids
+                .iter()
+                .any(|id| crate::computer_control::mcp_server_ids_equivalent(id, server_id)),
             None => false,
         }
     });
@@ -84,14 +87,16 @@ pub fn available_builtin_tool_names(tools: &[ChatToolDefinition]) -> Vec<String>
 pub fn disabled_builtin_tool_feedback(function_name: &str) -> Option<String> {
     // Builtin name set = static native registry (17 native + todo/ask_user)
     // plus the non-native builtin sources listed here.
-    const EXTRA_BUILTIN_NAMES: &[&str] = &["mixer_generate_image"];
-    // 模型按 wire 名（保留名别名）调用——反查回内部名再比对注册表。
+    const EXTRA_BUILTIN_NAMES: &[&str] = &["mixer_generate_image", "mixer_video_analysis"];
+    // 模型按 wire 名（保留名别名）或改名前的旧名调用——规整到现名再比对注册表。
     let function_name = crate::mcp::types::resolve_reserved_wire_alias(function_name);
+    let canonical = crate::mcp::types::canonical_tool_name(function_name);
     let is_builtin = crate::mcp::native_registry::find_entry(function_name).is_some()
+        || crate::mcp::native_registry::find_entry(canonical).is_some()
         || EXTRA_BUILTIN_NAMES.contains(&function_name);
     if is_builtin {
         Some(format!(
-            "Kivio tool `{function_name}` is not enabled for this chat. Do not call it again; answer using the available context and enabled tools only."
+            "Kivio tool `{function_name}` is not enabled in the current tool set, so this call was not executed. This applies to this tool only; it does not establish a filesystem restriction or that other tools are unavailable. Continue with a currently declared tool if it can perform the requested work. If none can, explain the specific missing capability without inventing a permission or provider error."
         ))
     } else {
         None
@@ -110,6 +115,9 @@ pub fn is_kivio_builtin_tool(tool: &ChatToolDefinition) -> bool {
 }
 
 pub fn builtin_tool_bypasses_approval(tool: &ChatToolDefinition) -> bool {
+    if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+        return true;
+    }
     if tool.source == "skill" && is_native_skill_tool_name(&tool.name) {
         return true;
     }
@@ -224,7 +232,7 @@ fn work_style_prompt(available_builtin_tools: &[String]) -> String {
         .any(|tool| tool.as_str() == "read");
     let has_tools = !available_builtin_tools.is_empty();
     let file_clause = if can_edit_files {
-        " after editing files you don't need to restate what changed (the user can see it)."
+        " After editing files, briefly report the outcome, relevant verification, and any remaining user action."
     } else {
         ""
     };
@@ -234,11 +242,14 @@ fn work_style_prompt(available_builtin_tools: &[String]) -> String {
     // 阶段性播报；交付前必须用工具验证（生成图片逐张 read 质检），这是 skill 定义的
     // 「生成→检查→重做」循环能真正执行的前提。
     let mut prompt = format!(
-        "How you work: address only the current request — no filler preamble on simple answers, no wrap-up postamble;{file_clause} Match length to the task: answer simple questions in a sentence or two, and expand into structured output only for complex or report-style tasks — don't pad to look thorough. When the user only asks how to do something or whether it's possible, answer first; don't jump to making changes, and don't do work they didn't ask for."
+        "How you work: address only the current request — no filler preamble on simple answers or generic sign-off.{file_clause} Match length to the task: answer simple questions in a sentence or two, and expand into structured output only for complex or report-style tasks — don't pad to look thorough. When the user only asks how to do something or whether it's possible, answer first; don't jump to making changes, and don't do work they didn't ask for."
     );
     if has_tools {
         prompt.push_str(
             " During multi-step tool work, keep the user oriented: before starting a new phase or changing course, say what you're doing in one short sentence — visible progress, not play-by-play; don't restate tool output. After waiting on a long job, report substance from the new output — what finished, failed, or was rate-limited — not that it is still running.",
+        );
+        prompt.push_str(
+            " Your final answer must be self-contained: intermediate progress, clarification cards and their answers, tool output, and reasoning are collapsed in the UI. Include the result and all remaining steps the user must perform, with the exact paths, commands, links, and settings they need, even if you already gave them before an ask_user question. Incorporate the user's selected answer. Never replace required instructions with 'see above', 'as described earlier', or a pointer into the work log. Repeat only what is needed to use the result, not the whole work history. Keep reasoning in the dedicated reasoning channel; do not put thinking transcripts, Thinking headings, or <think> blocks in the user-facing answer.",
         );
         prompt.push_str(
             " Before declaring a deliverable done, verify it with your tools instead of assuming success: re-open what you produced and check it against the request",
@@ -269,6 +280,59 @@ fn project_context_prompt(project: &ProjectPromptContext) -> String {
             project.name
         ),
     }
+}
+
+fn computer_control_system_prompt(
+    registry: &skills::SkillRegistry,
+    chat_tools: &ChatToolsConfig,
+    tools_available: bool,
+    assistant_snapshot: Option<&ChatAssistantSnapshot>,
+) -> Option<String> {
+    if !tools_available
+        || !chat_tools.enabled
+        || !chat_tools.native_tools.skill_runtime
+        || !chat_tools.native_tools.run_command
+        || !chat_tools.native_tools.read_file
+    {
+        return None;
+    }
+
+    let skill_available = |skill_id: &str| {
+        registry.find(skill_id).is_some()
+            && skill_allowed_for_conversation(chat_tools, assistant_snapshot, skill_id, false)
+    };
+    let mut lines = Vec::new();
+
+    if skill_available("playwright-cli") {
+        lines.push(
+            "- Browser interaction: prefer Playwright CLI over generic web tools; activate the `playwright-cli` skill before using it.",
+        );
+    }
+
+    if skill_available("cua-driver") {
+        let cua_server = chat_tools.servers.iter().find(|server| {
+            server.enabled
+                && !server.command.trim().is_empty()
+                && (crate::computer_control::is_cua_mcp_server_id(&server.id)
+                    || server.connector_id.as_deref() == Some("computer-control:cua")
+                    || server.connector_id.as_deref()
+                        == Some(crate::computer_control::LEGACY_CUA_MCP_CONNECTOR_ID))
+        });
+        let mcp_available = cua_server.is_some_and(|server| {
+            assistant_snapshot.is_none_or(|assistant| {
+                assistant.mcp_server_ids.iter().any(|server_id| {
+                    crate::computer_control::mcp_server_ids_equivalent(server_id, &server.id)
+                })
+            })
+        });
+        if mcp_available {
+            lines.push(
+                "- Desktop application interaction: prefer Cua Driver; activate the `cua-driver` skill and use its enabled MCP tools.",
+            );
+        }
+    }
+
+    (!lines.is_empty()).then(|| format!("Enabled computer-control tools:\n{}", lines.join("\n")))
 }
 
 pub fn build_chat_system_prompt_with_segments(
@@ -405,7 +469,7 @@ pub fn build_chat_system_prompt_with_segments(
         );
     }
 
-    // Chat 没有文件/shell/skill 激活：这些段会教模型去 list_dir / run_command，
+    // Chat 没有文件/shell/skill 激活：这些段会教模型去 read / bash，
     // 和「写文件 / Shell 只在 Agent 可用」矛盾，故整段跳过。
     if !is_chat_runtime {
         if let Some(path) = obsidian_vault_path
@@ -415,8 +479,8 @@ pub fn build_chat_system_prompt_with_segments(
             let text = format!(
                 "Obsidian vault path: {path}\n\
                  This is a local Obsidian markdown vault. Use the native file tools: \
-                 list_dir to browse (entries include modified time), glob_files to find *.md by name, \
-                 search_files to search by content/keyword, read_file to read a note; \
+                 read with the vault directory path to browse, glob with that path to find *.md by name, \
+                 grep with that path to search by content/keyword, read with a note's path to read it. Use only tools declared in this request; \
                  notes cross-reference each other via [[wikilink]].\n\
                  For Obsidian syntax or file-format details, activate the obsidian-markdown / \
                  obsidian-bases / json-canvas / obsidian-cli skills."
@@ -442,6 +506,21 @@ pub fn build_chat_system_prompt_with_segments(
                 "runtime_context",
                 "Runtime context",
                 text,
+            );
+        }
+
+        if let Some(text) = computer_control_system_prompt(
+            registry,
+            chat_tools,
+            tools_available,
+            assistant_snapshot,
+        ) {
+            append_context_segment(
+                &mut prompt,
+                &mut segments,
+                "runtime_context",
+                "Runtime context",
+                &text,
             );
         }
     }
@@ -802,6 +881,45 @@ pub(crate) const IMAGE_PART_TYPES: [&str; 3] = ["image_url", "input_image", "ima
 /// content-part `type` 值：文本部件（按其 `text` 字段估算）。
 pub(crate) const TEXT_PART_TYPES: [&str; 2] = ["text", "input_text"];
 
+/// 原生推理项的可读正文（无正文时用摘要）；密文不是 tokenizer 输入，不能按 base64 长度计数。
+pub(crate) fn estimate_reasoning_item_tokens(item: &Value) -> usize {
+    let text_tokens = |key: &str| -> Option<usize> {
+        let parts = item.get(key)?.as_array()?;
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p.get("text")?.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        (!texts.is_empty()).then(|| texts.into_iter().map(estimate_tokens).sum())
+    };
+    text_tokens("content")
+        .or_else(|| text_tokens("summary"))
+        .unwrap_or(0)
+}
+
+/// 同一推理可能同时保存在 reasoning_items 和 reasoning_content 中，只计算一份。
+pub(crate) fn estimate_message_reasoning_tokens(message: &Value) -> usize {
+    let native: usize = message
+        .get("reasoning_items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|entry| estimate_reasoning_item_tokens(entry.get("item").unwrap_or(entry)))
+                .sum()
+        })
+        .unwrap_or(0);
+    if native > 0 {
+        return native;
+    }
+    message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0)
+}
+
 /// 估算任意 `Value`（含多模态数组 content）的 token 数。**图片部件记 0**、文本部件按文本、
 /// 对象按 key+value 递归、字符串按 `estimate_tokens`。压缩侧（estimate_message_tokens /
 /// serialize）与上下文用量条（commands.rs::count_tokens_in_value 委托本函数）**共用同一口径**，
@@ -811,8 +929,28 @@ pub(crate) fn estimate_value_tokens(value: &Value) -> usize {
         Value::String(text) => estimate_tokens(text),
         Value::Array(items) => items.iter().map(estimate_value_tokens).sum(),
         Value::Object(map) => {
+            if map.contains_key("reasoning_items") {
+                return map
+                    .iter()
+                    .filter(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            "reasoning_items" | "reasoning_content" | "reasoning"
+                        )
+                    })
+                    .map(|(key, value)| estimate_tokens(key) + estimate_value_tokens(value))
+                    .sum::<usize>()
+                    + estimate_message_reasoning_tokens(value);
+            }
             if let Some(kind) = map.get("type").and_then(Value::as_str) {
-                if kind == "video_url" { return 0; }
+                if kind == "reasoning"
+                    && (map.contains_key("content") || map.contains_key("summary"))
+                {
+                    return estimate_reasoning_item_tokens(value);
+                }
+                if kind == "video_url" {
+                    return 0;
+                }
                 if IMAGE_PART_TYPES.contains(&kind) {
                     return 0;
                 }
@@ -833,17 +971,20 @@ pub(crate) fn tool_matches_recommended_name(tool: &ChatToolDefinition, recommend
     if recommended.is_empty() {
         return false;
     }
-    // 旧名归一化：persona/skill 白名单里写的旧工具名（find/ls/todo_update/list_background）
-    // 规整到现名，避免改名后被静默剔除。
-    let recommended = crate::mcp::types::canonical_tool_name(recommended);
-    tool.name == recommended
-        || tool.id == recommended
-        || tool.openai_tool_name() == recommended
+    // 只规整白名单条目，不规整工具自己的名字：MCP 完全可以真有一个叫
+    // `read_file` 的工具，不能被当成内置 `read`。条目是旧名时对上现名；
+    // 条目与工具都仍是旧名时也对上。
+    let canonical_recommended = crate::mcp::types::canonical_tool_name(recommended);
+    let wire = tool.openai_tool_name();
+    let matches_name =
+        |candidate: &str| candidate == recommended || candidate == canonical_recommended;
+    matches_name(&tool.name)
+        || matches_name(&tool.id)
+        || matches_name(&wire)
         || tool
             .server_id
             .as_deref()
-            .map(|server_id| format!("{server_id}:{}", tool.name) == recommended)
-            .unwrap_or(false)
+            .is_some_and(|server_id| matches_name(&format!("{server_id}:{}", tool.name)))
 }
 
 fn workbench_location_prompt(
@@ -898,6 +1039,7 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     let has_web_search = has("web_search");
     let has_web_fetch = has("web_fetch");
     let has_image_generation = has("mixer_generate_image");
+    let has_video_analysis = has("mixer_video_analysis");
     let has_advisor = has("advisor");
     let has_present_artifacts = has("present_artifacts");
     let has_write = has("write");
@@ -911,7 +1053,12 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     let mut bullets: Vec<String> = Vec::new();
     if has_file_cwd {
         bullets.push(
-            "Relative file paths and omitted command cwd resolve from the current default workbench (the bound project root for project conversations, or the per-conversation workbench otherwise). Explicit absolute or ~/ paths remain unrestricted and always take precedence.".to_string(),
+            "Relative file paths and omitted command cwd resolve from the current default workbench (the bound project root for project conversations, or the per-conversation workbench otherwise). Explicit absolute or ~/ paths can target locations outside it; normal OS permissions, tool approvals, and user constraints still apply. An empty workbench or search result does not show what exists elsewhere. Use the user's explicit path as given; when searching another directory, pass it as the search tool's path.".to_string(),
+        );
+    }
+    if has("read") {
+        bullets.push(
+            "For a user-provided disk file, call read with path directly; disk files do not need an artifact ID or registration with present_artifacts. Use read with artifact_ids only for exact art_ IDs already returned by tools. File reading, artifact registration, and showing a file to the user are separate operations.".to_string(),
         );
     }
     if has_write || has_edit {
@@ -958,7 +1105,7 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
             "Runtime environment: {os_name}; bash runs via {shell_name}. Match that shell's syntax ({shell_syntax_hint}). Each bash call is a fresh process — cwd does NOT persist across calls; switch directories with the `cwd` parameter, not a prior `cd`. To run multi-line or quoted code, write it to a file with write and run that — do not cram it into inline commands like `python -c \"...\"` (inline quotes are fragile across shells). When a tool returns a hard rejection, change strategy instead of retrying variants of the same action; never re-run a failed command unchanged; don't drop one-off probe or cleanup scripts into the project."
         ));
         bullets.push(
-            "bash runs on the host shell from the current default workbench; non-zero exit means failure. Paths with spaces must use the `cwd` parameter—never `cd path && command`; do not combine `cwd` with a leading `cd ... &&` prefix. Finite commands (builds, tests, image-generation batches) stay in the foreground: bash waits until the process exits. Put parallel work inside one command (a script --concurrency flag, etc.), not as N bash jobs. Pass timeout_ms only if you want the process killed at that deadline. Never-ending servers such as `npm run dev`, `tauri dev`, and `vite` start in the background automatically and return a job_id immediately; do not start the same dev server twice. Explain and get confirmation before destructive, network, or environment-changing commands. Run a skill's bundled scripts with run_command; never use host pip unless the user explicitly asked for a host Python install.".to_string(),
+            "bash runs on the host shell from the current default workbench; non-zero exit means failure. Paths with spaces must use the `cwd` parameter—never `cd path && command`; do not combine `cwd` with a leading `cd ... &&` prefix. Finite commands (builds, tests, image-generation batches) stay in the foreground: bash waits until the process exits. Put parallel work inside one command (a script --concurrency flag, etc.), not as N bash jobs. Pass timeout_ms only if you want the process killed at that deadline. Never-ending servers such as `npm run dev`, `tauri dev`, and `vite` start in the background automatically and return a job_id immediately; do not start the same dev server twice. Obey user constraints and obtain any required authorization for destructive, network, or environment-changing commands. Run a skill's bundled scripts with bash; never use host pip unless the user explicitly asked for a host Python install.".to_string(),
         );
         bullets.push(
             "Background commands (bash with background:true, or auto-detected never-ending servers): the call returns a job_id immediately. Inspect with bash_output (pass the job_id; default wait ~30s; use next_offset for the next read). Do not background a command that will exit. List jobs with bash_output (no job_id), and stop one with kill_background. Status in history may be stale, so refresh once with bash_output before reporting a background command's result. Background commands survive across turns until you kill them or the app exits, so kill_background a dev server when you no longer need it.".to_string(),
@@ -984,12 +1131,15 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     }
     if has_present_artifacts {
         bullets.push(
-            "When the user asks to show, preview, attach, or send a local file or image in the chat, you MUST call present_artifacts at the exact display point. Copy art_ ids from tool results into artifact_ids, or pass paths for existing local files. Arguments are those short strings only — never file contents, base64, or data URLs. Reading or analyzing a file does NOT display it.".to_string(),
+            "Keep internal QA screenshots, extracted frames, intermediate exports, drafts, and failed attempts in the work log by default. In your final answer, select only the deliverables and evidence the user needs. Put [label](artifact:art_ID) for a file or ![description](artifact:art_ID) for an image beside the relevant explanation, using exact art_ IDs from tool results. Do not put every generated file into a gallery or repeat a file card already referenced in the answer. To obtain an ID for a selected existing local file, you MUST call present_artifacts with paths; its default mode prepare registers files without expanding previews. Files with existing IDs can be referenced directly. Use present_artifacts with mode preview only when the user explicitly asks to see work now or needs to inspect alternatives to decide how to continue. Reading or analyzing a file does NOT display it. Never invent file IDs or paths, and never pass file contents, base64, or data URLs as identifiers.".to_string(),
         );
+    }
+    if has_video_analysis {
+        bullets.push("When the user's request needs video details not already in saved observations, call mixer_video_analysis yourself. Do not ask the user to choose an analysis mode or type a command. Reuse observations for follow-ups; unrelated messages need no analysis.".to_string());
     }
     if has_image_generation {
         bullets.push(
-            "When the user asks to create, generate, draw, or edit an image, call mixer_generate_image; do not merely describe it. Pass paths or artifact_ids to edit existing images; this turn's attached images are used automatically if omitted.".to_string(),
+            "To create or edit an image, call mixer_generate_image using the argument examples in that tool's description.".to_string(),
         );
     }
     if has_advisor {
@@ -1047,6 +1197,20 @@ mod tests {
         assert!(!prompt.contains("verify it with your tools"), "{prompt}");
     }
 
+    #[test]
+    fn work_style_prompt_requires_actionable_final_answer_after_clarification() {
+        for tools in [vec!["ask_user".to_string()], vec!["bash".to_string()]] {
+            let prompt = work_style_prompt(&tools);
+            assert!(prompt.contains("final answer must be self-contained"));
+            assert!(prompt.contains("exact paths, commands, links, and settings"));
+            assert!(prompt.contains("before an ask_user question"));
+            assert!(prompt.contains("Incorporate the user's selected answer"));
+            assert!(prompt.contains("dedicated reasoning channel"));
+            assert!(!prompt.contains("don't need to restate what changed"));
+            assert!(!prompt.contains("no wrap-up postamble"));
+        }
+    }
+
     fn test_assistant_snapshot(
         mcp_server_ids: Vec<&str>,
         skill_ids: Vec<&str>,
@@ -1061,6 +1225,27 @@ mod tests {
             model: String::new(),
             mcp_server_ids: mcp_server_ids.into_iter().map(str::to_string).collect(),
             skill_ids: skill_ids.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    fn test_skill_record(id: &str) -> skills::SkillRecord {
+        skills::SkillRecord {
+            meta: skills::SkillMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: String::new(),
+                source: "user".to_string(),
+                path: None,
+                recommended_tools: Vec::new(),
+                disable_model_invocation: false,
+                files: Vec::new(),
+                triggers: Vec::new(),
+                argument_hint: None,
+                arguments: Vec::new(),
+            },
+            location: std::path::PathBuf::new(),
+            base_dir: std::path::PathBuf::new(),
+            body: String::new(),
         }
     }
 
@@ -1123,6 +1308,103 @@ mod tests {
         assert!(prompt.contains("bash"));
         assert!(!prompt.contains("web_search"));
         assert!(!prompt.contains("web_fetch"));
+    }
+
+    #[test]
+    fn chat_prompt_mentions_enabled_playwright_cli() {
+        let registry = skills::SkillRegistry {
+            records: vec![test_skill_record("playwright-cli")],
+            warnings: Vec::new(),
+        };
+        let mut chat_tools = crate::settings::ChatToolsConfig::default();
+        chat_tools.enabled = true;
+        chat_tools.native_tools.skill_runtime = true;
+        chat_tools.native_tools.run_command = true;
+        chat_tools.native_tools.read_file = true;
+
+        let build = |chat_tools: &crate::settings::ChatToolsConfig| {
+            build_chat_system_prompt(
+                "zh-CN",
+                false,
+                false,
+                &registry,
+                chat_tools,
+                true,
+                &["bash".to_string(), "read".to_string()],
+                None,
+                None,
+                None,
+                None,
+                "",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+        };
+
+        let prompt = build(&chat_tools);
+        assert!(
+            prompt.contains("Enabled computer-control tools"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("prefer Playwright CLI over generic web tools"),
+            "{prompt}"
+        );
+
+        chat_tools.disabled_skill_ids = vec!["playwright-cli".to_string()];
+        let disabled_prompt = build(&chat_tools);
+        assert!(
+            !disabled_prompt.contains("prefer Playwright CLI"),
+            "{disabled_prompt}"
+        );
+    }
+
+    #[test]
+    fn computer_control_prompt_requires_cua_skill_and_mcp() {
+        let registry = skills::SkillRegistry {
+            records: vec![test_skill_record("cua-driver")],
+            warnings: Vec::new(),
+        };
+        let mut chat_tools = crate::settings::ChatToolsConfig::default();
+        chat_tools.enabled = true;
+        chat_tools.native_tools.skill_runtime = true;
+        chat_tools.native_tools.run_command = true;
+        chat_tools.native_tools.read_file = true;
+        chat_tools.servers.push(crate::settings::ChatMcpServer {
+            id: "computer-control-cua-driver".to_string(),
+            name: "Cua Driver".to_string(),
+            enabled: true,
+            command: "cua-driver".to_string(),
+            args: vec!["mcp".to_string()],
+            ..Default::default()
+        });
+
+        let prompt =
+            computer_control_system_prompt(&registry, &chat_tools, true, None).expect("Cua prompt");
+        assert!(prompt.contains("prefer Cua Driver"), "{prompt}");
+
+        let legacy_assistant = test_assistant_snapshot(
+            vec![crate::computer_control::LEGACY_CUA_MCP_SERVER_ID],
+            vec!["cua-driver"],
+        );
+        assert!(computer_control_system_prompt(
+            &registry,
+            &chat_tools,
+            true,
+            Some(&legacy_assistant),
+        )
+        .is_some());
+
+        chat_tools.servers[0].enabled = false;
+        assert!(computer_control_system_prompt(&registry, &chat_tools, true, None).is_none());
     }
 
     #[test]
@@ -1337,8 +1619,11 @@ mod tests {
         );
 
         assert!(prompt.contains("MUST call present_artifacts"));
-        assert!(prompt.contains("Copy art_ ids from tool results into artifact_ids"));
-        assert!(prompt.contains("paths for existing local files"));
+        assert!(prompt.contains("using exact art_ IDs from tool results"));
+        assert!(prompt.contains("selected existing local file"));
+        assert!(prompt.contains("mode prepare"));
+        assert!(prompt.contains("[label](artifact:art_ID)"));
+        assert!(prompt.contains("Internal QA") || prompt.contains("internal QA"));
         assert!(prompt.contains("Reading or analyzing a file does NOT display it"));
     }
 
@@ -1497,6 +1782,18 @@ mod tests {
     }
 
     #[test]
+    fn assistant_mcp_restrictions_accept_legacy_cua_id() {
+        let assistant = test_assistant_snapshot(vec!["plugin-cua-driver"], vec![]);
+        let mut cua = test_mcp_tool();
+        cua.server_id = Some("computer-control-cua-driver".to_string());
+        let mut tools = vec![cua];
+
+        apply_assistant_mcp_restrictions(&mut tools, Some(&assistant));
+
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
     fn assistant_empty_mcp_list_drops_all_mcp_tools() {
         let assistant = test_assistant_snapshot(vec![], vec![]);
         let mut tools = vec![crate::mcp::types::native_web_fetch_tool(), test_mcp_tool()];
@@ -1576,11 +1873,17 @@ mod tests {
 
         assert!(feedback.contains("not enabled"));
         assert!(feedback.contains("web_search"));
+        assert!(feedback.contains("this tool only"));
+        assert!(!feedback.contains("Do not call it again; answer"));
         assert!(disabled_builtin_tool_feedback("mcp__server__tool").is_none());
         // 模型按 wire 别名调用时同样识别为内置工具（保留名规避）。
         let alias_feedback = disabled_builtin_tool_feedback("search_web")
             .expect("wire alias resolves to the builtin tool");
         assert!(alias_feedback.contains("not enabled"));
+        let renamed = disabled_builtin_tool_feedback("read_file")
+            .expect("pre-rename file tool names resolve to the current builtin");
+        assert!(renamed.contains("not enabled"));
+        assert!(renamed.contains("this tool only"));
     }
 
     #[test]
@@ -1591,6 +1894,19 @@ mod tests {
         let prompt = native_tools_prompt(&names, false).expect("prompt");
         assert!(prompt.contains("search_web"), "{prompt}");
         assert!(!prompt.contains("web_search"), "{prompt}");
+    }
+
+    #[test]
+    fn file_guidance_distinguishes_disk_paths_from_artifact_ids() {
+        let prompt = native_tools_prompt(
+            &["read".into(), "bash".into(), "present_artifacts".into()],
+            false,
+        )
+        .unwrap();
+        assert!(!prompt.contains("with run_command"));
+        assert!(prompt.contains("read with path"));
+        assert!(prompt.contains("does not show what exists elsewhere"));
+        assert!(prompt.contains("do not need an artifact ID"));
     }
 
     #[test]
@@ -1874,8 +2190,7 @@ mod tests {
         let prompt =
             native_tools_prompt(&["mixer_generate_image".to_string()], false).expect("prompt");
         assert!(prompt.contains("mixer_generate_image"), "{prompt}");
-        assert!(prompt.contains("edit"), "{prompt}");
-        assert!(prompt.contains("artifact_ids"), "{prompt}");
+        assert!(prompt.contains("argument examples"), "{prompt}");
     }
 
     #[test]

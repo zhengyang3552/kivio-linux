@@ -120,7 +120,13 @@ mod tests {
 
     #[test]
     fn video_model_gate_depends_on_capability_not_provider_or_auth() {
-        for format in ["openai_chat", "gemini", "anthropic_messages", "openai_responses", "xai_responses"] {
+        for format in [
+            "openai_chat",
+            "gemini",
+            "anthropic_messages",
+            "openai_responses",
+            "xai_responses",
+        ] {
             for oauth in [Value::Null, json!({"provider": "kimi"})] {
                 for capability in [Value::Null, json!(false), json!(true)] {
                     let provider = serde_json::from_value(json!({
@@ -129,7 +135,11 @@ mod tests {
                         "modelOverrides": {"private-video-model": {"capabilities": {"videoInput": capability}}}
                     })).unwrap();
                     let result = validate_model(&provider, "private-video-model");
-                    assert_eq!(result.is_ok(), capability == json!(true), "{format}: {result:?}");
+                    assert_eq!(
+                        result.is_ok(),
+                        capability == json!(true),
+                        "{format}: {result:?}"
+                    );
                 }
             }
         }

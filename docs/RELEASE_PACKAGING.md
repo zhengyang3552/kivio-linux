@@ -18,10 +18,16 @@ npm run build
 
 `npm run build` runs:
 
-1. `npm run build:swift`
+1. `npm run package:check`
+   - Verifies app/lockfile versions, MSI version inheritance, and resource mappings.
+2. `npm run icons:check`
+   - Verifies Windows assets against their unpadded source without changing macOS icons.
+3. `npm run build:swift`
    - Builds the macOS Swift sidecars.
    - On non-macOS platforms, creates stub binaries so Tauri `externalBin` validation passes.
-2. `tauri build`
+4. `npm run protocol:check`
+   - Verifies committed chat protocol artifacts.
+5. `tauri build`
    - Runs `beforeBuildCommand` from `src-tauri/tauri.conf.json`, currently `npm run build:ui`.
    - Vite writes the production frontend to `dist/`.
    - Tauri packages `dist/`, configured `externalBin` files, configured `resources`, and platform icons into DMG / MSI / NSIS bundles.
@@ -65,11 +71,23 @@ GitHub release packaging (this is the official path — do not build installers 
 
 ## Resources That Must Be Packaged
 
-`src-tauri/tauri.conf.json` controls app resources. At minimum, document Skill releases must include:
+`src-tauri/tauri.conf.json` controls app resources.
+
+After Tauri copies resources, `src-tauri/build.rs` prunes files no longer present
+in the source from the profile's `skills/` and `licenses/` directories. Keep
+these directory mappings aligned with `bundle.resources`; this prevents retired
+skills from surviving incremental builds. Resource roots are watched for additions
+and removals. The cleanup does not touch user-installed skills or app data.
+
+Validate this behavior with `cargo test --test bundled-resources` (on Windows,
+use `scripts/win-cargo-test.ps1 --test bundled-resources`).
+
+At minimum, document Skill releases must include:
 
 ```json
 "resources": {
-  "resources/skills": "skills"
+  "resources/skills": "skills",
+  "../docs/licenses": "licenses"
 }
 ```
 
@@ -82,12 +100,84 @@ The final installed app must contain:
 - `skills/obsidian-bases/SKILL.md` (+ `references/`)
 - `skills/json-canvas/SKILL.md` (+ `references/`)
 - `skills/obsidian-cli/SKILL.md`
+- `licenses/` (all files from `docs/licenses/`)
+
+`npm run package:check` checks all five release-version files (including the npm
+lockfile root package) and resource sources. `npm run test:packaging` covers version
+drift, old MSI overrides, missing licenses, modified resources and retired skills.
+Release jobs also pass `--version "$RELEASE_TAG"` to reject a tag/source mismatch.
+Do not pin `bundle.windows.wix.version`: Tauri derives MSI versions from the app
+version. This follows the [Tauri WiX configuration contract](https://v2.tauri.app/reference/config/#wixconfig).
+
+To check an extracted installer or portable layout, run:
+
+```bash
+node scripts/check-desktop-package.mjs --resources-dir /path/to/app/resources
+```
+
+This compares every mapped directory's file list and SHA-256 content against
+source, including unexpected old files. Release jobs check extracted NSIS/DMG
+contents; portable packaging copies all configured resource mappings and checks
+the staged contents before compression. Portable packaging also rejects an EXE
+whose embedded product version differs from the requested ZIP version.
 
 > The four `obsidian-*` / `json-canvas` skills (adapted from kepano/obsidian-skills, MIT —
 > see `resources/skills/NOTICE.md`) are gated at runtime on the Obsidian connector (a
 > configured vault path), so they only surface to the model once the user sets an Obsidian vault.
 
 ## Release Verification
+
+### Windows desktop baseline (2026-09-18 audit)
+
+This is a source/configuration audit, not a completed interactive certification.
+The icon work and packaging/autostart fixes are not installed on the user's PC yet.
+
+| Area | Evidence / status | Required interactive check |
+| --- | --- | --- |
+| Identity and version | Stable `com.zmair.kivio`; debug EXE reports Kivio Desktop / 2.9.9. Removed stale MSI 2.8.2 override; version checks run before builds. | Installed Apps, EXE properties, shortcut target after upgrade. |
+| Installation scope | NSIS uses `currentUser`; portable creates no Start Menu or uninstall entry. | Clean user install, upgrade and uninstall using CI artifacts; preserve user data. |
+| Resources | Installer and portable mappings include skills and licenses; full-content verification replaces presence-only confidence. | Inspect final ZIP as well as staged files. |
+| Startup | Windows now reads the OS startup state on launch; unrelated settings saves and rollback do not re-enable a Task Manager-disabled entry. Explicit preference changes still apply. | Enable, disable in Task Manager, reopen app and save an unrelated setting; entry must remain disabled. |
+| Single instance / tray | Activation restores the existing visible window without replacing its route; tray has Open/Settings/Quit and a tooltip. | Second launch while minimized, hidden, editing Settings and using an overlay; Quit actually exits. |
+| Taskbar / window controls | Chat is resizable, not always-on-top and appears in the taskbar. Min/max/restore/close buttons and native maximized-state synchronization exist. | Alt+Tab, Alt+F4, Win+Arrow, title-bar drag/double-click; verify close-to-tray behavior matches preference. |
+| DPI | Tao initializes Per-Monitor V2 awareness, with older-OS fallbacks. This does not prove every custom overlay scales correctly. | 100/150/200% scaling, mixed-DPI monitors, unplug/reconnect a monitor, no inaccessible windows. |
+| Windows 11 Snap hover | **Remaining gap:** custom maximize button has no native `WM_NCHITTEST` / `HTMAXBUTTON` integration. | Implement and verify the native hover menu; do not infer support from Win+Arrow alone. |
+| Update mode | **Remaining gap:** portable uses the NSIS updater and becomes an installed edition. Portable README now states this and explains manual ZIP replacement. | Separate portable update UX; interrupted download, installer failure and rollback. |
+| Update trust | **Remaining gap:** current updater downloads via HTTPS but does not independently verify an artifact signature before execution. Installed Windows EXE is unsigned. | Set up code-signing credentials and authenticated update verification; signing is not solved by setting a publisher string. |
+| Accessibility / appearance | Button labels and keyboard-focus styling exist; reduced-motion rules exist. Not a full accessibility pass. | Narrator, keyboard-only use, Windows contrast themes, light/dark mode and text scaling. |
+
+Microsoft's [Snap layout guidance](https://learn.microsoft.com/en-us/windows/apps/desktop/modernize/ui/apply-snap-layout-menu)
+requires native hit testing for a custom maximize button. Implement that with a
+dedicated native-window change and Windows 11 testing, not a CSS imitation.
+
+### Application icons
+
+Windows and macOS use different outer margins. Keep their asset generation separate:
+
+- Windows source: `public/icon.png`, the full-canvas rounded artwork. Run
+  `npm run icons:generate` to update `icons/icon.ico`, `windows-tray.png`,
+  `Square*Logo.png` and `StoreLogo.png` under `src-tauri/`.
+- `icon.ico` supplies the Windows executable, default window/taskbar icon and
+  NSIS installer icon. It includes 16, 24, 32, 48, 64 and 256 px layers.
+  Windows tray rendering uses the colored `windows-tray.png`, not the macOS template.
+  `build.rs` explicitly watches `icons/` so an incremental build recompiles the
+  executable's Windows icon resource after artwork changes.
+- macOS retains `source-rounded.png`, `icon.icns`, the shared PNG size variants
+  and `icon.png` with the existing ~80% artwork footprint. `tray-icon.png` is its
+  monochrome template; the system handles menu-bar light/dark appearance.
+- `npm run icons:check` regenerates into a temporary directory and verifies the
+  checked-in Windows assets and required ICO sizes. CI and both release platforms
+  run this check. Do not run an unscoped icon generation into `src-tauri/icons`:
+  it would overwrite macOS assets with Windows margins, or vice versa.
+
+The [Windows icon construction guide](https://learn.microsoft.com/en-us/windows/apps/design/style/iconography/app-icon-construction)
+defines the baseline ICO sizes. After a Windows build, inspect the icon embedded
+in the actual executable and check desktop/taskbar rendering at 100% and 150% scaling.
+An existing desktop shortcut still refers to the installed executable, not a dev
+build; install the new build before checking it. Refresh or recreate that shortcut
+if Explorer retains an old cached icon after the executable has been updated.
+
+### Installer contents
 
 Before publishing or announcing installers, inspect the final artifact contents.
 
@@ -168,4 +258,3 @@ A README-only bump is docs; `.github/workflows/ci.yml` skips `**.md` / `docs/**`
 ## Common Failure To Avoid
 
 Do not treat "Skill files are bundled" as equivalent to "the host can parse those documents." `SKILL.md` only tells the model to use host `read`/`bash` tools. If Python or a PDF/Office CLI is missing, the agent should say so rather than inventing contents.
-

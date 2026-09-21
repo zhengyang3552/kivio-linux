@@ -71,6 +71,7 @@ pub trait AgentHost: Send + Sync {
         &self,
         _conversation_id: &str,
         _used_tokens: u64,
+        _token_count_source: Option<&str>,
         _context_window_tokens: Option<u64>,
     ) {
     }

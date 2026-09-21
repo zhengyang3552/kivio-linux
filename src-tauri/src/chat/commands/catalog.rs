@@ -227,7 +227,9 @@ pub(crate) fn strip_transcripts_for_frontend(conversation: &mut Conversation) {
 fn strip_image_payloads_from_model_messages(messages: &mut [crate::chat::model::ModelMessage]) {
     for model_message in messages.iter_mut() {
         for part in model_message.content.iter_mut() {
-            if let crate::chat::model::MessagePart::Image { data, .. } | crate::chat::model::MessagePart::Video { data, .. } = part {
+            if let crate::chat::model::MessagePart::Image { data, .. }
+            | crate::chat::model::MessagePart::Video { data, .. } = part
+            {
                 data.clear();
             }
         }
@@ -243,7 +245,11 @@ fn strip_image_payloads_from_api_messages(messages: &mut [serde_json::Value]) {
             continue;
         };
         for part in parts.iter_mut() {
-            let key = if part.get("type").and_then(serde_json::Value::as_str) == Some("video_url") { "video_url" } else { "image_url" };
+            let key = if part.get("type").and_then(serde_json::Value::as_str) == Some("video_url") {
+                "video_url"
+            } else {
+                "image_url"
+            };
             let Some(image_url) = part.get_mut(key) else {
                 continue;
             };
@@ -384,7 +390,7 @@ pub(crate) async fn create_chat_conversation_internal(
         .map(|assistant| assistant.id.clone());
 
     let conversation = {
-        let _create_guard = state.chat_create_conversation_lock.lock().await;
+        let _create_guard = state.chat_runtime().lock_conversation_creation().await;
         if let Some(conversation) = crate::chat::repository::repository(app)
             .find_reusable_blank(
                 app,

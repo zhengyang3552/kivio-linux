@@ -2,8 +2,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isPlaceholderTitle, optimisticConversationTitle } from './conversationTitle'
 import { estimateTokens } from '../utils/tokens'
-import { isExecutableAgentPlanText } from './agentPlan'
 import { isTauriRuntime } from './utils'
+import { externalCliSettingsApi } from '../api/externalCliSettings'
 import type { ConversationPin } from './conversationPins'
 import type {
   AgentRuntimeConfig,
@@ -19,13 +19,13 @@ import type {
   ConversationSearchHit,
   AgentPlanMode,
   GoalState,
-  DetectedExternalAgent,
   PendingAttachment,
 } from './types'
 import type { ThinkingLevel, WebSearchMode, ModelRef, AdditionalDirectory } from './types'
 import type { CliImportResult, ImportableCliSession } from './types'
 
-export type { DetectedExternalAgent, AgentRuntimeConfig }
+export type { AgentRuntimeConfig }
+export type { DetectedExternalAgent } from '../api/externalCliSettings'
 
 async function invokeGoalMutation(command: string, conversationId: string, extra: Record<string, unknown> = {}): Promise<Conversation> {
   const result = await invoke<{ success: boolean; conversation?: Conversation; error?: string }>(command, { conversationId, ...extra })
@@ -45,196 +45,14 @@ function mockGoalStatus(conversationId: string, status: GoalState['status']): Co
   return conversations[index]
 }
 
-/** `chat_external_cli_scan_cc_switch` 的返回。`hasApiKey` 是布尔，后端不回明文 key。 */
-export interface CcSwitchProvider {
-  agentId: string
-  id: string
-  name: string
-  remark: string
-  env: Array<{ key: string; value: string }>
-  configToml: string
-  authJson: string
-  hasApiKey: boolean
-  isCurrent: boolean
-}
-
-export interface CcSwitchScan {
-  providers: CcSwitchProvider[]
-  /** 认得出但 Kivio 没有落地通道而跳过的条数（grok / hermes / openclaw…）。 */
-  skipped: number
-}
-
-/** `$DSH_HOME/settings.yaml` 里三个官方插件 namespace 的当前值。`null` 字段 = 沿用 schema 默认。 */
-export interface DshPluginSettingsSnapshot {
-  settingsPath: string
-  shell: {
-    timeoutMs: number | null
-    maxOutputBytes: number | null
-    timeoutMsDefault: number
-    maxOutputBytesDefault: number
-  }
-  agentLoop: {
-    maxParallelToolCalls: number | null
-    maxParallelToolCallsDefault: number
-  }
-  webSearch: {
-    baseUrl: string | null
-    maxUses: number | null
-    apiKeyEnv: string
-    apiKeyConfigured: boolean
-    apiKeyWritable: boolean
-    baseUrlDefault: string
-    maxUsesDefault: number
-  }
-}
-
-/** 只带要改的 namespace。字段 `null` = 恢复默认。 */
-export interface DshPluginSettingsPatch {
-  shell?: {
-    timeoutMs?: number | null
-    maxOutputBytes?: number | null
-  }
-  agentLoop?: {
-    maxParallelToolCalls?: number | null
-  }
-  webSearch?: {
-    baseUrl?: string | null
-    maxUses?: number | null
-    apiKey?: string
-  }
-}
-
-export interface DshPluginEntry {
-  id: string
-  moduleName: string
-  enabled: boolean
-}
-
-/** `$DSH_HOME/.credentials.yaml` 里官方 DeepSeek 模型密钥的状态。不回读密钥本身。 */
-export interface DshOfficialCredential {
-  configured: boolean
-  writable: boolean
-}
-
-export interface DshNativeProviderModel {
-  id: string
-  name: string
-}
-
-/** 用户点「修改」时才回读的 `settings.yaml` 第三方供应商，含凭据文件里的密钥。 */
-export interface DshNativeProviderDetail {
-  id: string
-  name: string
-  baseUrl: string
-  api: string
-  apiKey: string
-  apiKeyEnv: string
-  models: DshNativeProviderModel[]
-  defaultModel: string
-}
-
-/** `$DSH_HOME/.agent-presets` 里用户自己写的 Agent preset（不含官方四档）。 */
-export interface DshAgentPresetOption {
-  id: string
-  label: string
-  description?: string | null
-}
-
-/** PI 全局 Package 与 ~/.pi/agent/extensions 的结构化清单。 */
-export interface PiExtensionInventory {
-  agentDir: string
-  extensionsDir: string
-  packages: PiExtensionPackage[]
-  localExtensions: PiLocalExtension[]
-}
-
-export interface PiExtensionPackage {
-  source: string
-  name: string
-  version: string | null
-  description: string | null
-  path: string | null
-  enabled: boolean
-  canToggle: boolean
-  hasExtensions: boolean
-  extensionEntries: number
-  resources: string[]
-}
-
-export interface PiLocalExtension {
-  relativePath: string
-  name: string
-  path: string
-  enabled: boolean
-  kind: 'file' | 'directory'
-}
-
-export interface PiExtensionCommandResult {
-  output: string
-}
-
-export interface PiSkillInventory {
-  agentDir: string
-  piSkillsDir: string
-  agentsSkillsDir: string
-  skillCommandsEnabled: boolean
-  configuredPaths: PiSkillConfiguredPath[]
-  skills: PiSkillEntry[]
-}
-
-export interface PiSkillConfiguredPath {
-  path: string
-  exists: boolean
-}
-
-export interface PiSkillEntry {
-  name: string
-  description: string | null
-  path: string
-  sourceKind: 'pi' | 'agents' | 'configured' | 'package'
-  packageSource: string | null
-  packageRoot: string | null
-  enabled: boolean
-  canToggle: boolean
-  canRemove: boolean
-}
-
-/** `chat_external_cli_install_info` 的返回。 */
-export interface ExternalCliInstallInfo {
-  agentId: string
-  localVersion: string | null
-  latestVersion: string | null
-  updateAvailable: boolean
-  /** 可直接执行的安装/更新命令；null = 只能照文档手动装。 */
-  command: string | null
-  docsUrl: string
-  /** 已存在的配置目录绝对路径；null = 还没生成。 */
-  configDir: string | null
-}
-
-/** 订阅安装日志。`done` 那条带最终成功与否，`line` 为 null。 */
-export async function onExternalCliInstallLog(
-  handler: (event: { agentId: string; line: string | null; done: boolean; success: boolean }) => void,
-): Promise<() => void> {
-  if (!isTauriRuntime()) return () => {}
-  const { listen } = await import('@tauri-apps/api/event')
-  const un = await listen<{ agentId: string; line: string | null; done: boolean; success: boolean }>(
-    'external-cli-install',
-    (e) => handler(e.payload),
-  )
-  return un
-}
-
-/** 订阅后台重探完成的可用性列表（`chat_detect_external_agents` 先返回落盘快照，探完再推这条）。 */
-export async function onExternalAgentsUpdated(
-  handler: (agents: DetectedExternalAgent[]) => void,
-): Promise<() => void> {
-  if (!isTauriRuntime()) return () => {}
-  const { listen } = await import('@tauri-apps/api/event')
-  return await listen<{ agents: DetectedExternalAgent[] }>('external-agents-updated', (e) =>
-    handler(e.payload.agents ?? []),
-  )
-}
+export type {
+  CcSwitchProvider, CcSwitchScan, DshPluginSettingsSnapshot, DshPluginSettingsPatch,
+  DshPluginEntry, DshOfficialCredential, DshNativeProviderModel, DshNativeProviderDetail,
+  DshAgentPresetOption, PiExtensionInventory, PiExtensionPackage, PiLocalExtension,
+  PiExtensionCommandResult, PiSkillInventory, PiSkillConfiguredPath, PiSkillEntry,
+  ExternalCliInstallInfo,
+} from '../api/externalCliSettings'
+export { onExternalCliInstallLog, onExternalAgentsUpdated } from '../api/externalCliSettings'
 
 export const BUILTIN_AGENT_RUNTIME: AgentRuntimeConfig = {
   kind: 'builtin',
@@ -724,7 +542,9 @@ const mockChatApi = {
     content: string,
     attachments: PendingAttachment[] = [],
     activeSkillId?: string | null,
+    planMessageId?: string,
   ): Promise<Conversation> {
+    if (planMessageId !== undefined) throw new Error('请在桌面应用中执行计划文档')
     const conversations = loadMockConversations()
     const index = conversations.findIndex((item) => item.id === conversationId)
     if (index < 0) throw new Error('Conversation not found')
@@ -754,25 +574,6 @@ const mockChatApi = {
         timestamp: now,
       },
     ]
-    const currentPlanMode = conversation.agent_plan_state?.mode ?? conversation.agentPlanState?.mode ?? 'act'
-    if (currentPlanMode === 'plan') {
-      const assistantIndex = conversation.messages.length - 1
-      const reply = conversation.messages[assistantIndex]?.content ?? ''
-      if (isExecutableAgentPlanText(reply)) {
-        conversation.agent_plan_state = {
-          mode: 'plan',
-          status: 'draft',
-          plan: reply,
-          updated_at: now,
-        }
-        conversation.agentPlanState = conversation.agent_plan_state
-        conversation.messages[assistantIndex] = {
-          ...conversation.messages[assistantIndex],
-          agent_plan: conversation.agent_plan_state,
-          agentPlan: conversation.agent_plan_state,
-        }
-      }
-    }
     if (isPlaceholderTitle(conversation.title)) {
       const nextTitle = optimisticConversationTitle(
         content,
@@ -842,49 +643,9 @@ const mockChatApi = {
   async cancelGoal(conversationId: string): Promise<Conversation> { return mockGoalStatus(conversationId, 'cancelled') },
 
   async executeAgentPlan(conversationId: string, messageId?: string): Promise<Conversation> {
-    const conversations = loadMockConversations()
-    const index = conversations.findIndex((item) => item.id === conversationId)
-    if (index < 0) throw new Error('Conversation not found')
-    const now = nowSeconds()
-    const messageIndex = messageId
-      ? conversations[index].messages.findIndex((message) => message.id === messageId && message.role === 'assistant')
-      : -1
-    if (messageId && messageIndex < 0) throw new Error('计划消息不存在')
-    const messagePlan = messageIndex >= 0
-      ? conversations[index].messages[messageIndex].agent_plan ?? conversations[index].messages[messageIndex].agentPlan ?? null
-      : null
-    if (messageId && !isExecutableAgentPlanText(messagePlan?.plan)) throw new Error('该消息不是可执行计划')
-    const current = messagePlan ?? conversations[index].agent_plan_state ?? conversations[index].agentPlanState ?? {
-      mode: 'act',
-      status: 'empty',
-      plan: null,
-      updated_at: 0,
-    }
-    const hasPlan = isExecutableAgentPlanText(current.plan)
-    const conversation = {
-      ...conversations[index],
-      agent_plan_state: {
-        ...current,
-        mode: 'act' as AgentPlanMode,
-        status: hasPlan ? 'approved' as const : 'empty' as const,
-        updated_at: now,
-      },
-      updated_at: now,
-    }
-    conversation.agentPlanState = conversation.agent_plan_state
-    if (messageIndex >= 0) {
-      conversation.messages = conversation.messages.map((message, i) =>
-        i === messageIndex
-          ? { ...message, agent_plan: conversation.agent_plan_state, agentPlan: conversation.agent_plan_state }
-          : message,
-      )
-    }
-    const contextState = estimateMockContext(conversation)
-    conversation.context_state = contextState
-    conversation.contextState = contextState
-    conversations[index] = conversation
-    saveMockConversations(conversations)
-    return conversation
+    void conversationId
+    void messageId
+    throw new Error('请在桌面应用中执行计划文档')
   },
 
   async deleteConversation(conversationId: string): Promise<void> {
@@ -1703,9 +1464,10 @@ export const chatApi = {
     content: string,
     attachments: PendingAttachment[] = [],
     activeSkillId?: string | null,
+    planMessageId?: string,
   ): Promise<Conversation> {
     if (!isTauriRuntime()) {
-      return mockChatApi.sendMessage(conversationId, content, attachments, activeSkillId)
+      return mockChatApi.sendMessage(conversationId, content, attachments, activeSkillId, planMessageId)
     }
     // 磁盘附件传路径；内存文本附件（粘贴长文本虚拟 txt）直接传内容，由后端注入 prompt，不落盘。
     const diskPaths = attachments.filter((a) => a.content === undefined).map((a) => a.path)
@@ -1720,6 +1482,7 @@ export const chatApi = {
         attachments: diskPaths,
         textAttachments,
         activeSkillId,
+        planMessageId,
       }
     )
     if (!result.success || !result.conversation) {
@@ -2108,238 +1871,7 @@ export const chatApi = {
     await invoke<void>('chat_cancel_stream', { conversationId })
   },
 
-  async detectExternalAgents(
-    forceRefresh = false,
-    conversationId?: string | null,
-  ): Promise<DetectedExternalAgent[]> {
-    if (!isTauriRuntime()) {
-      return [
-        {
-          id: 'claude',
-          name: 'Claude Code',
-          available: false,
-          models: [{ id: 'default', label: 'Default' }],
-        },
-      ]
-    }
-    const result = await invoke<{ success: boolean; agents: DetectedExternalAgent[] }>(
-      'chat_detect_external_agents',
-      { forceRefresh, conversationId },
-    )
-    return result.agents ?? []
-  },
-
-  // 懒查：只探选中 agent 的模型（cwd-scoped）。列表阶段不查模型，避免对所有 CLI 跑昂贵探测。
-  async detectExternalAgentModels(
-    agentId: string,
-    conversationId?: string | null,
-    force = false,
-  ): Promise<{
-    models: DetectedExternalAgent['models']
-    reasoningOptions: NonNullable<DetectedExternalAgent['reasoningOptions']>
-    /** 按模型的 effort 档位（kimi：K3 有 low/high/max，always_thinking 模型无）。 */
-    reasoningByModel: Record<string, NonNullable<DetectedExternalAgent['reasoningOptions']>>
-    source: 'probed' | 'fallback'
-    probeError?: string
-    // CLI 自己当前配置的模型/推理等级（用于胶囊自动同步「同步 CLI 当前配置」）。null = 无当前概念。
-    currentModel?: string | null
-    currentReasoning?: string | null
-  }> {
-    if (!isTauriRuntime()) {
-      return { models: [], reasoningOptions: [], reasoningByModel: {}, source: 'probed' }
-    }
-    const result = await invoke<{
-      success: boolean
-      models?: DetectedExternalAgent['models']
-      reasoningOptions?: NonNullable<DetectedExternalAgent['reasoningOptions']>
-      reasoningByModel?: Record<string, NonNullable<DetectedExternalAgent['reasoningOptions']>>
-      source?: 'probed' | 'fallback'
-      probeError?: string
-      currentModel?: string | null
-      currentReasoning?: string | null
-    }>('chat_detect_external_agent_models', { agentId, conversationId, force })
-    return {
-      models: result.models ?? [],
-      reasoningOptions: result.reasoningOptions ?? [],
-      reasoningByModel: result.reasoningByModel ?? {},
-      // 向后兼容：旧后端不返回 source 时视为 probed（不显示降级角标）。
-      source: result.source ?? 'probed',
-      probeError: result.probeError,
-      currentModel: result.currentModel ?? null,
-      currentReasoning: result.currentReasoning ?? null,
-    }
-  },
-
-  /** 设置页「本地 CLI Agent」：本地版本 / npm 最新版 / 安装命令 / 配置目录。 */
-  async externalCliInstallInfo(agentId: string): Promise<ExternalCliInstallInfo | null> {
-    if (!isTauriRuntime()) return null
-    return await invoke<ExternalCliInstallInfo>('chat_external_cli_install_info', { agentId })
-  },
-
-  /** 跑安装/更新命令；日志通过 `external-cli-install` 事件流回来（见 onExternalCliInstallLog）。 */
-  async externalCliInstall(agentId: string): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_external_cli_install', { agentId })
-  },
-
-  async piExtensionsInventory(): Promise<PiExtensionInventory | null> {
-    if (!isTauriRuntime()) return null
-    return await invoke<PiExtensionInventory>('chat_pi_extensions_inventory')
-  },
-
-  async piExtensionSetEnabled(kind: 'package' | 'local', id: string, enabled: boolean): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_extension_set_enabled', { kind, id, enabled })
-  },
-
-  async piExtensionInstall(source: string): Promise<PiExtensionCommandResult> {
-    return await invoke<PiExtensionCommandResult>('chat_pi_extension_install', { source })
-  },
-
-  async piExtensionUpdate(source?: string): Promise<PiExtensionCommandResult> {
-    return await invoke<PiExtensionCommandResult>('chat_pi_extension_update', {
-      source: source ?? null,
-    })
-  },
-
-  async piExtensionRemove(source: string): Promise<PiExtensionCommandResult> {
-    return await invoke<PiExtensionCommandResult>('chat_pi_extension_remove', { source })
-  },
-
-  async piExtensionOpen(kind: 'package' | 'local', id: string): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_extension_open', { kind, id })
-  },
-
-  async piExtensionsOpenDir(): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_extensions_open_dir')
-  },
-
-  async piSkillsInventory(): Promise<PiSkillInventory | null> {
-    if (!isTauriRuntime()) return null
-    return await invoke<PiSkillInventory>('chat_pi_skills_inventory')
-  },
-
-  async piSkillSetEnabled(skill: PiSkillEntry, enabled: boolean): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skill_set_enabled', {
-      path: skill.path,
-      packageSource: skill.packageSource,
-      enabled,
-    })
-  },
-
-  async piSkillCommandsSetEnabled(enabled: boolean): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skill_commands_set_enabled', { enabled })
-  },
-
-  async piSkillAddPath(path: string): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skill_add_path', { path })
-  },
-
-  async piSkillRemovePath(path: string): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skill_remove_path', { path })
-  },
-
-  async piSkillRemove(skill: PiSkillEntry): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skill_remove', {
-      path: skill.path,
-      packageSource: skill.packageSource,
-    })
-  },
-
-  async piSkillOpen(skill: PiSkillEntry): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skill_open', {
-      path: skill.path,
-      packageSource: skill.packageSource,
-    })
-  },
-
-  async piSkillsOpenDir(kind: 'pi' | 'agents'): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_pi_skills_open_dir', { kind })
-  },
-
-  async dshPluginSettingsGet(): Promise<DshPluginSettingsSnapshot | null> {
-    if (!isTauriRuntime()) return null
-    return await invoke<DshPluginSettingsSnapshot>('chat_dsh_plugin_settings_get')
-  },
-
-  async dshPluginSettingsSave(patch: DshPluginSettingsPatch): Promise<DshPluginSettingsSnapshot> {
-    return await invoke<DshPluginSettingsSnapshot>('chat_dsh_plugin_settings_save', { patch })
-  },
-
-  async dshPluginInventory(): Promise<DshPluginEntry[]> {
-    if (!isTauriRuntime()) return []
-    return await invoke<DshPluginEntry[]>('chat_dsh_plugin_inventory')
-  },
-
-  async dshOpenSettingsFile(): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_dsh_open_settings_file')
-  },
-
-  async dshOfficialCredentialStatus(): Promise<DshOfficialCredential> {
-    if (!isTauriRuntime()) return { configured: false, writable: true }
-    return await invoke<DshOfficialCredential>('chat_dsh_official_credential_status')
-  },
-
-  async dshOfficialCredentialSave(apiKey: string): Promise<DshOfficialCredential> {
-    return await invoke<DshOfficialCredential>('chat_dsh_official_credential_save', { apiKey })
-  },
-
-  async dshNativeProviderGet(id: string): Promise<DshNativeProviderDetail> {
-    return await invoke<DshNativeProviderDetail>('chat_dsh_native_provider_get', { id })
-  },
-
-  async dshNativeProviderDelete(id: string): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_dsh_native_provider_delete', { id })
-  },
-
-  async listDshAgentPresets(): Promise<DshAgentPresetOption[]> {
-    if (!isTauriRuntime()) return []
-    const list = await invoke<DshAgentPresetOption[]>('chat_dsh_list_agent_presets')
-    return Array.isArray(list) ? list : []
-  },
-
-  /**
-   * 删除供应商后清掉它物化出来的文件。
-   * 保存设置时后端会自动物化并清缓存（`persist_settings`），所以只有删除需要显式调用。
-   */
-  async externalCliProviderCleanup(
-    agentId: string,
-    providerId: string,
-    nativeProviderId?: string,
-    providerName?: string,
-  ): Promise<void> {
-    if (!isTauriRuntime()) return
-    await invoke('chat_external_cli_provider_cleanup', {
-      agentId,
-      providerId,
-      nativeProviderId,
-      providerName,
-    })
-  },
-
-  /** 供应商弹窗的「获取模型」：拿 base_url + key 去中转站问模型列表（只作建议用）。 */
-  async externalCliFetchRelayModels(baseUrl: string, apiKey: string): Promise<string[]> {
-    if (!isTauriRuntime()) return []
-    return await invoke<string[]>('chat_external_cli_fetch_relay_models', { baseUrl, apiKey })
-  },
-
-  /** 扫描本机 cc-switch 的库，列出可导入的供应商（只读）。 */
-  async externalCliScanCcSwitch(): Promise<CcSwitchScan> {
-    if (!isTauriRuntime()) return { providers: [], skipped: 0 }
-    return await invoke<CcSwitchScan>('chat_external_cli_scan_cc_switch')
-  },
-
+  ...externalCliSettingsApi,
   async listExternalCliSlashCommands(
     agentId: string,
     conversationId?: string | null,

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { SettingRow, HotkeyInput, SettingsGroup } from '../components'
 import { Button } from '../../components/Button'
-import type { I18n } from '../i18n'
+import type { I18n } from '../../components/i18n'
 import type { HotkeyConflict, HotkeyScopeKey } from '../SettingsShell'
 import type { Settings as SettingsData } from '../../api/tauri'
 import { DEFAULT_HOTKEYS } from '../hotkeyDefaults'
@@ -62,15 +62,15 @@ function hotkeyForScope(settings: SettingsData, scope: HotkeyScopeKey): string {
     case 'closeChat':
       return settings.closeChatHotkey || ''
     case 'screenshotTranslation':
-      return settings.screenshotTranslation?.hotkey ?? ''
+      return settings.screenshotTranslation.hotkey
     case 'screenshotTranslationText':
-      return settings.screenshotTranslation?.textHotkey ?? ''
+      return settings.screenshotTranslation.textHotkey
     case 'screenshotTranslationReplace':
       return settings.screenshotTranslation?.replaceHotkey ?? ''
     case 'screenshotAnnotate':
-      return settings.screenshotAnnotate?.hotkey ?? ''
+      return settings.screenshotAnnotate.hotkey
     case 'lens':
-      return settings.lens?.hotkey ?? ''
+      return settings.lens.hotkey
   }
 }
 
@@ -235,7 +235,7 @@ export function HotkeysTab({
       <SettingRow label={t.screenshotHotkey}>
         <HotkeyInput
           inline
-          value={settings.screenshotTranslation?.hotkey ?? ''}
+          value={settings.screenshotTranslation.hotkey}
           placeholder={t.hotkeyPlaceholder}
           recording={recordingTarget === 'screenshotTranslation'}
           onToggleRecording={() => onToggleRecording('screenshotTranslation')}
@@ -250,7 +250,7 @@ export function HotkeysTab({
       <SettingRow label={t.screenshotTextHotkey}>
         <HotkeyInput
           inline
-          value={settings.screenshotTranslation?.textHotkey ?? ''}
+          value={settings.screenshotTranslation.textHotkey}
           placeholder={t.hotkeyPlaceholder}
           recording={recordingTarget === 'screenshotTranslationText'}
           onToggleRecording={() => onToggleRecording('screenshotTranslationText')}
@@ -280,7 +280,7 @@ export function HotkeysTab({
       <SettingRow label={t.annotateHotkeyLabel}>
         <HotkeyInput
           inline
-          value={settings.screenshotAnnotate?.hotkey ?? ''}
+          value={settings.screenshotAnnotate.hotkey}
           placeholder={t.hotkeyPlaceholder}
           recording={recordingTarget === 'screenshotAnnotate'}
           onToggleRecording={() => onToggleRecording('screenshotAnnotate')}
@@ -295,7 +295,7 @@ export function HotkeysTab({
       <SettingRow label={t.lensTabLabel}>
         <HotkeyInput
           inline
-          value={settings.lens?.hotkey ?? ''}
+          value={settings.lens.hotkey}
           placeholder={t.hotkeyPlaceholder}
           recording={recordingTarget === 'lens'}
           onToggleRecording={() => onToggleRecording('lens')}

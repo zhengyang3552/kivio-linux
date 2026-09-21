@@ -1,4 +1,4 @@
-import { onExternalCliInstallLog } from '../chat/api'
+import { onExternalCliInstallLog } from '../api/externalCliSettings'
 
 export type CliInstallResult = 'ok' | 'fail' | null
 

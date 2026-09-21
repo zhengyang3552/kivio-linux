@@ -106,7 +106,7 @@ pub fn resolve_sandbox_export_file_path(path: &str) -> Result<PathBuf, String> {
     if !full.is_absolute() {
         return Err("Generated file path must be absolute".to_string());
     }
-    if !full.is_file() {
+    if !full.is_file() && !full.is_dir() {
         return Err("Generated file does not exist".to_string());
     }
     fs::canonicalize(full).map_err(|err| format!("Resolve generated file path failed: {err}"))
@@ -397,7 +397,7 @@ pub fn format_exported_paths(exports: &[SandboxExportedArtifact]) -> String {
         return String::new();
     }
     let mut lines = vec![
-        "generated files (saved to the current workbench and registered as artifacts; copy their art_ ids into present_artifacts to show selected files in chat — never file contents):"
+        "generated files (saved to the current workbench and registered as artifacts; reference only needed deliverables in the final answer with [label](artifact:art_ID) or ![description](artifact:art_ID), using their exact art_ IDs — never file contents):"
             .to_string(),
     ];
     for export in exports {
@@ -574,8 +574,14 @@ mod tests {
 
         // >32KB 的噪声 PNG（避免被 PNG 压缩到阈值之下）
         let img = image::RgbImage::from_fn(512, 512, |x, y| {
-            let v = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503));
-            image::Rgb([(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8])
+            let v = x
+                .wrapping_mul(2654435761)
+                .wrapping_add(y.wrapping_mul(40503));
+            image::Rgb([
+                (v & 0xff) as u8,
+                ((v >> 8) & 0xff) as u8,
+                ((v >> 16) & 0xff) as u8,
+            ])
         });
         let mut buf = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
@@ -603,10 +609,13 @@ mod tests {
         fs::write(&text_path, b"hello kivio").expect("write txt");
         let artifact = build_delivery_artifact_for_path(&text_path).expect("text artifact");
         assert_eq!(artifact.mime_type, "text/plain");
-        assert_eq!(artifact.data_url, format!(
-            "data:text/plain;base64,{}",
-            general_purpose::STANDARD.encode(b"hello kivio")
-        ));
+        assert_eq!(
+            artifact.data_url,
+            format!(
+                "data:text/plain;base64,{}",
+                general_purpose::STANDARD.encode(b"hello kivio")
+            )
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -723,6 +732,8 @@ mod tests {
         fs::write(&file, "ok").expect("write");
         let resolved = resolve_sandbox_export_file_path(&file.to_string_lossy()).expect("resolve");
         assert_eq!(resolved, fs::canonicalize(&file).unwrap());
+        let folder = resolve_sandbox_export_file_path(&dir.to_string_lossy()).expect("resolve dir");
+        assert_eq!(folder, fs::canonicalize(&dir).unwrap());
         let _ = fs::remove_dir_all(dir);
     }
 }

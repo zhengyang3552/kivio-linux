@@ -36,8 +36,15 @@ pub fn resolve_reserved_wire_alias(name: &str) -> &str {
 /// **方向与 `RESERVED_WIRE_ALIASES` 相反**：wire 别名是"内部名 → 模型可见名"（改对外暴露）；
 /// 这里是"旧输入名 → 现内部名"（把历史输入规整到现工具），**不参与**工具声明/提示词渲染。
 const LEGACY_TOOL_ALIASES: &[(&str, &str)] = &[
-    ("ls", "read"),                     // ls 并入 read（read 现在可读目录）
-    ("find", "glob"),                   // find 改名 glob
+    ("read_file", "read"), // 对外名缩短前的文件工具
+    ("write_file", "write"),
+    ("edit_file", "edit"),
+    ("list_dir", "read"), // list_dir / ls 并入 read（read 现在可读目录）
+    ("ls", "read"),
+    ("search_files", "grep"),
+    ("glob_files", "glob"),
+    ("find", "glob"), // find 改名 glob
+    ("run_command", "bash"),
     ("list_background", "bash_output"), // list_background 并入 bash_output（无 job_id=列表）
     ("todo_update", "todo_write"),      // todo_update 并入 todo_write（整表替换）
     ("skill_activate", "skill"),        // skill_activate 改名 skill（合并 read_file/run_script 后）
@@ -246,7 +253,7 @@ pub fn native_skill_activate_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "skill__activate".to_string(),
         name: "skill".to_string(),
-        description: "Load a specialized skill when the task at hand matches one of the skills listed in the system prompt. Injects the skill's instructions and resources into the current conversation — the output may contain detailed workflow guidance plus references to scripts and files in the skill directory (read them with `read`, run scripts with `run_command`). The skill name must match one listed in available_skills.".to_string(),
+        description: "Load a specialized skill when the task at hand matches one of the skills listed in the system prompt. Injects the skill's instructions and resources into the current conversation — the output may contain detailed workflow guidance plus references to scripts and files in the skill directory (use `read` for files and `bash` for scripts when those tools are declared in this request). The skill name must match one listed in available_skills.".to_string(),
         source: "skill".to_string(),
         server_id: None,
         server_name: Some("Skill".to_string()),
@@ -274,14 +281,15 @@ pub fn native_read_file_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__read_file".to_string(),
         name: "read".to_string(),
-        description: "Read a local file or directory. For a file: text is line-numbered as `N<TAB>line` for easy reference; the numbers are display-only and are NOT part of the file — never include them in edit old_string. Output is capped at 2000 lines or 50KB, whichever is hit first, so a single read can never flood the context; when the cap or your own limit stops the read early the result says so and reports total_lines and next_offset — continue with offset until you have what you need. Optional offset/limit select a 1-based line window (the cap still applies on top). For a directory path: returns its entries (folded in the former `ls` tool); offset/limit are ignored. Image files (png/jpg/webp/…) are also supported: the image is shown to you directly when your model has vision, otherwise it is described or OCR'd to text. To inspect several images at once, pass `paths` (up to 12). Images are read individually by default — always do that for analysis, QA, spelling, logos, or any per-image detail. A numbered contact sheet is used only for a first-pass overview of 6–12 similar images when the user asked to skim the set, or when you set overview=true for that skim; never for analysis. Re-read a single path for fine text. For PDF/Word/Excel, use the matching skill instead.".to_string(),
+        description: "Read a local file or directory. For a file: text is line-numbered as `N<TAB>line` for easy reference; the numbers are display-only and are NOT part of the file — never include them in edit old_string. Output is capped at 2000 lines or 50KB, whichever is hit first, so a single read can never flood the context; when the cap or your own limit stops the read early, the result ENDS with a notice like `[Showing lines X-Y of Z. Use offset=N to continue.]` — if the part you need is not in this window, call read again with that offset before moving on. Optional offset/limit select a 1-based line window (the cap still applies on top); an offset past the last line is an error. For a directory path: returns its entries (folded in the former `ls` tool); offset/limit are ignored. Image files (png/jpg/webp/…) are also supported: the image is shown to you directly when your model has vision, otherwise it is described or OCR'd to text. To inspect several images at once, pass `paths` (up to 12). Images are read individually by default — always do that for analysis, QA, spelling, logos, or any per-image detail. A numbered contact sheet is used only for a first-pass overview of 6–12 similar images when the user asked to skim the set, or when you set overview=true for that skim; never for analysis. Re-read a single path for fine text. For PDF/Word/Excel, use the matching skill instead.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File path to read. Relative paths resolve from the project root/current workspace; absolute and ~/ paths are also accepted when allowed by workspace mode." },
+                "path": { "type": "string", "description": "File path or directory to read. Relative paths use the current working directory (project root or conversation workbench). Explicit absolute and ~/ paths can point outside it; normal OS permissions and tool approvals apply. Use the user's disk path directly; no artifact ID or registration is required." },
+                "artifact_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 12, "description": "Exact art_ IDs already returned by tools in this conversation. Use for known generated artifacts; use path for a user-provided disk path. Supply artifact_ids or path/paths, not both. No filesystem search or registration is needed when the ID is already known." },
                 "paths": {
                     "type": "array",
                     "description": "Several image files to inspect in one call (png/jpg/webp/gif, max 12). Default is one image each. Do not use this for text files.",
@@ -332,7 +340,7 @@ pub fn native_search_files_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__search_files".to_string(),
         name: "grep".to_string(),
-        description: "Search text in a file or under a directory. By default `query` is a literal substring; set regex=true to treat it as a regular expression. If you already know the exact file, pass that file path directly; for broader searches, pass a directory and use `glob` to narrow the scope. Relative paths resolve from the project root; respects .gitignore and skips common dependency/build folders (node_modules, target, dist, …).".to_string(),
+        description: "Search text in a file or under a directory. By default `query` is a literal substring; set regex=true to treat it as a regular expression. If you already know the exact file, pass that file path directly; for broader searches, pass a directory and use `glob` to narrow the scope. Relative paths use the current working directory (project root or conversation workbench); explicit absolute and ~/ paths can point outside it. Respects .gitignore and skips common dependency/build folders (node_modules, target, dist, …); no matches does not establish that a file is missing or inaccessible.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -341,7 +349,7 @@ pub fn native_search_files_tool() -> ChatToolDefinition {
             "properties": {
                 "query": { "type": "string", "description": "Text to search for (alias: pattern). Literal substring by default; a regular expression when regex=true." },
                 "pattern": { "type": "string", "description": "Alias for query." },
-                "path": { "type": "string", "description": "File or directory path, defaults to project root/current workspace" },
+                "path": { "type": "string", "description": "File or directory path; defaults to the current working directory. To search elsewhere, pass that absolute or ~/ path explicitly." },
                 "regex": { "type": "boolean", "description": "Treat query as a regular expression, default false (literal substring)" },
                 "case_sensitive": { "type": "boolean", "description": "Case-sensitive matching, default false" },
                 "include_hidden": { "type": "boolean", "description": "Include dotfiles and hidden entries" },
@@ -362,15 +370,15 @@ pub fn native_glob_files_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__glob_files".to_string(),
         name: "glob".to_string(),
-        description: "Find files/directories under a directory by glob pattern such as \"src/**/*.tsx\". Relative paths resolve from the project root; respects .gitignore.".to_string(),
+        description: "Find files/directories under a directory by glob pattern such as \"src/**/*.tsx\". Relative paths use the current working directory (project root or conversation workbench); explicit absolute and ~/ paths can point outside it. Respects .gitignore; an empty result covers only the searched directory and filters. For a known file path, use read directly.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Glob pattern with *, ?, and ** support" },
-                "path": { "type": "string", "description": "Directory path to search, defaults to project root/current workspace" },
+                "pattern": { "type": "string", "description": "Relative glob pattern with *, ?, and ** support; put the search directory in path, not in an absolute pattern." },
+                "path": { "type": "string", "description": "Directory path to search; defaults to the current working directory. To search elsewhere, pass that absolute or ~/ path explicitly." },
                 "include_hidden": { "type": "boolean", "description": "Include dotfiles and hidden entries" },
                 "max_results": { "type": "integer", "description": "Maximum paths to return, default 200, max 500" }
             },
@@ -393,7 +401,7 @@ pub fn native_write_file_tool() -> ChatToolDefinition {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Project-relative path in project mode, otherwise an explicitly requested absolute/home/~/ path" },
+                "path": { "type": "string", "description": "Target file path. Relative paths use the current working directory (project root or conversation workbench). Explicit absolute and ~/ paths can point outside it; normal OS permissions and tool approvals apply." },
                 "content": { "type": "string", "description": "Full text content to save" }
             },
             "required": ["path", "content"]
@@ -415,7 +423,7 @@ pub fn native_edit_file_tool() -> ChatToolDefinition {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string" },
+                "path": { "type": "string", "description": "Existing file path. Relative paths use the current working directory (project root or conversation workbench). Explicit absolute and ~/ paths can point outside it; normal OS permissions and tool approvals apply." },
                 "edits": {
                     "type": "array",
                     "description": "One or more replacements, applied in order. Each old_string must occur exactly once in the current file.",
@@ -446,7 +454,7 @@ pub fn native_run_command_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__run_command".to_string(),
         name: "bash".to_string(),
-        description: format!("Run a host shell command (build, test, etc.).{shell_hint} In a project conversation, the command starts from the bound project root by default; any explicit cwd is only a startup directory and is validated as workspace-local. Do not use `cd path && command` when the path contains spaces—pass `cwd` and run only the remaining command. Do not combine `cwd` with a leading `cd ... &&` prefix. Foreground commands wait until they exit — omit timeout_ms unless you want the process killed at a deadline. Do not background finite jobs (builds, tests, image-generation batches); put parallel work inside one command. Long-running never-ending servers such as `npm run dev`, `npm run tauri dev`, and `vite` are started in the background automatically and return immediately with a job_id. This is a sensitive host-shell capability, not the same boundary as the file tools: obey user constraints and explain or seek confirmation before cross-directory, destructive, network, or environment-changing commands. A non-zero exit code is returned as a tool error with stdout/stderr. Host Python package installs require an explicit user request and allow_host_python_package_install=true."),
+        description: format!("Run a host shell command (build, test, etc.).{shell_hint} With cwd omitted, start in the current working directory (project root or conversation workbench). An explicit absolute or ~/ cwd can point outside it and must be an existing directory; it is a startup directory, not a filesystem boundary. Normal OS permissions and tool approvals apply. Do not use `cd path && command` when the path contains spaces—pass `cwd` and run only the remaining command. Do not combine `cwd` with a leading `cd ... &&` prefix. Foreground commands wait until they exit — omit timeout_ms unless you want the process killed at a deadline. Do not background finite jobs (builds, tests, image-generation batches); put parallel work inside one command. Long-running never-ending servers such as `npm run dev`, `npm run tauri dev`, and `vite` are started in the background automatically and return immediately with a job_id. Obey user constraints and obtain any required authorization for destructive, network, or environment-changing commands. A non-zero exit code is returned as a tool error with stdout/stderr. Host Python package installs require an explicit user request and allow_host_python_package_install=true."),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -454,7 +462,7 @@ pub fn native_run_command_tool() -> ChatToolDefinition {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Shell command" },
-                "cwd": { "type": "string", "description": "Working directory (required when the path contains spaces; do not use `cd ... &&` for that)" },
+                "cwd": { "type": "string", "description": "Existing startup directory, defaults to the current working directory. Relative paths use that base; absolute and ~/ paths can point outside it. To run in another directory, pass it here, including when it contains spaces; do not use a leading `cd ... &&`." },
                 "background": { "type": "boolean", "description": "Run in background and return a job_id immediately. Auto-enabled for never-ending dev servers. Do not use this for finite jobs that will exit." },
                 "timeout_ms": { "type": "integer", "description": "Optional kill deadline in ms (max 600000). Omit to wait until the command exits. Timeout kills the process and returns partial output; it does not background the job." },
                 "allow_host_python_package_install": { "type": "boolean", "description": "Only true when the user explicitly asked to modify the host Python environment; installs must use --user or a virtual environment." }
@@ -545,7 +553,7 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__present_artifacts".to_string(),
         name: "present_artifacts".to_string(),
-        description: "Show files or images in the chat. Call this when the user should see a file; reading or describing it does not display it. Pass only a short JSON of identifiers: copy `art_…` ids from tool results into artifact_ids, or pass existing disk paths. Never both for the same file. Never invent a path for a generated file. Never put file contents, image bytes, base64, or data URLs in any field. Caption is optional plain text. Max 16 files. Unselected files stay hidden. Example: {\"artifact_ids\":[\"art_…\"]}".to_string(),
+        description: "Prepare selected deliverables for final-answer references (default mode: prepare). For an existing local file, pass its path to obtain an art_ ID. In the final answer, place [label](artifact:art_ID) for a file or ![description](artifact:art_ID) for an image at the relevant paragraph. Files that already have IDs can be referenced directly without calling this tool. Use mode preview only when the user explicitly requests an immediate preview or must inspect alternatives before you continue. Do not present internal QA screenshots, extracted frames, drafts, or failed attempts by default. Pass only a short JSON of identifiers: copy `art_…` ids from tool results into artifact_ids, or pass existing disk paths. Never both for the same file. Never invent a path for a generated file. Never put file contents, image bytes, base64, or data URLs in any field. Caption is optional plain text. Max 16 files. Unselected files stay hidden. Example: {\"artifact_ids\":[\"art_…\"]}".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -565,6 +573,11 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 16
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["prepare", "preview"],
+                    "description": "Defaults to prepare: register only selected final deliverables for inline references, without expanding them during work. preview immediately displays files for an explicit user preview/choice."
                 },
                 "caption": {
                     "type": "string",
@@ -696,10 +709,16 @@ pub fn native_memory_search_tool() -> ChatToolDefinition {
 }
 
 pub fn mixer_generate_image_tool() -> ChatToolDefinition {
+    mixer_generate_image_tool_for(None)
+}
+
+/// Mixer 生图工具。`model` 写进 description，因为发给上游的只有 name/description/parameters，
+/// `server_id` 只给 UI，模型看不见。
+pub fn mixer_generate_image_tool_for(model: Option<&str>) -> ChatToolDefinition {
     ChatToolDefinition {
         id: "mixer__generate_image".to_string(),
         name: "mixer_generate_image".to_string(),
-        description: "Generate or edit image artifacts using the Mixer image generation model configured in Settings. For image-to-image / edits, pass paths of local images or artifact_ids of images generated earlier in this conversation. If the user attached images this turn and you omit both, those attachments are used automatically.".to_string(),
+        description: mixer_generate_image_description(model),
         source: "mixer".to_string(),
         server_id: None,
         server_name: Some("Mixer".to_string()),
@@ -708,34 +727,41 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Detailed image generation or edit prompt"
+                    "description": "What the image should look like, or how to change the reference"
                 },
                 "size": {
                     "type": "string",
-                    "enum": ["auto", "1024x1024", "1024x1536", "1536x1024"],
-                    "description": "Optional output size. Use auto unless the user asked for a square, portrait, or landscape image."
+                    "description": "Only if the user asked. 512, 1K, 2K, 4K, or WIDTHxHEIGHT such as 1536x864."
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": [
+                        "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9",
+                        "2:1", "1:2", "1:4", "4:1"
+                    ],
+                    "description": "Only if the user asked for a shape. Omit to let the model choose."
                 },
                 "quality": {
                     "type": "string",
-                    "enum": ["auto", "low", "medium", "high"],
-                    "description": "Optional quality setting"
+                    "enum": ["low", "medium", "high"],
+                    "description": "Only if the user asked"
                 },
                 "n": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 4,
-                    "description": "Number of images to generate"
+                    "description": "How many images. Default 1"
                 },
                 "paths": {
                     "type": "array",
-                    "description": "Local image files to edit or use as references. Use Kivio attachment copy paths from this turn, or files you already read.",
+                    "description": "Local image files to edit",
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 4
                 },
                 "artifact_ids": {
                     "type": "array",
-                    "description": "IDs of images generated earlier in this conversation to edit or use as references.",
+                    "description": "art_ IDs from earlier generate/edit results",
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 4
@@ -747,6 +773,24 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
         annotations: None,
         output_schema: None,
     }
+}
+
+fn mixer_generate_image_description(model: Option<&str>) -> String {
+    let model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("the Mixer image model from Settings");
+    format!(
+        "Generate or edit an image with {model}. The image model is fixed; do not pass a model name.\n\
+         New image: {{\"prompt\":\"a fox in snow\"}}\n\
+         Widescreen 2K: {{\"prompt\":\"city skyline\",\"aspect_ratio\":\"16:9\",\"size\":\"2K\"}}\n\
+         4K: {{\"prompt\":\"poster\",\"aspect_ratio\":\"16:9\",\"size\":\"4K\"}}\n\
+         Custom pixels: {{\"prompt\":\"poster\",\"size\":\"1536x864\"}}\n\
+         Edit a file: {{\"prompt\":\"make it night\",\"paths\":[\"C:/ref.png\"]}}\n\
+         Edit a prior result: {{\"prompt\":\"add a title\",\"artifact_ids\":[\"art_...\"]}}\n\
+         User attached images this turn: omit paths and artifact_ids.\n\
+         Omit size and aspect_ratio unless the user asked. quality=low|medium|high only if asked. n=1-4."
+    )
 }
 
 pub fn native_web_fetch_tool() -> ChatToolDefinition {
@@ -1096,6 +1140,32 @@ mod tests {
     }
 
     #[test]
+    fn mixer_image_tool_description_names_model_and_shows_calls() {
+        let unnamed = mixer_generate_image_tool();
+        assert!(unnamed.description.contains("Mixer image model"));
+        assert!(unnamed
+            .description
+            .contains("{\"prompt\":\"a fox in snow\"}"));
+        assert!(unnamed.description.contains("aspect_ratio"));
+        assert!(unnamed.description.contains("2K"));
+        assert!(unnamed.description.contains("paths"));
+        assert!(unnamed.description.contains("artifact_ids"));
+
+        let named = mixer_generate_image_tool_for(Some("gpt-image-2"));
+        assert!(
+            named.description.contains("gpt-image-2"),
+            "{}",
+            named.description
+        );
+        assert!(named.description.contains("do not pass a model name"));
+        let wire = named.to_openai_tool();
+        assert_eq!(wire["function"]["name"], "mixer_generate_image");
+        assert!(wire["function"]["description"]
+            .as_str()
+            .is_some_and(|text| text.contains("gpt-image-2")));
+    }
+
+    #[test]
     fn skill_and_native_tools_use_prompt_facing_names() {
         assert_eq!(native_skill_activate_tool().openai_tool_name(), "skill");
         // 保留名规避：native web_search 在 wire/prompt 上声明为别名 search_web。
@@ -1158,12 +1228,10 @@ mod tests {
                 .unwrap()
                 .contains("`art_…`"),
         );
-        assert!(
-            def.input_schema["properties"]["caption"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("plain-text"),
-        );
+        assert!(def.input_schema["properties"]["caption"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("plain-text"),);
     }
 
     #[test]
@@ -1201,6 +1269,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Directory"));
+        for tool in [
+            native_read_file_tool(),
+            grep,
+            find,
+            native_write_file_tool(),
+            native_edit_file_tool(),
+            native_run_command_tool(),
+        ] {
+            let declaration = tool.to_openai_tool().to_string();
+            assert!(
+                !declaration.contains("when allowed by workspace mode"),
+                "{}",
+                tool.name
+            );
+            assert!(
+                !declaration.contains("validated as workspace-local"),
+                "{}",
+                tool.name
+            );
+            assert!(
+                declaration.contains("absolute"),
+                "{} must describe explicit paths",
+                tool.name
+            );
+        }
+        assert!(!native_skill_activate_tool()
+            .description
+            .contains("`run_command`"));
     }
 
     #[test]
@@ -1452,14 +1548,22 @@ mod tests {
     #[test]
     fn canonical_tool_name_maps_legacy_names() {
         // 旧名 → 现名（移除/合并/改名后仍可路由）。
+        assert_eq!(canonical_tool_name("read_file"), "read");
+        assert_eq!(canonical_tool_name("write_file"), "write");
+        assert_eq!(canonical_tool_name("edit_file"), "edit");
+        assert_eq!(canonical_tool_name("list_dir"), "read");
         assert_eq!(canonical_tool_name("ls"), "read");
+        assert_eq!(canonical_tool_name("search_files"), "grep");
+        assert_eq!(canonical_tool_name("glob_files"), "glob");
         assert_eq!(canonical_tool_name("find"), "glob");
+        assert_eq!(canonical_tool_name("run_command"), "bash");
         assert_eq!(canonical_tool_name("list_background"), "bash_output");
         assert_eq!(canonical_tool_name("todo_update"), "todo_write");
         // 现名与未知名原样返回。
         assert_eq!(canonical_tool_name("read"), "read");
         assert_eq!(canonical_tool_name("glob"), "glob");
         assert_eq!(canonical_tool_name("bash"), "bash");
+        assert_eq!(canonical_tool_name("read_file_extra"), "read_file_extra");
     }
 
     #[test]

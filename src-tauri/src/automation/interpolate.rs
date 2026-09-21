@@ -12,11 +12,16 @@ pub fn interpolate(template: &str, prev: &NodeOutput) -> String {
     // Resolve node references once, without interpreting templates inside data.
     let mut values = Vec::new();
     while let Some(start) = rest.find("{{nodes.") {
-        let Some(end) = rest[start..].find("}}") else { break };
+        let Some(end) = rest[start..].find("}}") else {
+            break;
+        };
         expanded.push_str(&rest[..start]);
         let reference = &rest[start + 8..start + end];
-        let value = reference.split_once('#').and_then(|(id, pointer)|
-            prev.sources.get(id).and_then(|value| value.pointer(pointer)));
+        let value = reference.split_once('#').and_then(|(id, pointer)| {
+            prev.sources
+                .get(id)
+                .and_then(|value| value.pointer(pointer))
+        });
         let text = match value {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Null) | None => String::new(),
@@ -35,7 +40,10 @@ pub fn interpolate(template: &str, prev: &NodeOutput) -> String {
             break;
         };
         let path = &out[abs + 7..abs + 7 + end];
-        if path.is_empty() || !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        if path.is_empty()
+            || !path
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
         {
             search_from = abs + 7;
             continue;
@@ -61,16 +69,29 @@ pub fn check_references(value: &Value, prev: &NodeOutput) -> Result<(), String> 
                 let end = rest[start..].find("}}").ok_or("unclosed node reference")?;
                 let reference = &rest[start + 8..start + end];
                 let (id, pointer) = reference.split_once('#').ok_or("invalid node reference")?;
-                if prev.sources.get(id).and_then(|value| value.pointer(pointer)).is_none() {
+                if prev
+                    .sources
+                    .get(id)
+                    .and_then(|value| value.pointer(pointer))
+                    .is_none()
+                {
                     return Err(format!("node reference is unavailable: {reference}; run the upstream path or use recorded input"));
                 }
                 rest = &rest[start + end + 2..];
             }
         }
-        Value::Array(items) => for item in items { check_references(item, prev)?; },
-        Value::Object(fields) => for (key, value) in fields {
-            if key != "label" { check_references(value, prev)?; }
-        },
+        Value::Array(items) => {
+            for item in items {
+                check_references(item, prev)?;
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key != "label" {
+                    check_references(value, prev)?;
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -79,7 +100,11 @@ pub fn check_references(value: &Value, prev: &NodeOutput) -> Result<(), String> 
 fn lookup_json(value: &Value, path: &str) -> Option<String> {
     let mut current = value;
     for part in path.split('.') {
-        current = if current.is_array() { current.get(part.parse::<usize>().ok()?)? } else { current.get(part)? };
+        current = if current.is_array() {
+            current.get(part.parse::<usize>().ok()?)?
+        } else {
+            current.get(part)?
+        };
     }
     match current {
         Value::Null => Some(String::new()),
@@ -97,7 +122,9 @@ pub fn eval_if(op: &str, expected: &str, actual: &str) -> bool {
 }
 
 pub fn node_disabled(data: &Value) -> bool {
-    data.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)
+    data.get("disabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -118,10 +145,7 @@ mod tests {
 
     #[test]
     fn does_not_rescan_placeholders_inside_output_text() {
-        let prev = NodeOutput::with_json(
-            "see {{json.status}}",
-            json!({ "status": 200 }),
-        );
+        let prev = NodeOutput::with_json("see {{json.status}}", json!({ "status": 200 }));
         assert_eq!(interpolate("{{output}}", &prev), "see {{json.status}}");
         assert_eq!(
             interpolate("{{output}} / {{json.status}}", &prev),
@@ -131,10 +155,7 @@ mod tests {
 
     #[test]
     fn does_not_expand_output_placeholder_inside_json_values() {
-        let prev = NodeOutput::with_json(
-            "HELLO",
-            json!({ "note": "see {{output}}" }),
-        );
+        let prev = NodeOutput::with_json("HELLO", json!({ "note": "see {{output}}" }));
         assert_eq!(interpolate("{{json.note}}", &prev), "see {{output}}");
     }
 
@@ -150,14 +171,21 @@ mod tests {
     #[test]
     fn node_references_support_arrays_escaped_keys_and_never_expand_data() {
         let mut input = NodeOutput::from_text("previous");
-        input.sources.insert("node-id".into(), serde_json::json!({
-            "text": "{{output}}", "json": { "商品/规格~": [{ "name": "蓝色" }] }
-        }));
+        input.sources.insert(
+            "node-id".into(),
+            serde_json::json!({
+                "text": "{{output}}", "json": { "商品/规格~": [{ "name": "蓝色" }] }
+            }),
+        );
         let template = "{{nodes.node-id#/text}} / {{nodes.node-id#/json/商品~1规格~0/0/name}}";
         assert!(check_references(&serde_json::json!(template), &input).is_ok());
         assert_eq!(interpolate(template, &input), "{{output}} / 蓝色");
         assert!(check_references(&serde_json::json!("{{nodes.other#/text}}"), &input).is_err());
-        assert!(check_references(&serde_json::json!("{{nodes.node-id#/json/missing}}"), &input).is_err());
+        assert!(check_references(
+            &serde_json::json!("{{nodes.node-id#/json/missing}}"),
+            &input
+        )
+        .is_err());
     }
 
     #[test]

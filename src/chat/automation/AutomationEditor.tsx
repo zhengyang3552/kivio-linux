@@ -25,12 +25,12 @@ import { save as saveDialog } from '@tauri-apps/plugin-dialog'
 import { ArrowLeft, Download, Play, Plus, Square } from 'lucide-react'
 import { isTauriRuntime } from '../../api/tauri'
 import { Button } from '../../components/Button'
-import { Toggle } from '../../settings/components'
-import { useT, useLang } from '../../settings/i18n'
+import { Toggle } from '../../settings/public/controls'
+import { useT, useLang } from '../../components/i18n'
 import { WorkflowWorkbench } from './WorkflowWorkbench'
 import { localizeValidationIssue, workflowIssues } from './workflowData'
 import { ValidationContext } from './nodes/chrome'
-import type { ValidationIssue, NodeOutput } from './types'
+import type { ValidationIssue, NodeOutput } from '../../api/automationContracts'
 import { AddNodePicker } from './AddNodePicker'
 import { automationApi } from './api'
 import { NodeInspector } from './NodeInspector'
@@ -67,11 +67,13 @@ import {
   isAttachmentType,
   isTriggerType,
   branchHandles,
-  type AgentSlot,
-  type Automation,
-  type AutomationNodeType,
-  type FlowNode as FlowNodeModel,
-} from './types'
+} from './nodeSemantics'
+import type {
+  AgentSlot,
+  Automation,
+  AutomationNodeType,
+  FlowNode as FlowNodeModel,
+} from '../../api/automationContracts'
 
 const nodeTypes = {
   'trigger.manual': FlowNode,

@@ -351,8 +351,10 @@ pub(super) async fn read_images_as_tool_result(
         return Ok(text_tool_result(notes.join("\n")));
     }
 
-    let artifacts: Vec<mcp::types::ChatToolArtifact> =
-        accepted.iter().map(|path| image_read_artifact(path)).collect();
+    let artifacts: Vec<mcp::types::ChatToolArtifact> = accepted
+        .iter()
+        .map(|path| image_read_artifact(path))
+        .collect();
     let names = artifacts
         .iter()
         .map(|artifact| artifact.name.as_str())

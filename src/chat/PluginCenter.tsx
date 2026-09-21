@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { i18n, LangContext, type Lang } from '../settings/i18n'
+import { i18n, LangContext, type Lang } from '../components/i18n'
 import { PluginPackages } from './PluginPackages'
-import { ThirdPartyApps } from './ThirdPartyApps'
 
-export type PluginCenterSection = 'plugins' | 'apps' | 'connectors'
+export type PluginCenterSection = 'plugins' | 'connectors'
 
 interface PluginCenterTabsProps {
   section: PluginCenterSection
@@ -16,12 +15,11 @@ function PluginCenterTabs({ section, onChange, lang }: PluginCenterTabsProps) {
   const refs = useRef<Partial<Record<PluginCenterSection, HTMLButtonElement | null>>>({})
   const tabs = [
     ['plugins', t.tabPlugins],
-    ['apps', t.pluginCenterApps],
     ['connectors', t.tabConnectors],
   ] as const
 
   return (
-    <div className="mb-4 mt-2 flex w-fit items-center gap-1" role="tablist" aria-label={t.pluginCenterCategories}>
+    <div className="mb-4 mt-2 flex w-fit items-center gap-1" role="tablist" aria-label={lang === 'zh' ? '插件与连接器' : 'Plugins and connectors'}>
       {tabs.map(([id, label], index) => (
         <button
           key={id}
@@ -68,26 +66,19 @@ interface PluginCenterProps {
   onSectionChange: (section: PluginCenterSection) => void
   lang: Lang
   connectors: ReactNode
-  onRequestAiInstall?: (pluginId: string) => void | Promise<void>
 }
 
-export function PluginCenter({ section, onSectionChange, lang, connectors, onRequestAiInstall }: PluginCenterProps) {
-  const [appsOpened, setAppsOpened] = useState(section === 'apps')
+export function PluginCenter({ section, onSectionChange, lang, connectors }: PluginCenterProps) {
   const [connectorsOpened, setConnectorsOpened] = useState(section === 'connectors')
   useEffect(() => {
-    if (section === 'apps') setAppsOpened(true)
     if (section === 'connectors') setConnectorsOpened(true)
   }, [section])
 
-  // 首次访问时加载应用；之后保留两个面板，切换不丢失导入草稿或进行中的安装。
   return (
     <LangContext.Provider value={lang}>
       <PluginCenterTabs section={section} onChange={onSectionChange} lang={lang} />
       <div id="plugin-center-panel-plugins" role="tabpanel" aria-labelledby="plugin-center-tab-plugins" tabIndex={0} hidden={section !== 'plugins'}>
         <PluginPackages lang={lang} />
-      </div>
-      <div id="plugin-center-panel-apps" role="tabpanel" aria-labelledby="plugin-center-tab-apps" tabIndex={0} hidden={section !== 'apps'}>
-        {(appsOpened || section === 'apps') && <ThirdPartyApps onRequestAiInstall={onRequestAiInstall} />}
       </div>
       <div id="plugin-center-panel-connectors" role="tabpanel" aria-labelledby="plugin-center-tab-connectors" tabIndex={0} hidden={section !== 'connectors'}>
         {(connectorsOpened || section === 'connectors') && connectors}

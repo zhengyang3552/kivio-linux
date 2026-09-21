@@ -1,9 +1,12 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { X } from 'lucide-react'
-import { chatApi, type CcSwitchProvider } from '../chat/api'
+import {
+  externalCliSettingsApi,
+  type CcSwitchProvider,
+} from '../api/externalCliSettings'
 import { Button, IconButton } from '../components/Button'
-import { i18n, type Lang } from './i18n'
+import { i18n, type Lang } from '../components/i18n'
 
 /**
  * 从 cc-switch 导入供应商。后端只读打开它的库，这里只负责勾选和落库。
@@ -32,7 +35,7 @@ export function CcSwitchImportModal({
 
   useEffect(() => {
     let cancelled = false
-    void chatApi
+    void externalCliSettingsApi
       .externalCliScanCcSwitch()
       .then((scan) => {
         if (cancelled) return

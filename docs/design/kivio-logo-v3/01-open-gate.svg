@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" color="#171918">
+  <title>Kivio Open Gate</title>
+  <g stroke="currentColor" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M27 20v60"/>
+    <path d="M71 21 37 50l34 29"/>
+  </g>
+  <circle cx="37" cy="50" r="5" fill="currentColor"/>
+</svg>

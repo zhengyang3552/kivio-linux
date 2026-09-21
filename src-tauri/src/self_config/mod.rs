@@ -7,7 +7,7 @@ mod tests;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 use crate::mcp::native_registry::{text_tool_result, NativeCallCtx, NativeToolFuture};
 use crate::mcp::types::{ChatToolDefinition, McpToolCallResult};
@@ -205,10 +205,6 @@ pub fn configure(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
             serde_json::from_value(ctx.arguments.clone()).map_err(|e| e.to_string())?;
         let before = ctx.state.settings_read().clone();
         let operation = configure_action(&ctx, action).await;
-        if operation.is_ok() {
-            // Notify webviews without broadcasting settings or credentials.
-            let _ = ctx.app.emit("kivio-configuration-changed", ());
-        }
         match operation {
             Ok(value) => result(
                 &before,
@@ -376,12 +372,7 @@ fn update_settings(
     ctx: &NativeCallCtx<'_>,
     change: impl FnOnce(&mut Settings) -> Result<(), String>,
 ) -> Result<(), String> {
-    // Read-modify-persist under the application's settings lock, just like package activation.
-    let mut current = ctx.state.settings_write();
-    let mut next = current.clone();
-    change(&mut next)?;
-    crate::settings::persist_settings(ctx.app, &next)?;
-    *current = next;
+    crate::settings::update_settings(ctx.app, ctx.state, change)?;
     Ok(())
 }
 

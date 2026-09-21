@@ -1138,13 +1138,11 @@ mod tests {
 
         let records = host.records.lock().unwrap_or_else(|err| err.into_inner());
         assert_eq!(records.len(), 1);
-        assert!(
-            records[0]
-                .result_preview
-                .as_deref()
-                .unwrap_or_default()
-                .contains("正在展示文件")
-        );
+        assert!(records[0]
+            .result_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("正在展示文件"));
         assert!(!records[0]
             .result_preview
             .as_deref()

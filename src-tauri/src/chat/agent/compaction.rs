@@ -194,11 +194,7 @@ fn estimate_message_tokens(message: &Value) -> usize {
         .get("tool_calls")
         .map(|calls| estimate_tokens(&calls.to_string()))
         .unwrap_or(0);
-    let reasoning = message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .map(estimate_tokens)
-        .unwrap_or(0);
+    let reasoning = super::prepare::estimate_message_reasoning_tokens(message);
     let content = match message.get("content") {
         Some(Value::String(text)) => estimate_tokens(text),
         Some(other) => estimate_value_tokens(other),
@@ -845,12 +841,27 @@ fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> usize {
     messages
         .iter()
         .map(|message| {
+            let native_reasoning: usize = message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::ReasoningItem { item, .. } => {
+                        Some(super::prepare::estimate_reasoning_item_tokens(item))
+                    }
+                    _ => None,
+                })
+                .sum();
             let parts: usize = message
                 .content
                 .iter()
                 .map(|part| match part {
-                    MessagePart::Text { text } | MessagePart::Reasoning { text } => {
-                        estimate_tokens(text)
+                    MessagePart::Text { text } => estimate_tokens(text),
+                    MessagePart::Reasoning { text } => {
+                        if native_reasoning == 0 {
+                            estimate_tokens(text)
+                        } else {
+                            0
+                        }
                     }
                     MessagePart::ToolCall {
                         name,
@@ -867,7 +878,7 @@ fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> usize {
                     | MessagePart::ReasoningItem { .. } => 0,
                 })
                 .sum();
-            parts + 4
+            parts + native_reasoning + 4
         })
         .sum()
 }
@@ -1204,7 +1215,7 @@ pub(crate) fn decay_warning_for(compression_count: usize) -> Option<String> {
     }
 }
 
-async fn summarize_history(
+pub(crate) async fn summarize_history(
     state: &crate::state::AppState,
     provider: &crate::settings::ModelProvider,
     model: &str,
@@ -1326,7 +1337,7 @@ async fn summarize_history(
 }
 
 /// `summarize_history` 的三态返回：成功（压缩后视图 + 摘要正文）/ 取消 / 失败。
-enum CompactOutcome {
+pub(crate) enum CompactOutcome {
     Compacted(Vec<Value>, String),
     Cancelled,
     Failed,
@@ -1379,6 +1390,8 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     // 图片，任何情况下都是纯浪费，而 token 估算看不见它们（详见 `prune_image_parts`）。
     let saved_bytes = prune_image_parts(&mut state.runtime_messages, IMAGE_BYTES_BUDGET);
     if saved_bytes > 0 {
+        state.last_step_usage = None;
+        state.initial_anchor_valid = false;
         eprintln!("Chat context: pruned {saved_bytes} bytes of image data from the send view");
     }
     // 统一基准：裸窗口 × AUTO_COMPACT_RATIO（0.90），对齐 Codex。去掉 safe_window 折扣——
@@ -1389,7 +1402,7 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     }
     // 真实用量锚点口径（对齐 pi/opencode 的 ground-truth 优先）：有锚点时用 provider 实报的
     // 上次 prompt token 数 + 锚点响应起往后新增消息的字符估算；无锚点回落纯字符估算。
-    // 取 `max(纯估算)` 作保守下限，绝不因锚点偏小比现状更乐观。
+    // 纯估算仅用于没有有效实报的情况，不能覆盖已上报的用量。
     let budget = (window as f32 * AUTO_COMPACT_RATIO) as usize;
     // 纯字符估算 = 消息 + **工具 schema**（对齐 pi/footer 的兜底口径：pi 兜底含 system+每工具+消息；
     // Kivio footer 也含 `estimate_tool_segments`）。工具定义随每次请求发送、provider 会计入，漏算会
@@ -1437,7 +1450,7 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     } else {
         (None, 0)
     };
-    let (estimated, _anchored) =
+    let (estimated, anchored) =
         super::context_estimate::effective_context_tokens(anchor_prompt, trailing, estimate_full);
     // **内置路径的实时用量通道**：本函数每个 planning 轮都跑一次，且这两个数就是权威口径
     // （`compute_context_state` 用的是同一对函数 `anchor_total_tokens` +
@@ -1448,6 +1461,7 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     env.host.emit_context_usage_live(
         &config.conversation_id,
         estimated as u64,
+        super::context_estimate::token_count_source(anchored, trailing),
         Some(window as u64),
     );
     if estimated <= budget {
@@ -1494,24 +1508,26 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
         .host
         .wait_for_generation_inactive(&config.conversation_id, config.generation);
     let runtime_before_compact = state.runtime_messages.clone();
-    let compacted = summarize_history(
-        config.state,
-        &config.provider,
-        &config.model,
-        &state.runtime_messages,
-        keep_tokens,
-        window,
-        // 用模型真实 max output（而非 run 的 config.max_output_tokens），与持久化路径
-        // compact_conversation 口径统一——否则 run 配的小输出会把摘要卡短、9 段产出被截。
-        chat_max_output_tokens_for_model(Some(&config.provider), &config.model)
+    let compacted = config
+        .provider_runtime
+        .summarize(super::provider_runtime::SummaryRequest {
+            provider: &config.provider,
+            model: &config.model,
+            messages: &state.runtime_messages,
+            keep_tokens,
+            window,
+            // Keep the model's real output budget, not the run's shorter answer budget.
+            max_output_tokens: chat_max_output_tokens_for_model(
+                Some(&config.provider),
+                &config.model,
+            )
             .unwrap_or(SUMMARY_OUTPUT_TOKENS),
-        config.retry_attempts,
-        &config.conversation_id,
-        &config.message_id,
-        None,
-        Some(cancel),
-    )
-    .await;
+            retry_attempts: config.retry_attempts,
+            conversation_id: &config.conversation_id,
+            message_id: &config.message_id,
+            cancel: Some(cancel),
+        })
+        .await;
 
     match compacted {
         CompactOutcome::Compacted(compacted, summary_text) => {

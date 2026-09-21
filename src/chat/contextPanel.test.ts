@@ -9,7 +9,7 @@ import {
   contextSegmentGroupId,
   fullnessLabel,
 } from './contextPanel'
-import { i18n } from '../settings/i18n'
+import { i18n } from '../components/i18n'
 import type { ConversationContextState } from './types'
 
 describe('contextSegmentGroupId', () => {
@@ -167,12 +167,20 @@ describe('applyLiveContextUsage', () => {
     expect(noWindow?.usage_ratio).toBeNull()
   })
 
-  // 口径的单一真源在 Rust 侧：状态阈值与来源标签不在前端重算，轮末的权威快照负责刷新它们。
-  it('does not invent a status or a token source of its own', () => {
+  it('clears a stale reported label when live usage has no reported source', () => {
     const next = applyLiveContextUsage(base, { usedTokens: 990_000 })
     expect(next?.status).toBe('normal')
-    expect(next?.token_count_source).toBe('cli_reported')
+    expect(next?.token_count_source).toBeUndefined()
+    expect(next?.tokenCountSource).toBeUndefined()
     expect(next?.compression_count).toBe(2)
+  })
+
+  it('uses the live source instead of inheriting the previous count source', () => {
+    const mixed = applyLiveContextUsage(base, { usedTokens: 269_350, tokenCountSource: 'provider_reported_with_estimate' })
+    expect(mixed?.token_count_source).toBe('provider_reported_with_estimate')
+    const reported = applyLiveContextUsage(mixed, { usedTokens: 269_150, tokenCountSource: 'provider_reported' })
+    expect(reported?.token_count_source).toBe('provider_reported')
+    expect(reported?.estimated_input_tokens).toBe(269_150)
   })
 
   // 分段按比例缩放：明细只有轮末算得准，但留在旧总量上会让进度条里出现一条对不上的缝。

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" color="#171918">
+  <title>Kivio Orbit Window</title>
+  <path d="M50 16A34 34 0 1 0 84 50" stroke="currentColor" stroke-width="8" stroke-linecap="round"/>
+  <rect x="35" y="35" width="30" height="30" rx="11" stroke="currentColor" stroke-width="8"/>
+  <circle cx="82" cy="27" r="7" fill="currentColor"/>
+</svg>

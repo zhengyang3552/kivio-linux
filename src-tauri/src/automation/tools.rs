@@ -5,19 +5,18 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::mcp::types::McpToolCallResult;
 use crate::native_tools::TOOL_OUTPUT_MAX_BYTES;
-use crate::state::AppState;
 
-use super::commands;
+use super::application;
 use super::history;
-use super::hotkeys::fingerprint as hotkey_fingerprint;
+use super::mutations;
 use super::runner;
 use super::storage;
 use super::types::{
-    Automation, AutomationRun, NodeOutput, RunOrigin, SCHEMA_VERSION, ValidationIssue,
+    Automation, AutomationRun, NodeOutput, RunOrigin, ValidationIssue, SCHEMA_VERSION,
 };
 use super::validate;
 
@@ -71,23 +70,12 @@ pub(crate) fn upsert(app: &AppHandle, arguments: &Value) -> Result<McpToolCallRe
             "issues": issues,
         }));
     }
-    let previous = if automation.id.trim().is_empty() {
-        None
-    } else {
-        storage::get(app, &automation.id).ok()
-    };
-    let saved = storage::save(app, automation)?;
-    let hotkey_changed = previous
-        .as_ref()
-        .map(|old| hotkey_fingerprint(old) != hotkey_fingerprint(&saved))
-        .unwrap_or(saved.enabled);
-    if hotkey_changed {
-        commands::refresh_hotkeys(app);
-    }
+    let created = automation.id.trim().is_empty() || storage::get(app, &automation.id).is_err();
+    let saved = mutations::save(app, automation)?;
     ok_json(json!({
         "automation": saved,
         "issues": issues,
-        "created": previous.is_none(),
+        "created": created,
     }))
 }
 
@@ -97,16 +85,13 @@ pub(crate) fn set_enabled(app: &AppHandle, arguments: &Value) -> Result<McpToolC
         .get("enabled")
         .and_then(Value::as_bool)
         .ok_or_else(|| "enabled must be a boolean".to_string())?;
-    let saved = storage::set_enabled(app, &id, enabled)?;
-    commands::refresh_hotkeys(app);
+    let saved = mutations::set_enabled(app, &id, enabled)?;
     ok_json(json!({ "automation": saved.meta() }))
 }
 
 pub(crate) fn delete(app: &AppHandle, arguments: &Value) -> Result<McpToolCallResult, String> {
     let id = required_id(arguments)?;
-    runner::cancel(app, &id)?;
-    storage::delete(app, &id)?;
-    commands::refresh_hotkeys(app);
+    mutations::delete(app, &id)?;
     ok_json(json!({ "deleted": id }))
 }
 
@@ -134,13 +119,7 @@ pub(crate) async fn run(
     let automation = storage::get(app, &id)?;
     let input = parse_run_input(arguments.get("input"));
     let timeout = Duration::from_secs(parse_timeout_secs(arguments));
-    let started = runner::enqueue(
-        app.clone(),
-        id.clone(),
-        RunOrigin::Agent,
-        None,
-        input,
-    )?;
+    let started = runner::enqueue(app.clone(), id.clone(), RunOrigin::Agent, None, input)?;
     let run_id = started.run_id;
     let mut guard = CancelOnDrop {
         app: app.clone(),
@@ -149,25 +128,20 @@ pub(crate) async fn run(
     };
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some((conversation_id, generation)) = chat_generation {
-            if !app
-                .state::<AppState>()
-                .is_chat_generation_active(conversation_id, generation)
-            {
-                let _ = runner::cancel(app, &id);
-                guard.disarm();
-                return Ok(error_json(
-                    "cancelled",
-                    json!({
-                        "type": "automation_run",
-                        "automationId": id,
-                        "runId": run_id,
-                        "name": automation.name,
-                        "status": "cancelled",
-                    }),
-                    "Automation run was cancelled.",
-                ));
-            }
+        if !application::chat_owner_active(app, chat_generation) {
+            let _ = runner::cancel(app, &id);
+            guard.disarm();
+            return Ok(error_json(
+                "cancelled",
+                json!({
+                    "type": "automation_run",
+                    "automationId": id,
+                    "runId": run_id,
+                    "name": automation.name,
+                    "status": "cancelled",
+                }),
+                "Automation run was cancelled.",
+            ));
         }
         if Instant::now() >= deadline {
             guard.disarm();
@@ -179,7 +153,7 @@ pub(crate) async fn run(
                 "message": "Automation is still running. Use automation_runs with this run_id to inspect progress.",
             }));
         }
-        if !is_run_active(app, &id, &run_id) {
+        if !application::automation_run_active(app, &id, &run_id) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(POLL_MS)).await;
@@ -187,16 +161,6 @@ pub(crate) async fn run(
     guard.disarm();
     let record = history::get(app, &id, &run_id)?;
     Ok(run_tool_result(&automation.name, &record))
-}
-
-fn is_run_active(app: &AppHandle, automation_id: &str, run_id: &str) -> bool {
-    app.state::<AppState>()
-        .automation_active_runs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(automation_id)
-        .map(|active| active == run_id)
-        .unwrap_or(false)
 }
 
 struct CancelOnDrop {
@@ -224,8 +188,8 @@ fn parse_upsert_automation(arguments: &Value) -> Result<Automation, String> {
         .get("automation")
         .cloned()
         .ok_or_else(|| "automation object is required".to_string())?;
-    let mut automation: Automation = serde_json::from_value(value)
-        .map_err(|err| format!("invalid automation graph: {err}"))?;
+    let mut automation: Automation =
+        serde_json::from_value(value).map_err(|err| format!("invalid automation graph: {err}"))?;
     automation.schema_version = SCHEMA_VERSION;
     Ok(automation)
 }
@@ -309,10 +273,7 @@ fn clip_run(run: &AutomationRun) -> Value {
 }
 
 fn last_output(run: &AutomationRun) -> Option<String> {
-    run.nodes
-        .iter()
-        .rev()
-        .find_map(|node| node.output.clone())
+    run.nodes.iter().rev().find_map(|node| node.output.clone())
 }
 
 fn run_tool_result(name: &str, run: &AutomationRun) -> McpToolCallResult {
@@ -352,7 +313,10 @@ fn run_tool_result(name: &str, run: &AutomationRun) -> McpToolCallResult {
     }
 }
 
-fn validation_error(issues: &[ValidationIssue], automation: Option<&Automation>) -> McpToolCallResult {
+fn validation_error(
+    issues: &[ValidationIssue],
+    automation: Option<&Automation>,
+) -> McpToolCallResult {
     let schema_hint = super::types::upsert_schema_hint();
     let body = json!({
         "ok": false,
@@ -418,7 +382,7 @@ fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation::types::{Automation, FlowNode, SCHEMA_VERSION, Vec2, Viewport};
+    use crate::automation::types::{Automation, FlowNode, Vec2, Viewport, SCHEMA_VERSION};
     use crate::automation::validate::{has_errors, prepare_for_upsert, validate};
 
     #[test]
@@ -491,7 +455,11 @@ mod tests {
         let mut automation: Automation =
             serde_json::from_str(crate::automation::types::UPSERT_MINIMAL_EXAMPLE).unwrap();
         prepare_for_upsert(&mut automation);
-        assert!(!has_errors(&validate(&automation)), "{:?}", validate(&automation));
+        assert!(
+            !has_errors(&validate(&automation)),
+            "{:?}",
+            validate(&automation)
+        );
     }
 
     #[test]
@@ -514,11 +482,7 @@ mod tests {
         });
         let result = validation_error(&issues, None);
         assert!(result.is_error);
-        assert!(
-            result.content.contains("schemaHint"),
-            "{}",
-            result.content
-        );
+        assert!(result.content.contains("schemaHint"), "{}", result.content);
         assert!(
             result.content.contains("trigger.schedule"),
             "{}",

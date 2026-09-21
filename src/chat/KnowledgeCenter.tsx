@@ -25,13 +25,13 @@ import {
   type ModelProvider,
   type Settings,
 } from '../api/tauri'
-import { getSettingsCached, refreshSettings, saveSettingsCached } from '../api/settingsCache'
+import { getSettingsCached, updateSettingsCached } from '../api/settingsCache'
 import { Button, IconButton } from '../components/Button'
-import { Input, Select } from '../settings/components'
-import { KnowledgeIcon } from '../settings/NavIcons'
+import { Input, Select } from '../settings/public/controls'
+import { KnowledgeIcon } from '../settings/public/icons'
 import { resolveModelInfo } from '../data/modelMatching'
-import { KnowledgeRagPanel } from '../settings/KnowledgeRagPanel'
-import { useLang, useT } from '../settings/i18n'
+import { KnowledgeRagPanel } from '../settings/public/knowledge'
+import { useLang, useT } from '../components/i18n'
 import { RetrievalTestPanel } from './RetrievalTestPanel'
 import {
   kbCreateLibrary,
@@ -282,8 +282,7 @@ export function KnowledgeCenter() {
     setSettings((prev) => (prev ? { ...prev, ...patch } : prev))
     void (async () => {
       try {
-        const fresh = await refreshSettings()
-        const saved = await saveSettingsCached({ ...fresh, ...patch })
+        const saved = await updateSettingsCached((fresh) => ({ ...fresh, ...patch }))
         setSettings(saved)
       } catch (e) {
         setError(String(e))
@@ -295,13 +294,13 @@ export function KnowledgeCenter() {
   const toggleRag = useCallback((v: boolean) => {
     void (async () => {
       try {
-        const fresh = await refreshSettings()
-        const chatTools = fresh.chatTools
-        if (!chatTools) return
-        const saved = await saveSettingsCached({
+        const saved = await updateSettingsCached((fresh) => ({
           ...fresh,
-          chatTools: { ...chatTools, nativeTools: { ...chatTools.nativeTools, knowledgeSearch: v } },
-        })
+          chatTools: {
+            ...fresh.chatTools,
+            nativeTools: { ...fresh.chatTools.nativeTools, knowledgeSearch: v },
+          },
+        }))
         setSettings(saved)
       } catch (e) {
         setError(String(e))

@@ -74,6 +74,7 @@ impl OpenAiChatProvider<'_> {
             // key 被拒：key 与 24h 一并消失（24h 只跟 key 一起发）。
             if body.get("prompt_cache_key").is_some() && error_rejects_prompt_cache_key(err) {
                 self.state
+                    .provider_runtime()
                     .mark_prompt_cache_key_unsupported(&self.provider.base_url);
                 learned = true;
             } else if body.get("prompt_cache_retention").is_some()
@@ -81,6 +82,7 @@ impl OpenAiChatProvider<'_> {
             {
                 // 只拒 24h：保留 key，停发 retention。
                 self.state
+                    .provider_runtime()
                     .mark_prompt_cache_retention_unsupported(&self.provider.base_url);
                 learned = true;
             }
@@ -103,13 +105,18 @@ impl OpenAiChatProvider<'_> {
     ) -> Result<reqwest::Response, String> {
         let anonymous = self.provider.is_opencode_free();
         if crate::chat::video::has_video(request) {
-            crate::chat::video::validate_request(self.provider, request).map_err(|e| e.to_string())?;
+            crate::chat::video::validate_request(self.provider, request)
+                .map_err(|e| e.to_string())?;
             crate::chat::video::validate_body(body).map_err(|e| e.to_string())?;
         }
         if anonymous && !crate::opencode_free::is_free_model(&request.model) {
             return Err("OpenCode Free only supports free models; refresh the model list".into());
         }
-        let keys = if anonymous { vec![String::new()] } else { self.provider.api_keys.clone() };
+        let keys = if anonymous {
+            vec![String::new()]
+        } else {
+            self.provider.api_keys.clone()
+        };
         send_with_failover(
             self.state,
             label,
@@ -117,7 +124,10 @@ impl OpenAiChatProvider<'_> {
             &self.provider.id,
             &keys,
             |key| {
-                let req = self.state.client_for(self.provider).post(self.chat_completions_url());
+                let req = self
+                    .state
+                    .client_for(self.provider)
+                    .post(self.chat_completions_url());
                 let req = if anonymous { req } else { req.bearer_auth(key) };
                 let req = crate::api::attach_json_body(
                     self.with_session_headers(
@@ -560,6 +570,7 @@ impl OpenAiChatProvider<'_> {
         if self.provider.prompt_caching_enabled()
             && !self
                 .state
+                .provider_runtime()
                 .prompt_cache_key_unsupported(&self.provider.base_url)
         {
             if let Some(conversation_id) = request
@@ -574,6 +585,7 @@ impl OpenAiChatProvider<'_> {
                     crate::settings::CacheRetention::Long
                 ) && !self
                     .state
+                    .provider_runtime()
                     .prompt_cache_retention_unsupported(&self.provider.base_url)
                 {
                     body["prompt_cache_retention"] = Value::String("24h".to_string());
@@ -1721,7 +1733,9 @@ mod tests {
             "conv_abc"
         );
         // 学习该端点拒绝后：就地跳过。
-        state.mark_prompt_cache_key_unsupported("https://integrate.api.nvidia.com/v1");
+        state
+            .provider_runtime()
+            .mark_prompt_cache_key_unsupported("https://integrate.api.nvidia.com/v1");
         assert!(make("https://integrate.api.nvidia.com/v1")
             .get("prompt_cache_key")
             .is_none());
@@ -1788,7 +1802,9 @@ mod tests {
         assert_eq!(relay["prompt_cache_key"], "conv_abc");
         assert_eq!(relay["prompt_cache_retention"], "24h");
         // 学习停发 24h 后仍保留 key。
-        state.mark_prompt_cache_retention_unsupported("https://api.deepseek.com/v1");
+        state
+            .provider_runtime()
+            .mark_prompt_cache_retention_unsupported("https://api.deepseek.com/v1");
         let after = body_with("https://api.deepseek.com/v1", "long");
         assert_eq!(after["prompt_cache_key"], "conv_abc");
         assert!(after.get("prompt_cache_retention").is_none());

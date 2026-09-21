@@ -1,6 +1,6 @@
 # Kivio 自配置技能与操作工具
 
-用户可以直接说“把这个 skill 给你装上”“这个插件为什么不生效”“帮我接这个 MCP”。模型先按资源类型加载对应指南，再用原生工具检查和操作，最后区分安装、发现、启用、实际调用的结果。
+用户可以直接说“把这个 skill 给你装上”“这个插件为什么不生效”“帮我接这个 MCP”。模型加载统一配置指南，按资源类型读取相关参考文件，再用原生工具检查和操作，最后区分安装、发现、启用、实际调用的结果。
 
 本次调查基于 2026-09-06 的 Kivio 2.9.6 工作树，初始 HEAD `226368e23b048af648a93adaba198530dfb34e50`。ZCode 截图仅作为能力分类参考，未复制其规则。调查以本地实现为依据，没有把第三方安装说明视为用户指令，也没有安装第三方插件来做调研。
 
@@ -8,7 +8,7 @@
 
 | 查明的事实 | 实现依据（仓库相对路径） | 对技能设计的影响 |
 | --- | --- | --- |
-| 内置 skills 由 Tauri resources 分发并自动扫描 | `src-tauri/tauri.conf.json`；`src-tauri/src/skills/discover.rs` | 直接增加七个内置目录，无额外安装器或个人目录硬编码 |
+| 内置 skills 由 Tauri resources 分发并自动扫描 | `src-tauri/tauri.conf.json`；`src-tauri/src/skills/discover.rs` | 一个内置入口及随包参考文件，无额外安装器或个人目录硬编码 |
 | 普通 skill 内置优先、项目其次，同 ID 第一份生效 | `skills/discover.rs::{scan_root_entries,dedup_records}` | 不能建议通过同名个人副本覆盖内置技能 |
 | frontmatter 是轻量解析，不是完整 YAML 语义 | `skills/parse.rs` | 单行 description；不把 allowed-tools 当权限配置 |
 | 模型原来只拿到 skill 加载器，没有通用配置操作工具 | `mcp/{types,native_registry}.rs` | 增加 kivio_inspect / kivio_configure，避免教模型调用不存在的 CLI 或把 Tauri IPC 当模型工具 |
@@ -18,17 +18,16 @@
 | 内置 Chat 不加载 skill；外部 CLI 有独立配置与原生会话 | `chat/agent/prepare.rs`；`chat/commands/tooling.rs`；`external_agents/` | 自配置目标必须先分清宿主，导入会话仍绑定原 CLI |
 | 工具和技能注册信息每轮冻结；前端设置有缓存 | `skills/runtime.rs`；`chat/agent/`；`src/api/settingsCache.ts` | 返回下一轮刷新提示；操作成功通过无敏感载荷的事件刷新设置缓存 |
 
-## 七个内置技能
+## 统一内置入口
 
-位于 `src-tauri/resources/skills/`，每个入口含独立触发描述；只在相关任务中加载正文。可直接从技能页查看，或自然语言自动匹配：
+[kivio-configuration-guide](../../src-tauri/resources/skills/kivio-configuration-guide/SKILL.md) 是唯一的配置与诊断 Skill，保留原 ID 和自动匹配。入口集中说明宿主识别、操作与验收；模型按任务读取同目录下的参考文件：
 
-- [kivio-configuration-guide](../../src-tauri/resources/skills/kivio-configuration-guide/SKILL.md)：身份、配置地图、操作路由和工具契约。
-- [kivio-diagnosing-skills](../../src-tauri/resources/skills/kivio-diagnosing-skills/SKILL.md)：技能安装、备份更新、优先级、发现和激活。
-- [kivio-diagnosing-plugins](../../src-tauri/resources/skills/kivio-diagnosing-plugins/SKILL.md)：通用包、预设 CLI、连接器分类及兼容诊断。
-- [kivio-diagnosing-mcp](../../src-tauri/resources/skills/kivio-diagnosing-mcp/SKILL.md)：独立 MCP 配置、连接测试、所有权和过滤排查。
-- [kivio-diagnosing-hooks](../../src-tauri/resources/skills/kivio-diagnosing-hooks/SKILL.md)：两套 Hook 与同步输入输出协议。
-- [kivio-diagnosing-commands](../../src-tauri/resources/skills/kivio-diagnosing-commands/SKILL.md)：skill triggers、参数替换和插件命名空间。
-- [kivio-diagnosing-runtime](../../src-tauri/resources/skills/kivio-diagnosing-runtime/SKILL.md)：内置/外部运行时、CLI 检测、模型和会话绑定。
+- `references/configuration-map.md`：配置路径、供应商、模型与提示词。
+- `references/skills.md`、`plugins.md`、`mcp.md`：扩展安装、启停和排查。
+- `references/hooks.md`、`commands.md`、`runtime.md`：事件、斜杠命令和运行时诊断。
+- `references/tools.md`：操作工具契约；发现规则、包格式和 Hook 协议由各专题继续链接。
+
+原六个诊断 Skill 已合并为普通参考文件，不再单独进入技能列表。已有助手若只白名单引用了旧诊断 ID，需要改选统一入口；旧诊断斜杠名称不再提供。所有参考随同一个技能目录分发，也适用于外部 CLI 的技能暂存。
 
 Kivio 不读取 `agents/openai.yaml` 的调用策略，因此这套资源采用 Kivio 已支持的简单 frontmatter，没有额外生成不会生效的元数据。
 
@@ -48,7 +47,7 @@ Kivio 不读取 `agents/openai.yaml` 的调用策略，因此这套资源采用 
 
 Windows Rust 测试使用 `scripts/win-cargo-test.ps1 --lib self_config`、`--lib mcp::native_registry`、`--lib skills::`；前端使用 `npm test` / `npx tsc --noEmit`。这不等于已对真实服务、实际模型选择及所有平台进行端到端验收。
 
-本次执行结果：七个技能通过 skill-creator 校验及 Kivio 解析器测试；13 份指南文件的相对链接检查通过；上述 Rust 分组共 64 项通过；前端 177 个测试文件、1,376 项通过；TypeScript、协议生成物检查和生产 UI 构建通过。本次变更的前端文件单独 lint 通过；全仓 lint 因已有 `output/playwright/plugin-tabs.tsx:33` 的 `react-refresh/only-export-components` warning 未通过，未修改该无关临时文件。未启动新构建的桌面应用或连接真实第三方服务进行验收。
+初次实现（2026-09-06、合并前）的验证记录：七个技能通过 skill-creator 校验及 Kivio 解析器测试；13 份指南文件的相对链接检查通过；Rust 分组共 64 项通过；前端 1,376 项通过，TypeScript、协议生成物和生产 UI 构建检查通过。该历史记录不代表后续改动的验证结果。
 
 手动验收建议在测试账户/测试项目完成：
 

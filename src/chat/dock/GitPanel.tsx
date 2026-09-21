@@ -1,13 +1,11 @@
-// Git 面板：Changes（分组列表 + 提交框）/ History（虚拟化提交列表 + 内联 diff）两视图。
+// Git 面板：Changes（分组列表 + 提交框）/ History（提交线图 + 文件统计）两视图。
 import { useEffect, useMemo, useState } from 'react'
-import { VList } from 'virtua'
 import {
   Check,
   ChevronDown,
   ChevronRight,
   FolderSearch,
   GitBranch,
-  GitCommitHorizontal,
   Loader2,
   Minus,
   Plus,
@@ -15,15 +13,16 @@ import {
   Undo2,
   X,
 } from 'lucide-react'
-import { i18n, type Lang } from '../../settings/i18n'
+import { i18n, type Lang } from '../../components/i18n'
 import { IconButton } from '../../components/Button'
 import { dockApi } from './api'
 import { ConfirmDialog } from './ConfirmDialog'
 import { DiffView } from './DiffView'
+import { GitHistory } from './GitHistory'
 import { DockContextMenu, type DockMenuAnchor, type DockMenuItem } from './DockContextMenu'
-import { partitionStatusEntries, relativeTime, statusLetter, type StatusLetter } from './gitReviewModel'
+import { partitionStatusEntries, statusLetter, type StatusLetter } from './gitReviewModel'
 import { useGitReview } from './useGitReview'
-import type { GitBranchItem, GitStatusEntry } from './types'
+import type { GitBranchItem, GitStatusEntry } from '../../api/dockContracts'
 
 const STATUS_BADGE_CLASS: Record<StatusLetter, string> = {
   M: 'bg-amber-500/15 text-amber-700 dark:text-amber-300',
@@ -66,7 +65,7 @@ export function GitPanel({ workdir, active, lang, onRevealInTree }: GitPanelProp
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [menu, setMenu] = useState<{ anchor: DockMenuAnchor; entry: GitStatusEntry } | null>(null)
   const [discardTarget, setDiscardTarget] = useState<GitStatusEntry | null>(null)
-  const [expandedSha, setExpandedSha] = useState<string | null>(null)
+  const [historyRefresh, setHistoryRefresh] = useState(0)
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({})
 
   // 分支下拉
@@ -96,18 +95,9 @@ export function GitPanel({ workdir, active, lang, onRevealInTree }: GitPanelProp
     setCommitMessage('')
     setBranches(null)
     setBranchOpen(false)
-    setExpandedSha(null)
     setMenu(null)
     setDiscardTarget(null)
   }, [workdir])
-
-  // History 视图首次打开时加载第一页。
-  useEffect(() => {
-    if (view === 'history' && review.commits.length === 0 && !review.historyLoading && active) {
-      void review.loadHistory(false)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, active])
 
   const partitioned = useMemo(
     () => partitionStatusEntries(status?.entries ?? []),
@@ -140,12 +130,6 @@ export function GitPanel({ workdir, active, lang, onRevealInTree }: GitPanelProp
     const next = selectedPath === entry.path ? null : entry.path
     setSelectedPath(next)
     void review.selectFileDiff(next)
-  }
-
-  const handleToggleCommit = (sha: string) => {
-    const next = expandedSha === sha ? null : sha
-    setExpandedSha(next)
-    if (next && !review.commitDiffs[next]) void review.loadCommitDiff(next)
   }
 
   const menuItems = (entry: GitStatusEntry): DockMenuItem[] => {
@@ -369,7 +353,7 @@ export function GitPanel({ workdir, active, lang, onRevealInTree }: GitPanelProp
             </button>
           ))}
         </div>
-        <IconButton label={t.dockRefresh} size="sm" variant="ghost" onClick={() => void review.refresh()}>
+        <IconButton label={t.dockRefresh} size="sm" variant="ghost" onClick={() => { void review.refresh({ force: true }); setHistoryRefresh((value) => value + 1) }}>
           <RefreshCw size={13} className={review.statusLoading ? 'animate-spin' : ''} />
         </IconButton>
 
@@ -552,82 +536,7 @@ export function GitPanel({ workdir, active, lang, onRevealInTree }: GitPanelProp
           </div>
         </>
       ) : (
-        <div className="min-h-0 flex-1">
-          {review.commits.length === 0 && !review.historyLoading ? (
-            <div className="px-3 py-8 text-center text-[12px] text-neutral-400 dark:text-neutral-500">
-              {t.dockGitHistoryEmpty}
-            </div>
-          ) : (
-            <VList className="custom-scrollbar h-full">
-              {review.commits.map((commit) => {
-                const expanded = expandedSha === commit.sha
-                const diffSlot = review.commitDiffs[commit.sha]
-                return (
-                  <div key={commit.sha} className="border-b border-neutral-200/50 dark:border-neutral-700/30">
-                    <button
-                      type="button"
-                      className="flex w-full items-start gap-2 px-2 py-1.5 text-left transition-colors hover:bg-neutral-500/5 dark:hover:bg-neutral-400/5"
-                      onClick={() => handleToggleCommit(commit.sha)}
-                    >
-                      <GitCommitHorizontal size={13} strokeWidth={1.75} className="mt-0.5 shrink-0 text-neutral-400" />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[12px] text-neutral-700 dark:text-neutral-200">
-                          {commit.subject}
-                        </span>
-                        <span className="mt-0.5 flex items-center gap-1.5 text-[10px] text-neutral-400 dark:text-neutral-500">
-                          <span className="font-mono">{commit.shortSha}</span>
-                          <span className="truncate">{commit.authorName}</span>
-                          <span className="shrink-0">{relativeTime(commit.authorDate, lang)}</span>
-                        </span>
-                      </span>
-                      {expanded ? (
-                        <ChevronDown size={12} strokeWidth={2} className="mt-1 shrink-0 text-neutral-400" />
-                      ) : (
-                        <ChevronRight size={12} strokeWidth={2} className="mt-1 shrink-0 text-neutral-400" />
-                      )}
-                    </button>
-                    {expanded && (
-                      <div className="px-2 pb-2">
-                        {!diffSlot || diffSlot === 'loading' ? (
-                          <div className="flex items-center justify-center gap-2 py-3 text-[11px] text-neutral-400">
-                            <Loader2 size={12} className="animate-spin" />
-                            {t.dockLoading}
-                          </div>
-                        ) : diffSlot === 'error' ? (
-                          <button
-                            type="button"
-                            className="w-full py-2 text-center text-[11px] text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
-                            onClick={() => void review.loadCommitDiff(commit.sha)}
-                          >
-                            {t.dockRetry}
-                          </button>
-                        ) : (
-                          <DiffView
-                            patch={diffSlot.patch}
-                            truncated={diffSlot.truncated}
-                            lang={lang}
-                            emptyText={t.dockDiffEmpty}
-                          />
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-              {(review.historyHasMore || review.historyLoading) && (
-                <button
-                  type="button"
-                  className="flex w-full items-center justify-center gap-1.5 py-2 text-[11px] text-neutral-400 transition-colors hover:text-neutral-600 disabled:opacity-50 dark:hover:text-neutral-300"
-                  disabled={review.historyLoading}
-                  onClick={() => void review.loadHistory(true)}
-                >
-                  {review.historyLoading && <Loader2 size={11} className="animate-spin" />}
-                  {t.dockGitLoadMore}
-                </button>
-              )}
-            </VList>
-          )}
-        </div>
+        <GitHistory workdir={workdir} lang={lang} active={active} refreshKey={historyRefresh} />
       )}
 
       {menu && (

@@ -24,7 +24,7 @@ import {
   type GitMutationResult,
   type GitRepoState,
   type GitSnapshot,
-} from './types'
+} from '../../api/dockContracts'
 
 const MOCK_NOT_REPO: GitRepoState = {
   repoRoot: '',
@@ -177,9 +177,9 @@ export const dockApi = {
     return normalizeGitDiffResult(raw)
   },
 
-  async gitLog(workdir: string, limit = 50, skip = 0): Promise<GitLogResult> {
+  async gitLog(workdir: string, limit = 50, skip = 0, allBranches = true): Promise<GitLogResult> {
     if (!isTauriRuntime()) return { commits: [], hasMore: false }
-    const raw = await invoke('dock_git_log', { workdir, limit, skip })
+    const raw = await invoke('dock_git_log', { workdir, limit, skip, allBranches })
     return normalizeGitLogResult(raw)
   },
 

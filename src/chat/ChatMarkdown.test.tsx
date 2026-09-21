@@ -1,4 +1,4 @@
-import { render, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { ChatMarkdown } from './ChatMarkdown'
 import { clearSettledMarkdownCache, settledMarkdownCacheSize } from './settledMarkdownCache'
@@ -33,6 +33,40 @@ describe('ChatMarkdown 公式稳定性', () => {
 })
 
 describe('ChatMarkdown artifact 图片', () => {
+  it('places files and images by exact ID and resolves artifacts arriving after the text', () => {
+    const content = 'Before\n\n![Selected](artifact:art_second)\n\nBetween\n\n[Video](artifact:art_video)\n\nAfter'
+    const { container, rerender } = render(<ChatMarkdown content={content} artifacts={[]} />)
+    expect(screen.getAllByRole('status')).toHaveLength(2)
+    rerender(<ChatMarkdown content={content} artifacts={[
+      { id: 'art_first', name: 'same.png', mime_type: 'image/png', data_url: 'data:image/png;base64,AAAA' },
+      { id: 'art_second', name: 'same.png', mime_type: 'image/png', data_url: 'data:image/png;base64,BBBB' },
+      { id: 'art_video', name: 'demo.mp4', mime_type: 'video/mp4', path: '/work/demo.mp4' },
+    ]} />)
+    const image = container.querySelector('img')!
+    const video = screen.getByRole('button', { name: '打开文件 demo.mp4' })
+    expect(video.className).not.toContain('h-16')
+    expect(image).toHaveAttribute('src', 'data:image/png;base64,BBBB')
+    expect(image.compareDocumentPosition(screen.getByText('Between')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.getByText('Between').compareDocumentPosition(video) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(video.compareDocumentPosition(screen.getByText('After')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(container.querySelector('p div')).toBeNull()
+    fireEvent.click(video)
+  })
+
+  it('does not send malformed artifact references to local file handling', () => {
+    render(<ChatMarkdown content={'[Bad file](artifact:../../secrets)'} />)
+    expect(screen.getByRole('status')).toHaveTextContent('文件不可用')
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+  })
+
+  it('renders reference-style artifact links as file cards', () => {
+    render(<ChatMarkdown content={'[Report][result]\n\n[result]: artifact:art_report'} artifacts={[
+      { id: 'art_report', name: 'report.pdf', mime_type: 'application/pdf', path: '/work/report.pdf' },
+    ]} />)
+    expect(screen.getByRole('button', { name: '打开文件 report.pdf' })).toBeVisible()
+  })
+
   it('Streamdown 清洗前保留相对图片路径，并映射到 artifact data URL', () => {
     const { container } = render(
       <ChatMarkdown

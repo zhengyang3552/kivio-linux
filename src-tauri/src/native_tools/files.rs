@@ -103,7 +103,7 @@ pub fn read_file(
     let path = arguments
         .get("path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "read_file requires path".to_string())?;
+        .ok_or_else(|| "read requires path".to_string())?;
     let full = resolve_tool_read_path(workspace, path)?;
     if !full.is_file() {
         return Err(format!("不是可读取的文件: {path}"));
@@ -131,7 +131,8 @@ pub fn read_file(
 
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
-    let start = offset.saturating_sub(1).min(lines.len());
+    let start = offset.saturating_sub(1);
+    offset_in_bounds(offset, start, total_lines)?;
     let requested_end = limit
         .map(|lim| (start + lim).min(lines.len()))
         .unwrap_or(lines.len());
@@ -146,6 +147,7 @@ pub fn read_file(
         lines[start..end].join("\n")
     };
     let display_path = workspace_display_path(workspace, &full);
+    let next_offset = truncated.then(|| next_offset_after(start, end, kept, capped));
     Ok(ReadFileResult {
         resolved_path: full.display().to_string(),
         content: returned_content,
@@ -154,10 +156,21 @@ pub fn read_file(
         end_line: end,
         truncated,
         file_size: metadata.len(),
-        next_offset: truncated.then(|| next_offset_after(start, end, kept, capped)),
-        warnings: cap_warnings(capped, &display_path, start, end, kept),
+        next_offset,
+        warnings: continuation_notice(capped, &display_path, start, end, total_lines, next_offset),
         path: display_path,
     })
+}
+
+/// 对齐 pi：`offset` 落在文件末尾之后是调用错误，不是「读到 0 行」的空成功。
+/// 空文件读 `offset=1` 仍允许（没有行也能给出 0-0 of 0）。
+fn offset_in_bounds(offset: usize, start: usize, total_lines: usize) -> Result<(), String> {
+    if total_lines > 0 && start >= total_lines {
+        return Err(format!(
+            "Offset {offset} is beyond end of file ({total_lines} lines total)"
+        ));
+    }
+    Ok(())
 }
 
 /// 下一次续读的起始行。
@@ -210,36 +223,44 @@ fn truncate_head(lines: &[&str]) -> (usize, Option<TruncatedBy>) {
     (lines.len(), None)
 }
 
-/// 把触顶原因翻成模型能照做的一句话（对齐 pi 的 `[Showing lines … Use offset=N to
-/// continue.]`）。没触顶就没有 warning——文件本来就读完了，不该吓唬模型。
-fn cap_warnings(
+/// 给模型的续读通知，照抄 pi `read.ts` 的四种句式；由 `read_file_tool_result` 贴在正文
+/// **末尾**（不是头上），这样模型读完一页最后看到的就是下一步。读完了就没有通知。
+///
+/// - 行数顶到：`[Showing lines X-Y of Z. Use offset=N to continue.]`
+/// - 字节顶到：`[Showing lines X-Y of Z (50KB limit). Use offset=N to continue.]`
+/// - 自己给的 limit 停下、文件还有：`[R more lines in file. Use offset=N to continue.]`
+/// - 首行单行就超预算：指去 bash 单独取那一行；`next_offset` 已跳过它，避免原地打转。
+fn continuation_notice(
     capped: Option<TruncatedBy>,
     path: &str,
     start: usize,
     end: usize,
-    kept: usize,
+    total_lines: usize,
+    next_offset: Option<usize>,
 ) -> Vec<String> {
+    let Some(next) = next_offset else {
+        return Vec::new();
+    };
     let kb = TOOL_OUTPUT_MAX_BYTES / 1024;
+    let first = start + 1;
     match capped {
-        None => Vec::new(),
-        // 怪物长行的逃生口。`head -c` 取的是 run_command 的**内联**上限而不是 50KB：
-        // 超过那个数 run_command 会把输出转存成日志文件，模型还得回头 read 它，那一行
-        // 依旧超 50KB —— 兜了一圈回到原点。命令给的是示例（Windows 上未必有 sed），
-        // 路径是真路径，模型可以直接照抄。
-        Some(TruncatedBy::Bytes) if kept == 0 => vec![format!(
-            "第 {line} 行单行就超过 {kb}KB 的单次读取上限。用 run_command 单独取它，\
-             例如 `sed -n '{line}p' {path} | head -c {inline}`；或用 offset={next} 跳过这一行继续。",
-            line = start + 1,
-            next = start + 2,
+        // 怪物长行的逃生口。`head -c` 取的是 bash 的**内联**上限而不是 50KB：超过那个数
+        // bash 会把输出转存成日志文件，模型还得回头 read 它，那一行依旧超 50KB —— 兜了一圈
+        // 回到原点。命令是示例（Windows 上未必有 sed），路径是真路径，模型可以直接照抄。
+        Some(TruncatedBy::Bytes) if end == start => vec![format!(
+            "[Line {first} exceeds the {kb}KB limit. Use bash: sed -n '{first}p' {path} | head -c {inline}. \
+             Or use offset={next} to skip it.]",
             inline = super::shell::MAX_INLINE_COMMAND_OUTPUT_BYTES,
         )],
         Some(TruncatedBy::Bytes) => vec![format!(
-            "单次读取上限 {kb}KB 已触顶（不是文件结尾），用 offset={} 继续。",
-            end + 1
+            "[Showing lines {first}-{end} of {total_lines} ({kb}KB limit). Use offset={next} to continue.]"
         )],
         Some(TruncatedBy::Lines) => vec![format!(
-            "单次读取上限 {TOOL_OUTPUT_MAX_LINES} 行已触顶（不是文件结尾），用 offset={} 继续。",
-            end + 1
+            "[Showing lines {first}-{end} of {total_lines}. Use offset={next} to continue.]"
+        )],
+        None => vec![format!(
+            "[{remaining} more lines in file. Use offset={next} to continue.]",
+            remaining = total_lines.saturating_sub(end),
         )],
     }
 }
@@ -284,6 +305,7 @@ fn read_file_window_streaming(
         total_lines += 1;
     }
 
+    offset_in_bounds(offset, start, total_lines)?;
     let start = start.min(total_lines);
     let kept = window.len();
     let end = (start + kept).min(total_lines);
@@ -296,6 +318,7 @@ fn read_file_window_streaming(
         None
     };
     let display_path = workspace_display_path(workspace, full);
+    let next_offset = truncated.then(|| next_offset_after(start, end, kept, capped));
     Ok(ReadFileResult {
         resolved_path: full.display().to_string(),
         content: window.join("\n"),
@@ -304,8 +327,8 @@ fn read_file_window_streaming(
         end_line: end,
         truncated,
         file_size: metadata.len(),
-        next_offset: truncated.then(|| next_offset_after(start, end, kept, capped)),
-        warnings: cap_warnings(capped, &display_path, start, end, kept),
+        next_offset,
+        warnings: continuation_notice(capped, &display_path, start, end, total_lines, next_offset),
         path: display_path,
     })
 }
@@ -831,10 +854,6 @@ fn planned_file_result(
     })
 }
 
-/// LCS guard: above this many DP cells for the changed middle region, fall back
-/// to a coarse single-hunk diff (whole middle as remove+add).
-const DIFF_LCS_MAX_CELLS: usize = 250_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffOpKind {
     Equal,
@@ -970,70 +989,40 @@ fn build_diff_ops<'a>(
     }
     let middle_old = &old_lines[prefix..old_end];
     let middle_new = &new_lines[prefix..new_end];
-    if middle_old.len().saturating_mul(middle_new.len()) > DIFF_LCS_MAX_CELLS {
-        // Coarse fallback: whole middle as remove+add in a single block.
-        for line in middle_old {
-            ops.push(DiffOp {
-                kind: DiffOpKind::Remove,
-                text: line,
-            });
-        }
-        for line in middle_new {
-            ops.push(DiffOp {
-                kind: DiffOpKind::Add,
-                text: line,
-            });
-        }
+    // A disjoint rewrite has no common lines: emit its exact result directly.
+    // Otherwise Myers preserves unchanged islands without allocating an N*M table.
+    let old_set: HashSet<&str> = middle_old.iter().map(String::as_str).collect();
+    if !middle_new
+        .iter()
+        .any(|line| old_set.contains(line.as_str()))
+    {
+        ops.extend(middle_old.iter().map(|text| DiffOp {
+            kind: DiffOpKind::Remove,
+            text,
+        }));
+        ops.extend(middle_new.iter().map(|text| DiffOp {
+            kind: DiffOpKind::Add,
+            text,
+        }));
     } else {
-        let m = middle_old.len();
-        let n = middle_new.len();
-        let width = n + 1;
-        let mut dp = vec![0u32; (m + 1) * width];
-        for i in (0..m).rev() {
-            for j in (0..n).rev() {
-                dp[i * width + j] = if middle_old[i] == middle_new[j] {
-                    dp[(i + 1) * width + j + 1] + 1
-                } else {
-                    dp[(i + 1) * width + j].max(dp[i * width + j + 1])
-                };
-            }
-        }
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < m && j < n {
-            if middle_old[i] == middle_new[j] {
-                ops.push(DiffOp {
+        for change in
+            similar::capture_diff_slices(similar::Algorithm::Myers, middle_old, middle_new)
+        {
+            if change.tag() == similar::DiffTag::Equal {
+                ops.extend(middle_old[change.old_range()].iter().map(|text| DiffOp {
                     kind: DiffOpKind::Equal,
-                    text: &middle_old[i],
-                });
-                i += 1;
-                j += 1;
-            } else if dp[(i + 1) * width + j] >= dp[i * width + j + 1] {
-                ops.push(DiffOp {
-                    kind: DiffOpKind::Remove,
-                    text: &middle_old[i],
-                });
-                i += 1;
+                    text,
+                }));
             } else {
-                ops.push(DiffOp {
+                ops.extend(middle_old[change.old_range()].iter().map(|text| DiffOp {
+                    kind: DiffOpKind::Remove,
+                    text,
+                }));
+                ops.extend(middle_new[change.new_range()].iter().map(|text| DiffOp {
                     kind: DiffOpKind::Add,
-                    text: &middle_new[j],
-                });
-                j += 1;
+                    text,
+                }));
             }
-        }
-        while i < m {
-            ops.push(DiffOp {
-                kind: DiffOpKind::Remove,
-                text: &middle_old[i],
-            });
-            i += 1;
-        }
-        while j < n {
-            ops.push(DiffOp {
-                kind: DiffOpKind::Add,
-                text: &middle_new[j],
-            });
-            j += 1;
         }
     }
     for line in &old_lines[old_end..] {
@@ -1809,9 +1798,74 @@ mod tests {
         assert!(result.content.starts_with("2000 "));
         assert!(result.truncated);
         assert_eq!(result.next_offset, Some(2003));
-        assert!(result.warnings.is_empty(), "user limit is not a cap hit");
+        assert_eq!(
+            result.warnings,
+            vec!["[998 more lines in file. Use offset=2003 to continue.]".to_string()],
+            "user limit is reported as remaining lines, not as a cap hit"
+        );
+
+        // Streaming path also rejects an offset past the end.
+        let err = read_file(
+            &workspace,
+            &json!({ "path": file.to_string_lossy(), "offset": 3001 }),
+        )
+        .unwrap_err();
+        assert!(err.contains("beyond end of file"), "{err}");
 
         let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn read_file_rejects_offset_past_end_and_reports_user_limit_remainder() {
+        let workspace = NativeToolWorkspace::global(&[]);
+        let file = std::env::temp_dir().join(format!("kivio_off_{}.txt", uuid::Uuid::new_v4()));
+        let body = (1..=100)
+            .map(|i| format!("Line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&file, &body).expect("write");
+
+        // pi: offset beyond EOF is an error, not an empty success.
+        let err = read_file(
+            &workspace,
+            &json!({ "path": file.to_string_lossy(), "offset": 101 }),
+        )
+        .unwrap_err();
+        assert_eq!(err, "Offset 101 is beyond end of file (100 lines total)");
+
+        // Last line is still readable.
+        let tail = read_file(
+            &workspace,
+            &json!({ "path": file.to_string_lossy(), "offset": 100 }),
+        )
+        .expect("read last line");
+        assert_eq!(tail.content, "Line 100");
+        assert!(!tail.truncated);
+        assert!(tail.warnings.is_empty(), "nothing left → no notice");
+
+        // Self-set limit that stops early: remaining-lines notice (pi wording).
+        let window = read_file(
+            &workspace,
+            &json!({ "path": file.to_string_lossy(), "offset": 41, "limit": 20 }),
+        )
+        .expect("windowed read");
+        assert_eq!(window.start_line, 41);
+        assert_eq!(window.end_line, 60);
+        assert_eq!(
+            window.warnings,
+            vec!["[40 more lines in file. Use offset=61 to continue.]".to_string()]
+        );
+
+        // Empty file: offset 1 is fine and yields 0-0 of 0 without a notice.
+        let empty = std::env::temp_dir().join(format!("kivio_empty_{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&empty, "").expect("write");
+        let result =
+            read_file(&workspace, &json!({ "path": empty.to_string_lossy() })).expect("empty read");
+        assert_eq!(result.total_lines, 0);
+        assert!(result.warnings.is_empty());
+
+        let _ = fs::remove_file(file);
+        let _ = fs::remove_file(empty);
     }
 
     #[test]
@@ -1830,7 +1884,10 @@ mod tests {
         assert_eq!(result.end_line, TOOL_OUTPUT_MAX_LINES);
         assert!(result.truncated);
         assert_eq!(result.next_offset, Some(TOOL_OUTPUT_MAX_LINES + 1));
-        assert!(result.warnings[0].contains("2000 行"));
+        assert_eq!(
+            result.warnings,
+            vec!["[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]".to_string()]
+        );
         // An oversized model-supplied `limit` cannot lift the cap.
         let forced = read_file(
             &workspace,
@@ -1848,7 +1905,10 @@ mod tests {
             read_file(&workspace, &json!({ "path": fat.to_string_lossy() })).expect("read fat");
         assert!(result.content.len() <= TOOL_OUTPUT_MAX_BYTES);
         assert_eq!(result.end_line, 2, "two 20KB lines fit under 50KB");
-        assert!(result.warnings[0].contains("50KB"));
+        assert_eq!(
+            result.warnings,
+            vec!["[Showing lines 1-2 of 4 (50KB limit). Use offset=3 to continue.]".to_string()]
+        );
         let _ = fs::remove_file(fat);
 
         // A single line bigger than the whole budget: nothing to return, but the
@@ -1859,7 +1919,9 @@ mod tests {
             .expect("read monster line");
         assert!(result.content.is_empty());
         assert_eq!(result.next_offset, Some(2), "skips past the monster line");
-        assert!(result.warnings[0].contains("run_command"));
+        assert!(result.warnings[0]
+            .starts_with("[Line 1 exceeds the 50KB limit. Use bash: sed -n '1p' "));
+        assert!(result.warnings[0].ends_with("Or use offset=2 to skip it.]"));
         let _ = fs::remove_file(monster);
     }
 
@@ -1878,7 +1940,11 @@ mod tests {
         )
         .expect("zero limit");
         assert_eq!(result.next_offset, Some(1), "must not skip line 1");
-        assert!(result.warnings.is_empty(), "no cap was hit");
+        assert_eq!(
+            result.warnings,
+            vec!["[3 more lines in file. Use offset=1 to continue.]".to_string()],
+            "no cap was hit; the notice is the plain remaining-lines form"
+        );
         let _ = fs::remove_file(file);
 
         // The byte budget counts BYTES, not chars: CJK is 3 bytes per char, so two
@@ -2581,6 +2647,88 @@ mod tests {
     }
 
     #[test]
+    fn diff_counts_match_lcs_for_repeated_lines_and_empty_files() {
+        // Independent small-input oracle, including ambiguous repeated lines.
+        let sequences: Vec<String> = (0..=5)
+            .flat_map(|len| {
+                (0..(1usize << len)).map(move |bits| {
+                    (0..len)
+                        .map(|i| if bits & (1 << i) == 0 { "a\n" } else { "b\n" })
+                        .collect()
+                })
+            })
+            .collect();
+        for old in &sequences {
+            for new in &sequences {
+                let a: Vec<_> = old.lines().collect();
+                let b: Vec<_> = new.lines().collect();
+                let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+                for i in 0..a.len() {
+                    for j in 0..b.len() {
+                        lcs[i + 1][j + 1] = if a[i] == b[j] {
+                            lcs[i][j] + 1
+                        } else {
+                            lcs[i][j + 1].max(lcs[i + 1][j])
+                        };
+                    }
+                }
+                let (_, additions, removals) = unified_diff("repeat.txt", Some(old), Some(new));
+                let common = lcs[a.len()][b.len()];
+                assert_eq!(
+                    (additions, removals),
+                    (b.len() - common, a.len() - common),
+                    "{old:?} -> {new:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diff_large_disjoint_rewrite_has_exact_counts() {
+        let old = (0..10_000)
+            .map(|i| format!("old {i}\n"))
+            .collect::<String>();
+        let new = (0..10_000)
+            .map(|i| format!("new {i}\n"))
+            .collect::<String>();
+        let (diff, additions, removals) = unified_diff("rewrite.txt", Some(&old), Some(&new));
+        assert_eq!((additions, removals), (10_000, 10_000));
+        assert_eq!(diff.matches("@@ -").count(), 1);
+        assert!(diff.contains("-old 9999\n") && diff.contains("+new 9999\n"));
+    }
+
+    #[test]
+    fn distant_local_edits_preserve_large_file_diff() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = NativeToolWorkspace::project(
+            "test".into(),
+            "Test".into(),
+            Some(root.path().to_string_lossy().into_owned()),
+        );
+        let lines: Vec<_> = (0..1303).map(|i| format!("原始行 {i}\r\n")).collect();
+        let before = lines.concat();
+        fs::write(root.path().join("large.txt"), &before).unwrap();
+        let mut expected = before.clone();
+        let mut edits = Vec::new();
+        for (index, start) in [50, 250, 450, 650, 850, 1150].into_iter().enumerate() {
+            let count = if index < 2 { 4 } else { 3 };
+            let old = lines[start..start + count].concat();
+            let new = (0..5)
+                .map(|i| format!("替换 {index}-{i}\r\n"))
+                .collect::<String>();
+            expected = expected.replace(&old, &new);
+            edits.push(json!({"old_string": old, "new_string": new}));
+        }
+        let result = edit_file(&workspace, &json!({"path": "large.txt", "edits": edits})).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("large.txt")).unwrap(),
+            expected
+        );
+        assert_eq!((result.additions, result.removals), (30, 20));
+        assert_eq!(result.diff.matches("@@ -").count(), 6);
+    }
+
+    #[test]
     fn write_file_returns_structured_diff_metadata() {
         let root = std::env::temp_dir().join(format!("kivio_write_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("mkdir");
@@ -2611,28 +2759,47 @@ mod tests {
     }
 
     #[test]
-    fn project_workspace_rejects_escape_paths() {
-        let root = std::env::temp_dir().join(format!("kivio_project_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("mkdir");
-        let workspace = NativeToolWorkspace::project(
-            "proj_test".to_string(),
-            "Test".to_string(),
-            Some(root.to_string_lossy().into_owned()),
-        );
-
-        let err = read_file(&workspace, &json!({ "path": "../secret.txt" })).unwrap_err();
-        assert!(err.contains(".."));
-
-        // Explicit absolute paths outside the project are allowed for reads,
-        // matching non-project conversations.
-        let outside = std::env::temp_dir().join(format!("kivio_outside_{}", uuid::Uuid::new_v4()));
-        fs::write(&outside, "secret").expect("write outside");
-        let result = read_file(&workspace, &json!({ "path": outside.to_string_lossy() }))
-            .expect("absolute read outside project");
-        assert_eq!(result.content, "secret");
-
-        let _ = fs::remove_file(outside);
-        let _ = fs::remove_dir_all(root);
+    fn empty_workbench_allows_explicit_external_file_access() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workbench");
+        let downloads = fixture.path().join("Downloads").join("bot");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&downloads).unwrap();
+        let outside = downloads.join("bot.py");
+        fs::write(&outside, "print('external file')").unwrap();
+        for workspace in [
+            NativeToolWorkspace::conversation(root.clone()),
+            NativeToolWorkspace::project(
+                "proj_test".into(),
+                "Test".into(),
+                Some(root.to_string_lossy().into_owned()),
+            ),
+        ] {
+            let empty: Value =
+                serde_json::from_str(&glob_files(&workspace, &json!({"pattern": "*.py"})).unwrap())
+                    .unwrap();
+            assert_eq!(empty["matches"].as_array().unwrap().len(), 0);
+            let read = read_file(&workspace, &json!({"path": outside})).unwrap();
+            assert_eq!(read.content, "print('external file')");
+            let relative =
+                read_file(&workspace, &json!({"path": "../Downloads/bot/bot.py"})).unwrap();
+            assert_eq!(relative.content, read.content);
+            let found: Value = serde_json::from_str(
+                &glob_files(&workspace, &json!({"path": downloads, "pattern": "*.py"})).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+            let matches = search_files(
+                &workspace,
+                &json!({"path": outside, "query": "external file"}),
+            )
+            .unwrap();
+            assert!(matches.contains("external file"));
+            assert_eq!(
+                super::super::resolve_tool_existing_dir(&workspace, downloads.to_str()).unwrap(),
+                fs::canonicalize(&downloads).unwrap()
+            );
+        }
     }
 
     #[test]

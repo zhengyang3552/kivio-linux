@@ -63,7 +63,14 @@
         },
         "prompt": {
           "type": "string"
-        }
+        },
+        "required": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "valueSchema": true
       },
       "required": [
         "id",
@@ -357,6 +364,13 @@
             "null"
           ]
         },
+        "tokenCountSource": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "usedTokens": {
           "format": "uint64",
           "minimum": 0,
@@ -398,6 +412,43 @@
     },
     "ChatConversationEventEnvelope": {
       "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "conversationId": {
+              "type": "string"
+            },
+            "protocolVersion": {
+              "const": 1,
+              "type": "integer"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scope": {
+              "const": "conversation",
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "type": {
+              "const": "title_updated",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "title",
+            "protocolVersion",
+            "scope",
+            "conversationId",
+            "revision"
+          ],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "properties": {
@@ -767,6 +818,16 @@
     "ChatPlanStatePayload": {
       "additionalProperties": false,
       "properties": {
+        "document": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/ChatPlanMode"
         },
@@ -2247,6 +2308,26 @@
         "round",
         "sensitive",
         "artifacts"
+      ],
+      "type": "object"
+    },
+    "PlanDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "path"
       ],
       "type": "object"
     }

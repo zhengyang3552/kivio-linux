@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Archive, Pin } from 'lucide-react'
 import type { ChatProject, ChatSet, ConversationListItem } from './types'
-import { i18n, type I18n, type Lang } from '../settings/i18n'
+import { i18n, type I18n, type Lang } from '../components/i18n'
 import { chatApi, normalizeAgentRuntime } from './api'
 import {
   displayConversationTitle,
@@ -431,8 +431,11 @@ export const ConversationList = memo(function ConversationList({
                   短龄叠在槽右侧（置顶时针占左、龄占右）。慢波保持原始 chat-gen-wave。 */}
 
               <div
-                className="kv-conv-trailing relative mr-1 flex h-[22px] w-[44px] shrink-0 items-center justify-end"
+                className={`kv-conv-trailing relative mr-1 flex h-[22px] shrink-0 items-center justify-end ${
+                  conv.pinned ? 'w-[48px]' : 'w-[44px]'
+                }`}
                 data-busy={isGenerating && !conv.pinned ? '' : undefined}
+                data-pinned={conv.pinned ? '' : undefined}
               >
                 {compactAge && (
                   <span
@@ -451,7 +454,11 @@ export const ConversationList = memo(function ConversationList({
                     <span /><span /><span /><span />
                   </span>
                 )}
-                <div className="kv-conv-actions flex items-center">
+                <div
+                  className={`kv-conv-actions flex items-center ${
+                    conv.pinned ? 'w-full justify-between' : ''
+                  }`}
+                >
                   <button
                     type="button"
                     data-no-drag

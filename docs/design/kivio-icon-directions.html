@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Kivio · 五套图标设计提案</title>
+<style>
+:root{--bg:#111313;--panel:#1a1d1c;--panel2:#202423;--line:#303634;--ink:#f0f2eb;--muted:#9ba39d;--accent:#b8e0c2;--secondary:#72b98d;--selected:#303b34;--nav-size:18px;--stage:#181a19;--card:#1c1f1d;--hover:#292e2b;font-family:'Segoe UI','Microsoft YaHei',sans-serif;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-size:14px}button,input,select{font:inherit}button,select{color:inherit}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:4px}button{border:0;background:transparent}svg{display:block;flex-shrink:0}button,a,input,select{-webkit-tap-highlight-color:transparent}button{transition:background .16s,border-color .16s,color .16s}button:hover{background:var(--hover)}[hidden]{display:none!important}
+body.light{--bg:#f3f3ed;--panel:#fffefa;--panel2:#eeeee7;--line:#d7dbd2;--ink:#222923;--muted:#626f65;--stage:#f9faf5;--card:#fffefa;--hover:#e8ece3;--selected:#e0e8db;color-scheme:light}body.mono .direction .samples,body.mono .size-cell,body.mono .brand-mark{color:var(--ink)!important}body.mono .icon{--secondary:currentColor!important;color:inherit!important}
+.page{max-width:1512px;margin:auto;padding:28px 46px 36px}.masthead{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:22px}.wordmark{font-size:25px;font-weight:650;letter-spacing:-1px;display:flex;align-items:center;gap:12px}.wordmark small{font-size:11px;font-weight:400;letter-spacing:2px;color:var(--muted);border-left:1px solid var(--line);padding-left:16px;margin-left:6px}.edition{font-family:Consolas,monospace;font-size:11px;letter-spacing:1px;color:var(--muted)}.intro{display:flex;justify-content:space-between;align-items:end;padding:32px 0 28px;gap:20px}.eyebrow{font:11px Consolas,monospace;letter-spacing:2px;color:var(--accent);margin:0 0 12px}.intro h1{font-size:32px;font-weight:550;letter-spacing:1px;margin:0 0 10px}.intro p{color:var(--muted);margin:0;line-height:1.8;font-size:13px}.intro-note{max-width:230px;text-align:right;font-size:12px!important}.directions{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:30px}.direction{text-align:left;padding:17px 17px 15px;border:1px solid var(--line);border-radius:12px;background:var(--panel);position:relative;min-width:0}.direction.active{border-color:var(--accent);background:var(--selected)}.direction .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:19px}.number{font:11px Consolas,monospace;color:var(--muted)}.tag{font-size:10px;color:var(--accent)}.direction .samples{display:flex;gap:16px;height:30px;align-items:center;margin-bottom:17px;color:var(--swatch)}.direction strong{font-size:15px;letter-spacing:.4px;display:block;font-weight:550}.direction .sub{font-size:11px;color:var(--muted);display:block;margin-top:6px}.toolbar{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:18px;flex-wrap:wrap}.tabs{display:flex;gap:24px}.tab{font-size:14px;padding:10px 0;color:var(--muted);border-bottom:2px solid transparent}.tab.active{color:var(--ink);border-color:var(--accent)}.controls{display:flex;align-items:center;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--muted)}.controls label{display:flex;align-items:center;gap:7px}.controls select{border:1px solid var(--line);background:var(--panel);padding:6px 8px;border-radius:6px}.controls input{accent-color:var(--accent)}.theme{border:1px solid var(--line);border-radius:6px;padding:7px 12px;color:var(--ink)}
+.overview{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:22px 24px;border:1px solid var(--line);border-radius:12px 12px 0 0;background:var(--panel)}.overview h2{font-size:22px;font-weight:550;margin:0 0 7px}.overview h2 span{font:12px Consolas,monospace;color:var(--accent);margin-right:12px}.overview p{color:var(--muted);font-size:12px;line-height:1.8;margin:0}.choose{background:var(--accent);border:1px solid var(--accent);color:#17271c;padding:10px 17px;border-radius:7px;white-space:nowrap;font-weight:600;font-size:12px}.choose:hover{filter:brightness(.92);background:var(--accent)}.stage{display:grid;grid-template-columns:212px 252px 1fr;border:1px solid var(--line);border-top:0;background:var(--stage);border-radius:0 0 12px 12px;overflow:hidden;min-height:630px}.settings{border-right:1px solid var(--line);padding:20px 12px}.section-label{font:10px Consolas,monospace;letter-spacing:1px;color:var(--muted);margin:0 10px 17px}.settings h3{font-size:20px;margin:0 10px 16px}.nav-row{display:flex;width:100%;align-items:center;text-align:left;gap:13px;min-height:35px;padding:7px 12px;margin:2px 0;color:var(--muted);border-radius:7px;font-size:13px;white-space:nowrap}.nav-row .icon{width:var(--nav-size);height:var(--nav-size)}.nav-row.selected{background:var(--selected);color:var(--ink)}.nav-row.selected .icon{color:var(--accent)}.menu-preview{padding:20px 15px;border-right:1px solid var(--line)}.menu-box{padding:9px 7px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel);margin-top:21px}.menu-box .nav-row{padding:7px 10px}.nav-row .shortcut{margin-left:auto;font-size:10px;font-family:Consolas,monospace;opacity:.6}.subnav{display:grid;grid-template-columns:1fr 1fr;gap:1px 2px;margin:2px 2px 0}.subnav .nav-row{font-size:12px;gap:8px;padding:7px 7px}.chevron{margin-left:auto;color:var(--muted)}.context-note{margin:24px 6px;color:var(--muted);font-size:12px;line-height:1.9}.context-note strong{display:block;color:var(--ink);font-weight:500;margin-bottom:6px}.brand-card{margin:30px 5px 0;border-top:1px solid var(--line);padding-top:22px;display:flex;gap:14px;align-items:center}.brand-mark{width:50px;height:50px;border-radius:14px;background:var(--selected);display:flex;align-items:center;justify-content:center;color:var(--accent)}.brand-card strong{font-size:12px;font-weight:500}.brand-card p{font-size:10px;color:var(--muted);line-height:1.7;margin:4px 0 0}.specimens{padding:20px 24px 24px;min-width:0}.specimens .section-label{margin:0}.catalog-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:22px}.catalog-head span{font-size:10px;color:var(--muted)}.icon-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.specimen{padding:15px 4px 12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;border:1px solid var(--line);border-radius:9px;min-width:0;background:var(--card);min-height:76px}.specimen .icon{color:var(--accent);width:28px;height:28px}.specimen span{font-size:10px;color:var(--muted);white-space:nowrap}.specimen:hover{border-color:var(--accent)}.spec-note{font-size:11px;color:var(--muted);line-height:1.8;margin:16px 0 0}.footer{display:flex;justify-content:space-between;gap:20px;align-items:center;padding-top:21px;font-size:11px;color:var(--muted)}.text-btn{color:var(--ink);font-size:12px;padding:7px 0;border-bottom:1px solid var(--line)}.footer-actions{display:flex;align-items:center;gap:20px}.saved{color:var(--accent)}
+.comparison-wrap{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}table{width:100%;border-collapse:collapse;text-align:center;min-width:720px}thead th{padding:20px 10px;border-bottom:1px solid var(--line);font-weight:500;background:var(--panel2)}thead th span{display:block;font:10px Consolas,monospace;color:var(--muted);margin-bottom:6px}tbody th{text-align:left;padding:16px 22px;font-size:12px;color:var(--muted);font-weight:400}td{padding:8px;border-bottom:1px solid var(--line)}tbody th{border-bottom:1px solid var(--line)}td button{display:inline-flex;align-items:center;justify-content:center;width:64px;height:40px;border-radius:6px}td .icon{width:var(--nav-size);height:var(--nav-size)}tr:last-child td,tr:last-child th{border-bottom:0}.compare-info{color:var(--muted);font-size:12px;margin:0 0 18px;line-height:1.7}dialog{width:min(580px,calc(100vw - 32px));background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:16px;padding:28px;box-shadow:0 30px 90px #0006}dialog::backdrop{background:#0009;backdrop-filter:blur(5px)}.dialog-head{display:flex;justify-content:space-between;align-items:center}.dialog-head h3{font-size:20px;font-weight:550;margin:0}.close{font-size:23px;color:var(--muted);width:32px;height:32px;border-radius:6px}.dialog-meta{color:var(--muted);font-size:12px;line-height:1.8}.sizes{display:flex;justify-content:space-between;align-items:end;padding:35px 8px;gap:15px}.size-cell{display:flex;flex-direction:column;align-items:center;gap:20px;color:var(--accent)}.size-cell span{font:10px Consolas,monospace;color:var(--muted)}.states{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:26px}.state{display:flex;align-items:center;justify-content:center;gap:8px;padding:15px 4px;font-size:12px;border-radius:8px;border:1px solid var(--line);color:var(--muted)}.state.is-selected{background:var(--selected);color:var(--accent)}.state.is-disabled{opacity:.35}.dialog-actions{display:flex;justify-content:space-between;align-items:center}.dialog-actions span{font-size:10px;color:var(--muted)}.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:12px 22px;background:var(--ink);color:var(--bg);box-shadow:0 10px 30px #0003;border-radius:9px;font-size:13px;z-index:5;max-width:calc(100vw - 32px);text-align:center}
+@media(min-width:1400px){.icon-grid{grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.specimen{min-height:102px}.stage{grid-template-columns:222px 280px 1fr}}
+@media(max-width:1100px){.page{padding:24px}.direction .samples{gap:11px}.direction .samples .icon{width:21px;height:21px}.stage{grid-template-columns:190px 230px 1fr}.specimens{padding:20px 15px}.icon-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.specimen{min-height:78px}.specimen span{font-size:9px}.intro-note{display:none}}
+@media(max-width:800px){.directions{grid-template-columns:repeat(5,190px);overflow:auto;padding-bottom:8px}.stage{grid-template-columns:200px 1fr}.settings{grid-row:span 2}.menu-preview{border-right:0;border-bottom:1px solid var(--line)}.menu-box{max-width:280px;margin-top:0}.context-note,.brand-card{display:none}.menu-preview .section-label{margin-bottom:12px}.icon-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.overview{align-items:start}.overview p{max-width:380px}.footer{align-items:start}.footer-actions{flex-wrap:wrap;gap:12px}.wordmark small{display:none}}
+@media(max-width:560px){.page{padding:20px 16px}.intro{padding:27px 0 23px}.intro h1{font-size:27px}.intro p{font-size:12px}.edition{font-size:9px}.controls{gap:12px}.toolbar{margin-bottom:14px}.stage{grid-template-columns:1fr}.settings{grid-row:auto;border-right:0;border-bottom:1px solid var(--line)}.settings nav{display:grid;grid-template-columns:1fr 1fr;gap:0 5px}.settings h3{margin-bottom:10px}.menu-box{max-width:none}.subnav{grid-template-columns:1fr 1fr}.overview{padding:20px 17px;flex-wrap:wrap}.overview h2{font-size:20px}.overview .choose{margin-top:3px}.icon-grid{grid-template-columns:repeat(4,minmax(0,1fr))}.specimens{padding:20px 16px}.footer{flex-direction:column;line-height:1.8}.dialog-actions{gap:15px}.dialog-actions span{max-width:160px}.states{gap:6px}.state{font-size:10px}.sizes{gap:8px}.intro .eyebrow{font-size:10px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<main class="page">
+ <header class="masthead"><div class="wordmark"><svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5v14M18 5l-9 8 10 6M10 11l4-4"/></svg>kivio<span aria-hidden="true">.</span><small>ICON DESIGN STUDY</small></div><span class="edition">VOL. 01 / SEPT 2026</span></header>
+ <section class="intro"><div><div class="eyebrow">24 TOUCHPOINTS · 5 VISUAL LANGUAGES</div><h1>让每个入口，都有自己的性格。</h1><p>为 Kivio 重画的一套视觉语言。从一个图标，到整个侧边栏。</p></div><p class="intro-note">先看轮廓，再看气质。<br>点击方案，直接比较真实菜单中的效果。</p></section>
+ <nav class="directions" id="directions" aria-label="五套图标方案"></nav>
+ <div class="toolbar"><div class="tabs" role="tablist" aria-label="预览方式"><button id="scene-tab" class="tab active" role="tab" aria-selected="true" aria-controls="scene" data-view="scene">应用实景</button><button id="compare-tab" class="tab" role="tab" aria-selected="false" aria-controls="compare" data-view="compare" tabindex="-1">五套并排对比</button></div><div class="controls"><label>导航尺寸 <select id="size" aria-label="导航图标尺寸"><option value="16">16 px</option><option value="18" selected>18 px</option><option value="20">20 px</option><option value="24">24 px</option></select></label><label><input id="mono" type="checkbox">纯单色</label><button class="theme" id="theme" aria-pressed="false">切换浅色</button></div></div>
+ <section id="scene" role="tabpanel" aria-labelledby="scene-tab"><div class="overview"><div><h2 id="direction-title"></h2><p id="direction-description"></p></div><button class="choose" id="choose">标记这套方案</button></div><div class="stage"><aside class="settings"><p class="section-label">01 / SETTINGS</p><h3>设置</h3><nav id="settings-nav" aria-label="设置图标预览"></nav></aside><section class="menu-preview"><p class="section-label">02 / WORKSPACE</p><div class="menu-box" id="workspace-nav"></div><div class="context-note"><strong id="principle-title"></strong><span id="principle"></span></div><div class="brand-card"><div class="brand-mark" id="brand-mark"></div><div><strong>一个共同的 K</strong><p>Agent 符号沿用 K 的折角，<br>让整套图标有品牌记忆。</p></div></div></section><section class="specimens"><div class="catalog-head"><p class="section-label">03 / THE COLLECTION</p><span>24 枚 · 点击查看细节</span></div><div class="icon-grid" id="icon-grid"></div><p class="spec-note">上方图标以 28 px 展示轮廓；左侧菜单按所选尺寸显示。点击任意图标，查看 16–64 px 和状态变化。</p></section></div></section>
+ <section id="compare" role="tabpanel" aria-labelledby="compare-tab" hidden><p class="compare-info">同一功能，五种画法。建议先打开「纯单色」比较轮廓，再切回彩色比较整体气质。点击图标可放大。</p><div class="comparison-wrap"><table><thead id="compare-head"></thead><tbody id="compare-body"></tbody></table></div></section>
+ <footer class="footer"><div>独立设计提案 · 手绘 SVG · 覆盖两张参考截图的全部 24 个入口<br><span id="saved" class="saved" aria-live="polite">尚未标记方案</span></div><div class="footer-actions"><span>选一套，也可以混合你喜欢的元素。</span><button id="export" class="text-btn">导出当前套系 SVG 图谱 ↗</button></div></footer>
+</main>
+<dialog id="detail" aria-labelledby="detail-title"><div class="dialog-head"><h3 id="detail-title"></h3><button class="close" id="close" aria-label="关闭图标详情">×</button></div><p class="dialog-meta" id="detail-meta"></p><div class="sizes" id="detail-sizes"></div><div class="states" id="detail-states"></div><div class="dialog-actions"><span>24 × 24 矢量网格 · 可无限缩放</span><button class="choose" id="download-icon">下载这枚 SVG</button></div></dialog>
+<div class="toast" id="toast" role="status" hidden></div>
+<script>
+'use strict';
+// All geometry is authored for this study. No icon font, library or remote asset is required.
+const path=(d,a='')=>`<path d="${d}" ${a}/>`;
+const circle=(x,y,r,a='')=>`<circle cx="${x}" cy="${y}" r="${r}" ${a}/>`;
+const rect=(x,y,w,h,r=0,a='')=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" ${a}/>`;
+const ellipse=(x,y,rx,ry,a='')=>`<ellipse cx="${x}" cy="${y}" rx="${rx}" ry="${ry}" ${a}/>`;
+const soft='fill="currentColor" fill-opacity=".16" stroke="none"';
+const secondary='stroke="var(--secondary,currentColor)"';
+const fill='fill="currentColor" stroke="none"';
+const cut='fill="var(--cut,#1a1d1c)" stroke="none"';
+const items=[
+ ['general','基础','GENERAL'],['model','模型','MODELS'],['keys','快捷键','SHORTCUTS'],['translate','翻译','TRANSLATE'],['lens','Lens','LENS'],['agent','Kivio Agent','KIVIO AGENT'],['memory','记忆','MEMORY'],['mixer','混音器','MIXER'],['cli','本地 CLI 管理','LOCAL CLI'],['hooks','Hooks','HOOKS'],['plugin','插件','PLUGINS'],['sessions','对话库','CONVERSATIONS'],['web','网络搜索','WEB SEARCH'],['usage','用量统计','USAGE'],['about','关于','ABOUT'],['new','新建聊天','NEW CHAT'],['search','搜索','SEARCH'],['extensions','扩展','EXTENSIONS'],['assistant','助手','ASSISTANTS'],['skill','Skill','SKILLS'],['mcp','MCP','MCP'],['knowledge','知识库','KNOWLEDGE'],['notes','笔记','NOTES'],['automation','自动化','AUTOMATION']
+];
+const schemes=[
+ {id:'orbit',name:'Orbit · 轻环',en:'OPEN & ROUNDED',accent:'#b8e0c2',light:'#367044',secondary:'#72b98d',lightSecondary:'#3b8158',width:1.7,cap:'round',join:'round',desc:'留白的圆环、柔和的转角。安静、耐看，适合作为 Kivio 的日常默认图标。',principleTitle:'以「开放的圆」为共同语言',principle:'用断开的环、短弧和圆点建立家族感；模型用轨道表达，CLI 用终端表达，让相近功能各有轮廓。',tag:'推荐 · 日常使用'},
+ {id:'facet',name:'Facet · 切面',en:'ANGULAR & DUOTONE',accent:'#e8bf91',light:'#926028',secondary:'#bf8c5e',lightSecondary:'#a97539',width:1.65,cap:'round',join:'round',desc:'斜切角、折叠面、轻双色。更有工具感，也更容易形成属于 Kivio 的独特识别。',principleTitle:'用一个切角，串起整套系统',principle:'以斜面和菱形组织图形，用浅填充表达第二层结构。保持外轮廓简洁，避免双色变成额外的装饰。',tag:'推荐 · 品牌识别'},
+ {id:'solid',name:'Solid · 墨块',en:'BOLD & COMPACT',accent:'#c5c8f6',light:'#605b98',secondary:'#9298d6',lightSecondary:'#7871aa',width:0,cap:'round',join:'round',desc:'实心剪影与负形切口。小尺寸下依然醒目，适合高密度导航和更强的操作感。',principleTitle:'靠剪影认出功能',principle:'用块面和镂空取代细描边。模型、记忆、插件分别使用星核、花形和拼接块，缩小后也保留不同重心。',tag:'强识别 · 高密度'},
+ {id:'pixel',name:'Grid · 像素',en:'STEPPED & PRECISE',accent:'#bce181',light:'#527222',secondary:'#88b04f',lightSecondary:'#6b872e',width:1.65,cap:'square',join:'miter',desc:'直角、阶梯和网格节奏。带一点终端与像素工具的气质，鲜明、克制，也更偏开发者。',principleTitle:'让每个转弯都落在网格上',principle:'去掉圆弧，用阶梯轮廓表达圆形、连接和气泡。16 px 下会更硬朗；20–24 px 更能看出它的个性。',tag:'鲜明 · 开发者气质'},
+ {id:'ribbon',name:'Ribbon · 游线',en:'FLUID & COLOURFUL',accent:'#8fcbed',light:'#30789d',secondary:'#eca989',lightSecondary:'#ad6441',width:1.9,cap:'round',join:'round',desc:'流动曲线与功能分色。亲近、轻快，适合希望把 Kivio 做得更有温度、更容易扫读的方向。',principleTitle:'一笔流线，一处颜色',principle:'用连续的曲线建立手感，按功能分配蓝、绿、杏、紫四色。彩色只出现在图标中，让文字和导航保持安静。',tag:'亲和 · 功能分色'}
+];
+const drawings={
+ orbit:{
+  general:path('M19 7a8 8 0 1 0 1 9M12 2v4M22 12h-4')+circle(12,12,3),
+  model:ellipse(12,12,9,4,'transform="rotate(-35 12 12)"')+path('M8 4c-4 4 4 16 8 16M16 4c2 2 3 5 3 8')+circle(12,12,1.6,fill),
+  keys:rect(3,6,18,13,4)+path('M7 10h.1M11 10h.1M15 10h2M7 14h.1M11 15h6'),
+  translate:path('M3 17 7 6l4 11M4.5 13h5M14 6h7M17.5 4v2M15 9c0 4 2 6 6 8M20 6c0 6-3 10-7 12'),
+  lens:path('M9 3H7a4 4 0 0 0-4 4v2M15 3h2a4 4 0 0 1 4 4v2M21 15v2a4 4 0 0 1-4 4h-2M9 21H7a4 4 0 0 1-4-4v-2')+circle(12,12,4)+circle(13,11,.8,fill),
+  agent:path('M5 4v16M18 4 8 13l11 6M11 10l4 1')+circle(19,5,1.4,fill),
+  memory:path('M8 5c-7 2-4 12 2 10M16 19c7-2 4-12-2-10M9 9c5-3 9 5 4 7')+circle(8,5,1.3,fill)+circle(16,19,1.3,fill),
+  mixer:path('M6 3v9m0 5v4M12 3v3m0 5v10M18 3v12m0 5v1')+circle(6,14.5,2.5)+circle(12,8.5,2.5)+circle(18,17.5,2.5),
+  cli:rect(3,5,18,15,4)+path('m7 10 3 3-3 3M13 16h4M8 3h8'),
+  hooks:path('M12 3v11a5 5 0 0 1-10 0v-3l3 3M9 6l3-3 3 3M16 11h5m-3-3 3 3-3 3'),
+  plugin:path('M4 10V7a3 3 0 0 1 3-3h3a2.5 2.5 0 1 1 5 0h3a2 2 0 0 1 2 2v4a2.5 2.5 0 1 0 0 5v3a2 2 0 0 1-2 2h-5M4 14v6h5')+circle(4,12,1.2,fill),
+  sessions:path('M7 17 3 20V8a4 4 0 0 1 4-4h9a4 4 0 0 1 4 4v5a4 4 0 0 1-4 4H7M9 21h8a6 6 0 0 0 6-6M8 9h7M8 12h4'),
+  web:circle(11,11,8)+path('M3 11h16M11 3c-5 4-5 12 0 16M11 3c3 3 4 7 2 11m4 3 4 4'),
+  usage:path('M4 4v13a3 3 0 0 0 3 3h14M8 15V9M13 15V5M18 15v-4')+circle(18,7,1.3,fill),
+  about:path('M16 4a9 9 0 1 0 4 4')+path('M10 11h2v6m-2 0h4')+circle(12,7,1,fill),
+  new:path('M10 4H7a4 4 0 0 0-4 4v12l5-3h8a4 4 0 0 0 4-4v-2M17 2v6m-3-3h6'),
+  search:circle(10.5,10.5,7.5)+path('m16 16 5 5M7 10a4 4 0 0 1 3-3'),
+  extensions:rect(3,3,7,7,2.5)+rect(14,14,7,7,2.5)+path('M17.5 3v7M14 6.5h7M10 17.5A3.5 3.5 0 1 1 6.5 14'),
+  assistant:path('M6 8h12a3 3 0 0 1 3 3v6a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3v-6a3 3 0 0 1 3-3ZM12 8V4M8 14v1m8-1v1M9 18h6')+circle(12,3,1,fill),
+  skill:path('M12 3c1 5 3 7 8 9-5 1-7 4-8 9-1-5-3-8-8-9 5-2 7-4 8-9ZM19 3v4m-2-2h4'),
+  mcp:path('M7 3v4h10V3M5 7h14v4a7 7 0 0 1-14 0V7ZM12 18v3M9 11h6'),
+  knowledge:path('M12 6C9 3 5 3 3 4v15c3-1 6-1 9 2 3-3 6-3 9-2V4c-2-1-6-1-9 2Zm0 0v15M6 8l3 1m6 0 3-1'),
+  notes:path('M9 4h8a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3V7M3 9h3m-3 5h3M10 9h6m-6 4h6m-6 4h3M7 2v4'),
+  automation:circle(5,6,2.5)+circle(19,18,2.5)+path('M7.5 6H15a4 4 0 0 1 4 4v2m-3-3 3 3 3-3M16.5 18H9a4 4 0 0 1-4-4v-2m-3 3 3-3 3 3')
+ },
+ facet:{
+  general:path('M12 2 21 7v10l-9 5-9-5V7Z',soft)+path('M12 2 21 7v10l-9 5-9-5V7Z')+path('m8 12 4-4 4 4-4 4Z'),
+  model:path('m12 2 10 6-10 6L2 8Z',soft)+path('m12 2 10 6-10 6L2 8Zm-9 11 9 6 9-6M3 17l9 5 9-5M12 14v8'),
+  keys:path('M3 6h15l3 3v10H3Z',soft)+path('M3 6h15l3 3v10H3ZM7 10h1m3 0h1m3 0h1M7 14h1m3 1h6'),
+  translate:path('M2 4h10v12H2Z',soft)+path('M3 16 7 5l4 11M4 12h6M14 5h7M17 3v2m-3 5 7 8m-1-13c0 6-2 9-6 12M12 21h9'),
+  lens:path('M7 3h10l4 4v10l-4 4H7l-4-4V7Z',soft)+path('M8 3H7L3 7v2M16 3h1l4 4v2M21 15v2l-4 4h-1M8 21H7l-4-4v-2m5-9 9 9m0-9-9 9')+path('m12 7 5 5-5 5-5-5Z'),
+  agent:path('M4 3h4v8l10-8h3L10 13l11 8h-6l-7-6v6H4Z',soft)+path('M4 3v18h4v-6l8 6h5L10 13 21 3h-5l-8 8V3Z'),
+  memory:path('m12 3 8 5v8l-8 5-8-5V8Z',soft)+path('m12 3 8 5v8l-8 5-8-5V8Zm0 0v9m-8 4 8-4 8 4')+path('m9 10 3-2 3 2v4l-3 2-3-2Z'),
+  mixer:path('M6 3v2m0 6v10M12 3v10m0 6v2M18 3v4m0 6v8')+path('m3 8 3-3 3 3-3 3Zm6 8 3-3 3 3-3 3Zm6-6 3-3 3 3-3 3Z','fill="none"')+path('m3 8 3-3 3 3-3 3Z',soft),
+  cli:path('M3 4h14l4 4v12H3Z',soft)+path('M3 4h14l4 4v12H3ZM17 4v4h4M7 10l3 3-3 3m6 0h4'),
+  hooks:path('M14 2 4 13h7l-1 9 10-12h-7Z',soft)+path('M14 2 4 13h7l-1 9 10-12h-7Z')+path('m14 2-3 11',secondary),
+  plugin:path('M3 9h6V3h6v6h6v6h-6v6H9v-6H3Z',soft)+path('M3 9h6V3h6v6h6v6h-6v6H9v-6H3ZM9 9h6v6H9Z'),
+  sessions:path('M3 4h15l3 3v10H9l-6 4Z',soft)+path('M3 4h15l3 3v10H9l-6 4ZM7 8h10M7 12h7M18 4v3h3'),
+  web:path('m12 2 9 5v10l-9 5-9-5V7Z',soft)+path('m12 2 9 5v10l-9 5-9-5V7Zm0 0L7 12l5 10 5-10Zm-9 10h18'),
+  usage:path('M4 13h4v7H4Zm6-6h4v13h-4Zm6-4h4v17h-4Z',soft)+path('M4 13h4v7H4Zm6-6h4v13h-4Zm6-4h4v17h-4Z'),
+  about:path('m12 2 9 5v10l-9 5-9-5V7Z',soft)+path('m12 2 9 5v10l-9 5-9-5V7ZM12 11v6')+path('m12 6 1.5 1.5L12 9l-1.5-1.5Z',fill),
+  new:path('M3 4h12l6 6v8H9l-6 3Z',soft)+path('M3 4h12v6h6v8H9l-6 3ZM15 4l6 6M7 11v5m-2-2.5h5'),
+  search:path('M7 3h8l4 4v8l-4 4H7l-4-4V7Z',soft)+path('M7 3h8l4 4v8l-4 4H7l-4-4V7Zm10 14 5 5M7 8l3-2'),
+  extensions:path('m7 2 5 5-5 5-5-5Zm10 10 5 5-5 5-5-5Z',soft)+path('m7 2 5 5-5 5-5-5Zm10 10 5 5-5 5-5-5ZM16 3h5v5M3 16v5h5'),
+  assistant:path('M3 7h14l4 4v9H3Z',soft)+path('M3 7h14l4 4v9H3ZM12 7V3m-2 0h4M7 12h2m6 0h2M8 16h8'),
+  skill:path('m12 2 4 6 6 4-6 4-4 6-4-6-6-4 6-4Z',soft)+path('m12 2 4 6 6 4-6 4-4 6-4-6-6-4 6-4Zm0 0v20M2 12h20'),
+  mcp:path('M4 7h16v6l-8 6-8-6Z',soft)+path('M4 7h16v6l-8 6-8-6ZM8 3v4m8-4v4m-4 12v3M8 11h8'),
+  knowledge:path('M3 3h7l2 3 2-3h7v16h-7l-2 3-2-3H3Z',soft)+path('M3 3h7l2 3 2-3h7v16h-7l-2 3-2-3H3ZM12 6v16M6 7h3m6 0h3M6 11h3m6 0h3'),
+  notes:path('M4 3h12l4 4v14H4Z',soft)+path('M4 3h12l4 4v14H4ZM16 3v4h4M8 10h8m-8 4h8m-8 4h5'),
+  automation:path('M3 3h6v6H3Zm12 12h6v6h-6Z',soft)+path('M3 3h6v6H3Zm12 12h6v6h-6ZM9 6h9v6m-3-3 3 3 3-3M15 18H6v-6m-3 3 3-3 3 3')
+ },
+ solid:{
+  general:path('M9 2h6l1 3 3 1 3 5-2 2v4l-5 4-3-1-3 1-5-4v-4l-2-2 3-5 3-1Z M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Z','fill-rule="evenodd"'),
+  model:path('m12 2 4 6 6 4-6 4-4 6-4-6-6-4 6-4Zm0 6-4 4 4 4 4-4Z','fill-rule="evenodd"'),
+  keys:path('M5 5a3 3 0 0 0-3 3v9a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3V8a3 3 0 0 0-3-3ZM6 9v2h2V9Zm5 0v2h2V9Zm5 0v2h2V9ZM7 15v2h10v-2Z','fill-rule="evenodd"'),
+  translate:path('M5 4h4l5 16h-3l-1-4H4l-1 4H0Zm2 4-2 5h4Z','fill-rule="evenodd"')+path('M16 2h3v3h5v3h-2c0 3-1 5-3 7l4 3-2 2-4-4-3 3-2-2 3-3-2-3 2-1 2 2c1-1 2-3 2-4h-6V5h3Z'),
+  lens:path('M7 2H2v5h3V5h2Zm10 0v3h2v2h3V2ZM2 17v5h5v-3H5v-2Zm17 0v2h-2v3h5v-5ZM12 6a6 6 0 1 0 0 12 6 6 0 0 0 0-12Zm0 3a3 3 0 1 1 0 6 3 3 0 0 1 0-6Z','fill-rule="evenodd"'),
+  agent:path('M3 3h5v8l9-8h6L12 13l11 8h-8l-7-6v6H3Z'),
+  memory:path('M12 9C4-3-3 7 7 12-3 18 6 27 12 16c6 11 15 2 5-4 10-5 3-15-5-3Z M12 10.2a1.8 1.8 0 1 0 0 3.6 1.8 1.8 0 0 0 0-3.6Z','fill-rule="evenodd"'),
+  mixer:rect(4,2,3,20,1.5)+rect(10.5,2,3,20,1.5)+rect(17,2,3,20,1.5)+rect(2,7,7,5,2)+rect(8.5,14,7,5,2)+rect(15,5,7,5,2),
+  cli:path('M5 4a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3V7a3 3 0 0 0-3-3ZM6 8l5 5-5 5-1.5-1.5L8 13 4.5 9.5ZM12 16h6v2h-6Z','fill-rule="evenodd"'),
+  hooks:path('M14 1 3 14h7l-1 9L22 9h-8Z'),
+  plugin:path('M4 4h5V3a3 3 0 0 1 6 0v1h5v5h1a3 3 0 0 1 0 6h-1v5h-5v-1a3 3 0 0 0-6 0v1H4v-5h1a3 3 0 0 0 0-6H4Z'),
+  sessions:path('M4 3h13a3 3 0 0 1 3 3v9a3 3 0 0 1-3 3H8l-6 4V5a2 2 0 0 1 2-2ZM6 7v2h10V7Zm0 5v2h7v-2Z','fill-rule="evenodd"')+path('M22 8h1v13l-4-1H10l3-1h5a3 3 0 0 0 3-3V8Z'),
+  web:path('M10 2a10 10 0 0 0-8 9h5c0-4 1-7 3-9ZM2 13a10 10 0 0 0 8 9c-2-3-3-5-3-9Zm7-2h6c0-5-2-8-3-8s-3 3-3 8Zm0 2c0 5 2 8 3 8s3-3 3-8Zm8-2h5a10 10 0 0 0-8-9c2 2 3 5 3 9Zm0 2c0 4-1 6-3 9a10 10 0 0 0 8-9Z'),
+  usage:rect(3,12,5,9,1.5)+rect(9.5,6,5,15,1.5)+rect(16,2,5,19,1.5),
+  about:path('M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm-1.5 4v3h3V6Zm0 5v7h3v-7Z','fill-rule="evenodd"'),
+  new:path('M5 4a3 3 0 0 0-3 3v15l6-4h9a3 3 0 0 0 3-3v-5h-5V4Z')+path('M18 1h3v3h3v3h-3v3h-3V7h-3V4h3Z'),
+  search:path('M10.5 2a8.5 8.5 0 1 0 5.4 15.1l5 5 2.2-2.2-5-5A8.5 8.5 0 0 0 10.5 2Zm0 3a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11Z','fill-rule="evenodd"'),
+  extensions:rect(2,2,8,8,2)+rect(2,14,8,8,2)+rect(14,14,8,8,2)+path('M16 2h4v2h2v4h-2v2h-4V8h-2V4h2Z'),
+  assistant:path('M11 2h2v4h6a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3H5a3 3 0 0 1-3-3V9a3 3 0 0 1 3-3h6ZM6 11v3h3v-3Zm9 0v3h3v-3ZM8 17v2h8v-2Z','fill-rule="evenodd"'),
+  skill:path('m12 1 3 8 8 3-8 3-3 8-3-8-8-3 8-3Z')+path('m20 1 1 2 2 1-2 1-1 2-1-2-2-1 2-1Z'),
+  mcp:path('M6 1h3v5h6V1h3v5h3v5a9 9 0 0 1-7.5 8.9V23h-3v-3.1A9 9 0 0 1 3 11V6h3ZM7 10v3h10v-3Z','fill-rule="evenodd"'),
+  knowledge:path('M2 3h7l2 2v17l-3-3H2Zm4 4v2h3V7Zm0 5v2h3v-2ZM15 3h7v16h-6l-3 3V5Zm0 4v2h4V7Zm0 5v2h4v-2Z','fill-rule="evenodd"'),
+  notes:path('M7 2h11a3 3 0 0 1 3 3v16a1 1 0 0 1-1 1H7Zm3 5v2h8V7Zm0 5v2h8v-2Zm0 5v2h5v-2Z','fill-rule="evenodd"')+rect(2,2,3,20,1),
+  automation:rect(2,2,7,7,2)+rect(15,15,7,7,2)+path('M11 4h9v6h3l-4.5 4L14 10h3V7h-6ZM13 20H4v-6H1l4.5-4 4.5 4H7v3h6Z')
+ },
+ pixel:{
+  general:path('M9 2h6v3h4v4h3v6h-3v4h-4v3H9v-3H5v-4H2V9h3V5h4Z')+rect(9,9,6,6),
+  model:path('M9 2h6v4h4v4h3v4h-3v4h-4v4H9v-4H5v-4H2v-4h3V6h4ZM9 10h6v4H9Z'),
+  keys:path('M2 6h20v13H2ZM6 10h1m4 0h1m4 0h2M6 14h1m4 1h7'),
+  translate:path('M2 19V9h2V5h4v4h2v10M2 13h8M14 6h8m-4-3v3m-3 4v4h3v3h4M21 6v6h-3v7h-4'),
+  lens:path('M8 2H2v6M16 2h6v6M22 16v6h-6M8 22H2v-6M9 7h6v2h2v6h-2v2H9v-2H7V9h2Z'),
+  agent:path('M3 3h4v8h4V7h4V3h6v4h-4v4h-4v4h4v2h4v4h-8v-4H7v4H3Z'),
+  memory:path('M4 4h5v5H4ZM15 4h5v5h-5ZM9 16h6v5H9ZM9 6h6M6 9v4h6v3m6-7v4h-6'),
+  mixer:path('M5 2v5m0 6v9M12 2v12m0 6v2M19 2v5m0 6v9')+rect(2,7,6,6)+rect(9,14,6,6)+rect(16,7,6,6),
+  cli:path('M2 4h20v17H2ZM6 9h2v2h2v2H8v2H6m8 1h4'),
+  hooks:path('M12 2h5v5h-4v4h7v4h-4v4h-4v3H7v-7H3v-4h4V7h5Z'),
+  plugin:path('M3 7h5V2h8v5h5v5h-4v5h4v4h-8v-4H8v4H3v-9h4V7Z'),
+  sessions:path('M2 3h20v15H8v3H2ZM6 7h12M6 11h8'),
+  web:path('M7 2h10v3h4v4h2v6h-2v4h-4v3H7v-3H3v-4H1V9h2V5h4ZM1 12h22M10 2v5H8v10h2v5M14 2v5h2v10h-2v5'),
+  usage:path('M3 21V11h4v10m3 0V7h4v14m3 0V3h4v18M2 22h20'),
+  about:path('M7 2h10v3h4v4h1v6h-1v4h-4v3H7v-3H3v-4H2V9h1V5h4ZM12 11v6m-2 0h4')+rect(11,6,2,2,0,fill),
+  new:path('M12 3H2v18h4v-3h15v-6M18 2v7m-4-3.5h8M6 8h5M6 12h8'),
+  search:path('M6 2h9v3h4v10h-4v3H6v-3H2V5h4Zm10 14h3v3h3v3M6 6h4'),
+  extensions:rect(2,2,7,7)+rect(2,15,7,7)+rect(15,15,7,7)+path('M18 2v8m-4-4h8'),
+  assistant:path('M6 6h12v3h4v12H2V9h4Zm6 0V2m-2 0h4M6 12h2v3H6Zm10 0h2v3h-2ZM8 18h8'),
+  skill:path('M10 2h4v4h3v4h5v4h-5v4h-3v4h-4v-4H7v-4H2v-4h5V6h3Z'),
+  mcp:path('M7 2v5m10-5v5M3 7h18v8h-4v4H7v-4H3ZM12 19v3M8 11h8'),
+  knowledge:path('M2 3h7v3h6V3h7v16h-7v3H9v-3H2ZM12 6v16M5 8h3m8 0h3M5 12h3m8 0h3'),
+  notes:path('M4 2h12v4h4v16H4ZM16 2v4h4M8 10h8M8 14h8M8 18h5M2 7h4M2 12h4M2 17h4'),
+  automation:rect(2,2,6,6)+rect(16,16,6,6)+path('M8 5h11v7m-3-3v3h6V9M16 19H5v-7m-3 3v-3h6v3')
+ },
+ ribbon:{
+  general:path('M12 3c12 0 12 18 0 18S0 3 12 3Z')+path('M4 8c1 2 3 3 5 3m6 2c2 0 4 1 5 3',secondary)+circle(12,12,3),
+  model:path('M3 15C0 6 18 1 21 9S6 23 3 15Z')+path('M8 3c9-5 14 18 5 18S0 8 8 3Z',secondary)+circle(12,12,1.5,fill),
+  keys:rect(2,5,20,15,5,soft)+rect(2,5,20,15,5)+path('M6 10h1m4 0h1m4 0h2')+path('M7 15c3 2 7 2 10 0',secondary),
+  translate:path('M3 18C5 3 8 3 11 18M4 13h6')+path('M14 6c2 1 5 1 8 0M18 3v3m-3 4c1 4 3 6 7 7M21 7c-1 7-3 10-7 12',secondary),
+  lens:path('M8 3H6a3 3 0 0 0-3 3v2M16 3h2a3 3 0 0 1 3 3v2M21 16v2a3 3 0 0 1-3 3h-2M8 21H6a3 3 0 0 1-3-3v-2')+ellipse(12,12,5,4,'transform="rotate(-35 12 12)" '+secondary)+circle(12,12,1,fill),
+  agent:path('M5 3v18M19 3C16 8 11 12 5 13')+path('M10 11c0 7 8 6 10 10',secondary),
+  memory:path('M11 12c-9-14-16 7-4 6 9 0 4-19 12-14 8 5-2 13-8 8Z')+path('M11 12c7 13 13 7 10 2',secondary),
+  mixer:path('M5 3v4m0 5v9M12 3v11m0 5v2M19 3v2m0 5v11',secondary)+rect(2,7,6,5,2.5,'fill="none"')+rect(9,14,6,5,2.5,'fill="none"')+rect(16,5,6,5,2.5,'fill="none"'),
+  cli:rect(2,4,20,17,5,soft)+rect(2,4,20,17,5)+path('m6 9 4 4-4 4')+path('M14 16c1 1 3 1 4 0',secondary),
+  hooks:path('M15 3c-2 3-6 7-10 9h8l-3 9c4-3 7-7 10-10h-8Z')+path('M4 3h3M2 6h2',secondary),
+  plugin:path('M5 5h4c-3-5 9-5 6 0h4v4c5-3 5 9 0 6v4h-4c3 5-9 5-6 0H5v-4c-5 3-5-9 0-6Z')+path('M10 12h4',secondary),
+  sessions:path('M3 10c0-9 18-9 18 0 0 6-5 8-11 7l-7 4Z')+path('M7 10c3 2 7 2 10 0',secondary),
+  web:circle(12,12,9)+path('M3 11c4 3 12 3 18 0',secondary)+path('M12 3c-6 4-6 14 0 18 6-4 6-14 0-18Z'),
+  usage:path('M4 20V9M11 20V4M18 20V12')+path('M3 16c5 4 9-10 18-9',secondary),
+  about:path('M12 3c12 0 12 18 0 18S0 3 12 3Z')+path('M10 11h2v6h2',secondary)+circle(12,7,1,fill),
+  new:path('M12 4C4 1 0 9 4 15l-1 6 6-3c7 3 14-2 11-9')+path('M18 2v6m-3-3h6',secondary),
+  search:ellipse(10,10,7,8,'transform="rotate(35 10 10)"')+path('M15 16c1 2 3 4 6 5',secondary),
+  extensions:path('M3 4c7-5 10 5 5 6-4 1-8-2-5-6ZM16 14c8-3 9 8 2 8-6 0-7-6-2-8Z')+path('M18 2v8m-4-4h8M3 16c5-6 10 4 4 5-3 1-5-2-4-5Z',secondary),
+  assistant:path('M3 13C1 4 22 4 21 13v4c0 6-18 6-18 0ZM12 6V3')+path('M7 12v2m10-2v2M9 18c2 1 4 1 6 0',secondary),
+  skill:path('M12 2c1 7 3 9 10 10-7 1-9 3-10 10-1-7-3-9-10-10 7-1 9-3 10-10Z')+path('m19 2 1 1m1 2 1 1',secondary),
+  mcp:path('M7 2v5m10-5v5M4 7h16v4c0 10-16 10-16 0Z')+path('M12 18c0 4 5 4 7 3M8 11h8',secondary),
+  knowledge:path('M12 6C8 2 5 3 2 4v15c4-1 7 0 10 3 3-3 6-4 10-3V4c-3-1-6-2-10 2Zm0 0v16')+path('m6 9 2 1m8 0 2-1m-12 4 2 1m8 0 2-1',secondary),
+  notes:path('M5 4c4-2 10-2 14 0v16c-4-2-10-2-14 0Z')+path('M9 8c2-1 4-1 6 0m-6 4c2-1 4-1 6 0m-6 4h3',secondary)+path('M3 7h3m-3 6h3'),
+  automation:path('M7 5c7-5 15 0 13 7l-3-3m3 3 2-4')+path('M17 19C9 24 1 18 4 11l-2 3m2-3 3 3',secondary)+circle(5,6,2)+circle(19,18,2,secondary)
+ }
+};
+let current=0, selectedSetting='general', selectedMenu='extensions', view='scene', favorite=null, detailItem=null;
+try{const stored=localStorage.getItem('kivio-icon-choice-v1');if(schemes.some(s=>s.id===stored))favorite=stored}catch{}
+const $=id=>document.getElementById(id);
+const palette=s=>document.body.classList.contains('light')?[s.light,s.lightSecondary]:[s.accent,s.secondary];
+const ribbonColors=['#8fcbed','#b6c794','#e5b48e','#c1b4e2'];
+const ribbonLight=['#30789d','#61753a','#a66639','#79649c'];
+function iconColor(s,index){return s.id==='ribbon'?(document.body.classList.contains('light')?ribbonLight:ribbonColors)[index%4]:palette(s)[0]}
+function icon(s,key,size=24,paint=false){const i=items.findIndex(x=>x[0]===key);const color=paint?`color:${iconColor(s,i)};`:'';return `<svg class="icon" xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="${s.id==='solid'?'currentColor':'none'}" stroke="${s.id==='solid'?'none':'currentColor'}" stroke-width="${s.width}" stroke-linecap="${s.cap}" stroke-linejoin="${s.join}" style="${color}--secondary:${palette(s)[1]};--cut:var(--stage);" aria-hidden="true">${drawings[s.id][key]}</svg>`}
+function paintForNav(s,key){return s.id==='ribbon'}
+function updateTheme(){const s=schemes[current], [a,b]=palette(s);document.documentElement.style.setProperty('--accent',a);document.documentElement.style.setProperty('--secondary',b);document.documentElement.style.setProperty('--selected',document.body.classList.contains('light')?a+'18':a+'17')}
+function renderDirections(){$('directions').innerHTML=schemes.map((s,i)=>`<button class="direction ${current===i?'active':''}" data-scheme="${i}" aria-pressed="${current===i}" style="--swatch:${palette(s)[0]}"><div class="top"><span class="number">0${i+1}</span><span class="tag">${i===current?'正在预览':s.tag.split(' · ')[0]}</span></div><div class="samples">${['agent','model','memory','extensions'].map(k=>icon(s,k,26,true)).join('')}</div><strong>${s.name}</strong><span class="sub">${s.en}</span></button>`).join('')}
+function navButton(key,s){const item=items.find(x=>x[0]===key);return `<button class="nav-row ${key===selectedSetting?'selected':''}" data-setting="${key}" aria-pressed="${key===selectedSetting}">${icon(s,key,18,paintForNav(s,key))}<span>${item[1]}</span></button>`}
+function workspaceButton(key,s,extra=''){const item=items.find(x=>x[0]===key);return `<button class="nav-row ${key===selectedMenu?'selected':''}" data-menu="${key}" aria-pressed="${key===selectedMenu}">${icon(s,key,18,paintForNav(s,key))}<span>${item[1]}</span>${extra}</button>`}
+function renderScene(){const s=schemes[current];$('direction-title').innerHTML=`<span>0${current+1}</span>${s.name}`;$('direction-description').textContent=s.desc;$('principle-title').textContent=s.principleTitle;$('principle').textContent=s.principle;$('settings-nav').innerHTML=items.slice(0,15).map(x=>navButton(x[0],s)).join('');$('workspace-nav').innerHTML=workspaceButton('new',s,'<span class="shortcut">Ctrl N</span>')+workspaceButton('search',s)+workspaceButton('extensions',s,'<span class="chevron">⌄</span>')+`<div class="subnav">${items.slice(18).map(x=>workspaceButton(x[0],s)).join('')}</div>`;$('brand-mark').innerHTML=icon(s,'agent',32,true);$('icon-grid').innerHTML=items.map(([key,name])=>`<button class="specimen" data-detail="${key}" data-set="${current}" aria-label="查看${name}图标详情">${icon(s,key,28,true)}<span>${name}</span></button>`).join('');updateFavorite()}
+function renderCompare(){$('compare-head').innerHTML='<tr><th scope="col">功能入口</th>'+schemes.map((s,i)=>`<th scope="col"><span>0${i+1} / ${s.en}</span>${s.name}</th>`).join('')+'</tr>';$('compare-body').innerHTML=items.map(([key,name])=>`<tr><th scope="row">${name}</th>${schemes.map((s,i)=>`<td><button data-detail="${key}" data-set="${i}" aria-label="查看${s.name}的${name}图标">${icon(s,key,24,true)}</button></td>`).join('')}</tr>`).join('')}
+function render(){updateTheme();renderDirections();renderScene();renderCompare()}
+function updateFavorite(){const found=schemes.find(s=>s.id===favorite);$('saved').textContent=found?'已标记：'+found.name:'尚未标记方案';$('choose').textContent=favorite===schemes[current].id?'已标记这套 ✓':'标记这套方案'}
+function chooseScheme(index){current=index;render()}
+function switchView(value){view=value;document.querySelectorAll('[data-view]').forEach(b=>{const on=b.dataset.view===view;b.classList.toggle('active',on);b.setAttribute('aria-selected',on);b.tabIndex=on?0:-1});$('scene').hidden=view!=='scene';$('compare').hidden=view!=='compare'}
+function openDetail(key,index){detailItem={key,index};const s=schemes[index],item=items.find(x=>x[0]===key);$('detail-title').textContent=item[1];$('detail-meta').textContent=s.name+' / '+item[2]+' · 原始尺寸对照';$('detail-sizes').innerHTML=[16,18,20,24,32,64].map(size=>`<div class="size-cell">${icon(s,key,size,true)}<span>${size} px</span></div>`).join('');$('detail-states').innerHTML=`<div class="state">${icon(s,key,18)}默认</div><div class="state is-selected" style="color:${palette(s)[0]}">${icon(s,key,18)}选中</div><div class="state is-disabled">${icon(s,key,18)}禁用</div>`;if(!$('detail').open)$('detail').showModal()}
+function notify(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(notify.timer);notify.timer=setTimeout(()=>$('toast').hidden=true,2600)}
+function saveBlob(content,type,name){const url=URL.createObjectURL(new Blob([content],{type}));const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000)}
+function standaloneIcon(s,key,size=24){const mono=document.body.classList.contains('mono');const ink=getComputedStyle(document.body).color;const color=mono?ink:iconColor(s,items.findIndex(x=>x[0]===key));const second=mono?color:palette(s)[1];const content=drawings[s.id][key].replaceAll('var(--secondary,currentColor)',second).replaceAll('var(--stage)','none').replaceAll('var(--cut,#1a1d1c)','#000');const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="${s.id==='solid'?'currentColor':'none'}" stroke="${s.id==='solid'?'none':'currentColor'}" stroke-width="${s.width}" stroke-linecap="${s.cap}" stroke-linejoin="${s.join}" color="${color}">${content}</svg>`;return svg}
+function downloadIcon(){const {key,index}=detailItem;saveBlob(standaloneIcon(schemes[index],key),'image/svg+xml',`kivio-${schemes[index].id}-${key}.svg`);notify('SVG 已导出')}
+function exportSheet(){const s=schemes[current],bg=getComputedStyle(document.body).getPropertyValue('--stage').trim(),ink=getComputedStyle(document.body).color;const cells=items.map(([key,name],i)=>{const x=40+(i%6)*150,y=132+Math.floor(i/6)*125;return `<g transform="translate(${x} ${y})">${standaloneIcon(s,key,40).replace('<svg ','<svg x="40" y="0" ')}<text x="60" y="70" text-anchor="middle" font-size="12" fill="${ink}">${name}</text></g>`}).join('');const sheet=`<svg xmlns="http://www.w3.org/2000/svg" width="980" height="680" viewBox="0 0 980 680"><rect width="980" height="680" fill="${bg}"/><g font-family="Segoe UI,Microsoft YaHei,sans-serif"><text x="46" y="55" font-size="27" fill="${ink}">Kivio / ${s.name}</text><text x="46" y="84" font-size="12" fill="${ink}" opacity=".6">${s.en} · 24 CUSTOM ICONS · DESIGN STUDY 01</text>${cells}</g></svg>`;saveBlob(sheet,'image/svg+xml',`kivio-${s.id}-collection.svg`);notify('当前套系的 24 枚图标已导出')}
+document.addEventListener('click',event=>{const button=event.target.closest('button');if(!button)return;if(button.dataset.scheme!==undefined)chooseScheme(Number(button.dataset.scheme));if(button.dataset.view)switchView(button.dataset.view);if(button.dataset.setting){selectedSetting=button.dataset.setting;renderScene()}if(button.dataset.menu){selectedMenu=button.dataset.menu;renderScene()}if(button.dataset.detail)openDetail(button.dataset.detail,Number(button.dataset.set))});
+document.querySelector('.tabs').addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;event.preventDefault();const next=event.key==='Home'?'scene':event.key==='End'?'compare':view==='scene'?'compare':'scene';switchView(next);$(next+'-tab').focus()});
+$('size').addEventListener('change',event=>document.documentElement.style.setProperty('--nav-size',event.target.value+'px'));
+$('mono').addEventListener('change',event=>document.body.classList.toggle('mono',event.target.checked));
+$('theme').addEventListener('click',()=>{const light=document.body.classList.toggle('light');$('theme').textContent=light?'切换深色':'切换浅色';$('theme').setAttribute('aria-pressed',light);render()});
+$('choose').addEventListener('click',()=>{favorite=schemes[current].id;try{localStorage.setItem('kivio-icon-choice-v1',favorite);notify('已记下你的选择：'+schemes[current].name)}catch{notify('已标记当前方案（仅本次页面有效）')}updateFavorite()});
+$('close').addEventListener('click',()=>$('detail').close());$('detail').addEventListener('click',event=>{if(event.target===$('detail')){const r=$('detail').getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)$('detail').close()}});
+$('download-icon').addEventListener('click',downloadIcon);$('export').addEventListener('click',exportSheet);render();
+</script>
+</body>
+</html>

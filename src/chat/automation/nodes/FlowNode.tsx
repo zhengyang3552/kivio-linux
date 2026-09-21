@@ -2,7 +2,7 @@ import { Fragment, useContext, type CSSProperties } from 'react'
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
 import { Check, Loader2, Minus, Play, Plus, Power, Trash2, X } from 'lucide-react'
 import { IconButton } from '../../../components/Button'
-import { useT } from '../../../settings/i18n'
+import { useT } from '../../../components/i18n'
 import { catalogEntry, nodeSummary } from '../nodeCatalog'
 import {
   AGENT_SLOTS,
@@ -10,7 +10,8 @@ import {
   isAgentSlotRequired,
   slotAllowsMany,
 } from '../agentModel'
-import { isAttachmentType, isIfType, isSwitchType, isTriggerType, branchHandles, type AutomationNodeType, type FlowNodeData, type NodeRunStatus } from '../types'
+import type { AutomationNodeType, FlowNodeData, NodeRunStatus } from '../../../api/automationContracts'
+import { isAttachmentType, isIfType, isSwitchType, isTriggerType, branchHandles } from '../nodeSemantics'
 import { CanvasChromeContext, NodeRunStatusContext } from './chrome'
 import { ValidationContext } from './chrome'
 

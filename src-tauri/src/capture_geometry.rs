@@ -97,6 +97,20 @@ pub(crate) fn monitor_for_region(
         .map(|(_, idx)| idx)
 }
 
+/// Logical rectangles can overlap when each Windows monitor has a different
+/// scale. A frozen desktop must bind to the physical display chosen for Lens.
+pub(crate) fn monitor_for_physical_frame(
+    target: CaptureMonitor,
+    monitors: &[CaptureMonitor],
+) -> Option<usize> {
+    monitors.iter().position(|monitor| {
+        monitor.x == target.x
+            && monitor.y == target.y
+            && monitor.width == target.width
+            && monitor.height == target.height
+    })
+}
+
 #[allow(dead_code)]
 pub(crate) fn windows_monitor_region(
     region: CaptureRect,
@@ -129,6 +143,30 @@ pub(crate) fn windows_monitor_region(
         width: (right - left) as u32,
         height: (bottom - top) as u32,
     })
+}
+
+/// Map WebView client coordinates using the window's physical origin. Do not
+/// guess a monitor from globally divided logical coordinates at mixed DPI.
+pub(crate) fn windows_window_region(
+    local: CaptureRect,
+    window_x: i32,
+    window_y: i32,
+    pixel_ratio: f64,
+    monitor: CaptureMonitor,
+) -> Option<CaptureRegionPx> {
+    let scale = valid_scale(pixel_ratio);
+    windows_monitor_region(
+        CaptureRect {
+            x: window_x as f64 / scale + local.x,
+            y: window_y as f64 / scale + local.y,
+            width: local.width,
+            height: local.height,
+        },
+        CaptureMonitor {
+            scale_factor: scale,
+            ..monitor
+        },
+    )
 }
 
 fn is_positive_rect(rect: CaptureRect) -> bool {
@@ -192,6 +230,127 @@ impl From<CaptureDisplay> for CaptureRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_local_crops_use_selected_physical_monitor_at_each_scale() {
+        for (mx, my) in [(0, 0), (-1920, -1080), (3840, 180)] {
+            for scale in [1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0] {
+                let monitor = CaptureMonitor {
+                    x: mx,
+                    y: my,
+                    width: 1920,
+                    height: 1080,
+                    scale_factor: scale,
+                };
+                let rect = windows_window_region(
+                    CaptureRect {
+                        x: 10.0,
+                        y: 12.0,
+                        width: 30.0,
+                        height: 20.0,
+                    },
+                    mx,
+                    my,
+                    scale,
+                    monitor,
+                )
+                .unwrap();
+                assert_eq!(rect.x, (10.0 * scale).round() as u32);
+                assert_eq!(rect.y, (12.0 * scale).round() as u32);
+                assert_eq!(rect.x + rect.width, (40.0 * scale).round() as u32);
+                assert_eq!(rect.y + rect.height, (32.0 * scale).round() as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn window_crop_rounding_is_independent_of_monitor_origin() {
+        for (mx, my) in [(0, 0), (-3840, -2160), (3840, 180)] {
+            for scale in [1.1, 1.25, 1.5, 1.75, 2.25, 2.5, 2.75] {
+                let monitor = CaptureMonitor {
+                    x: mx,
+                    y: my,
+                    width: 1920,
+                    height: 1080,
+                    scale_factor: scale,
+                };
+                for x in 0..30 {
+                    let rect = windows_window_region(
+                        CaptureRect {
+                            x: x as f64,
+                            y: x as f64,
+                            width: 7.0,
+                            height: 7.0,
+                        },
+                        mx,
+                        my,
+                        scale,
+                        monitor,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        rect.x,
+                        (x as f64 * scale).round() as u32,
+                        "origin={mx},{my} scale={scale} x={x}"
+                    );
+                    assert_eq!(rect.y, (x as f64 * scale).round() as u32);
+                    assert_eq!(rect.x + rect.width, ((x + 7) as f64 * scale).round() as u32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn physical_frame_lookup_is_unambiguous_with_overlapping_logical_monitors() {
+        let primary = CaptureMonitor {
+            x: 0,
+            y: 0,
+            width: 3840,
+            height: 2160,
+            scale_factor: 1.0,
+        };
+        let secondary = CaptureMonitor {
+            x: 3840,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale_factor: 2.0,
+        };
+        // The secondary's logical bounds lie entirely inside the primary's.
+        assert_eq!(
+            monitor_for_region(secondary.logical_rect(), &[secondary, primary]),
+            Some(1)
+        );
+        assert_eq!(
+            monitor_for_physical_frame(secondary, &[secondary, primary]),
+            Some(0)
+        );
+        assert_eq!(
+            monitor_for_physical_frame(secondary, &[primary, secondary]),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn physical_frame_lookup_handles_negative_origins_portrait_and_hotplug() {
+        for scale in [1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0] {
+            let target = CaptureMonitor {
+                x: -1080,
+                y: -901,
+                width: 1080,
+                height: 1920,
+                scale_factor: scale,
+            };
+            assert_eq!(monitor_for_physical_frame(target, &[target]), Some(0));
+            assert_eq!(monitor_for_physical_frame(target, &[]), None);
+            let changed = CaptureMonitor {
+                width: 1920,
+                height: 1080,
+                ..target
+            };
+            assert_eq!(monitor_for_physical_frame(target, &[changed]), None);
+        }
+    }
 
     #[test]
     fn source_rect_is_display_relative_without_y_flip() {

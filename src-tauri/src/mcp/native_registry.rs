@@ -416,6 +416,16 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
     // Conversation-level tools below are appended in chat/commands.rs and
     // never exposed via list_native_builtin_tool_defs (enabled = false).
     NativeToolEntry {
+        name: "save_plan",
+        def: crate::chat::plan_document::tool,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::plan_document::handle),
+    },
+    NativeToolEntry {
         name: crate::chat::todo::TODO_WRITE_TOOL_NAME,
         def: crate::chat::todo::todo_write_tool,
         enabled: |_, _, _| false,
@@ -552,14 +562,37 @@ pub fn text_tool_result(content: String) -> McpToolCallResult {
 
 fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     Box::pin(async move {
+        let artifact_ids = string_list_argument(ctx.arguments, "artifact_ids")?;
+        let mut resolved_arguments = ctx.arguments.clone();
+        if !artifact_ids.is_empty() {
+            let extra_paths = string_list_argument(ctx.arguments, "paths")?;
+            if nonempty_path_arg(ctx.arguments).is_some() || !extra_paths.is_empty() {
+                return Err("Use artifact_ids or path/paths, not both".into());
+            }
+            let nc = ctx
+                .native_ctx
+                .ok_or("artifact_ids require an active conversation")?;
+            let paths = artifact_ids
+                .iter()
+                .map(|id| {
+                    let artifact =
+                        crate::chat::artifacts::resolve(ctx.app, &nc.conversation_id, id)?;
+                    crate::chat::artifacts::file_path(ctx.app, &nc.conversation_id, &artifact)
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if paths.len() == 1 {
+                resolved_arguments["path"] = serde_json::json!(paths[0]);
+            } else {
+                resolved_arguments["paths"] = serde_json::json!(paths);
+            }
+        }
+        let ctx = NativeCallCtx {
+            arguments: &resolved_arguments,
+            ..ctx
+        };
         let extra_paths = string_list_argument(ctx.arguments, "paths")?;
-        let single_path = ctx
-            .arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
+        let single_path = nonempty_path_arg(ctx.arguments);
 
         let mut requested = extra_paths;
         if let Some(path) = single_path.clone() {
@@ -573,7 +606,7 @@ fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
         if !image_paths.is_empty() && (requested.len() > 1 || !non_image) {
             if non_image {
                 return Ok(text_tool_result(
-                    "paths 只能用来读图片。文本文件请用 path 单独 read。".to_string(),
+                    "一次调用不能混读图片和文本，请分开 read。".to_string(),
                 ));
             }
             if let Some(nc) = ctx.native_ctx {
@@ -595,15 +628,27 @@ fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
                 return Ok(result);
             }
         }
-        if image_paths.is_empty() && !skipped.is_empty() && requested.len() > 1 {
-            return Ok(text_tool_result(skipped.join("\n")));
+        if image_paths.is_empty() && requested.len() > 1 {
+            return Ok(text_tool_result(read_non_image_paths(
+                ctx.workspace,
+                &requested,
+            )?));
         }
 
-        let raw_path = single_path.as_deref().unwrap_or_default();
-        if let Ok(path) = crate::native_tools::resolve_tool_read_path(ctx.workspace, raw_path) {
+        let raw_path = single_path
+            .or_else(|| requested.first().cloned())
+            .unwrap_or_default();
+        if let Ok(path) =
+            crate::native_tools::resolve_tool_read_path(ctx.workspace, raw_path.as_str())
+        {
             // 目录 → 列目录（并入原 ls 工具）。offset/limit 对目录忽略，走 list_dir 默认。
             if path.is_dir() {
-                let listing = crate::native_tools::list_dir(ctx.workspace, ctx.arguments)?;
+                let list_args = if nonempty_path_arg(ctx.arguments).is_some() {
+                    ctx.arguments.clone()
+                } else {
+                    serde_json::json!({ "path": raw_path })
+                };
+                let listing = crate::native_tools::list_dir(ctx.workspace, &list_args)?;
                 return Ok(text_tool_result(listing));
             }
             // 图片 → 三级视觉/OCR 策略（需要会话上下文取主模型能力）。
@@ -624,12 +669,52 @@ fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
             }
         }
         if raw_path.is_empty() {
-            return Err("read requires path or paths".to_string());
+            return Err("read requires path, paths or artifact_ids".to_string());
         }
         // 文本文件（及无法预解析为图片/文档的路径）→ 原同步文本读取。
-        let result = crate::native_tools::read_file(ctx.workspace, ctx.arguments)?;
+        // artifact_ids / paths 归一化后可能只有 raw_path，原 arguments 里没有 path。
+        let read_args = if nonempty_path_arg(ctx.arguments).is_some() {
+            ctx.arguments.clone()
+        } else {
+            serde_json::json!({ "path": raw_path })
+        };
+        let result = crate::native_tools::read_file(ctx.workspace, &read_args)?;
         super::registry::read_file_tool_result(result)
     })
+}
+
+fn nonempty_path_arg(arguments: &Value) -> Option<String> {
+    arguments
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn read_non_image_paths(
+    workspace: &NativeToolWorkspace,
+    requested: &[String],
+) -> Result<String, String> {
+    let mut parts = Vec::with_capacity(requested.len());
+    for raw in requested {
+        let args = serde_json::json!({ "path": raw });
+        if let Ok(path) = crate::native_tools::resolve_tool_read_path(workspace, raw) {
+            if path.is_dir() {
+                parts.push(crate::native_tools::list_dir(workspace, &args)?);
+                continue;
+            }
+            if let Some(hint) = skill_backed_document_hint(&path) {
+                parts.push(hint);
+                continue;
+            }
+        }
+        match crate::native_tools::read_file(workspace, &args) {
+            Ok(result) => parts.push(super::registry::read_file_tool_result(result)?.content),
+            Err(err) => parts.push(format!("{raw}: {err}")),
+        }
+    }
+    Ok(parts.join("\n\n"))
 }
 
 /// PDF/Word/Excel 由内置 skill + 主机命令解析；read 工具不读二进制文档；命中时返回引导提示而非 UTF-8 报错。
@@ -1168,6 +1253,12 @@ fn call_present_artifacts(
     workspace: &NativeToolWorkspace,
     arguments: &Value,
 ) -> Result<McpToolCallResult, String> {
+    let mode = match arguments.get("mode") {
+        None => "prepare",
+        Some(Value::String(value)) if value == "prepare" => "prepare",
+        Some(Value::String(value)) if value == "preview" => "preview",
+        Some(_) => return Err("present_artifacts mode must be prepare or preview".to_string()),
+    };
     let encoded = serde_json::to_string(arguments).unwrap_or_default();
     if encoded.chars().count() > PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS {
         return Err(
@@ -1206,6 +1297,7 @@ fn call_present_artifacts(
     let mut structured = serde_json::json!({
         "type": "artifact_presentation",
         "artifactIds": artifact_ids,
+        "mode": mode,
     });
     if let Some(caption) = caption {
         structured["caption"] = Value::String(caption);
@@ -1214,7 +1306,9 @@ fn call_present_artifacts(
     // 再追加一句 "Skipped ..."，模型收到的是自相矛盾的两句话（说要展示、又说跳过了），
     // 无法判断成没成，于是回空响应把整轮卡死（实测 out=4 tokens，稳定复现）。
     let shown = artifact_ids.len() + artifacts.len();
-    let mut content = if shown == 1 {
+    let mut content = if mode == "prepare" {
+        format!("Prepared {shown} file(s) for final-answer references. No expanded preview was displayed. Place only necessary file references beside their explanation in your final answer.")
+    } else if shown == 1 {
         "Displayed 1 file in the response.".to_string()
     } else {
         format!("Displayed {shown} files in the response.")
@@ -1260,6 +1354,48 @@ mod tests {
         // Text and image files are NOT routed to the document-skill hint.
         assert!(skill_backed_document_hint(Path::new("/a/readme.txt")).is_none());
         assert!(skill_backed_document_hint(Path::new("/a/shot.png")).is_none());
+    }
+
+    #[test]
+    fn empty_path_fields_do_not_count_as_explicit_paths() {
+        assert!(nonempty_path_arg(&serde_json::json!({})).is_none());
+        assert!(nonempty_path_arg(&serde_json::json!({ "path": "" })).is_none());
+        assert!(nonempty_path_arg(&serde_json::json!({ "path": "   " })).is_none());
+        assert_eq!(
+            nonempty_path_arg(&serde_json::json!({ "path": "a.txt" })).as_deref(),
+            Some("a.txt")
+        );
+    }
+
+    #[test]
+    fn read_non_image_paths_joins_each_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "alpha").unwrap();
+        std::fs::write(&b, "beta").unwrap();
+        let workspace = NativeToolWorkspace::conversation(dir.path().to_path_buf());
+        let body = read_non_image_paths(
+            &workspace,
+            &[
+                a.to_string_lossy().into_owned(),
+                b.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(body.contains("alpha"), "{body}");
+        assert!(body.contains("beta"), "{body}");
+        let missing = dir.path().join("missing.txt");
+        let with_gap = read_non_image_paths(
+            &workspace,
+            &[
+                a.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+        )
+        .unwrap();
+        assert!(with_gap.contains("alpha"), "{with_gap}");
+        assert!(with_gap.contains("missing.txt"), "{with_gap}");
     }
 
     #[test]
@@ -1318,6 +1454,7 @@ mod tests {
         "memory_read",
         "memory_modify",
         "memory_search",
+        "save_plan",
         "todo_write",
         "get_goal",
         "initialize_goal_criteria",
@@ -1428,6 +1565,7 @@ mod tests {
                 "memory_read",
                 "memory_modify",
                 "memory_search",
+                "save_plan",
                 "todo_write",
                 "get_goal",
                 "initialize_goal_criteria",
@@ -1653,6 +1791,7 @@ mod tests {
             Some(serde_json::json!({
                 "type": "artifact_presentation",
                 "artifactIds": ["art_a", "art_b"],
+                "mode": "prepare",
                 "caption": "Preview"
             }))
         );
@@ -1682,7 +1821,7 @@ mod tests {
         // 此前是无条件的 "Selected files will be displayed" + "Skipped ..."，两句矛盾，
         // 模型判断不出成没成而回空响应，整轮卡死（实测 out=4 tokens，稳定复现）。
         assert!(
-            result.content.contains("Displayed 1 file"),
+            result.content.contains("Prepared 1 file"),
             "must state how many were shown, got: {}",
             result.content
         );
@@ -1711,7 +1850,7 @@ mod tests {
         let workspace = NativeToolWorkspace::standalone();
         let result = call_present_artifacts(
             &workspace,
-            &serde_json::json!({ "artifact_ids": ["art_a", "art_b"] }),
+            &serde_json::json!({ "artifact_ids": ["art_a", "art_b"], "mode": "preview" }),
         )
         .expect("presentation result");
         assert!(
@@ -1752,7 +1891,8 @@ mod tests {
             result.structured_content,
             Some(serde_json::json!({
                 "type": "artifact_presentation",
-                "artifactIds": []
+                "artifactIds": [],
+                "mode": "prepare"
             }))
         );
     }
@@ -1769,5 +1909,20 @@ mod tests {
         )
         .expect_err("oversized payload");
         assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn present_artifacts_rejects_unknown_display_modes() {
+        let workspace = NativeToolWorkspace::standalone();
+        for mode in [serde_json::json!("unknown"), serde_json::json!(42)] {
+            assert!(call_present_artifacts(
+                &workspace,
+                &serde_json::json!({
+                    "artifact_ids": ["art_a"], "mode": mode
+                })
+            )
+            .unwrap_err()
+            .contains("mode"));
+        }
     }
 }

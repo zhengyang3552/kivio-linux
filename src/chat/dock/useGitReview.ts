@@ -1,15 +1,12 @@
 // Git 面板数据 hook：status 刷新（签名守卫防恒等重渲）、选中文件 diff、
-// history 分页、变更操作单飞行锁、workspace-activity 失效。
+// 变更操作单飞行锁、workspace-activity 失效。
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { dockApi } from './api'
-import { appendHistoryPage, gitStatusSignature } from './gitReviewModel'
-import type { GitCommitItem, GitDiffResult, GitDiffStatFile, GitMutationResult, GitRepoState } from './types'
+import { gitStatusSignature } from './gitReviewModel'
+import type { GitDiffResult, GitDiffStatFile, GitMutationResult, GitRepoState } from '../../api/dockContracts'
 import { workspaceActivity } from './workspaceActivity'
 
-const HISTORY_PAGE_SIZE = 50
 const FALLBACK_POLL_MS = 10_000
-
-export type CommitDiffSlot = GitDiffResult | 'loading' | 'error'
 
 export type UseGitReviewOptions = {
   workdir: string
@@ -22,12 +19,8 @@ export function useGitReview({ workdir, active }: UseGitReviewOptions) {
   const [viewError, setViewError] = useState('')
   const [mutationError, setMutationError] = useState('')
   const [busy, setBusy] = useState(false)
-  const [commits, setCommits] = useState<GitCommitItem[]>([])
-  const [historyHasMore, setHistoryHasMore] = useState(false)
-  const [historyLoading, setHistoryLoading] = useState(false)
   const [fileDiff, setFileDiff] = useState<{ key: string; result: GitDiffResult } | null>(null)
   const [fileDiffLoading, setFileDiffLoading] = useState(false)
-  const [commitDiffs, setCommitDiffs] = useState<Record<string, CommitDiffSlot>>({})
   /** 逐文件行数统计（改动列表行内徽标）：path → {additions, deletions}。 */
   const [fileStats, setFileStats] = useState<Record<string, GitDiffStatFile>>({})
 
@@ -96,10 +89,7 @@ export function useGitReview({ workdir, active }: UseGitReviewOptions) {
     setStatus(null)
     setViewError('')
     setMutationError('')
-    setCommits([])
-    setHistoryHasMore(false)
     setFileDiff(null)
-    setCommitDiffs({})
     fileStatsKeyRef.current = ''
     setFileStats({})
     if (workdir && active) void refresh()
@@ -174,38 +164,6 @@ export function useGitReview({ workdir, active }: UseGitReviewOptions) {
     setFileDiffLoading(false)
   }, [])
 
-  const loadHistory = useCallback(async (append: boolean) => {
-    const currentWorkdir = workdirRef.current
-    if (!currentWorkdir || historyLoading) return
-    setHistoryLoading(true)
-    try {
-      const skip = append ? commits.length : 0
-      const result = await dockApi.gitLog(currentWorkdir, HISTORY_PAGE_SIZE, skip)
-      if (workdirRef.current !== currentWorkdir) return
-      setCommits((prev) => (append ? appendHistoryPage(prev, result.commits) : result.commits))
-      setHistoryHasMore(result.hasMore)
-    } catch (err) {
-      if (workdirRef.current !== currentWorkdir) return
-      setViewError(err instanceof Error ? err.message : String(err))
-    } finally {
-      if (workdirRef.current === currentWorkdir) setHistoryLoading(false)
-    }
-  }, [commits.length, historyLoading])
-
-  const loadCommitDiff = useCallback(async (sha: string) => {
-    const currentWorkdir = workdirRef.current
-    if (!currentWorkdir) return
-    setCommitDiffs((prev) => (prev[sha] === 'loading' ? prev : { ...prev, [sha]: 'loading' }))
-    try {
-      const result = await dockApi.gitCommitDiff(currentWorkdir, sha)
-      if (workdirRef.current !== currentWorkdir) return
-      setCommitDiffs((prev) => ({ ...prev, [sha]: result }))
-    } catch {
-      if (workdirRef.current !== currentWorkdir) return
-      setCommitDiffs((prev) => ({ ...prev, [sha]: 'error' }))
-    }
-  }, [])
-
   /**
    * 变更操作单飞行：同一时刻只允许一个在飞；ok:false 时抛出（message/stderr 优先），
    * 成功则先应用随响应返回的新 status，再静默刷新兜底。
@@ -248,15 +206,9 @@ export function useGitReview({ workdir, active }: UseGitReviewOptions) {
     mutationError,
     clearMutationError,
     busy,
-    commits,
-    historyHasMore,
-    historyLoading,
-    loadHistory,
     fileDiff,
     fileDiffLoading,
     selectFileDiff,
-    commitDiffs,
-    loadCommitDiff,
     fileStats,
     refresh,
     runMutation,

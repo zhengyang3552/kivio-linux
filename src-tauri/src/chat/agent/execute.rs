@@ -22,6 +22,19 @@ pub type ToolExecutorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<McpToolCallResult, String>> + Send + 'a>>;
 
 pub trait ToolExecutor: Send + Sync {
+    /// Publish a complete, readable result before the model or UI sees success.
+    fn prepare_result<'a>(
+        &'a self,
+        _ctx: &ToolExecutionContext<'_>,
+        _tool: &ChatToolDefinition,
+        _arguments: &Value,
+        mut output: McpToolCallResult,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move {
+            assign_artifact_ids(&mut output.artifacts);
+            Ok(output)
+        })
+    }
     fn call<'a>(
         &'a self,
         ctx: &'a ToolExecutionContext<'a>,
@@ -63,8 +76,8 @@ pub fn match_tool_call<'a>(
     {
         return Some(exact);
     }
-    // 旧名归一化：工具被移除/合并/改名后（find→glob、ls→read、list_background→bash_output、
-    // todo_update→todo_write、skill_activate→skill），模型仍可能按旧名出牌。规整到现名后精确再比一次。
+    // 旧名归一化：工具被移除/合并/改名后（read_file→read、run_command→bash、
+    // find→glob、ls→read 等），模型仍可能按旧名出牌。规整到现名后精确再比一次。
     let canonical = crate::mcp::types::canonical_tool_name(function_name);
     if canonical != function_name {
         if let Some(hit) = tools
@@ -313,7 +326,14 @@ pub async fn execute_tool_call(
     host.emit_tool_record(ctx.conversation_id, ctx.run_id, ctx.message_id, &record);
     let started = Instant::now();
     let timeout_ms = effective_tool_timeout_ms(settings, tool, &call.arguments);
-    let call_fut = executor.call(ctx, tool, call.arguments.clone(), skill_cache);
+    let call_fut = async {
+        let output = executor
+            .call(ctx, tool, call.arguments.clone(), skill_cache)
+            .await?;
+        executor
+            .prepare_result(ctx, tool, &call.arguments, output)
+            .await
+    };
     let result = if host.requires_tool_completion() {
         // Cancellation stops further steps, but the worker remains "stopping"
         // until this operation returns. Its own native/provider deadlines still
@@ -345,7 +365,6 @@ pub async fn execute_tool_call(
     let mut follow_ups: Vec<Value> = Vec::new();
     let mut tool_content = match result {
         Ok(Ok(mut output)) if !output.is_error => {
-            assign_artifact_ids(&mut output.artifacts);
             if tool.name == "present_artifacts" {
                 complete_artifact_presentation(&mut output);
             }
@@ -861,26 +880,28 @@ fn artifact_presentation_hint(artifacts: &[ChatToolArtifact]) -> Option<String> 
     if artifacts.is_empty() {
         return None;
     }
-    let mut ids = Vec::new();
     let mut items = Vec::new();
     for artifact in artifacts {
         let Some(id) = artifact.id.as_deref() else {
             continue;
         };
-        ids.push(id);
         items.push(format!(
             "- {id}: {} ({})",
             artifact.name, artifact.mime_type
         ));
+        if let Some(path) = artifact.path.as_deref() {
+            items.push(format!(
+                "  Local file: {}",
+                serde_json::to_string(path).unwrap_or_default()
+            ));
+        }
     }
     if items.is_empty() {
         return None;
     }
-    let example = serde_json::json!({ "artifact_ids": ids });
     Some(format!(
-        "Available artifacts (not shown automatically):\n{}\nTo show selected files in chat, copy those art_ ids into present_artifacts. Example: {}. Do not pass file contents, base64, or data URLs. Existing local files can be shown with paths.",
-        items.join("\n"),
-        example,
+        "Available artifacts (not shown automatically):\n{}\nIn your final answer, reference only necessary deliverables at the relevant paragraph: [label](artifact:art_ID) for files, ![description](artifact:art_ID) for images. Replace art_ID with an exact ID listed above. Internal QA screenshots, extracted frames, drafts, and failed attempts normally stay in the work log. Do not pass file contents, base64, or data URLs. Use present_artifacts with paths to prepare selected existing local files; use mode preview only for an explicit user preview or choice.",
+        format!("{}\nTo inspect an artifact listed here, call read with artifact_ids containing its exact ID. If a local path is listed, it can also be used by file-based tools. For a user-provided disk path, use read with path directly; no artifact registration is required. Avoid guessing or searching for a generated filename when its exact ID or path is already available. Showing an image does not mean you have visually inspected it.", items.join("\n")),
     ))
 }
 
@@ -915,6 +936,18 @@ fn tool_content_with_structured_output(output: &McpToolCallResult, source: &str)
             }
             content.push_str(&hint);
         }
+    } else if let Some(structured) = output.structured_content.as_ref() {
+        // Old records have no mode. New calls need the IDs assigned to local
+        // files after execution, including when native content omits raw JSON.
+        if structured.get("mode").is_some() {
+            if let Some(ids) = structured.get("artifactIds").and_then(Value::as_array) {
+                let ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
+                content.push_str(&format!(
+                    "\n\nRegistered artifact IDs: {}. Use only needed IDs in your final answer: [label](artifact:art_ID) for files or ![description](artifact:art_ID) for images. Do not repeat a separate attachment gallery.",
+                    ids.join(", ")
+                ));
+            }
+        }
     }
     content
 }
@@ -928,6 +961,9 @@ fn effective_tool_timeout_ms(
     arguments: &Value,
 ) -> u64 {
     let default_timeout_ms = settings.chat_tools.tool_timeout_ms;
+    if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+        return default_timeout_ms.max(300_000);
+    }
     if tool.source == "mixer" && tool.name == "mixer_generate_image" {
         return default_timeout_ms.max(crate::chat::image_generation::IMAGE_GENERATION_TIMEOUT_MS);
     }
@@ -1347,6 +1383,10 @@ mod tests {
             tool_content_with_structured_output(&output, "native"),
             "display"
         );
+        output.structured_content.as_mut().unwrap()["mode"] = serde_json::json!("prepare");
+        let prepared_content = tool_content_with_structured_output(&output, "native");
+        assert!(prepared_content.contains("Registered artifact IDs: art_existing, art_local"));
+        assert!(prepared_content.contains("[label](artifact:art_ID)"));
     }
 
     #[test]
@@ -1365,9 +1405,12 @@ mod tests {
         assert!(hint.contains("art_report: report.txt (text/plain)"));
         assert!(hint.contains("not shown automatically"));
         assert!(hint.contains("present_artifacts"));
-        assert!(hint.contains(r#"{"artifact_ids":["art_report"]}"#));
+        assert!(hint.contains("[label](artifact:art_ID)"));
+        assert!(hint.contains("Internal QA screenshots"));
         assert!(hint.contains("Do not pass file contents, base64, or data URLs"));
-        assert!(hint.contains("Existing local files can be shown with paths"));
+        assert!(hint.contains("prepare selected existing local files"));
+        assert!(hint.contains("user-provided disk path"));
+        assert!(!hint.contains("Do not search the filesystem for generated filenames."));
     }
 
     #[test]
@@ -1385,12 +1428,26 @@ mod tests {
         // 旧名（移除/合并/改名前的名字）经归一化路由到现工具。
         let tools = vec![
             named_test_tool("read"),
+            named_test_tool("write"),
+            named_test_tool("edit"),
+            named_test_tool("grep"),
             named_test_tool("glob"),
+            named_test_tool("bash"),
             named_test_tool("bash_output"),
             named_test_tool("todo_write"),
         ];
+        assert_eq!(match_tool_call(&tools, "read_file").unwrap().name, "read");
+        assert_eq!(match_tool_call(&tools, "write_file").unwrap().name, "write");
+        assert_eq!(match_tool_call(&tools, "edit_file").unwrap().name, "edit");
+        assert_eq!(match_tool_call(&tools, "list_dir").unwrap().name, "read");
         assert_eq!(match_tool_call(&tools, "ls").unwrap().name, "read");
+        assert_eq!(
+            match_tool_call(&tools, "search_files").unwrap().name,
+            "grep"
+        );
+        assert_eq!(match_tool_call(&tools, "glob_files").unwrap().name, "glob");
         assert_eq!(match_tool_call(&tools, "find").unwrap().name, "glob");
+        assert_eq!(match_tool_call(&tools, "run_command").unwrap().name, "bash");
         assert_eq!(
             match_tool_call(&tools, "list_background").unwrap().name,
             "bash_output"

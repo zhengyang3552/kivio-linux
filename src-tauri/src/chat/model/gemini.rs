@@ -704,7 +704,9 @@ fn gemini_parts_from_message(
     let mut parts = Vec::new();
     for part in &message.content {
         match part {
-            MessagePart::Video { mime_type, data, .. } => {
+            MessagePart::Video {
+                mime_type, data, ..
+            } => {
                 if data.is_empty() {
                     parts.push(serde_json::json!({"text":"[视频附件不可用，请重新添加]"}));
                 } else {
@@ -715,7 +717,8 @@ fn gemini_parts_from_message(
                     } else {
                         mime_type.as_str()
                     };
-                    parts.push(serde_json::json!({"inlineData":{"mimeType":mime_type,"data":data}}));
+                    parts
+                        .push(serde_json::json!({"inlineData":{"mimeType":mime_type,"data":data}}));
                 }
             }
             MessagePart::Text { text } => {
@@ -1678,9 +1681,12 @@ mod tests {
         };
         for stream in [false, true] {
             let body = body_for(&request, stream);
-            assert_eq!(body["contents"][0]["parts"][0], serde_json::json!({
-                "inlineData": {"mimeType": "video/quicktime", "data": "AA=="}
-            }));
+            assert_eq!(
+                body["contents"][0]["parts"][0],
+                serde_json::json!({
+                    "inlineData": {"mimeType": "video/quicktime", "data": "AA=="}
+                })
+            );
         }
     }
 

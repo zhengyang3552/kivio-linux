@@ -5,11 +5,11 @@ import { createPortal } from 'react-dom'
 import { Toggle, Input, SettingsGroup } from '../components'
 import { IconButton } from '../../components/Button'
 import { ProviderSortableList } from '../ProviderSortableList'
-import { ProviderIcon, PROVIDER_PICKER_KEYS } from '../../chat/ModelIcon'
+import { ProviderIcon, PROVIDER_PICKER_KEYS } from '../../components/ModelIcon'
 import { PROVIDER_PRESETS, type ProviderPreset } from '../providerPresets'
 import { ProviderDetail } from './ProviderDetail'
 import { isProviderEnabled } from '../utils'
-import type { I18n, Lang } from '../i18n'
+import type { I18n, Lang } from '../../components/i18n'
 import type {
   Settings as SettingsData,
   ModelProvider,

@@ -1,6 +1,14 @@
 import type { Window } from '@tauri-apps/api/window'
 import { api } from '../api/tauri'
 import { isWindows } from './platform'
+import { hashPath } from './browserRoute'
+import {
+  isRememberableChatRoute,
+  pathFromHash,
+} from './routeCodec'
+
+export { hashPath } from './browserRoute'
+export { isChatOnboardingPath, isChatPath, isChatSettingsPath } from './routeCodec'
 
 export const CHAT_DEFAULT_SIZE = { width: 1280, height: 800 }
 /** 侧栏收起时可缩到的最小尺寸 */
@@ -30,22 +38,6 @@ const CHAT_WINDOW_GEOMETRY_KEY = 'kivio-chat-window-geometry'
 const CHAT_WINDOW_SIZE_KEY = 'kivio-chat-window-size'
 const WINDOWS_MINIMIZED_POSITION_SENTINEL = -10000
 const MIN_VISIBLE_GEOMETRY_EDGE = 80
-
-export function hashPath(): string {
-  return window.location.hash.replace('#', '').split('?')[0]
-}
-
-export function isChatPath(path: string): boolean {
-  return path === 'chat' || path.startsWith('chat/')
-}
-
-export function isChatSettingsPath(path: string): boolean {
-  return path === 'chat/settings' || path.startsWith('chat/settings/')
-}
-
-export function isChatOnboardingPath(path: string): boolean {
-  return path === 'chat/onboarding' || path.startsWith('chat/onboarding/')
-}
 
 function getLocalStorageItem(key: string): string | null {
   try {
@@ -79,8 +71,10 @@ function forgetRememberedChatGeometry() {
 export function normalizeStoredChatRoute(value: string | null): string | null {
   if (!value) return null
   const route = value.startsWith('#') ? value : `#${value}`
-  const path = route.replace('#', '').split('?')[0]
-  if (!isChatPath(path) || isChatSettingsPath(path) || isChatOnboardingPath(path) || path === 'chat/popout' || path.startsWith('chat/popout/')) return null
+  const path = pathFromHash(route)
+  // Rust accepts the root route when loading legacy/persisted state, but the
+  // live route observer deliberately remembers only concrete chat sub-routes.
+  if (path !== 'chat' && !isRememberableChatRoute(path)) return null
   return route
 }
 
@@ -88,7 +82,7 @@ export function normalizeStoredChatRoute(value: string | null): string | null {
  * 上次聊天路由的当前权威值由 Rust 持久化（app_data/chat-last-route.json，创建窗口时烤进
  * URL，见 src-tauri/src/windows.rs）。本模块只负责把路由变化同步给 Rust，并在内存里缓存
  * 一份供「已存在窗口被再次打开」时恢复。localStorage 的 `kivio-chat-last-route` 是旧版
- * 遗留：首次调用 getRememberedChatRoute() 时自动迁移到 Rust 并删除旧 key。
+ * 遗留：读取时自动迁移，Rust 确认成功后才删除旧 key；失败可在下次读取时重试。
  * 
  * 历史教训：localStorage 写入是异步落盘且错误被静默吞掉，退出前没有 flush 屏障，导致
  * 「每次重开固定恢复到一条旧对话」。
@@ -96,26 +90,45 @@ export function normalizeStoredChatRoute(value: string | null): string | null {
  * 校验逻辑（is_valid_chat_last_route / normalizeStoredChatRoute）在 Rust 和 TypeScript
  * 两侧各有一份，必须保持一致：chat 路由有效，settings / onboarding 无效。
  */
-let lastRouteCache: string | null = null
+// undefined means legacy storage has not been adopted; null is an explicit clear.
+let lastRouteCache: string | null | undefined
+let routeWriteRevision = 0
+let routeWriteTail: Promise<void> = Promise.resolve()
+
+function persistRememberedChatRoute(route: string | null, migration = false): Promise<void> {
+  const revision = ++routeWriteRevision
+  const legacy = getLocalStorageItem(CHAT_LAST_ROUTE_KEY)
+  // Serialize IPC writes, not just their callbacks: a delayed legacy write must
+  // finish before a newer remember/clear can update the authoritative store.
+  const write = routeWriteTail.then(async () => {
+    await api.rememberChatLastRoute(route)
+    if (revision === routeWriteRevision && getLocalStorageItem(CHAT_LAST_ROUTE_KEY) === legacy) {
+      removeLocalStorageItem(CHAT_LAST_ROUTE_KEY)
+    }
+  })
+  routeWriteTail = write.catch((err) => {
+    if (migration && revision === routeWriteRevision) lastRouteCache = undefined
+    console.warn('[persistence] Failed to persist chat route:', err)
+  })
+  // Existing observers can remain fire-and-forget; callers that await this
+  // operation still receive the actual persistence failure.
+  return write
+}
 
 
 export function rememberCurrentChatRoute() {
   const path = hashPath()
-  if (!path.startsWith('chat/') || isChatSettingsPath(path) || isChatOnboardingPath(path) || path === 'chat/popout' || path.startsWith('chat/popout/')) return
+  if (!isRememberableChatRoute(path)) return
   const route = window.location.hash || '#chat'
   lastRouteCache = route
-  api.rememberChatLastRoute(route).catch((err) => {
-    if (import.meta.env.DEV) {
-      console.warn('[persistence] Failed to remember chat route:', err)
-    }
-  })
+  return persistRememberedChatRoute(route)
 }
 
 
 export function getRememberedChatRoute(): string | null {
-  if (lastRouteCache) return lastRouteCache
+  if (lastRouteCache !== undefined) return lastRouteCache
   
-  // 自动迁移 localStorage 遗留值（仅首次调用时触发一次）
+  // Failed migrations release the cache so the next read can retry.
   const legacy = normalizeStoredChatRoute(getLocalStorageItem(CHAT_LAST_ROUTE_KEY))
   if (legacy) {
     adoptLegacyRememberedChatRoute(legacy)
@@ -128,12 +141,7 @@ export function getRememberedChatRoute(): string | null {
 
 export function forgetRememberedChatRoute() {
   lastRouteCache = null
-  removeLocalStorageItem(CHAT_LAST_ROUTE_KEY)
-  api.rememberChatLastRoute(null).catch((err) => {
-    if (import.meta.env.DEV) {
-      console.warn('[persistence] Failed to forget chat route:', err)
-    }
-  })
+  return persistRememberedChatRoute(null)
 }
 
 
@@ -143,13 +151,7 @@ export function forgetRememberedChatRoute() {
  */
 function adoptLegacyRememberedChatRoute(route: string) {
   lastRouteCache = route
-  removeLocalStorageItem(CHAT_LAST_ROUTE_KEY)
-  api.rememberChatLastRoute(route).catch((err) => {
-    if (import.meta.env.DEV) {
-      console.warn('[persistence] Failed to adopt legacy chat route:', err)
-    }
-  })
-
+  void persistRememberedChatRoute(route, true)
 }
 
 

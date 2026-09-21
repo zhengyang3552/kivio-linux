@@ -1,6 +1,6 @@
 //! 内置插件目录：广场条目 + 安装规范 + 启用后注入的 MCP / 提示。
 //!
-//! CLI 插件（OfficeCLI、Cua Driver）用**官方安装器**；Skill 落在 `~/.agents/skills`，
+//! CLI 插件（OfficeCLI）用**官方安装器**；Skill 落在 `~/.agents/skills`，
 //! Kivio 直接扫描。「让 AI 代装」只是可选。ego lite 仍在启用时从仓库下载 Skill。
 
 /// 官方 README 里的安装命令（按平台）。只给后端自动执行，不展示给用户。
@@ -107,8 +107,8 @@ pub const PLUGIN_CATALOG: &[CatalogPlugin] = &[CatalogPlugin {
     // Kivio 适配策略（英文）：仅保留 officecli 专属约束（MCP 优先、禁 watch、禁 mcp <ide>）+ skill 路由表；
     // 通用能力（图直喂 R1、临时目录/清理/绝对路径 R3、bash R4）已下沉到运行时，不再靠 hint 打补丁。
     system_hint: "\
-### OfficeCLI (plugin: officecli)\n\
-**Role.** Create/read/edit .docx / .xlsx / .pptx with OfficeCLI. Prefer this plugin over python-docx / openpyxl / python-pptx.\n\
+### OfficeCLI\n\
+**Role.** Create/read/edit .docx / .xlsx / .pptx with OfficeCLI. Prefer this tool over python-docx / openpyxl / python-pptx.\n\
 \n\
 **Skills (official set is installed).** Before substantial work, activate the matching skill (`skill` tool, or MCP `load_skill <cli-name>`):\n\
 - Base strategy → `officecli`\n\
@@ -150,7 +150,7 @@ Do **not** start layout-heavy work without the domain skill.\n\
         command: "npx skills add citrolabs/ego-lite",
     }],
     system_hint: "\
-### ego lite (plugin: ego-lite)\n\
+### ego lite\n\
 **Role.** Real Chromium browser automation for interactive web tasks — open pages, fill forms, click, screenshot, scrape, log in, test web apps.\n\
 Prefer the `ego-browser` skill over web_fetch / built-in browsing whenever the task needs real page interaction.\n\
 Activate the `ego-browser` skill, then run browser work via run_command as `ego-browser nodejs <<'EOF' … EOF` (default one invocation per task). Do NOT import Playwright or launch another browser.",
@@ -159,57 +159,6 @@ Activate the `ego-browser` skill, then run browser work via run_command as `ego-
     skill_download_url: Some("https://github.com/citrolabs/ego-lite"),
     mcp: None,
     install_doc: EGO_LITE_INSTALL_DOC,
-}, CatalogPlugin {
-    id: "cua-driver",
-    name: "Cua Driver",
-    description: "面向 AI Agent 的后台桌面操控。在 macOS / Windows / Linux 上点击、输入、读取无障碍树与窗口截图，不抢鼠标焦点。附带 Skill 与 MCP。",
-    binary: "cua-driver",
-    tags: &["Desktop", "Computer Use", "CLI", "Skill", "MCP"],
-    homepage: "https://cua.ai/cua-driver",
-    repo: "https://github.com/trycua/cua",
-    known_binary_paths: &[
-        r"%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe",
-        r"%USERPROFILE%\.local\bin\cua-driver",
-        "$HOME/.local/bin/cua-driver",
-        "/usr/local/bin/cua-driver",
-        "/opt/homebrew/bin/cua-driver",
-    ],
-    readme_urls: &[
-        "https://raw.githubusercontent.com/trycua/cua/main/README.md",
-        "https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/README.md",
-    ],
-    install_commands: &[
-        PluginInstallCommand {
-            platform: "unix",
-            command: r#"/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)""#,
-        },
-        PluginInstallCommand {
-            platform: "windows",
-            command: "irm https://cua.ai/driver/install.ps1 | iex",
-        },
-    ],
-    system_hint: "\
-### Cua Driver (plugin: cua-driver)\n\
-**Role.** Drive native desktop apps in the background — click, type, scroll, inspect accessibility trees, capture window screenshots — without stealing the user's cursor or focus.\n\
-Prefer this plugin over ad-hoc GUI scripts (PyAutoGUI, osascript click storms, cliclick) whenever the task is operating a real app on the host.\n\
-\n\
-**Skill.** Activate `cua-driver` before substantial desktop-driving work. Follow its snapshot-before-action loop; do not call tools ad-hoc.\n\
-\n\
-**Do NOT:**\n\
-- Run `cua-driver mcp-config --client claude|cursor|…` (Kivio already registers the official stdio server as plugin-cua-driver).\n\
-- Run `pip install cua` for this plugin — that is the separate Sandbox SDK, not the desktop driver.\n\
-- Launch a second computer-use driver when this plugin is enabled.\n\
-\n\
-**MCP first.** Prefer MCP tools (`list_apps`, `list_windows`, `get_window_state`, `click`, `type_text`, …) over `run_command cua-driver call …`. One persistent MCP process holds the runtime; bash cold-starts per call.\n\
-\n\
-**macOS.** `cua-driver mcp` proxies to CuaDriver.app. If tools fail on permissions, tell the user to grant Accessibility + Screen Recording to CuaDriver, then `open -n -g -a CuaDriver --args serve`.\n\
-\n\
-**Done.** Report the app/window driven and what you verified (screenshot / AX tree).",
-    skill_ids: &["cua-driver"],
-    skill_md: "", // 空 + 无 download = 官方 `skills install` 写入 ~/.agents 等，Kivio 直接扫描
-    skill_download_url: None,
-    mcp: Some(PluginMcpSpec { args: &["mcp"] }),
-    install_doc: CUA_DRIVER_INSTALL_DOC,
 }];
 
 /// `officecli load_skill` / skills install 的完整集合（CLI 子名 → frontmatter skill id）。
@@ -297,75 +246,20 @@ const OFFICECLI_INSTALL_DOC: &str = r#"## 本插件补充（OfficeCLI）
 装完官方二进制后提醒用户去插件页 **刷新并启用**，否则 MCP 不会进对话。
 "#;
 
-/// Cua Driver：官方一键安装器 + 单包 Skill + stdio MCP。不要和 `pip install cua`（Sandbox SDK）搞混。
-const CUA_DRIVER_INSTALL_DOC: &str = r#"## 本插件补充（Cua Driver）
-
-| 字段 | 值 |
-|------|-----|
-| plugin_id | cua-driver |
-| 命令名 | cua-driver |
-| 官网 | https://cua.ai/cua-driver |
-| 仓库 | https://github.com/trycua/cua |
-| 常见 Windows 安装目录 | `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin\cua-driver.exe` |
-| 常见 Unix 安装路径 | `~/.local/bin/cua-driver` |
-
-**范围：** 本插件只要 **Cua Driver**（本机后台桌面操控）。不要安装 Cua Sandbox / Cua Bench / Lume，也不要 `pip install cua`。
-
-### 安装阶段（本对话 · 由 Kivio AI 执行，非后台脚本）
-
-1. 按 README 安装官方 **cua-driver** 二进制（以刚读到的 README 为准；常见一键脚本）：
-   - macOS / Linux：`/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"`
-   - Windows PowerShell：`irm https://cua.ai/driver/install.ps1 | iex`，然后 `cua-driver autostart kick`
-2. 验收并贴出输出：
-   ```
-   cua-driver --version
-   cua-driver doctor
-   ```
-3. **macOS 权限（必须等人）：** 先启动守护进程，再申请 TCC：
-   ```
-   open -n -g -a CuaDriver --args serve
-   cua-driver permissions grant
-   ```
-   告诉用户：系统弹窗点「打开系统设置」后，在 **辅助功能** 和 **屏幕录制** 里打开 CuaDriver。完成后跑 `cua-driver permissions status`，两项都应为 granted。
-4. **官方 Skill：** `cua-driver skills install --all-platforms` 写入 `~/.agents/skills` / `~/.cua-driver/skills`。Kivio 直接扫描，**不必**再拷进插件目录。
-5. **不要**执行 `cua-driver mcp-config --client claude|cursor|vscode|…`（那是给其它 IDE 写配置的）。
-
-### 启用阶段（用户拨开关 · Kivio 运行时自动）
-
-1. **MCP**：注册官方 stdio `plugin-cua-driver` = `{绝对路径} mcp`。
-2. **Skill**：已在 `~/.agents/skills` 的 `cua-driver` 直接进对话（插件启用后才放行）。
-3. **系统提示**：Kivio 适配策略（优先 MCP、禁止 mcp-config）。
-
-装完官方二进制后提醒用户去插件页 **刷新并启用**，否则 MCP 不会进对话。
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn catalog_pins_three_plugins() {
-        assert_eq!(PLUGIN_CATALOG.len(), 3);
+    fn catalog_pins_two_plugins() {
+        assert_eq!(PLUGIN_CATALOG.len(), 2);
         assert!(catalog_plugin("officecli").is_some());
         assert!(catalog_plugin("ego-lite").is_some());
-        assert!(catalog_plugin("cua-driver").is_some());
+        assert!(catalog_plugin("cua-driver").is_none());
     }
 
     #[test]
-    fn cua_driver_is_cli_mcp_skill_plugin() {
-        let p = catalog_plugin("cua-driver").expect("cua-driver");
-        assert_eq!(p.binary, "cua-driver");
-        assert_eq!(p.skill_ids, &["cua-driver"]);
-        let mcp = p.mcp.as_ref().expect("stdio mcp");
-        assert_eq!(mcp.args, &["mcp"]);
-        assert!(p.install_doc.contains("cua-driver skills install"));
-        assert!(p.install_commands.iter().any(|c| {
-            c.platform == "windows" && c.command.contains("cua.ai/driver/install.ps1")
-        }));
-        assert!(p
-            .install_commands
-            .iter()
-            .any(|c| { c.platform == "unix" && c.command.contains("cua.ai/driver/install.sh") }));
+    fn catalog_plugins_keep_their_supported_install_paths() {
         let office = catalog_plugin("officecli").unwrap();
         assert!(office
             .install_commands
@@ -381,23 +275,13 @@ mod tests {
             .iter()
             .any(|c| c.platform == "macos"
                 && c.command.contains("npx skills add citrolabs/ego-lite")));
-        assert!(p.uses_shared_skill_dirs());
         assert!(office.uses_shared_skill_dirs());
         assert!(!ego.uses_shared_skill_dirs());
-        assert!(
-            p.install_doc.contains("不要 `pip install cua`")
-                || p.install_doc.contains("也不要 `pip install cua`")
-        );
-        assert!(p.system_hint.contains("plugin-cua-driver"));
         #[cfg(windows)]
         {
             assert_eq!(
                 office.host_install_command(),
                 Some("irm https://raw.githubusercontent.com/iOfficeAI/OfficeCLI/main/install.ps1 | iex")
-            );
-            assert_eq!(
-                p.host_install_command(),
-                Some("irm https://cua.ai/driver/install.ps1 | iex")
             );
             assert_eq!(ego.host_install_command(), None);
         }

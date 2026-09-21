@@ -10,7 +10,7 @@ import {
   fullnessLabel,
   segmentTokens,
 } from './contextPanel'
-import { i18n, type I18n, type Lang } from '../settings/i18n'
+import { i18n, type I18n, type Lang } from '../components/i18n'
 import { formatTokensK } from '../utils/tokens'
 import type { ConversationContextState } from './types'
 
@@ -158,7 +158,9 @@ export function ContextIndicator({
       : '—'
   const sourceLabel = isExternalContext
     ? (isCliReported ? t.contextSourceCliReported : t.contextSourceCliEstimated)
-    : (isProviderReported ? t.contextSourceProviderReported : t.contextSourceKivio)
+    : (isProviderReported ? t.contextSourceProviderReported
+      : tokenCountSource === 'provider_reported_with_estimate'
+        ? t.contextSourceProviderWithEstimate : t.contextSourceKivio)
   const ringRatio = usageRatio == null ? 0 : Math.max(0, Math.min(1, usageRatio))
   const lastClearUntilId = (
     contextState?.clear_boundaries ?? contextState?.clearBoundaries ?? []

@@ -1,4 +1,4 @@
-//! Official agy NDJSON protocol (verified with 1.1.26).
+//! Official agy NDJSON protocol (verified with 1.2.6; core stream remains compatible).
 //! https://antigravity.google/docs/cli/headless/
 //! One init per process, one result per turn. No control RPCs or native image blocks.
 use std::collections::{HashMap, HashSet};
@@ -14,13 +14,23 @@ use tokio::time::timeout;
 
 use crate::chat::model::ModelUsage;
 use crate::external_agents::session::live::{SessionCommand, CANCELLED_SESSION_LOST};
-use crate::external_agents::spawn::{cli_command, fold_stderr, kill_agent_process_tree};
+use crate::external_agents::spawn::{cli_command, kill_agent_process_tree};
 use crate::external_agents::types::UnifiedAgentEvent;
 use crate::proc::NoConsoleWindow;
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_CHARS: usize = 8192;
+
+fn antigravity_session_command(bin: &Path) -> tokio::process::Command {
+    let mut command = cli_command(bin);
+    // agy starts a detached self-updater on launch. CREATE_NO_WINDOW hides the
+    // CLI itself, but cannot constrain that detached helper, which can flash a
+    // console window on the first managed turn. Kivio owns CLI updates through
+    // the installer path, so managed sessions opt out of the background updater.
+    command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    command
+}
 
 #[derive(Default, Clone, Debug)]
 struct Usage {
@@ -254,7 +264,7 @@ impl AntigravitySession {
         cwd: &Path,
         resume: Option<&str>,
     ) -> Result<Self, String> {
-        let mut command = cli_command(bin);
+        let mut command = antigravity_session_command(bin);
         command
             .args(args)
             .current_dir(cwd)
@@ -338,7 +348,7 @@ impl AntigravitySession {
             }
             Err(error) => {
                 session.shutdown().await;
-                Err(fold_stderr(
+                Err(crate::external_agents::antigravity_slash::fold_error(
                     error,
                     &session
                         .stderr_tail
@@ -447,7 +457,11 @@ impl AntigravitySession {
                     Some(SessionCommand::StopTask { .. }) => {}
                 },
                 note = self.stderr_rx.recv(), if stderr_open => match note {
-                    Some(text) if !text.trim().is_empty() => { let _ = events.send(UnifiedAgentEvent::StatusNote { text }).await; }
+                    Some(text) if !text.trim().is_empty() => {
+                        let text = crate::external_agents::antigravity_slash::structured_error(&text)
+                            .unwrap_or(text);
+                        let _ = events.send(UnifiedAgentEvent::StatusNote { text }).await;
+                    }
                     None => stderr_open = false,
                     _ => {}
                 },
@@ -512,7 +526,7 @@ pub fn spawn_antigravity_session_actor(
                         {
                             error
                         } else {
-                            fold_stderr(
+                            crate::external_agents::antigravity_slash::fold_error(
                                 error,
                                 &session
                                     .stderr_tail
@@ -540,6 +554,19 @@ pub fn spawn_antigravity_session_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regular_session_disables_detached_auto_update() {
+        let command = antigravity_session_command(Path::new("agy"));
+        let value = command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "AGY_CLI_DISABLE_AUTO_UPDATE").then(|| value.and_then(|v| v.to_str()))
+            })
+            .flatten();
+        assert_eq!(value, Some("true"));
+    }
 
     async fn ask(control: &mpsc::Sender<SessionCommand>, prompt: &str) -> Vec<UnifiedAgentEvent> {
         let (events, mut rx) = mpsc::channel(256);

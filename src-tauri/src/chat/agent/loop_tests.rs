@@ -218,6 +218,7 @@ impl AgentHost for TestHost {
         &self,
         _conversation_id: &str,
         used_tokens: u64,
+        _token_count_source: Option<&str>,
         context_window_tokens: Option<u64>,
     ) {
         self.context_ticks
@@ -325,6 +326,7 @@ struct RecordingExecutor {
     active: AtomicUsize,
     max_active: AtomicUsize,
     events: Arc<Mutex<Vec<String>>>,
+    image_after_read: bool,
 }
 
 impl RecordingExecutor {
@@ -369,7 +371,16 @@ impl ToolExecutor for RecordingExecutor {
                 raw: Value::Null,
                 artifacts: Vec::new(),
                 structured_content: None,
-                follow_up_user_messages: Vec::new(),
+                follow_up_user_messages: if self.image_after_read && name == "read" {
+                    vec![serde_json::json!({
+                        "role": "user",
+                        "content": [{"type": "image_url", "image_url": {
+                            "url": "data:image/png;base64,aGVsbG8="
+                        }}]
+                    })]
+                } else {
+                    Vec::new()
+                },
             })
         })
     }
@@ -600,7 +611,7 @@ fn test_provider(base_url: &str) -> ModelProvider {
 
 fn test_run_config<'a>(state: &'a AppState, base_url: &str) -> AgentRunConfig<'a> {
     AgentRunConfig {
-        state,
+        provider_runtime: state,
         conversation_id: "conversation".to_string(),
         tool_conversation_id: "conversation".to_string(),
         depth: 0,
@@ -772,6 +783,35 @@ fn visible_tool_segment_calls_skip_hidden_disabled_builtin_feedback() {
     );
 }
 
+#[tokio::test]
+async fn disabled_tool_feedback_lists_remaining_tools_without_disabling_file_access() {
+    let host = TestHost::default();
+    let executor = RecordingExecutor::default();
+    let mut settings = Settings::default();
+    settings.chat_tools.approval_policy = "auto".into();
+    let mut cache = skills::SkillRunCache::default();
+    let result = execute_tool_round(
+        &host,
+        &executor,
+        &settings,
+        test_round_context(),
+        &[native_read_file_tool()],
+        &[],
+        vec![
+            pending_tool_call("disabled_bash", "bash"),
+            pending_tool_call("available_read", "read"),
+        ],
+        &mut cache,
+    )
+    .await;
+    let feedback = result.response_messages[0]["content"].as_str().unwrap();
+    assert!(feedback.contains("Available tools: read"), "{feedback}");
+    assert!(feedback.contains("this tool only"), "{feedback}");
+    assert_eq!(executor.events(), vec!["start:read", "finish:read"]);
+    assert_eq!(result.tool_records.len(), 1);
+    assert_eq!(result.tool_records[0].status, ToolCallStatus::Success);
+}
+
 #[test]
 fn reasoning_segment_order_precedes_text_in_same_step() {
     let mut builder = SegmentBuilder::new();
@@ -821,6 +861,52 @@ fn tool_round_limit_reached_only_for_finite_limits_at_boundary() {
     assert!(!tool_round_limit_reached(Some(3), 2));
     assert!(tool_round_limit_reached(Some(3), 3));
     assert!(tool_round_limit_reached(Some(3), 4));
+}
+
+#[tokio::test]
+async fn tool_image_follow_up_waits_for_all_results_across_batches_and_errors() {
+    // Regression: read(image) + bash produced tool/read, user/image, tool/bash.
+    // Strict providers reject the image turn with "No tool output found" for bash.
+    for trailing in ["web_fetch", "bash", "missing_tool"] {
+        let host = TestHost::default();
+        let executor = RecordingExecutor {
+            image_after_read: true,
+            ..Default::default()
+        };
+        let mut settings = Settings::default();
+        settings.chat_tools.approval_policy = "auto".into();
+        let tools = vec![
+            native_read_file_tool(),
+            native_web_fetch_tool(),
+            native_run_command_tool(),
+        ];
+        let mut skill_cache = skills::SkillRunCache::default();
+        let result = execute_tool_round(
+            &host,
+            &executor,
+            &settings,
+            test_round_context(),
+            &tools,
+            &[],
+            vec![
+                pending_tool_call("call_read", "read"),
+                pending_tool_call("call_next", trailing),
+            ],
+            &mut skill_cache,
+        )
+        .await;
+        assert!(!result.cancelled);
+        assert_eq!(result.response_messages.len(), 3);
+        assert_eq!(result.response_messages[0]["tool_call_id"], "call_read");
+        assert_eq!(
+            result.response_messages[1]["tool_call_id"], "call_next",
+            "No tool output found for call_next before image turn ({trailing})"
+        );
+        assert_eq!(
+            result.response_messages[2]["content"][0]["type"],
+            "image_url"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1619,6 +1705,49 @@ async fn run_loop_stream_planning_interrupt_after_tool_draft_returns_error_resul
 /// Fallback B: streamed synthesis request fails (HTTP 400) after a successful
 /// tool round; the tool records must survive with the bilingual fallback text.
 #[tokio::test]
+async fn tool_image_follow_up_recovery_keeps_question_and_language() {
+    let server = MockModelServer::start(vec![
+        MockResponse::Sse(planning_tool_call_sse_events()),
+        MockResponse::Status(
+            400,
+            r#"{"error":"No tool output found for call next"}"#.into(),
+        ),
+        MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"恢复回答"},"finish_reason":"stop"}]}"#.into(),
+            "[DONE]".into(),
+        ]),
+    ]);
+    let state = test_app_state();
+    let mut config = test_run_config(&state, &server.base_url);
+    // Real user messages can also have mixed text/image parts.
+    config.runtime_messages[1] = serde_json::json!({"role":"user", "content":[
+        {"type":"text", "text":"有GLM的官方群吗？"}
+    ]});
+    let executor = RecordingExecutor {
+        image_after_read: true,
+        ..Default::default()
+    };
+    let result = run_agent_loop(config, &TestHost::default(), &executor)
+        .await
+        .unwrap();
+    assert_eq!(result.stream_outcome, "recovered");
+    let bodies = server.captured_bodies();
+    assert_eq!(bodies.len(), 3);
+    let recovery: Value = serde_json::from_str(&bodies[2]).unwrap();
+    assert!(
+        recovery["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("有GLM的官方群吗？"),
+        "Recovery lost the actual question after a tool-generated image: {recovery}"
+    );
+    assert!(recovery["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("zh-CN"));
+}
+
+#[tokio::test]
 async fn run_loop_stream_synthesis_failure_preserves_tool_records_with_fallback() {
     let server = MockModelServer::start(vec![
         MockResponse::Sse(planning_tool_call_sse_events()),
@@ -2161,6 +2290,37 @@ async fn run_loop_no_anchor_skips_compaction_when_estimate_below_budget() {
 /// 且已经按权威口径算出了分子（`effective_context_tokens`）与分母
 /// （`context_window_for_model`），所以实时通道零额外计算。这条断言两件事：
 /// 一轮里**多次**上报（多次工具往返 ⇒ 多轮 ⇒ 多次上报），且数字单调不减。
+#[tokio::test]
+async fn run_loop_context_reported_anchor_wins_then_missing_usage_falls_back() {
+    let server = MockModelServer::start(vec![
+        MockResponse::Sse(planning_tool_call_sse_events()),
+        MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"done"}}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ]),
+    ]);
+    let state = test_app_state();
+    let mut config = test_run_config(&state, &server.base_url);
+    config.effective_chat_tools.max_tool_rounds = Some(2);
+    config.initial_anchor_total_tokens = Some(10);
+    config.initial_anchor_trailing_estimate = 0;
+    let host = TestHost::default();
+    let result = run_agent_loop(config, &host, &RecordingExecutor::default())
+        .await
+        .expect("run completes");
+    let ticks = host.recorded_context_ticks();
+    assert!(ticks.len() >= 2, "{ticks:?}");
+    assert_eq!(
+        ticks[0].0, 10,
+        "larger estimate must not override reported usage"
+    );
+    assert!(
+        ticks[1].0 > 10,
+        "missing usage must not retain a stale anchor: {ticks:?}"
+    );
+    assert!(result.last_step_usage.is_none());
+}
+
 #[tokio::test]
 async fn run_loop_reports_live_context_usage_each_round() {
     let server = MockModelServer::start(vec![
@@ -3822,6 +3982,47 @@ async fn a_successful_run_never_cancels_hooks() {
 // ---------------------------------------------------------------------------
 
 /// Smoke: plain chat with no tools returns a completed answer.
+#[tokio::test]
+async fn video_analysis_runs_only_when_the_main_model_calls_the_tool() {
+    for calls_video in [false, true] {
+        let final_answer = MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"Answer from the available context."}}]}"#.into(),
+            "[DONE]".into(),
+        ]);
+        let mut responses = Vec::new();
+        if calls_video {
+            responses.push(MockResponse::Sse(vec![
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_video","type":"function","function":{"name":"mixer_video_analysis","arguments":"{\"question\":\"What happens in the clip?\"}"}}]}}]}"#.into(),
+                "[DONE]".into(),
+            ]));
+        }
+        responses.push(final_answer);
+        let server = MockModelServer::start(responses);
+        let state = test_app_state();
+        let mut config = test_run_config(&state, &server.base_url);
+        config.tools = vec![crate::chat::video_analysis::tool_definition()];
+        config.effective_chat_tools.max_tool_rounds = Some(2);
+        config.runtime_messages = vec![serde_json::json!({
+            "role": "user", "content": "Tell me about the attached video."
+        })];
+        let host = TestHost::default();
+        let executor = RecordingExecutor::default();
+        let result = run_agent_loop(config, &host, &executor).await.unwrap();
+        assert_eq!(result.stream_outcome, "completed");
+        if calls_video {
+            assert_eq!(
+                executor.events(),
+                vec!["start:mixer_video_analysis", "finish:mixer_video_analysis"]
+            );
+            assert_eq!(result.tool_records[0].status, ToolCallStatus::Success);
+            assert!(server.captured_bodies()[1].contains("result:mixer_video_analysis"));
+        } else {
+            assert!(executor.events().is_empty());
+            assert!(result.tool_records.is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn run_loop_smoke_plain_answer_completes() {
     let server = MockModelServer::start(vec![MockResponse::Sse(vec![

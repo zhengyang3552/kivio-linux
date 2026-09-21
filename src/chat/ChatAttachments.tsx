@@ -3,9 +3,10 @@ import { ImageOff, X } from 'lucide-react'
 import { ChatImageContextMenu, type ChatImageMenuAnchor } from './ChatImageContextMenu'
 import { loadAttachmentDataUrl, openAttachment, type DisplayAttachment } from './attachmentPreview'
 import { FileChip } from './fileChip'
+import { fileLocationAction } from './fileLocation'
 import { openChatImageViewer } from './imageViewer'
 import { PastedTextEditorModal } from './PastedTextEditorModal'
-import { useT } from '../settings/i18n'
+import { useT } from '../components/i18n'
 
 type ChatAttachmentsProps = {
   attachments: DisplayAttachment[]
@@ -90,6 +91,7 @@ function ImagePreview({
           anchor={menuAnchor}
           src={src}
           name={attachment.name}
+          onRevealLocation={fileLocationAction(attachment.path, conversationId)}
           onOpenViewer={() => onPreview?.(src, attachment.name)}
           onClose={() => setMenuAnchor(null)}
         />
@@ -122,6 +124,8 @@ function FileAttachmentCard({
   return (
     <FileChip
       name={attachment.name}
+      kind={attachment.type === 'folder' ? 'folder' : undefined}
+      onRevealLocation={fileLocationAction(attachment.path, conversationId)}
       onClick={() => {
         if (typeof attachment.content === 'string' && onEdit) {
           onEdit(attachment)

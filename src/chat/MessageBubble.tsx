@@ -1,3 +1,5 @@
+import { invoke } from '@tauri-apps/api/core'
+import { requestDockPreview } from './dock/dockPreview'
 import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   AlertCircle,
@@ -20,15 +22,16 @@ import { ChatMarkdown, type ChatMarkdownOutlineSource, type MarkdownOutlineSourc
 import { DegradedAnswerCard } from './DegradedAnswerCard'
 import { GeneratedFileArtifacts } from './GeneratedFileArtifacts'
 import { MarkdownStreamingContext } from './markdownStreaming'
-import { artifactId, artifactPresentationFromToolCall, isArtifactPresentationToolCall } from './artifactPresentation'
-import { isExecutableAgentPlanText } from './agentPlan'
+import { artifactId, artifactPresentationFromToolCall, isArtifactPresentationToolCall, isVisibleArtifactPresentation } from './artifactPresentation'
+import { referencedArtifactIds } from './artifactReferences'
+import { hasAgentPlanText } from './agentPlan'
 import { artifactDataUrl, isImageArtifact } from './artifacts'
 import { loadArtifactDataUrl } from './attachmentPreview'
 import { openChatImageViewer } from './imageViewer'
 import { ChatInlineImage, CHAT_IMAGE_TILE_MAX_PX } from './ChatInlineImage'
 import { ReasoningBlock } from './ReasoningBlock'
 import { ChatDisclosureBody } from './ChatDisclosureBody'
-import { ModelIcon } from './ModelIcon'
+import { ModelIcon } from '../components/ModelIcon'
 import { ToolCallBlock, ImageReadCluster } from './ToolCallBlock'
 import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
 import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ModelRef, ToolCallRecord } from './types'
@@ -59,6 +62,7 @@ interface MessageBubbleProps {
   readOnly?: boolean
   message: ChatMessage
   conversationId?: string | null
+  conversationArtifactsById?: ReadonlyMap<string, ChatToolArtifact>
   tokensPerSec?: number
   reasoningDurationMs?: number | null
   reasoningDurationMsBySegmentId?: Record<string, number>
@@ -191,6 +195,8 @@ function ArtifactImage({
         src={src}
         alt={label || name}
         name={artifact.name}
+        path={artifact.path ?? artifact.filePath ?? artifact.localPath}
+        conversationId={conversationId}
         onOpenViewer={openViewer}
       />
       {label ? (
@@ -273,10 +279,12 @@ function ArtifactPresentationBlock({
   toolCall,
   artifacts,
   conversationId,
+  excludedArtifactIds,
 }: {
   toolCall: ToolCallRecord
   artifacts: ChatToolArtifact[]
   conversationId?: string | null
+  excludedArtifactIds?: ReadonlySet<string>
 }) {
   const presentation = artifactPresentationFromToolCall(toolCall)
   if (!presentation) {
@@ -291,16 +299,26 @@ function ArtifactPresentationBlock({
       .map((artifact) => [artifactId(artifact), artifact] as const)
       .filter(([id]) => Boolean(id)),
   )
-  const selected = presentation.artifactIds
+  const selectedIds = presentation.artifactIds.filter(id => !excludedArtifactIds?.has(id))
+  const selected = selectedIds
     .map((id) => artifactById.get(id))
     .filter((artifact): artifact is ChatToolArtifact => Boolean(artifact))
-  const missingCount = presentation.artifactIds.length - selected.length
+  const missingCount = selectedIds.length - selected.length
   if (presentation.artifactIds.length === 0) {
     return (
       <ToolCallErrorBoundary>
         <ToolCallBlock toolCall={toolCall} />
       </ToolCallErrorBoundary>
     )
+  }
+
+  if (!selectedIds.length) return null
+  if (presentation.mode === 'prepare') {
+    return <details className="not-prose my-1 text-xs text-neutral-500">
+      <summary className="cursor-pointer">已准备 {selectedIds.length} 个文件</summary>
+      <GeneratedFileArtifacts artifacts={selected} includeImages conversationId={conversationId} />
+      {missingCount > 0 && <span>{missingCount} 个文件不可用</span>}
+    </details>
   }
 
   return (
@@ -311,7 +329,7 @@ function ArtifactPresentationBlock({
         </div>
       ) : null}
       <GeneratedImageArtifacts artifacts={selected} conversationId={conversationId} />
-      <GeneratedFileArtifacts artifacts={selected} />
+      <GeneratedFileArtifacts artifacts={selected} conversationId={conversationId} />
       {missingCount > 0 ? (
         <div className="mt-2 inline-flex items-center gap-1.5 text-[11.5px] text-neutral-400 dark:text-neutral-500">
           <AlertCircle size={12} strokeWidth={1.9} />
@@ -352,27 +370,28 @@ function AgentPlanAction({
   disabled?: boolean
   onExecute?: (messageId: string) => Promise<void> | void
 }) {
-  const plan = planState?.plan?.trim() ?? ''
-  if (!isExecutableAgentPlanText(plan)) return null
-
-  const approved = (planState?.status ?? 'draft') === 'approved'
+  const [openError, setOpenError] = useState<string | null>(null)
+  const document = planState?.document
+  if (!document && !hasAgentPlanText(planState?.plan)) return null
   return (
-    <div className="not-prose mt-3 flex max-w-full items-center gap-2 border-l-2 border-emerald-400/70 pl-3 text-[12px] leading-5 text-neutral-500 dark:border-emerald-500/60 dark:text-neutral-400">
-      <ListChecks size={14} strokeWidth={2} className="shrink-0 text-emerald-600 dark:text-emerald-400" />
-      <span className="min-w-0 flex-1 truncate">{approved ? '已按这条计划执行' : '计划草案'}</span>
-      {!approved && onExecute && (
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={() => void onExecute(messageId)}
-          disabled={disabled}
-          title="执行这条计划"
-          aria-label="执行这条计划"
-        >
+    <div className="not-prose mt-3 border-l-2 border-emerald-400/70 pl-3 text-[12px] leading-5 text-neutral-500 dark:border-emerald-500/60 dark:text-neutral-400">
+      <div className="flex min-w-0 items-center gap-2">
+        <ListChecks size={14} className="shrink-0 text-emerald-600" />
+        {document ? (
+          <button className="min-w-0 flex-1 truncate text-left hover:underline" title={document.path} onClick={() => requestDockPreview(document.path)}>
+            {document.title}.md
+          </button>
+        ) : <span className="min-w-0 flex-1 truncate">计划草案</span>}
+        {document && <Button variant="ghost" size="sm" onClick={() => {
+          setOpenError(null)
+          void invoke('chat_open_generated_artifact', { path: document.path }).catch((error) => setOpenError(String(error)))
+        }}>打开编辑</Button>}
+        {onExecute && <Button variant="primary" size="sm" onClick={() => void onExecute(messageId)} disabled={disabled} aria-label="执行这条计划">
           <Play size={12} strokeWidth={2.2} fill="currentColor" />
-          执行这条计划
-        </Button>
-      )}
+          {document ? '执行当前版本' : '执行这条计划'}
+        </Button>}
+      </div>
+      {openError && <div role="alert">{openError}</div>}
     </div>
   )
 }
@@ -469,11 +488,13 @@ function TimelineToolSegment({
   toolCallById,
   artifacts,
   conversationId,
+  excludedArtifactIds,
 }: {
   segment: ChatMessageSegment
   toolCallById: ReadonlyMap<string, ToolCallRecord>
   artifacts: ChatToolArtifact[]
   conversationId?: string | null
+  excludedArtifactIds?: ReadonlySet<string>
 }) {
   const toolCallId = segmentToolCallId(segment)
   const toolCall = toolCallById.get(toolCallId)
@@ -489,6 +510,7 @@ function TimelineToolSegment({
         toolCall={toolCall}
         artifacts={artifacts}
         conversationId={conversationId}
+        excludedArtifactIds={excludedArtifactIds}
       />
     )
   }
@@ -697,14 +719,18 @@ function renderProcessSegments({
 }
 
 /**
- * 一轮过程 = 一个 Codex 式 Working 壳。
- * - 整轮生成中默认展开，工具完成、子代理等待不创建新的壳。
+ * 一轮过程共用一个 Working 开关；产物前后的过程按时间顺序分别展示。
+ * - 整轮生成中默认展开，后续过程不再被搬到已交付产物上方。
  * - 流式结束后默认收起，最终答复始终是容器外的独立正文。
  * - 用户手动点过开关后以用户操作为准。
  * - 折叠态只留 header，不挂组内 ReasoningBlock / ToolCallBlock / 过程旁白。
  */
 function TimelineGroupBlock({
   segments,
+  allProcessSegments,
+  showHeader,
+  userOpen,
+  onToggle,
   toolCalls,
   toolCallById,
   artifacts,
@@ -717,6 +743,10 @@ function TimelineGroupBlock({
   reasoningSegmentCount,
 }: {
   segments: ChatMessageSegment[]
+  allProcessSegments: ChatMessageSegment[]
+  showHeader: boolean
+  userOpen: boolean | null
+  onToggle: () => void
   toolCalls: ToolCallRecord[]
   toolCallById: ReadonlyMap<string, ToolCallRecord>
   artifacts: ChatToolArtifact[]
@@ -730,22 +760,23 @@ function TimelineGroupBlock({
 }) {
   const generating = messageStreaming
   const summary = useMemo(
-    () => summarizeToolGroup(segments, toolCalls, toolCallById),
-    [segments, toolCalls, toolCallById],
+    () => summarizeToolGroup(allProcessSegments, toolCalls, toolCallById),
+    [allProcessSegments, toolCalls, toolCallById],
   )
   const durationMs = useMemo(
-    () => groupWorkDurationMs(segments, toolCalls, toolCallById, reasoningDurationMs),
-    [segments, toolCalls, toolCallById, reasoningDurationMs],
+    () => groupWorkDurationMs(allProcessSegments, toolCalls, toolCallById, reasoningDurationMs),
+    [allProcessSegments, toolCalls, toolCallById, reasoningDurationMs],
   )
   const title = workingGroupTitle(generating, durationMs)
-  const [userOpen, setUserOpen] = useState<boolean | null>(null)
   const renderDetails = userOpen ?? generating
+
+  if (!showHeader && !renderDetails) return null
 
   return (
     <section aria-label="过程分组" className="not-prose">
-      <button
+      {showHeader && <button
         type="button"
-        onClick={() => setUserOpen(current => !(current ?? generating))}
+        onClick={onToggle}
         aria-expanded={renderDetails}
         data-chat-disclosure
         data-tauri-drag-region="false"
@@ -777,7 +808,7 @@ function TimelineGroupBlock({
             </span>
           )}
         </div>
-      </button>
+      </button>}
       <ChatDisclosureBody open={renderDetails} animate={userOpen !== null}>
         {() => (
           <div className="space-y-1.5">
@@ -828,6 +859,7 @@ function TimelineSegments({
   ownerMessageId: string
   onOutlineSourceChange?: (update: MarkdownOutlineSourceUpdate) => void
 }) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
   const prepared = useMemo(() => {
     const ordered = segments
     const toolCallById = new Map<string, ToolCallRecord>()
@@ -866,13 +898,31 @@ function TimelineSegments({
       messageStreaming ? 'running' : completed ? 'completed' : 'stopped',
       segment => {
         const tool = toolCallById.get(segmentToolCallId(segment))
-        return Boolean(tool && isArtifactPresentationToolCall(tool))
+        return Boolean(tool && isVisibleArtifactPresentation(tool))
       },
     )
-    return { toolCallById, citations, reasoningSegmentCount, groupItems }
+    const processGroups = groupItems.filter(item => item.type === 'group')
+    const allProcessSegments = processGroups.flatMap(item => item.segments)
+    const referencedIds = referencedArtifactIds(groupItems
+      .filter(item => item.type === 'text').map(item => segmentText(item.segment)).join('\n\n'))
+    const presentedIds = new Set<string>()
+    const presentationExclusions = new Map<string, ReadonlySet<string>>()
+    for (const item of groupItems) {
+      if (item.type !== 'presentation') continue
+      presentationExclusions.set(item.segment.id, new Set([...referencedIds, ...presentedIds]))
+      const tool = toolCallById.get(segmentToolCallId(item.segment))
+      const presentation = tool ? artifactPresentationFromToolCall(tool) : null
+      presentation?.artifactIds.forEach(id => presentedIds.add(id))
+    }
+    const fallbackIds = [...new Set(toolCalls.flatMap(tool => {
+      const presentation = artifactPresentationFromToolCall(tool)
+      return presentation?.mode === 'prepare' ? presentation.artifactIds : []
+    }))].filter(id => !referencedIds.has(id) && !presentedIds.has(id))
+    return { toolCallById, citations, reasoningSegmentCount, groupItems, processGroups, allProcessSegments, presentationExclusions, fallbackIds }
   }, [segments, toolCalls, completed, messageStreaming])
 
-  const { toolCallById, citations, reasoningSegmentCount, groupItems } = prepared
+  const { toolCallById, citations, reasoningSegmentCount, groupItems, processGroups, allProcessSegments, presentationExclusions, fallbackIds } = prepared
+  const artifactById = new Map(artifacts.map(artifact => [artifactId(artifact), artifact]))
   return (
     <section aria-label="回答时间线" className="space-y-1.5">
       {groupItems.map((item: TimelineGroupItem) => {
@@ -883,6 +933,7 @@ function TimelineSegments({
             toolCallById={toolCallById}
             artifacts={artifacts}
             conversationId={conversationId}
+            excludedArtifactIds={presentationExclusions.get(item.segment.id)}
           />
         }
         if (item.type === 'text') {
@@ -910,25 +961,37 @@ function TimelineSegments({
             </div>
           )
         }
-        const groupKey = `work-${ownerMessageId}`
+        const showHeader = item === processGroups[0]
+        const groupKey = showHeader ? `work-${ownerMessageId}` : `work-after-${item.segments[0].id}`
         return (
-          <div key={groupKey}>
-            <TimelineGroupBlock
-              segments={item.segments}
-              toolCalls={toolCalls}
-              toolCallById={toolCallById}
-              artifacts={artifacts}
-              citations={citations}
-              conversationId={conversationId}
-              messageStreaming={messageStreaming}
-              reasoningStreaming={reasoningStreaming}
-              reasoningDurationMs={reasoningDurationMs}
-              reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
-              reasoningSegmentCount={reasoningSegmentCount}
-            />
-          </div>
+          <TimelineGroupBlock
+            key={groupKey}
+            segments={item.segments}
+            allProcessSegments={allProcessSegments}
+            showHeader={showHeader}
+            userOpen={userOpen}
+            onToggle={() => setUserOpen(current => !(current ?? messageStreaming))}
+            toolCalls={toolCalls}
+            toolCallById={toolCallById}
+            artifacts={artifacts}
+            citations={citations}
+            conversationId={conversationId}
+            messageStreaming={messageStreaming}
+            reasoningStreaming={reasoningStreaming && item === processGroups[processGroups.length - 1]}
+            reasoningDurationMs={reasoningDurationMs}
+            reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
+            reasoningSegmentCount={reasoningSegmentCount}
+          />
         )
       })}
+      {!messageStreaming && completed && fallbackIds.length > 0 && <section aria-label="交付文件" className="not-prose text-xs text-neutral-500">
+        <span>文件</span>
+        <GeneratedFileArtifacts artifacts={fallbackIds.flatMap(id => {
+          const artifact = artifactById.get(id)
+          return artifact ? [artifact] : []
+        })} includeImages conversationId={conversationId} />
+        {fallbackIds.some(id => !artifactById.has(id)) && <span role="status">部分文件不可用</span>}
+      </section>}
     </section>
   )
 }
@@ -937,6 +1000,7 @@ function MessageBubbleComponent({
   readOnly = false,
   message,
   conversationId,
+  conversationArtifactsById,
   tokensPerSec,
   reasoningDurationMs,
   reasoningDurationMsBySegmentId,
@@ -997,8 +1061,21 @@ function MessageBubbleComponent({
     const hasTimelineSegments = timelineSegments.length > 0
     const messageArtifacts = message.artifacts ?? []
     const toolArtifacts = toolCalls.flatMap((toolCall) => toolCall.artifacts ?? [])
-    // Markdown 和显式展示引用仍使用全量 artifacts；回答末尾自动区域只兼容旧的无 ID artifact。
-    const renderArtifacts = [...messageArtifacts, ...toolArtifacts]
+    const artifactReferenceContent = [
+      message.content,
+      ...timelineSegments.map((segment) => segmentText(segment)),
+    ].join('\n\n')
+    const localArtifacts = [...messageArtifacts, ...toolArtifacts]
+    const localIds = new Set(localArtifacts.map(artifactId))
+    const earlierReferencedArtifacts = [...referencedArtifactIds(artifactReferenceContent)]
+      .filter(id => !localIds.has(id))
+      .flatMap(id => {
+        const artifact = conversationArtifactsById?.get(id)
+        return artifact ? [artifact] : []
+      })
+    // A later reply may cite an artifact produced by an earlier turn. Only add
+    // the cited IDs so unrelated files cannot affect relative image matching.
+    const renderArtifacts = [...earlierReferencedArtifacts, ...localArtifacts]
     const legacyMessageArtifacts = messageArtifacts.filter((artifact) => !artifactId(artifact))
     const legacyToolCalls = toolCalls.map((toolCall) => ({
       ...toolCall,
@@ -1006,10 +1083,6 @@ function MessageBubbleComponent({
     }))
     const isDirectImageGenerationPending =
       !isUser && message.content.trim() === DIRECT_IMAGE_GENERATION_PENDING
-    const artifactReferenceContent = [
-      message.content,
-      ...timelineSegments.map((segment) => segmentText(segment)),
-    ].join('\n\n')
     // 答案下方画廊：只挂「未引用 + 最后一轮截图」，避免 3 轮验收堆 9 张同名图
     const galleryImageArtifacts = selectGalleryImageArtifacts(
       legacyMessageArtifacts,
@@ -1042,7 +1115,7 @@ function MessageBubbleComponent({
       hasGeneratedImages,
       hasGeneratedFiles,
     }
-  }, [isUser, message])
+  }, [conversationArtifactsById, isUser, message])
   const {
     attachments,
     toolCalls,
@@ -1119,7 +1192,7 @@ function MessageBubbleComponent({
   // 工具调用超过 4 个时默认折叠（与思考过程一致）
   const toolsCollapsible = toolCalls.length > 4
   const agentPlan = message.agent_plan ?? message.agentPlan ?? agentPlanOverride
-  const isAgentPlanMessage = isExecutableAgentPlanText(agentPlan?.plan)
+  const isAgentPlanMessage = Boolean(agentPlan?.document) || hasAgentPlanText(agentPlan?.plan)
 
   const handleCopy = async () => {
     const ok = await copyToClipboard(message.content)
@@ -1288,7 +1361,7 @@ function MessageBubbleComponent({
                 conversationId={conversationId}
               />
             )}
-            {hasGeneratedFiles && <GeneratedFileArtifacts artifacts={generatedFileArtifacts} />}
+            {hasGeneratedFiles && <GeneratedFileArtifacts artifacts={generatedFileArtifacts} conversationId={conversationId} />}
           </>
         ) : (
           (hasAnswerContent || hasGeneratedImages || hasGeneratedFiles) && (
@@ -1313,7 +1386,7 @@ function MessageBubbleComponent({
                   conversationId={conversationId}
                 />
               )}
-              {hasGeneratedFiles && <GeneratedFileArtifacts artifacts={generatedFileArtifacts} />}
+              {hasGeneratedFiles && <GeneratedFileArtifacts artifacts={generatedFileArtifacts} conversationId={conversationId} />}
             </section>
           )
         )}

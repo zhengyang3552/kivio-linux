@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" color="#171918">
+  <title>Kivio Agent Bloom</title>
+  <g stroke="currentColor" stroke-width="8" stroke-linejoin="round">
+    <rect x="39" y="14" width="22" height="32" rx="11"/>
+    <rect x="54" y="39" width="32" height="22" rx="11"/>
+    <rect x="39" y="54" width="22" height="32" rx="11"/>
+    <rect x="14" y="39" width="32" height="22" rx="11"/>
+  </g>
+  <circle cx="50" cy="50" r="6" fill="currentColor"/>
+</svg>

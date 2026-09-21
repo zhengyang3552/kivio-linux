@@ -1,6 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, render } from '@testing-library/react'
 import { ChatInlineImage } from './ChatInlineImage'
+import { beginConversationTransition, completeConversationTransition, invalidateConversationTransition } from './conversationTransitionStore'
+
+afterEach(() => { act(() => invalidateConversationTransition()) })
 
 const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg'
 
@@ -15,6 +18,16 @@ function fireLoad(img: HTMLImageElement, width: number, height: number) {
 }
 
 describe('ChatInlineImage', () => {
+  it('loads mounted images eagerly under the conversation mask and restores lazy loading afterwards', () => {
+    const request = beginConversationTransition('image-opening')
+    const { container } = render(<ChatInlineImage src="https://example.com/opening.png" alt="opening" />)
+    const image = container.querySelector('img')!
+    expect(image).toHaveAttribute('loading', 'eager')
+    act(() => completeConversationTransition('image-opening', request))
+    expect(container.querySelector('img')).toBe(image)
+    expect(image).toHaveAttribute('loading', 'lazy')
+  })
+
   it('caps the long edge at 128px so tiles can sit in a row', () => {
     const { container } = render(<ChatInlineImage src={`${PNG}A`} alt="x" />)
     const button = container.querySelector('button')!

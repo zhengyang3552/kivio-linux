@@ -41,7 +41,7 @@ export interface PermissionModes {
 export const AGENT_MODE_OPTIONS: ModeOption[] = [
   { value: 'act', label: 'Act', description: '普通模式 · Normal', icon: Zap, tone: 'neutral' },
   { value: 'goal', label: 'Goal', description: '持续执行一个目标 · Persistent execution', icon: Target, tone: 'violet' },
-  { value: 'plan', label: 'Plan', description: '计划模式 · Enter plan mode', icon: ListChecks, tone: 'emerald' },
+  { value: 'plan', label: 'Plan', description: '生成计划文档 · Plan document', icon: ListChecks, tone: 'emerald' },
   {
     value: 'orchestrate',
     label: 'Orchestrate',

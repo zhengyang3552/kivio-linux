@@ -3,10 +3,22 @@ import {
   artifactId,
   artifactPresentationFromToolCall,
   isArtifactPresentationToolCall,
+  isVisibleArtifactPresentation,
 } from './artifactPresentation'
 import type { ToolCallRecord } from './types'
 
 describe('artifact presentation protocol', () => {
+  it('keeps newly prepared files in Work but preserves immediate previews and history', () => {
+    const call: ToolCallRecord = { id: 'prepare', name: 'present_artifacts', source: 'native',
+      structured_content: { type: 'artifact_presentation', artifactIds: ['art_a'], mode: 'prepare' } }
+    expect(artifactPresentationFromToolCall(call)?.mode).toBe('prepare')
+    expect(isVisibleArtifactPresentation(call)).toBe(false)
+    for (const mode of ['preview', undefined]) {
+      expect(isVisibleArtifactPresentation({ ...call, structured_content: {
+        type: 'artifact_presentation', artifactIds: ['art_a'], mode,
+      } })).toBe(true)
+    }
+  })
   it('reads, trims, and deduplicates camelCase artifact IDs', () => {
     const presentation = artifactPresentationFromToolCall({
       id: 'call-1',

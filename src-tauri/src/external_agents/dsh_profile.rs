@@ -55,6 +55,9 @@ const BRIDGE_FILENAME: &str = "kivio-dsh-bridge.mjs";
 const BRIDGE_SOURCE: &str = include_str!("../../resources/dsh/kivio-dsh-bridge.mjs");
 
 /// Bridge 复用官方 server/transport；dsh core API 由运行中的 profile 提供，避免安装第二份 core。
+///
+/// 这些 SDK 包的 npm `latest` 长期停在 0.0.1，而 dsh core 的生产 tag 已进入 0.1.x。
+/// 安装时必须追加当前 core 的精确版本，不能裸装包名。
 const REQUIRED_PACKAGES: &[&str] = &[
     "@deepseek-ai/dsh-sdk-jsonrpc-server",
     "@deepseek-ai/dsh-sdk-protocol",
@@ -76,9 +79,9 @@ const HOST_PLANE_TOOL_IDS: &[&str] = &[
     "tool-jobs",
     "tool-fs",
     "tool-fs-search",
-    "tool-str-replace-editor",
     "skill-filesystem",
     "tool-skill",
+    "command-goal",
     "tool-goal",
     "plan-mode",
     "compaction-basic",
@@ -285,19 +288,12 @@ fn render_patch(reasoning: Option<&str>, preset: Option<&str>) -> String {
     );
     out.push_str(&normalize_agent_preset(preset));
     out.push_str(
-        "\n\n# 与官方 web 共用 $DSH_HOME/storages，把 Kivio 会话挂进 Host Workspace。\n\
-         # 只写插件名，包从本机 dsh 安装解析，不 `plugin add` 进 kivio profile。\n\
+        "\n\n# dsh-base 0.1.5+ 已自带 storage/storage-json/storage-domain；这里只补 preset 所需的\n\
+         # Host 服务与 Workspace。\n\
+         # 重复 insert storage 会让新版 loader 以 duplicate loader entry id 直接退出。\n\
          - insert:\n\
-         \x20   - id: storage\n\
-         \x20     name: '@deepseek-ai/dsh-storage'\n\
-         \x20   - id: storage-json\n\
-         \x20     name: '@deepseek-ai/dsh-storage-json'\n\
-         \x20     config:\n\
-         \x20       root: !!js dshHomePath('storages')\n\
-         \x20   - id: storage-domain\n\
-         \x20     name: '@deepseek-ai/dsh-storage-domain'\n\
-         \x20     config:\n\
-         \x20       backend: json\n\
+         \x20   - id: subagent-model-selection-settings\n\
+         \x20     name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'\n\
          \x20   - id: workspace\n\
          \x20     name: '@deepseek-ai/dsh-workspace'\n\
          \n\
@@ -482,19 +478,56 @@ fn normalize_pi_reasoning_effort(value: Option<&str>) -> Option<&'static str> {
     }
 }
 
-/// 该 profile 的依赖是否已装好（两个包都要在 `node_modules` 里）。
-fn packages_installed(dir: &Path) -> bool {
-    REQUIRED_PACKAGES.iter().all(|pkg| {
-        let relative = pkg.trim_start_matches('@');
-        let (scope, name) = match relative.split_once('/') {
-            Some(parts) => parts,
-            None => return false,
-        };
+fn package_dir(dir: &Path, package: &str) -> Option<PathBuf> {
+    let relative = package.trim_start_matches('@');
+    let (scope, name) = relative.split_once('/')?;
+    Some(
         dir.join("node_modules")
             .join(format!("@{scope}"))
-            .join(name)
-            .exists()
-    })
+            .join(name),
+    )
+}
+
+fn installed_package_version(dir: &Path, package: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(package_dir(dir, package)?.join("package.json")).ok()?;
+    serde_json::from_str::<Value>(&raw)
+        .ok()?
+        .get("version")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// 两个 bridge SDK 都必须与正在运行的 dsh core 精确同版。
+fn packages_match_core(dir: &Path, core_version: &str) -> bool {
+    REQUIRED_PACKAGES
+        .iter()
+        .all(|package| installed_package_version(dir, package).as_deref() == Some(core_version))
+}
+
+fn versioned_package_specs(core_version: &str) -> Vec<String> {
+    REQUIRED_PACKAGES
+        .iter()
+        .map(|package| format!("{package}@{core_version}"))
+        .collect()
+}
+
+async fn dsh_core_version(bin: &Path) -> Result<String, String> {
+    if let Some(version) = crate::external_agents::spawn::cached_cli_version(bin)
+        .as_deref()
+        .and_then(crate::external_agents::installer::extract_semver)
+    {
+        return Ok(version);
+    }
+    let output = crate::external_agents::spawn::cli_probe_command(bin)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|err| format!("无法读取 dsh 版本：{err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    crate::external_agents::installer::extract_semver(&stdout)
+        .or_else(|| crate::external_agents::installer::extract_semver(&stderr))
+        .ok_or_else(|| "无法确定 dsh core 版本，不能安全安装匹配的 profile SDK".to_string())
 }
 
 /// 确保 profile 可用：装依赖（首次）+ 按当前设置重写 patch。
@@ -515,10 +548,11 @@ pub async fn ensure_profile_ready(
     std::fs::write(dir.join(".npmrc"), PROFILE_NPMRC)
         .map_err(|e| format!("写入 dsh profile npmrc 失败：{e}"))?;
 
-    if !packages_installed(&dir) {
-        install_packages(bin).await?;
+    let core_version = dsh_core_version(bin).await?;
+    if !packages_match_core(&dir, &core_version) {
+        install_packages(bin, &core_version).await?;
     }
-    strip_profile_agent_presets_dep(&dir);
+    normalize_profile_manifest(&dir)?;
 
     // patch 在依赖之后写：`dsh plugin` 首次会按模板初始化 profile 目录并写一份占位
     // `cordis.patch.yml`（内容是 `[]`），先写就会被它覆盖掉。
@@ -531,20 +565,31 @@ pub async fn ensure_profile_ready(
         .map_err(|e| format!("写入 dsh profile 配置失败：{e}"))
 }
 
-fn strip_profile_agent_presets_dep(dir: &Path) {
+fn normalize_profile_manifest(dir: &Path) -> Result<(), String> {
     let package_json = dir.join("package.json");
-    if let Ok(raw) = std::fs::read_to_string(&package_json) {
-        if let Ok(mut value) = serde_json::from_str::<Value>(&raw) {
-            let removed = value
-                .get_mut("dependencies")
-                .and_then(Value::as_object_mut)
-                .is_some_and(|deps| deps.remove(PROFILE_PRESET_PACKAGE).is_some());
-            if removed {
-                if let Ok(next) = serde_json::to_string_pretty(&value) {
-                    let _ = std::fs::write(&package_json, format!("{next}\n"));
-                }
-            }
-        }
+    let raw = std::fs::read_to_string(&package_json)
+        .map_err(|e| format!("读取 dsh profile package.json 失败：{e}"))?;
+    let mut value: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("解析 dsh profile package.json 失败：{e}"))?;
+    let manifest = value
+        .as_object_mut()
+        .ok_or_else(|| "dsh profile package.json 必须是 JSON 对象".to_string())?;
+    // dsh 0.1.5 的默认插件清单扩展会在首轮请求前读取活动插件的
+    // package.json；没有 version 会以 REQUEST_EXTENSION 失败。
+    let version = env!("CARGO_PKG_VERSION");
+    let version_changed = manifest.get("version").and_then(Value::as_str) != Some(version);
+    if version_changed {
+        manifest.insert("version".to_string(), Value::String(version.to_string()));
+    }
+    let removed_preset = manifest
+        .get_mut("dependencies")
+        .and_then(Value::as_object_mut)
+        .is_some_and(|deps| deps.remove(PROFILE_PRESET_PACKAGE).is_some());
+    if version_changed || removed_preset {
+        let next = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("序列化 dsh profile package.json 失败：{e}"))?;
+        std::fs::write(&package_json, format!("{next}\n"))
+            .map_err(|e| format!("写入 dsh profile package.json 失败：{e}"))?;
     }
     let relative = PROFILE_PRESET_PACKAGE.trim_start_matches('@');
     if let Some((scope, name)) = relative.split_once('/') {
@@ -554,6 +599,7 @@ fn strip_profile_agent_presets_dep(dir: &Path) {
                 .join(name),
         );
     }
+    Ok(())
 }
 
 /// `dsh plugin --profile kivio add <pkgs>`。
@@ -570,7 +616,7 @@ fn remove_provider_env_from_install(
     }
 }
 
-async fn install_packages(bin: &Path) -> Result<(), String> {
+async fn install_packages(bin: &Path, core_version: &str) -> Result<(), String> {
     use tokio::io::AsyncReadExt;
 
     crate::external_agents::installer::expose_node_on_path();
@@ -583,6 +629,7 @@ async fn install_packages(bin: &Path) -> Result<(), String> {
     crate::external_agents::installer::pin_official_npm_registry(&mut command);
     let config = crate::external_agents::overrides::agent_config("dsh").unwrap_or_default();
     remove_provider_env_from_install(&mut command, &config.providers);
+    let package_specs = versioned_package_specs(core_version);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -593,7 +640,7 @@ async fn install_packages(bin: &Path) -> Result<(), String> {
         .arg("--profile")
         .arg(KIVIO_PROFILE)
         .arg("add")
-        .args(REQUIRED_PACKAGES)
+        .args(&package_specs)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -707,20 +754,48 @@ mod tests {
         assert!(yml.contains("id: kivio-dsh-jsonrpc-bridge"));
         assert!(yml.contains("name: '@deepseek-ai/dsh-agent-presets'"));
         assert!(yml.contains("default: standard"));
+        assert!(yml.contains("name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'"));
         assert!(yml.contains("name: '@deepseek-ai/dsh-workspace'"));
-        assert!(yml.contains("dshHomePath('storages')"));
         assert!(yml.contains("- id: tool-bash\n  disabled: true"));
     }
 
     #[test]
-    fn patch_mounts_the_shared_dsh_workspace_registry() {
+    fn bridge_packages_are_pinned_to_the_dsh_core_version() {
+        assert_eq!(
+            versioned_package_specs("0.1.5-rc.2"),
+            vec![
+                "@deepseek-ai/dsh-sdk-jsonrpc-server@0.1.5-rc.2",
+                "@deepseek-ai/dsh-sdk-protocol@0.1.5-rc.2",
+            ]
+        );
+    }
+
+    #[test]
+    fn installed_bridge_versions_must_match_the_core() {
+        let dir = tempfile::tempdir().unwrap();
+        for package in REQUIRED_PACKAGES {
+            let package_dir = package_dir(dir.path(), package).unwrap();
+            std::fs::create_dir_all(&package_dir).unwrap();
+            std::fs::write(
+                package_dir.join("package.json"),
+                r#"{"version":"0.1.5-rc.2"}"#,
+            )
+            .unwrap();
+        }
+        assert!(packages_match_core(dir.path(), "0.1.5-rc.2"));
+        assert!(!packages_match_core(dir.path(), "0.1.6-alpha.2"));
+
+        let protocol = package_dir(dir.path(), "@deepseek-ai/dsh-sdk-protocol").unwrap();
+        std::fs::write(protocol.join("package.json"), r#"{"version":"0.0.1-rc.1"}"#).unwrap();
+        assert!(!packages_match_core(dir.path(), "0.1.5-rc.2"));
+    }
+
+    #[test]
+    fn patch_reuses_base_storage_and_mounts_the_workspace_registry() {
         let yml = render_patch(None, None);
-        assert!(yml.contains("name: '@deepseek-ai/dsh-storage'"));
-        assert!(yml.contains("name: '@deepseek-ai/dsh-storage-json'"));
-        assert!(yml.contains("name: '@deepseek-ai/dsh-storage-domain'"));
         assert!(yml.contains("name: '@deepseek-ai/dsh-workspace'"));
-        assert!(yml.contains("root: !!js dshHomePath('storages')"));
-        assert!(yml.contains("backend: json"));
+        assert!(!yml.contains("name: '@deepseek-ai/dsh-storage'"));
+        assert!(!yml.contains("id: tool-str-replace-editor"));
     }
 
     #[test]
@@ -731,7 +806,7 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("input.once('end', onInputClosed)"));
         assert!(BRIDGE_SOURCE.contains("DSH_AGENT_PRESET"));
         assert!(BRIDGE_SOURCE.contains("agentPresets"));
-        assert!(BRIDGE_SOURCE.contains("registerProvider"));
+        assert!(BRIDGE_SOURCE.contains("ctx.on('user-questions/request'"));
         assert!(BRIDGE_SOURCE.contains("session/ask"));
         assert!(BRIDGE_SOURCE.contains("withExclusiveAgentCall"));
         let cancel_at = BRIDGE_SOURCE
@@ -866,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_profile_agent_presets_dep_removes_the_shadowing_copy() {
+    fn normalize_profile_manifest_removes_the_shadowing_preset() {
         let dir =
             std::env::temp_dir().join(format!("kivio-dsh-preset-strip-{}", std::process::id()));
         let pkg_dir = dir
@@ -877,11 +952,11 @@ mod tests {
         std::fs::write(pkg_dir.join("package.json"), "{}").unwrap();
         std::fs::write(
             dir.join("package.json"),
-            r#"{"dependencies":{"@deepseek-ai/dsh-agent-presets":"0.0.1-rc.1","@deepseek-ai/dsh-sdk-protocol":"0.0.1-rc.1"}}"#,
+            r#"{"name":"dsh-profile-kivio","dependencies":{"@deepseek-ai/dsh-agent-presets":"0.0.1-rc.1","@deepseek-ai/dsh-sdk-protocol":"0.0.1-rc.1"}}"#,
         )
         .unwrap();
 
-        strip_profile_agent_presets_dep(&dir);
+        normalize_profile_manifest(&dir).unwrap();
 
         let value: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
@@ -893,8 +968,35 @@ mod tests {
             value["dependencies"]["@deepseek-ai/dsh-sdk-protocol"],
             "0.0.1-rc.1"
         );
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert!(!pkg_dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_manifest_without_legacy_preset_still_gets_a_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"dsh-profile-kivio","private":true,"dependencies":{"@deepseek-ai/dsh-sdk-protocol":"0.1.5-rc.2"},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base"]}}}"#,
+        )
+        .unwrap();
+
+        normalize_profile_manifest(dir.path()).unwrap();
+
+        let value: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            value["dependencies"]["@deepseek-ai/dsh-sdk-protocol"],
+            "0.1.5-rc.2"
+        );
+        assert_eq!(
+            value["dsh"]["profile"]["bundles"][0],
+            "@deepseek-ai/dsh-base"
+        );
     }
 
     #[test]

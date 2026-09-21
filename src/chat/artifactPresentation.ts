@@ -3,6 +3,8 @@ import type { ChatToolArtifact, ToolCallRecord } from './types'
 export interface ArtifactPresentation {
   artifactIds: string[]
   caption?: string
+  /** Missing on historical records, which keep their original visible delivery. */
+  mode?: 'prepare' | 'preview'
 }
 
 export function artifactId(artifact: ChatToolArtifact): string {
@@ -26,6 +28,7 @@ export function artifactPresentationFromToolCall(
     artifactIds?: unknown
     artifact_ids?: unknown
     caption?: unknown
+    mode?: unknown
   }
   if (value.type !== 'artifact_presentation') return null
   const rawIds = value.artifactIds ?? value.artifact_ids
@@ -37,7 +40,12 @@ export function artifactPresentationFromToolCall(
       .filter(Boolean),
   ))
   const caption = typeof value.caption === 'string' ? value.caption.trim() : ''
-  return { artifactIds, ...(caption ? { caption } : {}) }
+  const mode = value.mode === 'prepare' || value.mode === 'preview' ? value.mode : undefined
+  return { artifactIds, ...(caption ? { caption } : {}), ...(mode ? { mode } : {}) }
+}
+
+export function isVisibleArtifactPresentation(toolCall: ToolCallRecord): boolean {
+  return isArtifactPresentationToolCall(toolCall) && artifactPresentationFromToolCall(toolCall)?.mode !== 'prepare'
 }
 
 export function isArtifactPresentationToolCall(toolCall: ToolCallRecord): boolean {

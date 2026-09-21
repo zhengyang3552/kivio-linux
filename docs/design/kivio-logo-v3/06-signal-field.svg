@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" color="#171918">
+  <title>Kivio Signal Field</title>
+  <g stroke="currentColor" stroke-linecap="round">
+    <path d="M17 35c12-14 22-14 33 0s21 14 33 0" stroke-width="7"/>
+    <path d="M17 50c12-14 22-14 33 0s21 14 33 0" stroke-width="7" opacity=".72"/>
+    <path d="M17 65c12-14 22-14 33 0s21 14 33 0" stroke-width="7" opacity=".42"/>
+  </g>
+</svg>

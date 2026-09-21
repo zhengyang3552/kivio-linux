@@ -220,22 +220,13 @@ fn skill_settings_are_a_narrow_patch_and_unknown_actions_fail() {
 }
 
 #[test]
-fn bundled_guides_parse_and_are_automatically_discoverable() {
+fn bundled_configuration_guide_is_automatically_discoverable() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/skills");
-    for name in [
-        "kivio-configuration-guide",
-        "kivio-diagnosing-skills",
-        "kivio-diagnosing-plugins",
-        "kivio-diagnosing-mcp",
-        "kivio-diagnosing-hooks",
-        "kivio-diagnosing-commands",
-        "kivio-diagnosing-runtime",
-    ] {
-        let raw = fs::read_to_string(root.join(name).join("SKILL.md")).unwrap();
-        let parsed = crate::skills::parse_skill_markdown(&raw, "builtin", None, vec![]).unwrap();
-        assert_eq!(parsed.meta.id, name);
-        assert!(!parsed.meta.disable_model_invocation);
-        assert!(parsed.meta.description.chars().count() > 20);
-        assert!(!parsed.body.is_empty());
-    }
+    let name = "kivio-configuration-guide";
+    let raw = fs::read_to_string(root.join(name).join("SKILL.md")).unwrap();
+    let parsed = crate::skills::parse_skill_markdown(&raw, "builtin", None, vec![]).unwrap();
+    assert_eq!(parsed.meta.id, name);
+    assert!(!parsed.meta.disable_model_invocation);
+    assert!(parsed.meta.description.chars().count() > 20);
+    assert!(!parsed.body.is_empty());
 }

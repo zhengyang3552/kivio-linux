@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 import { vi } from 'vitest'
 import { InputBar } from './InputBar'
+import { insertTextIntoComposer } from './composerInsert'
 import { draftKey, getComposerDraft, setComposerDraft } from './composerDraft'
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }))
@@ -27,7 +28,70 @@ function UnmountOnSend({ conversationId }: { conversationId: string }) {
   return <InputBar onSend={() => setShow(false)} conversationId={conversationId} />
 }
 
+/** 复现首条「回到这里」：消息页输入框在回填信号发出后切成欢迎页输入框。 */
+function RewindFirstMessage({ conversationId }: { conversationId: string }) {
+  const [hasMessage, setHasMessage] = useState(true)
+  const inputBar = <InputBar onSend={() => {}} conversationId={conversationId} />
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => {
+          setHasMessage(false)
+          insertTextIntoComposer('原始首条消息')
+        }}
+      >
+        回到这里
+      </button>
+      {hasMessage ? (
+        <>
+          <div data-testid="message-list" />
+          {inputBar}
+        </>
+      ) : (
+        <div data-testid="empty-hero">
+          <InputBar onSend={() => {}} conversationId={conversationId} layout="inline" />
+        </div>
+      )}
+    </>
+  )
+}
+
 describe('InputBar 发送清草稿', () => {
+  it('显示自定义编辑菜单，拦截原生菜单且不冒泡到全局', () => {
+    const blockContextMenu = vi.fn((event: Event) => event.preventDefault())
+    document.addEventListener('contextmenu', blockContextMenu)
+    try {
+      render(<InputBar onSend={() => {}} conversationId="composer-context-menu" />)
+      const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
+      fireEvent(screen.getByRole('textbox'), event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(blockContextMenu).not.toHaveBeenCalled()
+      expect(screen.getByRole('menu')).toHaveClass('kv-menu')
+      expect(screen.getByRole('menuitem', { name: '粘贴' })).toBeVisible()
+    } finally {
+      document.removeEventListener('contextmenu', blockContextMenu)
+    }
+  })
+
+  it('回到首条消息后，原文会进入新挂载的欢迎页输入框', () => {
+    render(<RewindFirstMessage conversationId="c-rewind-first-message" />)
+
+    fireEvent.click(screen.getByRole('button', { name: '回到这里' }))
+
+    expect(screen.getByTestId('empty-hero')).toBeInTheDocument()
+    expect(screen.getByRole('textbox')).toHaveValue('原始首条消息')
+  })
+
+  it('回到首条消息时保留已有草稿，再追加被撤回的原文', () => {
+    render(<RewindFirstMessage conversationId="c-rewind-with-draft" />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '已有草稿' } })
+
+    fireEvent.click(screen.getByRole('button', { name: '回到这里' }))
+
+    expect(screen.getByRole('textbox')).toHaveValue('已有草稿 原始首条消息')
+  })
+
   it('上下键遍历用户历史，跳过空文字并恢复未发送草稿', () => {
     render(<InputBar onSend={() => {}} conversationId="history-draft" inputHistory={['第一条', '', '第二条']} />)
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement

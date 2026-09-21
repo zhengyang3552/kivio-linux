@@ -2,6 +2,11 @@ import { renderHook, act } from '@testing-library/react'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { useRef } from 'react'
 import { useChatRouting } from './useChatRouting'
+import {
+  beginConversationTransition,
+  invalidateConversationTransition,
+  isCurrentConversationTransition,
+} from '../conversationTransitionStore'
 
 /**
  * 回归重点（搬迁时最容易破的三件事）：
@@ -12,13 +17,18 @@ import { useChatRouting } from './useChatRouting'
 function setup(initialHash = '#chat', opts?: {
   onOpenPluginsSettings?: () => void
   onOpenSessionsSettings?: () => void
+  onLoadConversation?: (conversationId: string) => void
+  onLeaveConversation?: () => void
 }) {
   window.location.hash = initialHash
   const onViewChange = vi.fn()
-  const onLoadConversation = vi.fn()
+  const onLoadConversation = vi.fn(opts?.onLoadConversation)
   const onResetConversation = vi.fn()
+  const onLeaveConversation = vi.fn(opts?.onLeaveConversation)
   const onOpenPluginsSettings = opts?.onOpenPluginsSettings ?? vi.fn()
   const onOpenSessionsSettings = opts?.onOpenSessionsSettings ?? vi.fn()
+  const setSettingsInitialTab = vi.fn()
+  const setExtensionsNavItem = vi.fn()
 
   const rendered = renderHook(() => {
     const currentConversationIdRef = useRef<string | null>(null)
@@ -29,6 +39,9 @@ function setup(initialHash = '#chat', opts?: {
       currentConversationIdRef,
       onOpenPluginsSettings,
       onOpenSessionsSettings,
+      onLeaveConversation,
+      setSettingsInitialTab,
+      setExtensionsNavItem,
     })
     return { routing, currentConversationIdRef }
   })
@@ -40,6 +53,9 @@ function setup(initialHash = '#chat', opts?: {
     onResetConversation,
     onOpenPluginsSettings,
     onOpenSessionsSettings,
+    onLeaveConversation,
+    setSettingsInitialTab,
+    setExtensionsNavItem,
   }
 }
 
@@ -76,6 +92,7 @@ describe('useChatRouting 分支顺序', () => {
     ['#chat/mcp', 'mcp'],
     ['#chat/knowledge', 'knowledge'],
     ['#chat/notes', 'notes'],
+    ['#chat/artifacts', 'artifacts'],
     ['#chat/automations', 'automations'],
     ['#chat/onboarding', 'onboarding'],
   ]
@@ -113,6 +130,7 @@ describe('useChatRouting 分支顺序', () => {
 describe('useChatRouting hashchange', () => {
   beforeEach(() => {
     window.location.hash = '#chat'
+    invalidateConversationTransition()
   })
 
   it('hash 变化后重新解析', () => {
@@ -161,6 +179,59 @@ describe('useChatRouting hashchange', () => {
     })
     expect(onLoadConversation).toHaveBeenCalledWith('conv-10')
   })
+
+  it('进入中心页时先使旧 conversation transition 失效，迟到成功不提交', async () => {
+    let finish: (() => void) | undefined
+    const committed = vi.fn()
+    const onLoadConversation = (conversationId: string) => {
+      const requestId = beginConversationTransition(conversationId)
+      void new Promise<void>((resolve) => { finish = resolve }).then(() => {
+        if (isCurrentConversationTransition(requestId, conversationId)) committed(conversationId)
+      })
+    }
+    const { onLeaveConversation, onViewChange } = setup('#chat/missing-a', {
+      onLoadConversation,
+      onLeaveConversation: invalidateConversationTransition,
+    })
+    onLeaveConversation.mockClear()
+    onViewChange.mockClear()
+
+    act(() => {
+      window.location.hash = '#chat/settings'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+    expect(onLeaveConversation.mock.invocationCallOrder[0]).toBeLessThan(onViewChange.mock.invocationCallOrder[0]!)
+    await act(async () => { finish?.(); await Promise.resolve() })
+
+    expect(committed).not.toHaveBeenCalled()
+    expect(window.location.hash).toBe('#chat/settings')
+  })
+
+  it('进入 legacy redirect 时使旧 transition 失效，迟到失败不改路由或错误', async () => {
+    let fail: ((error: Error) => void) | undefined
+    const publishError = vi.fn()
+    const onLoadConversation = (conversationId: string) => {
+      const requestId = beginConversationTransition(conversationId)
+      void new Promise<void>((_resolve, reject) => { fail = reject }).catch((error: Error) => {
+        if (!isCurrentConversationTransition(requestId, conversationId)) return
+        publishError(error.message)
+        window.location.hash = '#chat'
+      })
+    }
+    setup('#chat/missing-a', {
+      onLoadConversation,
+      onLeaveConversation: invalidateConversationTransition,
+    })
+
+    act(() => {
+      window.location.hash = '#chat/plugins'
+      window.dispatchEvent(new HashChangeEvent('hashchange'))
+    })
+    await act(async () => { fail?.(new Error('not found')); await Promise.resolve() })
+
+    expect(publishError).not.toHaveBeenCalled()
+    expect(window.location.hash).toBe('#chat/plugins')
+  })
 })
 
 describe('useChatRouting sync*Route', () => {
@@ -189,5 +260,34 @@ describe('useChatRouting sync*Route', () => {
     expect(window.location.hash).toBe('#chat/conv-2')
     act(() => { r.syncConversationRoute(null) })
     expect(window.location.hash).toBe('#chat')
+  })
+})
+
+describe('useChatRouting center openers', () => {
+  beforeEach(() => {
+    window.location.hash = '#chat'
+  })
+
+  it('openEmbeddedSettings writes the tab, view, and settings hash', () => {
+    const { result, onViewChange, setSettingsInitialTab } = setup('#chat')
+    act(() => { result.current.routing.openEmbeddedSettings('usage') })
+    expect(setSettingsInitialTab).toHaveBeenCalledWith('usage')
+    expect(onViewChange).toHaveBeenCalledWith('settings')
+    expect(window.location.hash).toBe('#chat/settings')
+  })
+
+  it('openChatSettings is openEmbeddedSettings(chat)', () => {
+    const { result, setSettingsInitialTab } = setup('#chat')
+    act(() => { result.current.routing.openChatSettings() })
+    expect(setSettingsInitialTab).toHaveBeenCalledWith('chat')
+    expect(window.location.hash).toBe('#chat/settings')
+  })
+
+  it('openExtensionsItem records the nav item and opens that center', () => {
+    const { result, onViewChange, setExtensionsNavItem } = setup('#chat')
+    act(() => { result.current.routing.openExtensionsItem('mcp') })
+    expect(setExtensionsNavItem).toHaveBeenCalledWith('mcp')
+    expect(onViewChange).toHaveBeenCalledWith('mcp')
+    expect(window.location.hash).toBe('#chat/mcp')
   })
 })

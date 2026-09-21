@@ -401,8 +401,8 @@ export type TimelineGroupItem =
   | { type: 'presentation'; segment: ChatMessageSegment }
   | { type: 'group'; segments: ChatMessageSegment[] }
 
-/** 一条主代理答复只有一个过程容器，卡片和进度不再切断它。
- * 正文投影与过程归属分开：正常结束保留末尾答复，异常结束保留已有正文。
+/** 过程按交付位置分段展示，各段共享同一个 Work 开关。
+ * 过程段在中断后仍属于过程；保留末尾答复和无法判定为过程的部分正文。
  * 这里只改变展示，不改存储正文、复制或模型回放。
  */
 export function groupTimelineSegments(
@@ -414,8 +414,12 @@ export function groupTimelineSegments(
   const presentations = new Set(orderedSegments.filter(segment =>
     segment.kind === 'tool' && isPresentation?.(segment)))
   let lastProcessIndex = -1
+  let lastActivityIndex = -1
   orderedSegments.forEach((segment, index) => {
     if (presentations.has(segment)) return
+    if (segmentHasContent(segment) && segment.kind !== 'text') {
+      lastActivityIndex = index
+    }
     if (segmentHasContent(segment) && (segment.kind !== 'text'
       || segment.phase === 'tool_loop' || segment.phase === 'auxiliary')) {
       lastProcessIndex = index
@@ -425,24 +429,42 @@ export function groupTimelineSegments(
     index > lastProcessIndex && segment.kind === 'text' && segmentHasContent(segment)
     && !/^seg_\d+_cancelled_synthesis$/.test(segment.id)
     && (segment.phase === 'plain' || segment.phase === 'synthesis'))
-  const process: ChatMessageSegment[] = []
+  const hasCancellationNotice = orderedSegments.some(segment =>
+    segment.kind === 'text' && segmentHasContent(segment)
+    && /^seg_\d+_cancelled_synthesis$/.test(segment.id))
+  let process: ChatMessageSegment[] = []
   const body: TimelineGroupItem[] = []
+  const flushProcess = () => {
+    if (!process.length) return
+    body.push({ type: 'group', segments: process })
+    process = []
+  }
   orderedSegments.forEach((segment, index) => {
     if (!segmentHasContent(segment)) return
     if (presentations.has(segment)) {
+      flushProcess()
       body.push({ type: 'presentation', segment })
       return
     }
     const foldText = state === 'running'
-      ? index <= lastProcessIndex
-      : state === 'completed' && hasFinalAnswer && index <= lastProcessIndex
+      // A live model reply still carries tool_loop until the round finishes.
+      // Only subsequent reasoning/tools establish that it was progress text;
+      // its phase alone must not pull the streaming answer above deliveries.
+      ? index <= lastActivityIndex
+      // Stopping does not turn explicit progress into a final answer. Keep this
+      // independent of the saved outcome, which older history may not contain.
+      : ((segment.phase === 'tool_loop' || segment.phase === 'auxiliary')
+          && (state === 'stopped' || hasCancellationNotice || hasFinalAnswer || index <= lastActivityIndex))
+        || (hasFinalAnswer && index <= lastProcessIndex)
     if (segment.kind === 'text' && !foldText) {
+      flushProcess()
       body.push({ type: 'text', segment })
     } else {
       process.push(segment)
     }
   })
-  return process.length ? [{ type: 'group', segments: process }, ...body] : body
+  flushProcess()
+  return body
 }
 
 /** 后端 `started_at` 是 unix 秒；个别路径会写毫秒。 */

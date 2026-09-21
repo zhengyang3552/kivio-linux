@@ -63,7 +63,14 @@
         },
         "prompt": {
           "type": "string"
-        }
+        },
+        "required": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "valueSchema": true
       },
       "required": [
         "id",
@@ -166,6 +173,13 @@
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "tokenCountSource": {
+          "default": null,
+          "type": [
+            "string",
             "null"
           ]
         },
@@ -283,6 +297,16 @@
     "ChatPlanStatePayload": {
       "additionalProperties": false,
       "properties": {
+        "document": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/ChatPlanMode"
         },
@@ -2147,6 +2171,26 @@
           "type": "object"
         }
       ]
+    },
+    "PlanDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "path"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

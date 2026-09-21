@@ -224,6 +224,9 @@ describe('ConversationList generating wave', () => {
 
     const trailing = container.querySelector('.kv-conv-trailing')
     expect(trailing).not.toHaveAttribute('data-busy')
+    expect(trailing).toHaveAttribute('data-pinned')
+    expect(trailing).toHaveClass('w-[48px]')
+    expect(trailing?.querySelector('.kv-conv-actions')).toHaveClass('w-full', 'justify-between')
     expect(screen.queryByRole('status', { name: '正在生成' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '取消置顶' })).toBeInTheDocument()
   })
@@ -327,6 +330,5 @@ describe('ConversationList title display', () => {
     expect(onRename).not.toHaveBeenCalled()
   })
 })
-
 
 

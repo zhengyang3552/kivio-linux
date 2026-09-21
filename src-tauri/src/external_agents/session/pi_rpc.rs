@@ -1502,6 +1502,302 @@ fn pi_resume_is_live(bin: &Path, session_id: &str, cwd: &Path) -> bool {
     crate::external_agents::wsl::is_wsl_target(bin) || pi_native_session_present(session_id, cwd)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiRegenerateUserMessage {
+    pub content: String,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiRegenerateFork {
+    pub session_id: String,
+    pub session_path: Option<String>,
+    pub forked: bool,
+    pub needs_root_prompt: bool,
+}
+
+fn pi_entry_parent_id(entry: &Value) -> Option<&str> {
+    entry
+        .get("parentId")
+        .or_else(|| entry.get("parent_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn pi_entry_timestamp(entry: &Value) -> Option<i64> {
+    entry
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp())
+}
+
+fn pi_user_entry_text(entry: &Value) -> Option<String> {
+    let message = entry.get("message")?;
+    (entry.get("type").and_then(Value::as_str) == Some("message")
+        && message.get("role").and_then(Value::as_str) == Some("user"))
+    .then(|| flatten_pi_tool_content(message.get("content").unwrap_or(&Value::Null)))
+}
+
+fn canonical_pi_user_prompt(text: &str) -> String {
+    let user = text
+        .rsplit_once("# User request")
+        .map(|(_, value)| value.trim_start_matches(['\r', '\n', ' ', '\t']))
+        .unwrap_or(text);
+    normalize_space(user)
+}
+
+fn pi_prompt_matches(entry_text: &str, visible_text: &str) -> bool {
+    let expected = normalize_space(visible_text);
+    if expected.is_empty() {
+        return false;
+    }
+    let actual = canonical_pi_user_prompt(entry_text);
+    actual == expected
+        || actual
+            .strip_prefix(&expected)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with(char::is_whitespace))
+}
+
+fn active_pi_branch<'a>(entries: &'a [Value], leaf_id: &str) -> Result<Vec<&'a Value>, String> {
+    let by_id: HashMap<&str, &Value> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| (id, entry))
+        })
+        .collect();
+    let mut branch = Vec::new();
+    let mut cursor = Some(leaf_id);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = cursor {
+        if !seen.insert(id) {
+            return Err("Pi 原生会话树包含循环，无法安全重新生成".to_string());
+        }
+        let entry = by_id
+            .get(id)
+            .copied()
+            .ok_or_else(|| format!("Pi 原生会话活动分支缺少 entry {id}"))?;
+        branch.push(entry);
+        cursor = pi_entry_parent_id(entry);
+    }
+    branch.reverse();
+    Ok(branch)
+}
+
+fn select_pi_regenerate_entry<'a>(
+    entries: &'a [Value],
+    leaf_id: Option<&str>,
+    visible_users: &[PiRegenerateUserMessage],
+) -> Result<Option<&'a Value>, String> {
+    let target = visible_users
+        .last()
+        .ok_or_else(|| "Kivio 中没有可重新生成的用户消息".to_string())?;
+    let active_users: Vec<&Value> = match leaf_id {
+        Some(leaf_id) => active_pi_branch(entries, leaf_id)?
+            .into_iter()
+            .filter(|entry| pi_user_entry_text(entry).is_some())
+            .collect(),
+        None => Vec::new(),
+    };
+
+    // A failed send can leave the Kivio user bubble on screen before Pi accepted that prompt.
+    // In that case Pi is already positioned immediately before the visible target: submitting it
+    // directly is the correct retry, while forking would either fail or rewind one turn too far.
+    let visible_prefix = &visible_users[..visible_users.len() - 1];
+    let prefix_matches = active_users.len() == visible_prefix.len()
+        && active_users
+            .iter()
+            .zip(visible_prefix)
+            .all(|(entry, visible)| {
+                visible.content.trim().is_empty()
+                    || pi_user_entry_text(entry)
+                        .as_deref()
+                        .is_some_and(|text| pi_prompt_matches(text, &visible.content))
+            });
+    if prefix_matches {
+        return Ok(None);
+    }
+
+    // Normal conversations share the same user-message prefix. Select by ordinal so editing the
+    // visible target before regenerating still rewinds the original native turn. This also handles
+    // old buggy builds that appended duplicate regenerate prompts after the target.
+    let target_index = visible_users.len() - 1;
+    let shared_prefix_matches = active_users.len() >= visible_users.len()
+        && active_users[..target_index]
+            .iter()
+            .zip(visible_prefix)
+            .all(|(entry, visible)| {
+                visible.content.trim().is_empty()
+                    || pi_user_entry_text(entry)
+                        .as_deref()
+                        .is_some_and(|text| pi_prompt_matches(text, &visible.content))
+            });
+    if shared_prefix_matches {
+        return Ok(Some(active_users[target_index]));
+    }
+
+    // Older Kivio builds could append a regenerate prompt without moving Pi's leaf, leaving
+    // extra native user entries that are absent from the visible timeline. Match the target text
+    // on the active branch and use its original timestamp to prefer the real visible turn over
+    // those later duplicate prompts.
+    let mut matches: Vec<&Value> = active_users
+        .iter()
+        .copied()
+        .filter(|entry| {
+            pi_user_entry_text(entry)
+                .as_deref()
+                .is_some_and(|text| pi_prompt_matches(text, &target.content))
+        })
+        .collect();
+    if !matches.is_empty() {
+        matches.sort_by_key(|entry| {
+            pi_entry_timestamp(entry)
+                .map(|timestamp| timestamp.abs_diff(target.timestamp))
+                .unwrap_or(u64::MAX)
+        });
+        return Ok(Some(matches[0]));
+    }
+
+    // Image-only prompts can have an empty visible body while Pi stores only the generated
+    // attachment note, so text recovery is impossible. Positional fallback is limited to that
+    // case; a non-empty mismatch fails closed instead of rewinding an unrelated native turn.
+    if target.content.trim().is_empty() {
+        if let Some(entry) = active_users.get(target_index) {
+            return Ok(Some(*entry));
+        }
+    }
+    Err("无法把 Kivio 消息对应到 Pi 原生会话；未执行重新生成".to_string())
+}
+
+async fn pi_regenerate_request<R, W>(
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    stdin: &SharedPiWriter<W>,
+    id: &str,
+    mut payload: Value,
+) -> Result<Value, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    payload["id"] = Value::String(id.to_string());
+    write_rpc_value(stdin, &payload).await?;
+    loop {
+        let line = timeout(Duration::from_secs(15), reader.next_line())
+            .await
+            .map_err(|_| format!("Pi {id} 请求超时"))?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("Pi 在 {id} 响应前退出"))?;
+        let value: Value = serde_json::from_str(line.trim()).map_err(|error| error.to_string())?;
+        if value.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+            return Err("Pi 扩展在重新生成分支时要求交互，Kivio 暂时无法代答".to_string());
+        }
+        if value.get("type").and_then(Value::as_str) != Some("response")
+            || value.get("id").and_then(Value::as_str) != Some(id)
+        {
+            continue;
+        }
+        if value.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Pi 拒绝了重新生成分支请求")
+                .to_string());
+        }
+        return Ok(value);
+    }
+}
+
+async fn fork_pi_for_regenerate_io<R, W>(
+    reader: &mut tokio::io::Lines<BufReader<R>>,
+    stdin: &SharedPiWriter<W>,
+    visible_users: &[PiRegenerateUserMessage],
+) -> Result<PiRegenerateFork, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let entries_response = pi_regenerate_request(
+        reader,
+        stdin,
+        "kivio-regenerate-entries",
+        json!({"type":"get_entries"}),
+    )
+    .await?;
+    let data = entries_response
+        .get("data")
+        .ok_or_else(|| "Pi get_entries 响应缺少 data".to_string())?;
+    let entries = data
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Pi get_entries 响应缺少 entries".to_string())?;
+    let leaf_id = data
+        .get("leafId")
+        .or_else(|| data.get("leaf_id"))
+        .and_then(Value::as_str);
+    let selected = select_pi_regenerate_entry(entries, leaf_id, visible_users)?;
+    let forked = selected.is_some();
+    let needs_root_prompt = selected
+        .map(|entry| pi_entry_parent_id(entry).is_none())
+        .unwrap_or_else(|| visible_users.len() == 1);
+
+    if let Some(entry) = selected {
+        let entry_id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Pi 用户消息缺少 entry id".to_string())?;
+        let fork_response = pi_regenerate_request(
+            reader,
+            stdin,
+            "kivio-regenerate-fork",
+            json!({"type":"fork", "entryId":entry_id}),
+        )
+        .await?;
+        if fork_response
+            .get("data")
+            .and_then(|data| data.get("cancelled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Err("Pi 扩展取消了重新生成分支".to_string());
+        }
+    }
+
+    let state_response = pi_regenerate_request(
+        reader,
+        stdin,
+        "kivio-regenerate-state",
+        json!({"type":"get_state"}),
+    )
+    .await?;
+    let state = state_response
+        .get("data")
+        .ok_or_else(|| "Pi get_state 响应缺少 data".to_string())?;
+    let session_id = state
+        .get("sessionId")
+        .or_else(|| state.get("session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "Pi 分支后没有返回新的原生会话 id".to_string())?
+        .to_string();
+    let session_path = state
+        .get("sessionFile")
+        .or_else(|| state.get("session_file"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    Ok(PiRegenerateFork {
+        session_id,
+        session_path,
+        forked,
+        needs_root_prompt,
+    })
+}
+
 /// A live Pi RPC connection. The actor owns the child process while stdin/stdout are shared with
 /// the in-flight turn task so control commands can still be received during generation.
 pub struct PiRpcSession {
@@ -1591,7 +1887,19 @@ impl PiRpcSession {
         self.child.id()
     }
 
-    async fn close(&mut self) {
+    pub async fn fork_for_regenerate(
+        &mut self,
+        visible_users: &[PiRegenerateUserMessage],
+    ) -> Result<PiRegenerateFork, String> {
+        let mut reader = self.reader.lock().await;
+        let forked = fork_pi_for_regenerate_io(&mut reader, &self.stdin, visible_users).await?;
+        drop(reader);
+        self.session_id = forked.session_id.clone();
+        self.resumed = true;
+        Ok(forked)
+    }
+
+    pub(crate) async fn close(&mut self) {
         crate::external_agents::spawn::kill_agent_process_tree(&mut self.child);
         let _ = self.child.wait().await;
     }
@@ -3014,6 +3322,214 @@ mod tests {
 
         server.await.expect("mock server");
         assert_eq!(deltas, ["first", "second"]);
+    }
+
+    #[test]
+    fn regenerate_retry_does_not_rewind_when_pi_never_accepted_the_target() {
+        let entries = vec![
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-14T10:00:00.000Z","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-14T10:00:01.000Z","message":{"role":"assistant","content":"answer"}}),
+        ];
+        let visible = vec![
+            PiRegenerateUserMessage {
+                content: "first".into(),
+                timestamp: 1_757_844_000,
+            },
+            PiRegenerateUserMessage {
+                content: "second".into(),
+                timestamp: 1_757_844_002,
+            },
+        ];
+
+        assert_eq!(
+            select_pi_regenerate_entry(&entries, Some("a1"), &visible).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn regenerate_edited_target_still_selects_the_original_native_turn() {
+        let entries = vec![
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-14T10:00:00.000Z","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-14T10:00:01.000Z","message":{"role":"assistant","content":"answer"}}),
+            json!({"type":"message","id":"u2","parentId":"a1","timestamp":"2026-09-14T10:00:02.000Z","message":{"role":"user","content":"original second"}}),
+            json!({"type":"message","id":"a2","parentId":"u2","timestamp":"2026-09-14T10:00:03.000Z","message":{"role":"assistant","content":"old answer"}}),
+        ];
+        let visible = vec![
+            PiRegenerateUserMessage {
+                content: "first".into(),
+                timestamp: 1_757_844_000,
+            },
+            PiRegenerateUserMessage {
+                content: "edited second".into(),
+                timestamp: 1_757_844_002,
+            },
+        ];
+
+        let selected = select_pi_regenerate_entry(&entries, Some("a2"), &visible)
+            .unwrap()
+            .expect("edited target");
+        assert_eq!(selected["id"], "u2");
+    }
+
+    #[test]
+    fn regenerate_prefers_the_original_visible_turn_over_a_later_duplicate() {
+        let entries = vec![
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-14T10:00:00.000Z","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-14T10:00:01.000Z","message":{"role":"assistant","content":"answer"}}),
+            json!({"type":"message","id":"u2","parentId":"a1","timestamp":"2026-09-14T10:00:02.000Z","message":{"role":"user","content":"second"}}),
+            json!({"type":"message","id":"a2","parentId":"u2","timestamp":"2026-09-14T10:00:03.000Z","message":{"role":"assistant","content":"old answer"}}),
+            json!({"type":"message","id":"u2-duplicate","parentId":"a2","timestamp":"2026-09-14T10:05:00.000Z","message":{"role":"user","content":"second"}}),
+            json!({"type":"message","id":"a2-duplicate","parentId":"u2-duplicate","timestamp":"2026-09-14T10:05:01.000Z","message":{"role":"assistant","content":"newer answer"}}),
+        ];
+        let visible = vec![
+            PiRegenerateUserMessage {
+                content: "first".into(),
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-14T10:00:00.000Z")
+                    .unwrap()
+                    .timestamp(),
+            },
+            PiRegenerateUserMessage {
+                content: "second".into(),
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-14T10:00:02.000Z")
+                    .unwrap()
+                    .timestamp(),
+            },
+        ];
+
+        let selected = select_pi_regenerate_entry(&entries, Some("a2-duplicate"), &visible)
+            .unwrap()
+            .expect("visible target");
+        assert_eq!(selected["id"], "u2");
+    }
+
+    #[test]
+    fn regenerate_can_select_the_root_user_turn() {
+        let entries = vec![
+            json!({"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-14T10:00:00.000Z","message":{"role":"user","content":"first"}}),
+            json!({"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-14T10:00:01.000Z","message":{"role":"assistant","content":"answer"}}),
+        ];
+        let visible = vec![PiRegenerateUserMessage {
+            content: "first".into(),
+            timestamp: 1_757_844_000,
+        }];
+
+        let selected = select_pi_regenerate_entry(&entries, Some("a1"), &visible)
+            .unwrap()
+            .expect("root target");
+        assert_eq!(selected["id"], "u1");
+        assert_eq!(pi_entry_parent_id(selected), None);
+    }
+
+    #[tokio::test]
+    async fn regenerate_forks_pi_before_resubmitting_the_visible_user_message() {
+        let (client_stdin, server_stdin) = duplex(8192);
+        let stdin = Arc::new(Mutex::new(client_stdin));
+        let (client_stdout, mut server_stdout) = duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(server_stdin).lines();
+
+            let entries: Value = serde_json::from_str(
+                &requests
+                    .next_line()
+                    .await
+                    .expect("entries request")
+                    .expect("entries line"),
+            )
+            .expect("entries json");
+            assert_eq!(entries["type"], "get_entries");
+            let entries_id = entries["id"].as_str().expect("entries id");
+            server_stdout
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({
+                            "id": entries_id,
+                            "type": "response",
+                            "command": "get_entries",
+                            "success": true,
+                            "data": {
+                                "entries": [
+                                    {"type":"message","id":"u1","parentId":null,"timestamp":"2026-09-14T10:00:00.000Z","message":{"role":"user","content":"first"}},
+                                    {"type":"message","id":"a1","parentId":"u1","timestamp":"2026-09-14T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"old answer"}]}},
+                                    {"type":"message","id":"u2","parentId":"a1","timestamp":"2026-09-14T10:00:02.000Z","message":{"role":"user","content":"second"}},
+                                    {"type":"message","id":"a2","parentId":"u2","timestamp":"2026-09-14T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"later answer"}]}}
+                                ],
+                                "leafId": "a2"
+                            }
+                        })
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("entries response");
+
+            let fork: Value = serde_json::from_str(
+                &requests
+                    .next_line()
+                    .await
+                    .expect("fork request")
+                    .expect("fork line"),
+            )
+            .expect("fork json");
+            assert_eq!(fork["type"], "fork");
+            assert_eq!(fork["entryId"], "u2");
+            let fork_id = fork["id"].as_str().expect("fork id");
+            server_stdout
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id":fork_id,"type":"response","command":"fork","success":true,"data":{"text":"second","cancelled":false}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("fork response");
+
+            let state: Value = serde_json::from_str(
+                &requests
+                    .next_line()
+                    .await
+                    .expect("state request")
+                    .expect("state line"),
+            )
+            .expect("state json");
+            assert_eq!(state["type"], "get_state");
+            let state_id = state["id"].as_str().expect("state id");
+            server_stdout
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"id":state_id,"type":"response","command":"get_state","success":true,"data":{"sessionId":"forked-session","sessionFile":"C:/tmp/forked.jsonl"}})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("state response");
+        });
+
+        let mut reader = BufReader::new(client_stdout).lines();
+        let forked = fork_pi_for_regenerate_io(
+            &mut reader,
+            &stdin,
+            &[
+                PiRegenerateUserMessage {
+                    content: "first".into(),
+                    timestamp: 1_757_844_000,
+                },
+                PiRegenerateUserMessage {
+                    content: "second".into(),
+                    timestamp: 1_757_844_002,
+                },
+            ],
+        )
+        .await
+        .expect("fork regenerate");
+        server.await.expect("server");
+        assert_eq!(forked.session_id, "forked-session");
+        assert_eq!(forked.session_path.as_deref(), Some("C:/tmp/forked.jsonl"));
+        assert!(forked.forked);
+        assert!(!forked.needs_root_prompt);
     }
 
     #[tokio::test]

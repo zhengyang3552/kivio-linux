@@ -14,14 +14,7 @@
 //!   `CombinedTranslateEventSink` 把适配器的 `StreamPart` 翻译成现有 Tauri 事件。
 //! - `ocr_image_message` —— 视觉请求的 image+text 用户消息构造。
 
-use std::{
-    collections::HashSet,
-    fs,
-    future::Future,
-    path::Path,
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+use std::{collections::HashSet, fs, future::Future, path::Path, time::Duration};
 
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::{header::HeaderMap, Client, RequestBuilder, StatusCode};
@@ -460,7 +453,10 @@ where
         if is_cancelled() {
             return Err(format!("{} cancelled", label));
         }
-        let idx = match state.pick_active_key(provider_id, total, &tried) {
+        let idx = match state
+            .provider_runtime()
+            .pick_active_key(provider_id, total, &tried)
+        {
             Some(i) => i,
             None => break,
         };
@@ -468,7 +464,10 @@ where
         let key = api_keys[idx].as_str();
 
         // 是否还有未试过的备用 key —— 决定 429 是否在阈值处提前交回外层换 key。
-        let has_backup_key = state.pick_active_key(provider_id, total, &tried).is_some();
+        let has_backup_key = state
+            .provider_runtime()
+            .pick_active_key(provider_id, total, &tried)
+            .is_some();
         let rate_limit_cap = if has_backup_key {
             Some(RATE_LIMIT_KEY_SWITCH_THRESHOLD)
         } else {
@@ -486,12 +485,12 @@ where
         .await
         {
             Ok(resp) => {
-                state.mark_key_ok(provider_id, idx);
+                state.provider_runtime().mark_key_ok(provider_id, idx);
                 return Ok(resp);
             }
             Err(err_msg) => {
                 if is_failover_error(&err_msg) && tried.len() < total {
-                    state.mark_key_failed(provider_id, idx);
+                    state.provider_runtime().mark_key_failed(provider_id, idx);
                     eprintln!(
                         "[failover] {} key #{}/{} failed, switching to next: {}",
                         label,
@@ -504,7 +503,7 @@ where
                 }
                 // 非 failover 错误（或已穷举所有 key）→ 直接返回
                 if is_failover_error(&err_msg) {
-                    state.mark_key_failed(provider_id, idx);
+                    state.provider_runtime().mark_key_failed(provider_id, idx);
                 }
                 return Err(err_msg);
             }
@@ -898,17 +897,14 @@ pub async fn call_vision_api(
     if stream {
         // 启动新流：递增代号，存到本流持有的快照里；sink 每次 emit 只要发现全局代号 != 自己的快照
         // 就返回 Cancelled 错，适配器沿 `?` 上抛回来。
-        let generation = state
-            .explain_stream_generation
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        let generation = state.lens().begin_stream();
         let mut sink = LensEventSink::new(
             |payload| {
                 let _ = app.emit(event_name, payload);
             },
             image_id,
             stream_kind,
-            &state.explain_stream_generation,
+            state.lens(),
             generation,
         );
         let result =
@@ -938,7 +934,7 @@ pub async fn call_vision_api(
 // ===== 流式调用 =====
 
 /// 通用流式 chat 调用：组 `GenerateRequest` → 适配器流式 → `LensEventSink` emit 事件。
-/// 复用 explain_stream_generation 作取消代号（lens-stream / lens-translate-stream 都共用）。
+/// 复用 Lens owner 的 stream generation 作取消代号（lens-stream / lens-translate-stream 共用）。
 /// 取消不是错误：emit done("cancelled") 并返回已累积的部分文本。
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_chat_call(
@@ -970,17 +966,14 @@ pub async fn stream_chat_call(
         },
         metadata: legacy_request_metadata("Stream chat", usage_source, usage_operation),
     };
-    let generation = state
-        .explain_stream_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
+    let generation = state.lens().begin_stream();
     let mut sink = LensEventSink::new(
         |payload| {
             let _ = app.emit(event_name, payload);
         },
         image_id,
         kind,
-        &state.explain_stream_generation,
+        state.lens(),
         generation,
     );
     let result =
@@ -1040,16 +1033,13 @@ pub async fn stream_translate_combined(
             usage_operation,
         ),
     };
-    let my_gen = state
-        .explain_stream_generation
-        .fetch_add(1, Ordering::SeqCst)
-        + 1;
+    let my_gen = state.lens().begin_stream();
     let mut sink = CombinedTranslateEventSink::new(
         |payload| {
             let _ = app.emit(event_name, payload);
         },
         image_id,
-        &state.explain_stream_generation,
+        state.lens(),
         my_gen,
     );
     let result =
@@ -1090,14 +1080,14 @@ pub(crate) fn stream_cancelled_error() -> ModelError {
 /// - `ReasoningDelta` → `{ imageId, kind, delta: "", reasoningDelta }`
 /// - `Finish`         → `{ imageId, kind, delta: "", done: true, reason: "done", full }`
 ///
-/// 每次 emit 前检查 `explain_stream_generation` 代际：失配即返回 `Cancelled` 错。
+/// 每次 emit 前通过 Lens owner 检查 stream generation：失配即返回 `Cancelled` 错。
 /// 事件发送通过注入闭包完成（调用方包一层 `app.emit(event_name, …)`），便于脱离
 /// `AppHandle` 单测。
 pub(crate) struct LensEventSink<'a, F: FnMut(serde_json::Value) + Send> {
     emit_event: F,
     image_id: &'a str,
     kind: &'a str,
-    generation_atom: &'a AtomicU64,
+    generation_owner: &'a crate::lens::LensRuntimeState,
     my_generation: u64,
     full: String,
 }
@@ -1107,14 +1097,14 @@ impl<'a, F: FnMut(serde_json::Value) + Send> LensEventSink<'a, F> {
         emit_event: F,
         image_id: &'a str,
         kind: &'a str,
-        generation_atom: &'a AtomicU64,
+        generation_owner: &'a crate::lens::LensRuntimeState,
         my_generation: u64,
     ) -> Self {
         Self {
             emit_event,
             image_id,
             kind,
-            generation_atom,
+            generation_owner,
             my_generation,
             full: String::new(),
         }
@@ -1138,7 +1128,7 @@ impl<'a, F: FnMut(serde_json::Value) + Send> LensEventSink<'a, F> {
     }
 
     fn is_stale(&self) -> bool {
-        self.generation_atom.load(Ordering::SeqCst) != self.my_generation
+        !self.generation_owner.is_stream_current(self.my_generation)
     }
 }
 
@@ -1296,7 +1286,7 @@ impl CombinedTranslateSplitter {
 pub(crate) struct CombinedTranslateEventSink<'a, F: FnMut(serde_json::Value) + Send> {
     emit_event: F,
     image_id: &'a str,
-    generation_atom: &'a AtomicU64,
+    generation_owner: &'a crate::lens::LensRuntimeState,
     my_generation: u64,
     splitter: CombinedTranslateSplitter,
 }
@@ -1305,13 +1295,13 @@ impl<'a, F: FnMut(serde_json::Value) + Send> CombinedTranslateEventSink<'a, F> {
     pub(crate) fn new(
         emit_event: F,
         image_id: &'a str,
-        generation_atom: &'a AtomicU64,
+        generation_owner: &'a crate::lens::LensRuntimeState,
         my_generation: u64,
     ) -> Self {
         Self {
             emit_event,
             image_id,
-            generation_atom,
+            generation_owner,
             my_generation,
             splitter: CombinedTranslateSplitter::new(),
         }
@@ -1326,7 +1316,7 @@ impl<'a, F: FnMut(serde_json::Value) + Send> CombinedTranslateEventSink<'a, F> {
     }
 
     fn is_stale(&self) -> bool {
-        self.generation_atom.load(Ordering::SeqCst) != self.my_generation
+        !self.generation_owner.is_stream_current(self.my_generation)
     }
 
     fn emit_piece(&mut self, piece: CombinedSplitPiece) {
@@ -2064,7 +2054,8 @@ mod tests {
 
     #[test]
     fn lens_event_sink_translates_stream_parts_to_event_payloads() {
-        let generation = AtomicU64::new(7);
+        let generation = crate::lens::LensRuntimeState::default();
+        let current = generation.begin_stream();
         let mut events: Vec<serde_json::Value> = Vec::new();
         {
             let mut sink = LensEventSink::new(
@@ -2072,7 +2063,7 @@ mod tests {
                 "img-1",
                 "answer",
                 &generation,
-                7,
+                current,
             );
             sink.emit(text_delta("Hello")).unwrap();
             sink.emit(StreamPart::ReasoningDelta {
@@ -2106,14 +2097,16 @@ mod tests {
 
     #[test]
     fn lens_event_sink_cancelled_generation_errors_on_first_emit() {
-        let generation = AtomicU64::new(8); // 全局代际已前进（sink 持有的是 7）
+        let generation = crate::lens::LensRuntimeState::default();
+        let previous = generation.begin_stream();
+        generation.cancel_stream();
         let mut events: Vec<serde_json::Value> = Vec::new();
         let mut sink = LensEventSink::new(
             |payload| events.push(payload),
             "img-1",
             "answer",
             &generation,
-            7,
+            previous,
         );
         let err = sink.emit(text_delta("Hello")).unwrap_err();
         assert!(err.is_cancelled());
@@ -2131,13 +2124,15 @@ mod tests {
 
     #[test]
     fn combined_sink_cancelled_generation_errors_on_first_emit() {
-        let generation = AtomicU64::new(2);
+        let generation = crate::lens::LensRuntimeState::default();
+        let previous = generation.begin_stream();
+        generation.cancel_stream();
         let mut events: Vec<serde_json::Value> = Vec::new();
         let mut sink = CombinedTranslateEventSink::new(
             |payload| events.push(payload),
             "img-1",
             &generation,
-            1,
+            previous,
         );
         let err = sink.emit(text_delta("你好")).unwrap_err();
         assert!(err.is_cancelled());
@@ -2273,14 +2268,15 @@ mod tests {
 
     #[test]
     fn combined_sink_emits_split_events_and_done() {
-        let generation = AtomicU64::new(3);
+        let generation = crate::lens::LensRuntimeState::default();
+        let current = generation.begin_stream();
         let mut events: Vec<serde_json::Value> = Vec::new();
         {
             let mut sink = CombinedTranslateEventSink::new(
                 |payload| events.push(payload),
                 "img-9",
                 &generation,
-                3,
+                current,
             );
             sink.emit(text_delta(&format!("你好\n{TEST_SEP}\nHello")))
                 .unwrap();

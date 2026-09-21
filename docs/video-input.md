@@ -11,18 +11,39 @@ separate model capability from image input.
 - Enable **Video Input** in the model details. Known supported Gemini and Kimi
   models have defaults; fetching the Kimi model catalog also imports
   `supports_video_in`. Existing explicit capability overrides take precedence.
-- **Settings > Mixer > Video analysis model** supplies video understanding when
-  the main model lacks video input. A capable main model always receives videos
+- **Settings > Mixer > Video analysis model > Off** disables auxiliary video
+  analysis. Off is the first dropdown option; it prevents auxiliary calls and preserves the model
+  selection and saved reports. A capable main model always receives videos
   directly, even with an explicit auxiliary selection. Auto picks an enabled,
   credentialed model with video input; an explicit selection takes priority over
-  auto candidates and is validated before use. With no available model, the chat
+  auto candidates and is validated when the agent requests analysis. With no available model, the chat
   reports how to configure one instead of silently dropping the video.
-- The auxiliary model analyzes all videos in the active context in relation to
-  the user questions, then the main model answers from its observations. The
-  chat shows a video analysis step; usage logs classify it as video analysis.
-  Retry and follow-up requests re-analyze the active videos, so they incur another
-  auxiliary call. Cleared or summarized videos are not replayed. Cancellation or
-  analysis failure stops the reply. Original attachments remain unchanged.
+- Auxiliary analysis defaults to a detailed chronological breakdown, including
+  visible changes, readable text, presentation structure and uncertainties.
+  Broad requests do not reduce this intermediate record to a short synopsis;
+  explicit requests for brevity are handled in the main model's final answer.
+  Analysis requests allow up to 16,384 output tokens, capped by known model limits.
+  The expanded video analysis step retains the complete returned report.
+- Attaching or ordinarily sending a video **does not start Mixer analysis**.
+  The main agent receives attachment metadata and a `mixer_video_analysis` tool
+  when a suitable auxiliary model is available. It decides whether the current
+  question needs video understanding, calls the tool, and answers from its result.
+  There is no composer selector, analysis button, or video slash command.
+  The tool is available in both built-in Agent and Chat, including Plan, without
+  a separate approval prompt. External CLI attachment handling is unchanged.
+- Ordinary tool calls reuse a complete cached report. The agent can request
+  `refresh: true` when existing observations cannot answer the question or the
+  user asks for another analysis. Duplicate calls within a reply share a result.
+- Completed reports are stored with the assistant's video-analysis tool record,
+  including the originating request and video identities. Ordinary follow-ups
+  reuse these reports after reloading the conversation, without an auxiliary
+  call or reading/encoding the raw video files. Newly added videos do not trigger
+  analysis or inherit another video's report. Cleared, summarized, removed, or
+  replaced videos are excluded from cached observations. Regenerating a reply
+  deletes that reply's records; use an ordinary follow-up to retain its report.
+- With an unsupported main model, videos without saved observations are marked
+  as not analyzed; the model must not invent their contents. Disabling analysis removes
+  the tool from the main agent and also blocks execution if settings change mid-run. Tool failures are returned to the main agent; cancelling the reply interrupts analysis. Original attachments remain unchanged.
 - Send a video and a question. The video card opens the local file in its default
   application. External CLI agents continue receiving file paths rather than
   native video content.
@@ -30,7 +51,7 @@ separate model capability from image input.
 - Active context may contain at most 14 MiB of raw video; the final JSON request
   may not exceed 20 MB (20,000,000 bytes). Base64 expansion, images, prompts and tools all count
   toward the request limit. Trim videos or clear context when needed.
-- Follow-up questions and regeneration reload videos from conversation storage.
+- Native video requests and agent-invoked analysis reload videos from conversation storage.
   Cleared or summarized history is excluded. Missing files produce an error.
 - Unsupported models and unimplemented video transports must fail explicitly, without sending video
   bytes as image or text content.

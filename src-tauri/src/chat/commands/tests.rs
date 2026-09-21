@@ -20,9 +20,7 @@ use super::context::{
     estimate_image_tokens_for_dimensions, group_answer_excluded_from_context,
     mark_summary_stale_if_needed, resolve_usage_anchor, should_auto_compress_context,
 };
-use super::interaction::{
-    approve_agent_plan_for_execution, format_tool_approval_summary, stream_delta_event_kinds,
-};
+use super::interaction::{format_tool_approval_summary, stream_delta_event_kinds};
 use super::messages::{
     assistant_model_messages_for_storage, build_assistant_message, build_error_arm_message,
     content_from_segments, normalize_assistant_segments, reasoning_from_segments,
@@ -59,6 +57,47 @@ fn resolve_thinking_maps_levels_and_defaults_to_high() {
     assert_eq!(r(Some("max"), false), (true, Some("max".to_string())));
     // 未知值 → 当作未设置，落默认档 high。
     assert_eq!(r(Some("ultra"), true), (true, Some("high".to_string())));
+}
+
+#[test]
+fn text_only_video_replay_preserves_identity_without_opening_missing_files() {
+    let conversation: Conversation = serde_json::from_value(serde_json::json!({
+        "id": "video-replay", "title": "video", "provider_id": "main", "model": "text",
+        "created_at": 1, "updated_at": 1,
+        "messages": [{"id": "u1", "role": "user", "content": "Hello", "timestamp": 1,
+            "attachments": [{"id": "v1", "type": "video", "name": "clip.mp4", "path": "missing.mp4"}]}]
+    })).unwrap();
+    let messages = super::context::build_chat_api_messages_with_video(
+        None,
+        "system",
+        &conversation,
+        Some(0),
+        None,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert_eq!(crate::chat::video_analysis::video_count(&messages), 0);
+    assert!(messages[1]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("clip.mp4 [v1]"));
+    assert_eq!(messages[1]["content"][1]["text"], "Hello");
+    assert_eq!(conversation.messages[0].attachments.len(), 1);
+}
+
+#[test]
+fn video_analysis_tool_is_available_in_chat_and_plan_without_extra_approval() {
+    let tool = crate::chat::video_analysis::tool_definition();
+    assert!(agent_prepare::builtin_tool_bypasses_approval(&tool));
+    let mut tools = vec![tool.clone()];
+    assert!(
+        super::tooling::apply_chat_mode_tool_filter(&mut tools, true, &Default::default())
+            .is_empty()
+    );
+    assert_eq!(tools.len(), 1);
+    assert!(super::tooling::apply_agent_plan_tool_filter(&mut tools, true).is_empty());
+    assert_eq!(tools.len(), 1);
 }
 
 #[test]
@@ -1712,110 +1751,6 @@ fn test_conversation_with_summary(stale: bool) -> Conversation {
 }
 
 #[test]
-fn approve_agent_plan_targets_selected_message_plan() {
-    let mut conversation = test_conversation_with_summary(false);
-    let old_plan = "1. Inspect current code\n2. Draft older fix";
-    let new_plan = "1. Inspect plan mode\n2. Implement inline execution";
-    let mut older = test_chat_message("msg_plan_old", "assistant", old_plan, 10);
-    older.agent_plan = Some(AgentPlanState {
-        mode: crate::chat::AgentPlanMode::Plan,
-        status: crate::chat::AgentPlanStatus::Draft,
-        plan: Some(old_plan.to_string()),
-        updated_at: 10,
-    });
-    let mut newer = test_chat_message("msg_plan_new", "assistant", new_plan, 11);
-    newer.agent_plan = Some(AgentPlanState {
-        mode: crate::chat::AgentPlanMode::Plan,
-        status: crate::chat::AgentPlanStatus::Draft,
-        plan: Some(new_plan.to_string()),
-        updated_at: 11,
-    });
-    conversation.agent_plan_state = older.agent_plan.clone().unwrap();
-    conversation.messages.push(older);
-    conversation.messages.push(newer);
-
-    approve_agent_plan_for_execution(&mut conversation, Some("msg_plan_new")).unwrap();
-
-    assert_eq!(
-        conversation.agent_plan_state.plan.as_deref(),
-        Some(new_plan)
-    );
-    assert_eq!(
-        conversation.agent_plan_state.status,
-        crate::chat::AgentPlanStatus::Approved
-    );
-    let older = conversation
-        .messages
-        .iter()
-        .find(|message| message.id == "msg_plan_old")
-        .unwrap();
-    assert_eq!(
-        older.agent_plan.as_ref().unwrap().status,
-        crate::chat::AgentPlanStatus::Draft
-    );
-    let newer = conversation
-        .messages
-        .iter()
-        .find(|message| message.id == "msg_plan_new")
-        .unwrap();
-    assert_eq!(
-        newer.agent_plan.as_ref().unwrap().status,
-        crate::chat::AgentPlanStatus::Approved
-    );
-}
-
-#[test]
-fn approve_agent_plan_rejects_non_plan_message_target() {
-    let mut conversation = test_conversation_with_summary(false);
-    conversation.messages.push(test_chat_message(
-        "msg_plain",
-        "assistant",
-        "plain answer",
-        10,
-    ));
-
-    let error = approve_agent_plan_for_execution(&mut conversation, Some("msg_plain")).unwrap_err();
-
-    assert_eq!(error, "该消息不是可执行计划");
-}
-
-#[test]
-fn approve_agent_plan_rejects_empty_message_plan_target() {
-    let mut conversation = test_conversation_with_summary(false);
-    let mut message = test_chat_message("msg_empty_plan", "assistant", "plain answer", 10);
-    message.agent_plan = Some(AgentPlanState {
-        mode: crate::chat::AgentPlanMode::Plan,
-        status: crate::chat::AgentPlanStatus::Draft,
-        plan: Some("   ".to_string()),
-        updated_at: 10,
-    });
-    conversation.messages.push(message);
-
-    let error =
-        approve_agent_plan_for_execution(&mut conversation, Some("msg_empty_plan")).unwrap_err();
-
-    assert_eq!(error, "该消息不是可执行计划");
-}
-
-#[test]
-fn approve_agent_plan_rejects_non_executable_fragment_target() {
-    let mut conversation = test_conversation_with_summary(false);
-    let mut message = test_chat_message("msg_fragment_plan", "assistant", "没问题！积萌,", 10);
-    message.agent_plan = Some(AgentPlanState {
-        mode: crate::chat::AgentPlanMode::Plan,
-        status: crate::chat::AgentPlanStatus::Draft,
-        plan: Some("没问题！积萌,".to_string()),
-        updated_at: 10,
-    });
-    conversation.messages.push(message);
-
-    let error =
-        approve_agent_plan_for_execution(&mut conversation, Some("msg_fragment_plan")).unwrap_err();
-
-    assert_eq!(error, "该消息不是可执行计划");
-}
-
-#[test]
 fn strip_transcripts_for_frontend_keeps_interrupted_draft_drops_completed() {
     let mut completed = test_chat_message("msg_done", "assistant", "final answer", 2);
     completed.api_messages = vec![serde_json::json!({
@@ -2675,6 +2610,90 @@ fn test_conversation_with_messages(messages: Vec<ChatMessage>) -> Conversation {
     }
 }
 
+#[test]
+fn chat_without_read_only_mcp_skips_discovery_before_tool_filtering() {
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    conversation.agent_runtime.kind = crate::chat::AgentRuntimeKind::Chat;
+    let mut settings = Settings::default();
+    settings.chat.chat_mode.mcp_read_only = false;
+    assert!(
+        super::tooling::allowed_mcp_server_ids(&conversation, &settings)
+            .is_some_and(|ids| ids.is_empty())
+    );
+    settings.chat.chat_mode.mcp_read_only = true;
+    assert_eq!(
+        super::tooling::allowed_mcp_server_ids(&conversation, &settings),
+        None,
+    );
+}
+
+#[test]
+fn execute_document_reads_selected_file_and_missing_file_does_not_switch_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("选定 计划.md");
+    std::fs::write(&path, "用户编辑后的方案，无需列表").unwrap();
+    let mut message = test_chat_message("selected", "assistant", "已保存", 1);
+    message.agent_plan = Some(AgentPlanState {
+        document: Some(crate::chat::plan_document::PlanDocument {
+            id: "selected-plan".into(),
+            title: "方案".into(),
+            path: path.to_string_lossy().into(),
+        }),
+        ..Default::default()
+    });
+    let mut conversation = test_conversation_with_messages(vec![message]);
+    conversation.agent_plan_state.mode = crate::chat::AgentPlanMode::Plan;
+    let snapshot =
+        crate::chat::plan_document::prepare_execution_in(&mut conversation, "selected", dir.path())
+            .unwrap();
+    assert_eq!(snapshot, "用户编辑后的方案，无需列表");
+    assert_eq!(
+        conversation.agent_plan_state.mode,
+        crate::chat::AgentPlanMode::Act
+    );
+    assert_eq!(
+        conversation.agent_plan_state.document.as_ref().unwrap().id,
+        "selected-plan"
+    );
+    std::fs::remove_file(path).unwrap();
+    conversation.agent_plan_state.mode = crate::chat::AgentPlanMode::Plan;
+    assert!(crate::chat::plan_document::prepare_execution_in(
+        &mut conversation,
+        "selected",
+        dir.path()
+    )
+    .is_err());
+    assert_eq!(
+        conversation.agent_plan_state.mode,
+        crate::chat::AgentPlanMode::Plan
+    );
+}
+
+#[test]
+fn execute_legacy_plan_creates_document_once() {
+    let mut message = test_chat_message("legacy", "assistant", "旧计划正文", 1);
+    message.agent_plan = Some(AgentPlanState {
+        plan: Some("旧计划正文".into()),
+        ..Default::default()
+    });
+    let mut conversation = test_conversation_with_messages(vec![message]);
+    let dir = tempfile::tempdir().unwrap();
+    crate::chat::plan_document::prepare_execution_in(&mut conversation, "legacy", dir.path())
+        .unwrap();
+    let document = conversation.agent_plan_state.document.clone().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&document.path).unwrap(),
+        "旧计划正文"
+    );
+    crate::chat::plan_document::prepare_execution_in(&mut conversation, "legacy", dir.path())
+        .unwrap();
+    assert_eq!(
+        conversation.agent_plan_state.document.as_ref(),
+        Some(&document)
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
 fn grouped_assistant(id: &str, content: &str, group_id: &str, ts: i64) -> ChatMessage {
     let mut m = test_chat_message(id, "assistant", content, ts);
     m.group_id = Some(group_id.to_string());
@@ -2748,6 +2767,30 @@ fn resolve_usage_anchor_none_without_usage() {
     ]);
     let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
     assert_eq!(resolve_usage_anchor(&conv, Some(&provider)), (None, 0));
+}
+
+#[test]
+fn context_estimate_counts_native_reasoning_and_display_copy_once() {
+    let native = serde_json::json!({
+        "role": "assistant", "content": "Done",
+        "reasoning_items": [{"model": "deepseek-flash", "item": {
+            "type": "reasoning", "content": [{"type": "reasoning_text", "text": "think ".repeat(100)}],
+            "summary": [], "encrypted_content": "opaque".repeat(1000)
+        }}]
+    });
+    let mut mirrored = native.clone();
+    mirrored["reasoning_content"] = serde_json::json!("think ".repeat(100));
+    assert_eq!(
+        count_tokens_in_value(&mirrored),
+        count_tokens_in_value(&native)
+    );
+    let mut different_ciphertext = native.clone();
+    different_ciphertext["reasoning_items"][0]["item"]["encrypted_content"] =
+        serde_json::json!("x");
+    assert_eq!(
+        count_tokens_in_value(&native),
+        count_tokens_in_value(&different_ciphertext)
+    );
 }
 
 #[test]

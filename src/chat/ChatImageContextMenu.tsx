@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { save } from '@tauri-apps/plugin-dialog'
-import { Check, Clipboard, Download, Maximize2 } from 'lucide-react'
+import { Check, Clipboard, Download, FolderOpen, Maximize2 } from 'lucide-react'
 import { api } from '../api/tauri'
 import { useCloseAnimation } from './useCloseAnimation'
 import { useClampedMenuPosition } from './useClampedMenuPosition'
@@ -18,6 +18,7 @@ interface ChatImageContextMenuProps {
   src: string
   name?: string
   onOpenViewer?: () => void
+  onRevealLocation?: () => Promise<void>
   onClose: () => void
 }
 
@@ -26,6 +27,7 @@ export function ChatImageContextMenu({
   src,
   name,
   onOpenViewer,
+  onRevealLocation,
   onClose: onCloseProp,
 }: ChatImageContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null)
@@ -33,6 +35,7 @@ export function ChatImageContextMenu({
   const { closing, startClose, onAnimationEnd } = useCloseAnimation(onCloseProp)
   const onClose = startClose
   const [copied, setCopied] = useState(false)
+  const [locationError, setLocationError] = useState(false)
   const base64 = base64FromDataUrl(src)
 
   useEffect(() => {
@@ -126,6 +129,14 @@ export function ChatImageContextMenu({
           查看大图
         </button>
       ) : null}
+      {onRevealLocation && <button type="button" role="menuitem" className={itemClass} onClick={() => {
+        setLocationError(false)
+        void onRevealLocation().then(onClose).catch(() => setLocationError(true))
+      }}>
+        <FolderOpen size={16} strokeWidth={1.75} />
+        打开所在位置
+      </button>}
+      {locationError && <span role="status" className="block max-w-64 px-3 py-1 text-xs text-neutral-500">无法打开所在位置，请检查文件是否仍存在。</span>}
     </div>
   )
 

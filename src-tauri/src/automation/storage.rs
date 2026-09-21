@@ -115,7 +115,12 @@ pub(crate) fn save(app: &AppHandle, mut automation: Automation) -> Result<Automa
     automation.updated_at = now_iso();
     validate_graph(&automation)?;
     write_atomic(&file_path(app, &automation.id)?, &automation)?;
-    events::changed(app, "saved", &automation.id, Some(automation.updated_at.clone()));
+    events::changed(
+        app,
+        "saved",
+        &automation.id,
+        Some(automation.updated_at.clone()),
+    );
     super::schedule::poke();
     Ok(automation)
 }

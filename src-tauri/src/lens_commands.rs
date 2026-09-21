@@ -5,7 +5,6 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
 };
 
 use base64::{engine::general_purpose, Engine as _};
@@ -22,7 +21,10 @@ use crate::api::{
 };
 #[cfg(target_os = "windows")]
 use crate::capture_geometry::{
-    monitor_for_region, windows_monitor_region, CaptureMonitor, CaptureRect,
+    monitor_for_physical_frame, windows_window_region, CaptureMonitor, CaptureRect,
+};
+use crate::chat::external_send::{
+    PendingChatExternalAttachment, PendingChatExternalMessage, PendingChatExternalSend,
 };
 use crate::chat::model::{ModelMessage, ModelRole};
 use crate::lens;
@@ -39,9 +41,7 @@ use crate::replace_translation::mask::{blocks_from_groups, plate_fill};
 use crate::screenshot::cleanup_temp_file;
 use crate::settings::{self, default_question_prompt, ExplainMessage, OcrMode};
 use crate::shortcuts::{capture_active_selection, get_mouse_position, open_chat_window};
-use crate::state::{
-    AppState, PendingChatExternalAttachment, PendingChatExternalMessage, PendingChatExternalSend,
-};
+use crate::state::AppState;
 use crate::utils::{language_name, resolve_target_lang};
 use crate::web_search::{format_web_context, search_web, WebSearchResult};
 use crate::windows;
@@ -56,6 +56,8 @@ struct LensFrame {
     y: f64,
     width: f64,
     height: f64,
+    #[cfg(target_os = "windows")]
+    monitor: CaptureMonitor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,12 +88,12 @@ pub(crate) fn request_lens_close(app: &AppHandle) -> Result<(), String> {
 /// 宽限期内用户重开新会话时 `lens_open_seq` 已变，watchdog 自动作废。
 fn schedule_forced_lens_close(app: &AppHandle) {
     const FORCE_CLOSE_GRACE_MS: u64 = 800;
-    let seq = app.state::<AppState>().lens_open_seq.load(Ordering::SeqCst);
+    let seq = app.state::<AppState>().lens().session_seq();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(FORCE_CLOSE_GRACE_MS)).await;
         let state = app.state::<AppState>();
-        if state.lens_open_seq.load(Ordering::SeqCst) != seq {
+        if !state.lens().is_session_current(seq) {
             return;
         }
         let still_visible = active_overlay_window(&app)
@@ -176,10 +178,7 @@ pub(crate) fn lens_set_escape_guard(app: AppHandle, active: bool) {
 fn insert_temp_explain_image(app: &AppHandle, path: PathBuf) -> String {
     let image_id = Uuid::new_v4().to_string();
     let state = app.state::<AppState>();
-    {
-        let mut map = state.images_lock();
-        map.insert(image_id.clone(), path);
-    }
+    state.lens().register_image(image_id.clone(), path);
     image_id
 }
 
@@ -196,6 +195,47 @@ pub(crate) fn explain_read_image(
       "success": true,
       "data": format!("data:image/png;base64,{base64}")
     }))
+}
+
+/// The full-screen selection background is large. Keep disk I/O off the window
+/// thread and return raw PNG bytes, avoiding Base64 + JSON encoding/parsing while
+/// the user is already dragging the selection. Only the current freeze frame is
+/// accessible here; callers never supply filesystem paths.
+#[tauri::command]
+pub(crate) async fn lens_read_freeze_frame(
+    app: AppHandle,
+    image_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        {
+            if !state.lens().is_current_freeze_frame(&image_id) {
+                return Err("Freeze frame is no longer active".to_string());
+            }
+        }
+        let path = resolve_explain_image_path(&app, &state, &image_id)?;
+        fs::read(path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Cropped previews use the same registered-image resolver as explain_read_image,
+/// but disk reads run off the UI thread and PNG bytes avoid Base64/JSON copies.
+#[tauri::command]
+pub(crate) async fn lens_read_image(
+    app: AppHandle,
+    image_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let path = resolve_explain_image_path(&app, &state, &image_id)?;
+        fs::read(path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 // ====== Lens 模式命令 ======
@@ -284,6 +324,14 @@ fn lens_position_fullscreen(app: &AppHandle, window: &WebviewWindow) -> Option<L
         y: ly,
         width: lw,
         height: lh,
+        #[cfg(target_os = "windows")]
+        monitor: CaptureMonitor {
+            x: mp.x,
+            y: mp.y,
+            width: ms.width,
+            height: ms.height,
+            scale_factor: scale,
+        },
     })
 }
 
@@ -481,23 +529,16 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
     }
 
     let state = app.state::<AppState>();
-    // 自愈：busy=true 但已无浮窗可见（外部强关 / dev 重载等异常），重置 busy。
-    // 但要避开"正在开启中"的宽限期——开启过程要截冻结帧（200-500ms），窗口尚不可见，
-    // 此时若清 busy，快速连按热键会并发跑两次本函数（take-once 复位载荷被第二次吞掉）。
-    if state.lens_busy.load(Ordering::SeqCst) {
-        let visible = active_overlay_window(app).is_some();
-        if !visible && !state.lens_open_in_grace() {
-            state.lens_busy.store(false, Ordering::SeqCst);
-        }
-    }
-    if state.lens_busy.swap(true, Ordering::SeqCst) {
+    // begin_session 原子地完成 stale-busy 自愈、单会话占用、watchdog 代号和开启宽限期。
+    if state
+        .lens()
+        .begin_session(active_overlay_window(app).is_some())
+        .is_err()
+    {
         return Err("Lens already active".to_string());
     }
-    state.mark_lens_opened();
     cleanup_lens_freeze_frame(app);
-    state
-        .explain_stream_generation
-        .fetch_add(1, Ordering::SeqCst);
+    state.lens().cancel_stream();
 
     // 必须在 ensure_lens_window/show/set_focus 之前抓取。创建隐藏 webview 在 macOS 上也可能
     // 改变当前 focused UI element，导致 Cmd+C/AXSelectedText 读到 Lens 自己而不是前台 App。
@@ -521,17 +562,15 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
         __t0.elapsed().as_millis()
     );
     if mode == "translateText" && pending_selection.is_none() {
-        if let Ok(mut guard) = state.pending_selection.lock() {
-            *guard = None;
-        }
-        state.lens_busy.store(false, Ordering::SeqCst);
+        state.lens().replace_selection(None);
+        state.lens().release_session();
         return Ok(());
     }
 
     // 必须在 ensure_* 创建隐藏 WebView 之前记录。macOS 冷创建普通 NSWindow 可能短暂激活
     // Kivio；若等创建后才记录，就会把被抢来的 Kivio 误认成原前台 App，Chat 随之被排到最前。
     #[cfg(target_os = "macos")]
-    windows::remember_frontmost_app(&state.prev_frontmost_pid_lens);
+    windows::remember_frontmost_app(state.frontmost_apps().lens());
 
     // 按 mode 选目标窗口：chat → lens 问答窗口；translate / translateText → 独立快速翻译窗口。
     // 两者互斥（同一时刻只一个浮窗可见，由 lens_is_active 泛化 + 热键 toggle 保证）。
@@ -553,17 +592,15 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
         match ensured {
             Ok(w) => w,
             Err(e) => {
-                state.lens_busy.store(false, Ordering::SeqCst);
+                state.lens().release_session();
                 #[cfg(target_os = "macos")]
-                windows::restore_previous_frontmost_app(app, &state.prev_frontmost_pid_lens);
+                windows::restore_previous_frontmost_app(app, state.frontmost_apps().lens());
                 return Err(e);
             }
         }
     };
     // 结果暂存在 state.pending_selection，等前端 take 走。translate 模式写 None，避免遗留旧值。
-    if let Ok(mut guard) = state.pending_selection.lock() {
-        *guard = pending_selection;
-    }
+    state.lens().replace_selection(pending_selection);
     // 把 mode 编码进 hash query，前端通过 location.hash 读取（'#lens?mode=translate'）
     let safe_mode = match mode {
         "translate" => "translate",
@@ -573,12 +610,18 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
         _ => "chat",
     };
     let mut freeze_frame_image_id: Option<String> = None;
+    #[cfg(target_os = "windows")]
+    let mut initial_frame = None;
     if safe_mode == "translateText" {
         lens_position_text_floating(app, &window);
     } else {
         // 先在 hidden 状态下尝试定位：即便部分系统下 hidden 窗口 set_position 被忽略，也比
         // 不调强（成功则消除"先在旧位置闪一帧再跳到全屏"的可见跳变）。
         let frame = lens_position_fullscreen(app, &window);
+        #[cfg(target_os = "windows")]
+        {
+            initial_frame = frame;
+        }
         eprintln!(
             "[lens-timing]   ..after_position +{}ms",
             __t0.elapsed().as_millis()
@@ -609,7 +652,24 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
         None
     } else {
         // show 后再调，处理 always_on_top + visible_on_all_workspaces 把首次 set_position 吃掉的情况
-        lens_position_fullscreen(app, &window)
+        #[cfg(target_os = "windows")]
+        {
+            // Keep the display that supplied the frozen pixels. Re-reading the
+            // cursor here can move the overlay onto another monitor mid-open.
+            if let Some(frame) = initial_frame {
+                let monitor = frame.monitor;
+                let _ = window.set_position(tauri::PhysicalPosition::new(monitor.x, monitor.y));
+                let _ = window.set_size(tauri::PhysicalSize::new(monitor.width, monitor.height));
+                lens_clear_interactive_region(&window);
+                Some(frame)
+            } else {
+                lens_position_fullscreen(app, &window)
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            lens_position_fullscreen(app, &window)
+        }
     };
     let reset_detail = match frame {
         Some(frame) => serde_json::json!({
@@ -628,13 +688,7 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
     let reset_detail = serde_json::to_string(&reset_detail).unwrap_or_else(|_| "{}".to_string());
     // 复位载荷（frame + freezeFrameImageId）存进 AppState：前端无论冷挂载还是复用收到 lens:reset，
     // 都通过 lens_take_reset_payload 主动 take 取走（take-once，只被消费一次）。
-    {
-        let mut pending = state
-            .lens_pending_reset
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *pending = Some(reset_detail);
-    }
+    state.lens().replace_reset_payload(reset_detail);
     // 仅"复用已存在浮窗"时才 eval：设 mode hash + 触发 lens:reset，让已挂载的前端重入 select。
     // 冷创建：mode 已烤进创建 URL，前端冷挂载会自行 take 复位载荷 + 选区——绝不能再发 lens:reset，
     // 否则 mount 的 enterSelect 与事件的 enterSelect 双跑，把 take-once 的选中文本先取后作废丢弃。
@@ -700,6 +754,7 @@ fn capture_region_core(
     // 不再需要 hide webview + sleep 60ms 等 NSWindow.orderOut 生效（旧 `screencapture -R` 会截到全屏透明 lens 自己）。
     // Windows 版 capture_region_image 忽略 exclude_self_pid 参数。
     let _ = active_overlay_window(app); // 仍引用以保证当前浮窗 webview 存活
+    #[cfg(not(target_os = "windows"))]
     let exclude_self_pid: Option<i32> = {
         #[cfg(target_os = "macos")]
         {
@@ -710,7 +765,6 @@ fn capture_region_core(
             None
         }
     };
-
     match capture_region_from_freeze_frame(
         app,
         freeze_frame_image_id,
@@ -750,6 +804,9 @@ fn capture_region_core(
                 let hide_wait_ms: u64 = if cfg!(target_os = "windows") { 60 } else { 120 };
                 std::thread::sleep(std::time::Duration::from_millis(hide_wait_ms));
             }
+            #[cfg(target_os = "windows")]
+            let live = capture_region_image(overlay.as_ref(), x, y, width, height, scale_factor);
+            #[cfg(not(target_os = "windows"))]
             let live = capture_region_image(
                 absolute_x,
                 absolute_y,
@@ -769,11 +826,12 @@ fn capture_region_core(
     }
 }
 
-/// 把截图结果注册为 image_id（归档 + 状态表 + current id + 冻结帧清理）。
+/// 把截图结果注册为 image_id（归档 + 会话校验 + current id + 冻结帧清理）。
 fn register_captured_image(
     app: &AppHandle,
     result: Result<PathBuf, String>,
     freeze_frame_image_id: Option<&str>,
+    session_seq: u64,
 ) -> serde_json::Value {
     match result {
         Ok(path) => {
@@ -783,13 +841,12 @@ fn register_captured_image(
             // 自动归档（在 insert 前直接用 path，避免二次加锁）
             archive_captured_image(app, &path, &image_id);
 
+            if let Err(path) = state
+                .lens()
+                .register_current_image(session_seq, image_id.clone(), path)
             {
-                let mut map = state.images_lock();
-                map.insert(image_id.clone(), path);
-            }
-            {
-                let mut current = state.current_id_lock();
-                *current = Some(image_id.clone());
+                cleanup_temp_file(&path);
+                return serde_json::json!({ "success": false, "error": "Lens is no longer active" });
             }
             if let Some(freeze_id) = freeze_frame_image_id {
                 cleanup_lens_freeze_frame_if_current(app, freeze_id);
@@ -819,6 +876,7 @@ pub(crate) async fn lens_capture_window(
     freeze_frame_image_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let freeze_id = freeze_frame_image_id.as_deref();
+    let session_seq = app.state::<AppState>().lens().session_seq();
     #[cfg(target_os = "linux")]
     let result = match (absolute_x, absolute_y, x, y, width, height) {
         (Some(absolute_x), Some(absolute_y), Some(x), Some(y), Some(width), Some(height)) => {
@@ -845,7 +903,12 @@ pub(crate) async fn lens_capture_window(
         lens::capture_window(window_id)
     };
 
-    Ok(register_captured_image(&app, result, freeze_id))
+    Ok(register_captured_image(
+        &app,
+        result,
+        freeze_id,
+        session_seq,
+    ))
 }
 
 /// 区域截图：复用 capture_region_image 路径，注册 image_id 返回。
@@ -861,6 +924,7 @@ pub(crate) async fn lens_capture_region(
     scale_factor: f64,
     freeze_frame_image_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let session_seq = app.state::<AppState>().lens().session_seq();
     let result = capture_region_core(
         &app,
         absolute_x,
@@ -876,8 +940,8 @@ pub(crate) async fn lens_capture_region(
         &app,
         result,
         freeze_frame_image_id.as_deref(),
-    ))
-}
+        session_seq,
+    ))}
 
 /// 多轮提问：调用 vision API 流式发出 lens-stream 事件。
 /// 字段全部独立。空字符串使用默认值：
@@ -1200,20 +1264,10 @@ pub(crate) async fn lens_send_to_chat(
         attachments,
         messages: Vec::new(),
     };
-    {
-        let mut pending = state
-            .pending_chat_external_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.push(request);
-    }
+    state.enqueue_chat_external_send(request);
 
     if let Err(err) = open_chat_window(&app) {
-        let mut pending = state
-            .pending_chat_external_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.retain(|item| item.id != request_id);
+        state.rollback_chat_external_send(&request_id);
         for path in handoff_temp_paths {
             cleanup_temp_file(&path);
         }
@@ -1278,20 +1332,10 @@ pub(crate) async fn lens_send_history_to_chat(
         attachments,
         messages: history,
     };
-    {
-        let mut pending = state
-            .pending_chat_external_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.push(request);
-    }
+    state.enqueue_chat_external_send(request);
 
     if let Err(err) = open_chat_window(&app) {
-        let mut pending = state
-            .pending_chat_external_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.retain(|item| item.id != request_id);
+        state.rollback_chat_external_send(&request_id);
         for path in handoff_temp_paths {
             cleanup_temp_file(&path);
         }
@@ -1526,9 +1570,7 @@ fn extract_first_json_object(raw: &str) -> Option<String> {
 /// 取消正在进行的 lens 流（复用同一代号）。
 #[tauri::command]
 pub(crate) fn lens_cancel_stream(state: State<AppState>) -> Result<(), String> {
-    state
-        .explain_stream_generation
-        .fetch_add(1, Ordering::SeqCst);
+    state.lens().cancel_stream();
     Ok(())
 }
 
@@ -2309,18 +2351,11 @@ pub(crate) async fn lens_replace_translate(
 #[tauri::command]
 pub(crate) fn lens_close(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state
-        .explain_stream_generation
-        .fetch_add(1, Ordering::SeqCst);
-    let current_id = {
-        let current = state.current_id_lock();
-        current.clone()
-    };
-    if let Some(id) = current_id {
-        cleanup_explain_image(&app, &id);
+    state.lens().cancel_stream();
+    if let Some((_id, path)) = state.lens().close_session_and_take_current() {
+        cleanup_temp_file(&path);
     }
     cleanup_lens_freeze_frame(&app);
-    state.lens_busy.store(false, Ordering::SeqCst);
     unregister_lens_escape_shortcut(&app);
     if let Some(window) = active_overlay_window(&app) {
         // Windows：无 NSPanel 限制，且默认开启冻结帧（重建时背景是截屏冻结帧，不会白闪）
@@ -2345,7 +2380,7 @@ pub(crate) fn lens_close(app: AppHandle) -> Result<(), String> {
         }
     }
     #[cfg(target_os = "macos")]
-    windows::restore_previous_frontmost_app(&app, &state.prev_frontmost_pid_lens);
+    windows::restore_previous_frontmost_app(&app, state.frontmost_apps().lens());
     Ok(())
 }
 
@@ -2354,11 +2389,7 @@ pub(crate) fn lens_close(app: AppHandle) -> Result<(), String> {
 /// 的情况——丢事件也能从这里拉到冻结帧。无 pending（已被取走 / 未设置）返回 None。
 #[tauri::command]
 pub(crate) fn lens_take_reset_payload(state: State<'_, AppState>) -> Option<String> {
-    let taken = state
-        .lens_pending_reset
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
+    let taken = state.lens().take_reset_payload();
     eprintln!(
         "[lens-freeze] take_reset_payload -> {}",
         taken.as_deref().unwrap_or("<empty>")
@@ -2375,43 +2406,43 @@ pub(crate) fn lens_take_reset_payload(state: State<'_, AppState>) -> Option<Stri
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 fn prepare_freeze_frame(app: &AppHandle, frame: Option<LensFrame>) -> Option<String> {
     let frame = frame?;
-    let width = frame.width.round().max(1.0) as u32;
-    let height = frame.height.round().max(1.0) as u32;
-    let exclude_self_pid: Option<i32> = {
-        #[cfg(target_os = "macos")]
-        {
-            Some(std::process::id() as i32)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
+    #[cfg(target_os = "windows")]
+    let captured = capture_monitor_frame(frame.monitor);
+    #[cfg(not(target_os = "windows"))]
+    let captured = {
+        let width = frame.width.round().max(1.0) as u32;
+        let height = frame.height.round().max(1.0) as u32;
+        let exclude_self_pid: Option<i32> = {
+            #[cfg(target_os = "macos")]
+            {
+                Some(std::process::id() as i32)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        };
+        capture_region_image(
+            frame.x.round() as i32,
+            frame.y.round() as i32,
+            0,
+            0,
+            width,
+            height,
+            1.0,
+            exclude_self_pid,
+        )
     };
-    let path = capture_region_image(
-        frame.x.round() as i32,
-        frame.y.round() as i32,
-        0,
-        0,
-        width,
-        height,
-        1.0,
-        exclude_self_pid,
-    )
-    .map_err(|err| {
-        eprintln!("[lens-freeze] capture failed: {err}");
-        err
-    })
-    .ok()?;
+    let path = captured
+        .map_err(|err| {
+            eprintln!("[lens-freeze] capture failed: {err}");
+            err
+        })
+        .ok()?;
     eprintln!("[lens-freeze] captured frame -> {}", path.display());
     let image_id = insert_temp_explain_image(app, path);
     let state = app.state::<AppState>();
-    {
-        let mut freeze = state
-            .lens_freeze_frame_image_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *freeze = Some(image_id.clone());
-    }
+    state.lens().replace_freeze_frame(image_id.clone());
     Some(image_id)
 }
 
@@ -2431,14 +2462,7 @@ fn capture_region_from_freeze_frame(
 ) -> Option<Result<PathBuf, String>> {
     let image_id = freeze_frame_image_id?;
     let state = app.state::<AppState>();
-    let is_current_freeze = {
-        let freeze = state
-            .lens_freeze_frame_image_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        freeze.as_deref() == Some(image_id)
-    };
-    if !is_current_freeze {
+    if !state.lens().is_current_freeze_frame(image_id) {
         return None;
     }
 
@@ -2477,6 +2501,12 @@ fn crop_freeze_frame_image(
     .ok_or_else(|| "Invalid freeze-frame capture region".to_string())?;
     let cropped = image.crop_imm(rect.x, rect.y, rect.width, rect.height);
     let temp_path = std::env::temp_dir().join(format!("screenshot-{}.png", Uuid::new_v4()));
+    #[cfg(target_os = "windows")]
+    {
+        let rgba = cropped.into_rgba8();
+        write_png_fast(&temp_path, rgba.as_raw(), rgba.width(), rgba.height())?;
+    }
+    #[cfg(not(target_os = "windows"))]
     cropped.save(&temp_path).map_err(|e| e.to_string())?;
     Ok(temp_path)
 }
@@ -2498,37 +2528,32 @@ fn freeze_frame_crop_rect(
     } else {
         1.0
     };
-    let x = (x as f64 * scale).round() as i32;
-    let y = (y as f64 * scale).round() as i32;
-    let width = (width as f64 * scale).round().max(1.0) as u32;
-    let height = (height as f64 * scale).round().max(1.0) as u32;
-
-    let left = x.clamp(0, image_width as i32);
-    let top = y.clamp(0, image_height as i32);
-    let right = (x as i64 + width as i64).clamp(left as i64, image_width as i64) as i32;
-    let bottom = (y as i64 + height as i64).clamp(top as i64, image_height as i64) as i32;
+    // Round shared edges, not origin and extent independently: adjacent logical
+    // rectangles must meet at the same physical pixel at fractional DPI.
+    let left = (x as f64 * scale).round().clamp(0.0, image_width as f64) as u32;
+    let top = (y as f64 * scale).round().clamp(0.0, image_height as f64) as u32;
+    let right = ((x as f64 + width as f64) * scale)
+        .round()
+        .clamp(0.0, image_width as f64) as u32;
+    let bottom = ((y as f64 + height as f64) * scale)
+        .round()
+        .clamp(0.0, image_height as f64) as u32;
 
     if right <= left || bottom <= top {
         return None;
     }
 
     Some(ImageCropRect {
-        x: left as u32,
-        y: top as u32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
     })
 }
 
 fn cleanup_lens_freeze_frame(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let image_id = {
-        let mut freeze = state
-            .lens_freeze_frame_image_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        freeze.take()
-    };
+    let image_id = state.lens().take_freeze_frame();
     if let Some(image_id) = image_id {
         cleanup_explain_image(app, &image_id);
     }
@@ -2536,18 +2561,7 @@ fn cleanup_lens_freeze_frame(app: &AppHandle) {
 
 fn cleanup_lens_freeze_frame_if_current(app: &AppHandle, image_id: &str) {
     let state = app.state::<AppState>();
-    let should_cleanup = {
-        let mut freeze = state
-            .lens_freeze_frame_image_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if freeze.as_deref() == Some(image_id) {
-            *freeze = None;
-            true
-        } else {
-            false
-        }
-    };
+    let should_cleanup = state.lens().take_freeze_frame_if_current(image_id);
     if should_cleanup {
         cleanup_explain_image(app, image_id);
     }
@@ -2711,17 +2725,66 @@ pub(crate) fn lens_animate_floating(
 /// Windows 平台：截取指定区域的屏幕图像
 /// 需要将逻辑坐标根据缩放因子转换为物理坐标，再转换为相对于显示器的相对坐标
 #[cfg(target_os = "windows")]
+fn capture_monitor_frame(target: CaptureMonitor) -> Result<PathBuf, String> {
+    let monitors = Monitor::all().map_err(|e| e.to_string())?;
+    let geometry = monitors
+        .iter()
+        .map(|m| {
+            Ok(CaptureMonitor {
+                x: m.x().map_err(|e| e.to_string())?,
+                y: m.y().map_err(|e| e.to_string())?,
+                width: m.width().map_err(|e| e.to_string())?,
+                height: m.height().map_err(|e| e.to_string())?,
+                scale_factor: m.scale_factor().map_err(|e| e.to_string())? as f64,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let index = monitor_for_physical_frame(target, &geometry)
+        .ok_or_else(|| "Capture monitor changed while opening Lens".to_string())?;
+    // No logical-coordinate round trip: preserve every physical edge pixel,
+    // including fractional-DPI and portrait displays with odd dimensions.
+    let started = std::time::Instant::now();
+    let image = monitors[index].capture_image().map_err(|e| e.to_string())?;
+    if image.width() != target.width || image.height() != target.height {
+        return Err("Capture monitor resolution changed while opening Lens".to_string());
+    }
+    eprintln!(
+        "[lens-timing]     ...xcap.capture_monitor +{}ms",
+        started.elapsed().as_millis()
+    );
+    let path = std::env::temp_dir().join(format!("screenshot-{}.png", Uuid::new_v4()));
+    let started = std::time::Instant::now();
+    write_png_fast(&path, image.as_raw(), image.width(), image.height())?;
+    eprintln!(
+        "[lens-timing]     ...png.save +{}ms",
+        started.elapsed().as_millis()
+    );
+    Ok(path)
+}
+
+#[cfg(target_os = "windows")]
 fn capture_region_image(
-    absolute_x: i32,
-    absolute_y: i32,
+    window: Option<&WebviewWindow>,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
     scale_factor: f64,
-    _exclude_self_pid: Option<i32>,
 ) -> Result<PathBuf, String> {
-    let _ = (x, y, scale_factor);
+    // The caller retains the handle before hiding it for capture.
+    let window = window.ok_or_else(|| "Capture window is no longer active".to_string())?;
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let display = window
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Capture monitor is no longer available".to_string())?;
+    let target = CaptureMonitor {
+        x: display.position().x,
+        y: display.position().y,
+        width: display.size().width,
+        height: display.size().height,
+        scale_factor: display.scale_factor(),
+    };
     let __tc = std::time::Instant::now();
     let monitors = Monitor::all().map_err(|e| e.to_string())?;
     eprintln!(
@@ -2741,15 +2804,21 @@ fn capture_region_image(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let region = CaptureRect {
-        x: absolute_x as f64,
-        y: absolute_y as f64,
+        x: x as f64,
+        y: y as f64,
         width: width as f64,
         height: height as f64,
     };
-    let monitor_index = monitor_for_region(region, &monitor_geometry)
+    let monitor_index = monitor_for_physical_frame(target, &monitor_geometry)
         .ok_or_else(|| "No monitor found for capture region".to_string())?;
-    let capture_region = windows_monitor_region(region, monitor_geometry[monitor_index])
-        .ok_or_else(|| "Invalid capture region".to_string())?;
+    let capture_region = windows_window_region(
+        region,
+        position.x,
+        position.y,
+        scale_factor,
+        monitor_geometry[monitor_index],
+    )
+    .ok_or_else(|| "Invalid capture region".to_string())?;
     let monitor = &monitors[monitor_index];
 
     let __tcap = std::time::Instant::now();
@@ -2778,14 +2847,15 @@ fn capture_region_image(
 
 /// 快速无损 PNG 编码：`image` 默认编码器对全屏 4MP 图做自适应滤波 + 默认 zlib 压缩，
 /// 单帧编码约 350ms，是冻结帧/截图首帧出现的主要延迟。冻结帧只需「无损 + 快」，
-/// 改用 Fast 压缩 + 无滤波，编码降到几十毫秒（文件略大，临时文件可接受）。
+/// Fast + Sub 保留无损像素，并利用屏幕相邻像素的相似性降低压缩工作量。
+/// 实测 2560×1600 桌面：NoFilter 约 270ms/13MB，Sub 约 105ms/2.5MB。
 #[cfg(target_os = "windows")]
 fn write_png_fast(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
     use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::{ExtendedColorType, ImageEncoder};
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let writer = std::io::BufWriter::new(file);
-    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::NoFilter)
+    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Sub)
         .write_image(rgba, width, height, ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())
 }
@@ -2899,6 +2969,7 @@ pub(crate) fn lens_register_annotated_image(
     state: State<AppState>,
     base64_png: String,
 ) -> Result<serde_json::Value, String> {
+    let session_seq = state.lens().session_seq();
     let bytes = match general_purpose::STANDARD.decode(base64_png.as_bytes()) {
         Ok(b) => b,
         Err(e) => {
@@ -2919,23 +2990,22 @@ pub(crate) fn lens_register_annotated_image(
 
     // 不归档:归档目录只保留 capture 时的原图,合成版只活在 temp_dir + history。
     let image_id = Uuid::new_v4().to_string();
-    let previous_image_id = {
-        let current = state.current_id_lock();
-        current.clone()
-    };
-
-    {
-        let mut map = state.images_lock();
-        map.insert(image_id.clone(), temp_path);
-    }
-    {
-        let mut current = state.current_id_lock();
-        *current = Some(image_id.clone());
-    }
+    let previous_image_id =
+        match state
+            .lens()
+            .register_current_image(session_seq, image_id.clone(), temp_path)
+        {
+            Ok(previous) => previous,
+            Err(path) => {
+                cleanup_temp_file(&path);
+                return Ok(
+                    serde_json::json!({ "success": false, "error": "Lens is no longer active" }),
+                );
+            }
+        };
     if let Some(previous_image_id) = previous_image_id {
         if previous_image_id != image_id {
-            let mut map = state.images_lock();
-            if let Some(previous_path) = map.remove(&previous_image_id) {
+            if let Some(previous_path) = state.lens().remove_image(&previous_image_id) {
                 cleanup_temp_file(&previous_path);
             }
         }
@@ -3043,13 +3113,8 @@ fn archive_captured_image(app: &AppHandle, temp_path: &std::path::Path, image_id
 
 fn cleanup_explain_image(app: &AppHandle, image_id: &str) {
     let state = app.state::<AppState>();
-    let mut map = state.images_lock();
-    if let Some(path) = map.remove(image_id) {
+    if let Some(path) = state.lens().remove_image_and_clear_current(image_id) {
         cleanup_temp_file(&path);
-    }
-    let mut current = state.current_id_lock();
-    if current.as_deref() == Some(image_id) {
-        *current = None;
     }
 }
 
@@ -3080,16 +3145,13 @@ pub(crate) fn resolve_explain_image_path(
     image_id: &str,
 ) -> Result<PathBuf, String> {
     // 1. 活跃截图
-    {
-        let map = state.images_lock();
-        if let Some(path) = map.get(image_id).cloned() {
-            let temp_dir = std::env::temp_dir();
-            if !path.starts_with(&temp_dir) {
-                return Err("Invalid image path".to_string());
-            }
-            if path.exists() {
-                return Ok(path);
-            }
+    if let Some(path) = state.lens().image_path(image_id) {
+        let temp_dir = std::env::temp_dir();
+        if !path.starts_with(&temp_dir) {
+            return Err("Invalid image path".to_string());
+        }
+        if path.exists() {
+            return Ok(path);
         }
     }
     // 2. 历史持久副本
@@ -3112,14 +3174,13 @@ pub(crate) fn lens_commit_image_to_history(
     if dst.exists() {
         return Ok(()); // 幂等
     }
-    let map = state.images_lock();
-    let Some(src) = map.get(&image_id) else {
+    let Some(src) = state.lens().image_path(&image_id) else {
         return Err("Image is no longer available for history".to_string());
     };
     if !src.exists() {
         return Err("Image file is no longer available for history".to_string());
     }
-    fs::copy(&src, &dst).map_err(|e| format!("commit image to history: {e}"))?;
+    fs::copy(src, &dst).map_err(|e| format!("commit image to history: {e}"))?;
     Ok(())
 }
 
@@ -3138,6 +3199,38 @@ pub(crate) fn lens_delete_history_image(app: AppHandle, image_id: String) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freeze_crop_rounds_edges_not_width_independently() {
+        for scale in [1.25, 1.5, 1.75, 2.25, 2.5, 2.75] {
+            for x in 0..20 {
+                for width in 1..20 {
+                    let rect = freeze_frame_crop_rect(x, 0, width, 10, scale, 500, 500).unwrap();
+                    assert_eq!(
+                        rect.x + rect.width,
+                        ((x as f64 + width as f64) * scale).round() as u32,
+                        "scale={scale}, x={x}, width={width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fast_png_roundtrip_preserves_pixels_and_crop() {
+        let image = image::RgbaImage::from_fn(97, 53, |x, y| {
+            image::Rgba([(x * 7) as u8, (y * 13) as u8, (x ^ y) as u8, (x + y) as u8])
+        });
+        let path = std::env::temp_dir().join(format!("lens-png-test-{}.png", Uuid::new_v4()));
+        write_png_fast(&path, image.as_raw(), image.width(), image.height()).unwrap();
+        assert_eq!(image::open(&path).unwrap().to_rgba8(), image);
+        let cropped_path = crop_freeze_frame_image(&path, 7, 9, 31, 23, 1.0).unwrap();
+        let expected = image::imageops::crop_imm(&image, 7, 9, 31, 23).to_image();
+        assert_eq!(image::open(&cropped_path).unwrap().to_rgba8(), expected);
+        fs::remove_file(cropped_path).unwrap();
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn freeze_frame_crop_rect_clamps_to_image_bounds() {

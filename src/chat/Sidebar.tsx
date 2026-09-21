@@ -17,7 +17,7 @@ import {
 } from 'lucide-react'
 import type { ChatAssistant, ChatProject, ChatSet, ConversationListItem, ConversationSearchHit } from './types'
 import { HighlightText } from './searchHighlight'
-import { AgentIcon, KnowledgeIcon, McpIcon, SkillIcon } from '../settings/NavIcons'
+import { AgentIcon, KnowledgeIcon, McpIcon, SkillIcon, WorksIcon } from '../settings/public/icons'
 import { ConversationList } from './ConversationList'
 import { ChatSectionMenu } from './ChatSectionMenu'
 import { ProjectContextMenu } from './ProjectContextMenu'
@@ -39,7 +39,7 @@ import { useChatPerfRenderProbe } from './chatPerformanceProbe'
 import type { ConversationMenuAnchor } from './ConversationContextMenu'
 import type { ChatUserProfile } from './types'
 import { UserAvatar } from './UserAvatar'
-import { i18n, useT, type I18n, type Lang } from '../settings/i18n'
+import { i18n, useT, type I18n, type Lang } from '../components/i18n'
 import { conversationMarkdownFilename } from './conversationExport'
 import { displayConversationTitle, isPlaceholderTitle, isProvisionalTitle } from './conversationTitle'
 import { SwapTitle } from './SwapTitle'
@@ -55,7 +55,7 @@ function resolveChatUserProfile(
 
 const modLabel = isMac ? '⌘' : 'Ctrl'
 
-export type ExtensionsNavItem = 'assistants' | 'skill' | 'mcp' | 'knowledge' | 'notes' | 'automations'
+export type ExtensionsNavItem = import('./chatRoutes').ChatExtensionsNavItem
 
 /**
  * 点击会话时要同步切换的侧栏导航上下文。
@@ -190,6 +190,11 @@ export interface SidebarProps {
   currentConversationId?: string
   generatingConversationIds?: ReadonlySet<string>
   optimisticConversations?: ConversationListItem[]
+  /**
+   * 当前打开的对话。后端 list 排除归档，所以归档后仍开着的对话不会出现在
+   * `conversations` 里；生成中的乐观行能看见它，结束后就被剪掉。
+   */
+  openConversation?: ConversationListItem | null
   selectedProject?: ChatProject | null
   onSelectProject: (project: ChatProject | null) => void
   selectedSet?: ChatSet | null
@@ -605,6 +610,7 @@ export const Sidebar = memo(function Sidebar({
   currentConversationId,
   generatingConversationIds = new Set(),
   optimisticConversations = [],
+  openConversation = null,
   selectedProject = null,
   onSelectProject,
   selectedSet = null,
@@ -1129,8 +1135,15 @@ export const Sidebar = memo(function Sidebar({
     const active = conversations.filter(
       (item) => !item.archived && !suppressedConversationIds.has(item.id),
     )
-    if (optimisticConversations.length === 0) return applyPinOverrides(active, pinOverrides)
-    const realById = new Map(active.map((item) => [item.id, item]))
+    // 当前打开的对话即使已被归档 / 不在最近 80 里，也要留在侧栏，否则用户对着正文找不到入口。
+    // 刚从侧栏归档的除外：那条在 suppressed 里，不能又并回来。
+    const withOpen = (() => {
+      if (!openConversation || suppressedConversationIds.has(openConversation.id)) return active
+      if (active.some((item) => item.id === openConversation.id)) return active
+      return [{ ...openConversation, archived: false }, ...active]
+    })()
+    if (optimisticConversations.length === 0) return applyPinOverrides(withOpen, pinOverrides)
+    const realById = new Map(withOpen.map((item) => [item.id, item]))
     const visibleOptimisticConversations = optimisticConversations.filter((item) => {
       if (item.archived || suppressedConversationIds.has(item.id)) return false
       const real = realById.get(item.id)
@@ -1147,13 +1160,13 @@ export const Sidebar = memo(function Sidebar({
       // 先倒退成「新对话」再跳成生成标题，且行实例销毁重建导致 SwapTitle 过渡不触发。
       return isPlaceholderTitle(real.title)
     }).map((item) => overlayOptimisticConversation(item, realById.get(item.id)))
-    if (visibleOptimisticConversations.length === 0) return applyPinOverrides(active, pinOverrides)
+    if (visibleOptimisticConversations.length === 0) return applyPinOverrides(withOpen, pinOverrides)
     const optimisticIds = new Set(visibleOptimisticConversations.map((item) => item.id))
     return applyPinOverrides([
       ...visibleOptimisticConversations,
-      ...active.filter((item) => !optimisticIds.has(item.id)),
+      ...withOpen.filter((item) => !optimisticIds.has(item.id)),
     ], pinOverrides)
-  }, [conversations, generatingConversationIds, optimisticConversations, pinOverrides, suppressedConversationIds])
+  }, [conversations, generatingConversationIds, openConversation, optimisticConversations, pinOverrides, suppressedConversationIds])
 
   const normalizedSearchQuery = searchQuery.trim().toLowerCase()
 
@@ -1408,8 +1421,14 @@ export const Sidebar = memo(function Sidebar({
           active={searchOpen}
           iconMotion="group-hover:scale-110"
         />
+        <NavRow
+          icon={<WorksIcon size={17} strokeWidth={1.75} />}
+          label={t.chatNavArtifacts}
+          onClick={() => onOpenExtensionsItem('artifacts')}
+          active={extensionsActive === 'artifacts'}
+        />
         <ExtensionsNav
-          activeItem={extensionsActive}
+          activeItem={extensionsActive === 'artifacts' ? null : extensionsActive}
           onSelectItem={onOpenExtensionsItem}
         />
       </nav>

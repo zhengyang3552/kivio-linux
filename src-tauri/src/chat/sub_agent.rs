@@ -180,8 +180,12 @@ fn generation_cascade_active(
     parent_conversation_id: &str,
     parent_generation: u64,
 ) -> bool {
-    state.is_chat_generation_active(conversation_id, generation)
-        && state.is_chat_generation_active(parent_conversation_id, parent_generation)
+    state
+        .chat_runtime()
+        .is_generation_active(conversation_id, generation)
+        && state
+            .chat_runtime()
+            .is_generation_active(parent_conversation_id, parent_generation)
 }
 
 fn progress_tail(text: &str, max_chars: usize) -> String {
@@ -327,7 +331,8 @@ impl AgentHost for SubAgentHost {
         Box::pin(async move {
             self.app
                 .state::<AppState>()
-                .has_chat_consent(&self.parent_conversation_id)
+                .chat_interactions()
+                .has_session_consent(&self.parent_conversation_id)
         })
     }
 
@@ -353,7 +358,8 @@ impl AgentHost for SubAgentHost {
                 && self
                     .app
                     .state::<AppState>()
-                    .is_chat_generation_active(conversation_id, generation);
+                    .chat_runtime()
+                    .is_generation_active(conversation_id, generation);
         }
         // Cascade: the sub-agent run is active only while BOTH its own
         // generation and the parent generation are live. Parent cancel ⇒
@@ -393,6 +399,22 @@ struct SubAgentToolExecutor {
 }
 
 impl ToolExecutor for SubAgentToolExecutor {
+    fn prepare_result<'a>(
+        &'a self,
+        ctx: &ToolExecutionContext<'_>,
+        tool: &ChatToolDefinition,
+        arguments: &Value,
+        output: crate::mcp::types::McpToolCallResult,
+    ) -> ToolExecutorFuture<'a> {
+        crate::chat::artifacts::prepare_output(
+            &self.app,
+            ctx.tool_conversation_id,
+            ctx.message_id,
+            tool,
+            arguments,
+            output,
+        )
+    }
     fn call<'a>(
         &'a self,
         ctx: &'a ToolExecutionContext<'a>,
@@ -570,7 +592,7 @@ async fn run_sub_agent(app: AppHandle, req: SubAgentRequest) -> Result<AgentRunR
     let state: &AppState = &state;
     let sub_conversation_id = format!("subagent-{}", req.task_id);
 
-    let sub_generation = state.next_chat_generation(&sub_conversation_id);
+    let sub_generation = state.chat_runtime().begin_generation(&sub_conversation_id);
     let sub_run_id = req
         .managed
         .as_ref()
@@ -635,7 +657,7 @@ async fn run_sub_agent(app: AppHandle, req: SubAgentRequest) -> Result<AgentRunR
     let effective_chat_tools = req.settings.chat_tools.clone();
 
     let config = AgentRunConfig {
-        state,
+        provider_runtime: state,
         conversation_id: sub_conversation_id.clone(),
         tool_conversation_id: req.parent_conversation_id.clone(),
         depth: req.depth,

@@ -88,6 +88,7 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
         &self,
         conversation_id: &str,
         used_tokens: u64,
+        token_count_source: Option<&str>,
         context_window_tokens: Option<u64>,
     ) {
         emit_chat_context_usage_live(
@@ -95,6 +96,7 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
             conversation_id,
             &self.run_id,
             used_tokens,
+            token_count_source,
             context_window_tokens,
         );
     }
@@ -182,21 +184,22 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
 
     fn is_generation_active(&self, conversation_id: &str, generation: u64) -> bool {
         self.state
-            .is_chat_generation_active(conversation_id, generation)
+            .chat_runtime()
+            .is_generation_active(conversation_id, generation)
     }
 
     fn take_steering_messages(
         &self,
         conversation_id: &str,
     ) -> Vec<crate::chat::agent::SteeringMessage> {
-        self.state.take_chat_steering(conversation_id)
+        self.state.chat_runtime().take_steering(conversation_id)
     }
 
     fn take_follow_up_messages(
         &self,
         conversation_id: &str,
     ) -> Vec<crate::chat::agent::SteeringMessage> {
-        self.state.take_chat_follow_up(conversation_id)
+        self.state.chat_runtime().take_follow_up(conversation_id)
     }
 
     fn wait_for_generation_inactive<'a>(
@@ -318,7 +321,8 @@ impl crate::chat::agent::AgentHost for ProbeAgentHost<'_> {
 
     fn is_generation_active(&self, conversation_id: &str, generation: u64) -> bool {
         self.state
-            .is_chat_generation_active(conversation_id, generation)
+            .chat_runtime()
+            .is_generation_active(conversation_id, generation)
     }
 
     fn wait_for_generation_inactive<'a>(
@@ -335,8 +339,25 @@ impl crate::chat::agent::AgentHost for ProbeAgentHost<'_> {
 pub(super) struct RegistryToolExecutor<'a> {
     pub(super) app: AppHandle,
     pub(super) state: &'a AppState,
+    pub(super) video_analysis: tokio::sync::Mutex<crate::chat::video_analysis::VideoTool>,
 }
 impl crate::chat::agent::ToolExecutor for RegistryToolExecutor<'_> {
+    fn prepare_result<'a>(
+        &'a self,
+        ctx: &crate::chat::agent::ToolExecutionContext<'_>,
+        tool: &ChatToolDefinition,
+        arguments: &Value,
+        output: crate::mcp::types::McpToolCallResult,
+    ) -> crate::chat::agent::ToolExecutorFuture<'a> {
+        crate::chat::artifacts::prepare_output(
+            &self.app,
+            ctx.tool_conversation_id,
+            ctx.message_id,
+            tool,
+            arguments,
+            output,
+        )
+    }
     fn call<'a>(
         &'a self,
         ctx: &'a crate::chat::agent::ToolExecutionContext<'a>,
@@ -359,6 +380,14 @@ impl crate::chat::agent::ToolExecutor for RegistryToolExecutor<'_> {
                         );
                     }
                 }
+            }
+            if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+                return self
+                    .video_analysis
+                    .lock()
+                    .await
+                    .call(&self.app, self.state, ctx, &arguments)
+                    .await;
             }
             let native_ctx = mcp::registry::NativeToolContext {
                 // Conversation-scoped tools (todo / native workspace) target the

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use schemars::JsonSchema;
@@ -220,6 +221,8 @@ impl ChatToolPayload {
 pub struct ChatContextUsagePayload {
     pub used_tokens: u64,
     pub context_window_tokens: Option<u64>,
+    #[serde(default)]
+    pub token_count_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
@@ -312,6 +315,9 @@ pub enum ChatPlanStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ChatPlanStatePayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, inline)]
+    pub document: Option<crate::chat::plan_document::PlanDocument>,
     pub mode: ChatPlanMode,
     pub status: ChatPlanStatus,
     pub plan: Option<String>,
@@ -331,6 +337,7 @@ impl From<&crate::chat::AgentPlanState> for ChatPlanStatePayload {
                 crate::chat::AgentPlanStatus::Draft => ChatPlanStatus::Draft,
                 crate::chat::AgentPlanStatus::Approved => ChatPlanStatus::Approved,
             },
+            document: state.document.clone(),
             plan: state.plan.clone(),
             updated_at: state.updated_at,
         }
@@ -340,27 +347,49 @@ impl From<&crate::chat::AgentPlanState> for ChatPlanStatePayload {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
-pub enum ChatGoalStatus { Active, Verifying, Waiting, Paused, Blocked, Completed, Cancelled }
+pub enum ChatGoalStatus {
+    Active,
+    Verifying,
+    Waiting,
+    Paused,
+    Blocked,
+    Completed,
+    Cancelled,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ChatGoalCriterionPayload {
-    pub id: String, pub text: String, pub verified: bool,
-    pub evidence: Option<String>, pub evidence_kind: Option<String>, pub evidence_ref: Option<String>,
+    pub id: String,
+    pub text: String,
+    pub verified: bool,
+    pub evidence: Option<String>,
+    pub evidence_kind: Option<String>,
+    pub evidence_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ChatGoalStatePayload {
-    pub id: String, pub version: u64, pub objective: String, pub status: ChatGoalStatus,
-    pub criteria: Vec<ChatGoalCriterionPayload>, pub status_reason: Option<String>,
-    pub progress_summary: Option<String>, pub progress_revision: u64,
-    pub active_run_id: Option<String>, pub automatic_runs: u64, pub no_progress_runs: u32,
+    pub id: String,
+    pub version: u64,
+    pub objective: String,
+    pub status: ChatGoalStatus,
+    pub criteria: Vec<ChatGoalCriterionPayload>,
+    pub status_reason: Option<String>,
+    pub progress_summary: Option<String>,
+    pub progress_revision: u64,
+    pub active_run_id: Option<String>,
+    pub automatic_runs: u64,
+    pub no_progress_runs: u32,
     pub last_response_fingerprint: Option<String>,
-    pub input_tokens: Option<u64>, pub output_tokens: Option<u64>, pub total_tokens: Option<u64>,
-    pub created_at: i64, pub updated_at: i64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub created_at: i64,
+    pub updated_at: i64,
     #[serde(default)]
     pub completed_at: Option<i64>,
     #[serde(default)]
@@ -368,20 +397,48 @@ pub struct ChatGoalStatePayload {
 }
 
 impl From<&crate::chat::GoalState> for ChatGoalStatePayload {
-    fn from(g:&crate::chat::GoalState)->Self { Self {
-        id:g.id.clone(), version:g.version, objective:g.objective.clone(), status:match g.status {
-            crate::chat::GoalStatus::Active=>ChatGoalStatus::Active, crate::chat::GoalStatus::Verifying=>ChatGoalStatus::Verifying,
-            crate::chat::GoalStatus::Waiting=>ChatGoalStatus::Waiting, crate::chat::GoalStatus::Paused=>ChatGoalStatus::Paused,
-            crate::chat::GoalStatus::Blocked=>ChatGoalStatus::Blocked, crate::chat::GoalStatus::Completed=>ChatGoalStatus::Completed,
-            crate::chat::GoalStatus::Cancelled=>ChatGoalStatus::Cancelled },
-        criteria:g.criteria.iter().map(|c|ChatGoalCriterionPayload{id:c.id.clone(),text:c.text.clone(),verified:c.verified,evidence:c.evidence.clone(),evidence_kind:c.evidence_kind.clone(),evidence_ref:c.evidence_ref.clone()}).collect(),
-        status_reason:g.status_reason.clone(), progress_summary:g.progress_summary.clone(), progress_revision:g.progress_revision,
-        active_run_id:g.active_run_id.clone(), automatic_runs:g.automatic_runs,
-        no_progress_runs:g.no_progress_runs, last_response_fingerprint:g.last_response_fingerprint.clone(),
-        input_tokens:g.input_tokens, output_tokens:g.output_tokens,
-        total_tokens:g.total_tokens, created_at:g.created_at, updated_at:g.updated_at,
-        completed_at:g.completed_at, completed_message_id:g.completed_message_id.clone(),
-    }}
+    fn from(g: &crate::chat::GoalState) -> Self {
+        Self {
+            id: g.id.clone(),
+            version: g.version,
+            objective: g.objective.clone(),
+            status: match g.status {
+                crate::chat::GoalStatus::Active => ChatGoalStatus::Active,
+                crate::chat::GoalStatus::Verifying => ChatGoalStatus::Verifying,
+                crate::chat::GoalStatus::Waiting => ChatGoalStatus::Waiting,
+                crate::chat::GoalStatus::Paused => ChatGoalStatus::Paused,
+                crate::chat::GoalStatus::Blocked => ChatGoalStatus::Blocked,
+                crate::chat::GoalStatus::Completed => ChatGoalStatus::Completed,
+                crate::chat::GoalStatus::Cancelled => ChatGoalStatus::Cancelled,
+            },
+            criteria: g
+                .criteria
+                .iter()
+                .map(|c| ChatGoalCriterionPayload {
+                    id: c.id.clone(),
+                    text: c.text.clone(),
+                    verified: c.verified,
+                    evidence: c.evidence.clone(),
+                    evidence_kind: c.evidence_kind.clone(),
+                    evidence_ref: c.evidence_ref.clone(),
+                })
+                .collect(),
+            status_reason: g.status_reason.clone(),
+            progress_summary: g.progress_summary.clone(),
+            progress_revision: g.progress_revision,
+            active_run_id: g.active_run_id.clone(),
+            automatic_runs: g.automatic_runs,
+            no_progress_runs: g.no_progress_runs,
+            last_response_fingerprint: g.last_response_fingerprint.clone(),
+            input_tokens: g.input_tokens,
+            output_tokens: g.output_tokens,
+            total_tokens: g.total_tokens,
+            created_at: g.created_at,
+            updated_at: g.updated_at,
+            completed_at: g.completed_at,
+            completed_message_id: g.completed_message_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
@@ -570,6 +627,12 @@ pub struct ChatAskUserQuestionPayload {
     pub options: Vec<ChatAskUserOptionPayload>,
     pub allow_multiple: bool,
     pub allow_custom: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "Record<string, unknown>")]
+    pub value_schema: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
@@ -601,6 +664,8 @@ impl From<&crate::chat::ask_user::AskUserPromptPayload> for ChatAskUserPromptPay
                         .collect(),
                     allow_multiple: question.allow_multiple,
                     allow_custom: question.allow_custom,
+                    required: Some(question.required),
+                    value_schema: question.value_schema.clone(),
                 })
                 .collect(),
         }
@@ -763,6 +828,9 @@ pub struct ChatRunEventEnvelope {
 )]
 #[ts(tag = "type", rename_all = "snake_case")]
 pub enum ChatConversationEvent {
+    TitleUpdated {
+        title: String,
+    },
     ContextUpdated {
         context_state: ChatContextStatePayload,
     },
@@ -845,6 +913,37 @@ pub struct ChatProtocolSubscriber {
     pub channel: tauri::ipc::Channel<ChatProtocolEvent>,
 }
 
+/// Owns replay state and live window subscriptions. No protocol map or lock is
+/// exposed through the application composition root.
+#[derive(Default)]
+pub(crate) struct ChatProtocolState {
+    hub: Mutex<ChatProtocolHub>,
+    subscribers: Mutex<HashMap<String, ChatProtocolSubscriber>>,
+}
+
+impl ChatProtocolState {
+    fn hub(&self) -> std::sync::MutexGuard<'_, ChatProtocolHub> {
+        self.hub.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn subscribers(&self) -> std::sync::MutexGuard<'_, HashMap<String, ChatProtocolSubscriber>> {
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn running_snapshot(
+        &self,
+        conversation_id: &str,
+        run_id: &str,
+        message_id: &str,
+    ) -> Option<ChatRunSnapshot> {
+        self.hub()
+            .running_snapshot(conversation_id, run_id, message_id)
+            .cloned()
+    }
+}
+
 pub fn matching_subscriber_labels(
     subscribers: &HashMap<String, ChatProtocolSubscriber>,
     conversation_id: &str,
@@ -876,11 +975,7 @@ fn labels_matching_filters<'a>(
 }
 
 pub fn unsubscribe_label(state: &AppState, label: &str) {
-    state
-        .chat_protocol_subscribers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(label);
+    state.chat_protocol().subscribers().remove(label);
 }
 
 impl<'de> Deserialize<'de> for ChatProtocolEvent {
@@ -1765,10 +1860,7 @@ fn emit_protocol(app: &AppHandle, event: ChatProtocolEvent) {
     let high_frequency = event.is_high_frequency();
     let state = app.state::<AppState>();
     let targets: Vec<(String, tauri::ipc::Channel<ChatProtocolEvent>)> = {
-        let slots = state
-            .chat_protocol_subscribers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let slots = state.chat_protocol().subscribers();
         matching_subscriber_labels(&slots, &conversation_id, high_frequency)
             .into_iter()
             .filter_map(|label| {
@@ -1802,10 +1894,7 @@ fn emit_protocol(app: &AppHandle, event: ChatProtocolEvent) {
     }
     let mut reset = Vec::new();
     {
-        let mut slots = state
-            .chat_protocol_subscribers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut slots = state.chat_protocol().subscribers();
         for (label, channel_id) in dead {
             let still_dead = slots
                 .get(&label)
@@ -1835,14 +1924,10 @@ pub fn chat_protocol_subscribe(
     conversation_id: Option<String>,
 ) {
     let filter = crate::chat::popout::protocol_filter_for_window(window.label(), conversation_id);
-    state
-        .chat_protocol_subscribers
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(
-            window.label().to_string(),
-            ChatProtocolSubscriber { filter, channel },
-        );
+    state.chat_protocol().subscribers().insert(
+        window.label().to_string(),
+        ChatProtocolSubscriber { filter, channel },
+    );
 }
 
 pub fn register_run(
@@ -1871,11 +1956,13 @@ pub fn register_run_with_recovery(
     recovery: Option<ChatRunRecoveryMetadata>,
 ) {
     let state = app.state::<AppState>();
-    let event = state
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .register_with_recovery(conversation_id, run_id, message_id, base_revision, recovery);
+    let event = state.chat_protocol().hub().register_with_recovery(
+        conversation_id,
+        run_id,
+        message_id,
+        base_revision,
+        recovery,
+    );
     if let Some(event) = event {
         emit_protocol(app, ChatProtocolEvent::Run(event));
     }
@@ -1964,10 +2051,7 @@ fn schedule_delta_flush(app: &AppHandle, run_id: &str) {
         let state = app.state::<AppState>();
         // emit 必须在锁内：本任务与 emit_run_event 并发时，锁外 emit 会把已按 seq
         // 入库的事件乱序发出（前端会误判丢事件、白触发一次 sync）。
-        let mut hub = state
-            .chat_protocol
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut hub = state.chat_protocol().hub();
         if let Some(run) = hub.runs.get_mut(&run_id) {
             run.flush_scheduled = false;
         }
@@ -1984,10 +2068,7 @@ pub fn emit_run_event(app: &AppHandle, run_id: &str, event: ChatRunEvent) {
         // emit 留在锁内：入库（拿 seq）与发出必须是同一个临界区，否则与
         // 延迟冲刷任务并发时事件会乱序到达前端。合帧后事件频率已经很低，
         // 锁内一次 payload 序列化不构成争用点。
-        let mut hub = state
-            .chat_protocol
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut hub = state.chat_protocol().hub();
         let passthrough = match split_coalescible_delta(event) {
             Ok(pending) => match hub.buffer_delta(run_id, pending) {
                 Ok((envelopes, schedule_flush)) => {
@@ -2035,9 +2116,8 @@ pub fn emit_hook_failed(
     };
     let result = app
         .state::<AppState>()
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .chat_protocol()
+        .hub()
         .push(run_id, event.clone());
     match result {
         Ok(envelope) => emit_protocol(app, ChatProtocolEvent::Run(envelope)),
@@ -2109,9 +2189,8 @@ impl Drop for RegisteredRunGuard {
         let already_terminal = self
             .app
             .state::<AppState>()
-            .chat_protocol
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .chat_protocol()
+            .hub()
             .runs
             .get(&self.run_id)
             .is_some_and(|run| run.terminal_at.is_some());
@@ -2130,9 +2209,8 @@ impl Drop for RegisteredRunGuard {
 pub fn withdraw_tool_approval(app: &AppHandle, tool_call_id: &str) {
     let state = app.state::<AppState>();
     let event = state
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .chat_protocol()
+        .hub()
         .withdraw_tool_approval(tool_call_id);
     if let Some(event) = event {
         emit_protocol(app, ChatProtocolEvent::Run(event));
@@ -2141,17 +2219,15 @@ pub fn withdraw_tool_approval(app: &AppHandle, tool_call_id: &str) {
 
 pub fn resolve_session_consent(app: &AppHandle, run_id: &str) {
     app.state::<AppState>()
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .chat_protocol()
+        .hub()
         .resolve_session_consent(run_id);
 }
 
 pub fn resolve_user_prompt(app: &AppHandle, run_id: &str, tool_call_id: &str) {
     app.state::<AppState>()
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+        .chat_protocol()
+        .hub()
         .resolve_user_prompt(run_id, tool_call_id);
 }
 
@@ -2185,11 +2261,7 @@ pub fn chat_sync_state(
             CHAT_PROTOCOL_VERSION, request.protocol_version
         ));
     }
-    let mut result = state
-        .chat_protocol
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .sync(&request);
+    let mut result = state.chat_protocol().hub().sync(&request);
     result.conversation_revision =
         crate::chat::storage::load_conversation(&app, &request.conversation_id)
             .map(|conversation| conversation.revision)
@@ -2200,6 +2272,22 @@ pub fn chat_sync_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_owner_exposes_only_matching_live_run_snapshot() {
+        let protocol = ChatProtocolState::default();
+        protocol.hub().register("conversation", "run", "message", 1);
+        let snapshot = protocol
+            .running_snapshot("conversation", "run", "message")
+            .expect("registered run");
+        assert_eq!(snapshot.run_id, "run");
+        assert!(protocol
+            .running_snapshot("another", "run", "message")
+            .is_none());
+        assert!(protocol
+            .running_snapshot("conversation", "run", "wrong-message")
+            .is_none());
+    }
 
     #[test]
     fn serializes_exact_camel_case_wire_shape() {
@@ -2244,7 +2332,7 @@ mod tests {
             }),
             serde_json::json!({
                 "type": "context_usage_updated",
-                "usage": {"usedTokens": 10, "contextWindowTokens": 100}
+                "usage": {"usedTokens": 10, "contextWindowTokens": 100, "tokenCountSource": "provider_reported"}
             }),
             serde_json::json!({
                 "type": "compaction_updated", "phase": "started", "trigger": null,
@@ -2313,6 +2401,7 @@ mod tests {
         }
 
         let conversation_events = vec![
+            serde_json::json!({"type": "title_updated", "title": "Weather"}),
             serde_json::json!({
                 "type": "context_updated",
                 "contextState": {

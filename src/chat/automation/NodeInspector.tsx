@@ -1,23 +1,13 @@
 import type { ReactNode } from 'react'
 import { Play } from 'lucide-react'
 import { Button } from '../../components/Button'
-import { FieldBlock, Select, Toggle } from '../../settings/components'
-import { useT } from '../../settings/i18n'
+import { FieldBlock, Select, Toggle } from '../../settings/public/controls'
+import { useT } from '../../components/i18n'
 import { catalogEntry } from './nodeCatalog'
 import { AgentInspector } from './AgentInspector'
 import { slotForNodeType } from './agentModel'
-import {
-  isAttachmentType,
-  isTriggerType,
-  MAX_SWITCH_CASES,
-  type ClipboardOp,
-  type CommandData,
-  type FileOp,
-  type FlowNode,
-  type IfOp,
-  type SetField,
-  type SwitchCase,
-} from './types'
+import { MAX_SWITCH_CASES, type ClipboardOp, type CommandData, type FileOp, type FlowNode, type IfOp, type SetField, type SwitchCase } from '../../api/automationContracts'
+import { isAttachmentType, isTriggerType } from './nodeSemantics'
 
 function InspectorSection({ title, children }: { title: string, children: ReactNode }) {
   return (

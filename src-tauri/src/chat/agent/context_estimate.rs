@@ -6,7 +6,7 @@
 //! - `anchor_total_tokens` = 上次调用「整个 prompt + 该次响应」的真实 token 数（= 下一次请求
 //!   input 的主体，含 output，因为响应已成为历史）；
 //! - trailing 估算只覆盖锚点响应**之后**新增的消息（响应本身用真实 output 计入锚点，不重复估）；
-//! - 最终 `max(effective, 纯字符估算)` 作保守下限，保证引入锚点永不比现状更乐观。
+//! - 有有效实报就使用实报，只估算其后的新增内容；没有有效实报才整体估算。
 
 use crate::chat::model::ModelUsage;
 
@@ -64,27 +64,34 @@ pub(crate) fn prompt_tokens(usage: &ModelUsage, api_format: &str) -> Option<u64>
 ///
 /// - `anchor_total`：`Some` = 有可用锚点（上次「prompt+响应」真实 token 总数）；`None` = 无锚点。
 /// - `trailing_estimate`：锚点响应**之后**新增消息的字符估算。
-/// - `estimate_full`：整段对话的纯字符估算（含工具 schema，现状口径），作保守下限。
+/// - `estimate_full`：整段对话的纯字符估算（含工具 schema），仅在无锚点时兜底。
 ///
-/// 返回 `(tokens, anchored)`：`anchored == true` 仅当真实锚点值确实被采用（≥ 纯估算），
-/// 供 footer 决定标注「模型实报」还是「估算」。锚点值反而更小时（极少）取纯估算并标 `false`。
+/// 返回 `(tokens, anchored)`：`anchored` 表示采用了实报锚点。
+/// 若还含 trailing_estimate，调用方须标明是实报加增量估算，而不是纯实报。
 pub(crate) fn effective_context_tokens(
     anchor_total: Option<u64>,
     trailing_estimate: usize,
     estimate_full: usize,
 ) -> (usize, bool) {
     match anchor_total {
-        Some(total) => {
-            let anchored = (total as usize).saturating_add(trailing_estimate);
-            if anchored >= estimate_full {
-                (anchored, true)
-            } else {
-                // 锚点+增量竟小于纯估算（罕见，如锚点来自被压缩过的更小 prompt）——
-                // 取更保守的纯估算，且不标记为真实锚点。
-                (estimate_full, false)
-            }
-        }
+        Some(total) => (
+            usize::try_from(total)
+                .unwrap_or(usize::MAX)
+                .saturating_add(trailing_estimate),
+            true,
+        ),
         None => (estimate_full, false),
+    }
+}
+
+/// 同一来源标记用于落盘快照和循环内实时事件，防止压缩后沿用过期的「实报」标签。
+pub(crate) fn token_count_source(anchored: bool, trailing_estimate: usize) -> Option<&'static str> {
+    if !anchored {
+        None
+    } else if trailing_estimate == 0 {
+        Some("provider_reported")
+    } else {
+        Some("provider_reported_with_estimate")
     }
 }
 
@@ -159,16 +166,35 @@ mod tests {
     }
 
     #[test]
-    fn effective_falls_back_to_estimate_when_anchor_smaller() {
+    fn effective_reported_usage_wins_over_larger_estimate() {
         assert_eq!(
-            effective_context_tokens(Some(10_000), 1_000, 50_000),
-            (50_000, false)
+            effective_context_tokens(Some(269_150), 0, 339_433),
+            (269_150, true)
+        );
+    }
+
+    #[test]
+    fn effective_estimates_only_messages_after_reported_usage() {
+        assert_eq!(
+            effective_context_tokens(Some(269_150), 200, 339_433),
+            (269_350, true)
         );
     }
 
     #[test]
     fn effective_no_anchor_uses_estimate() {
         assert_eq!(effective_context_tokens(None, 0, 42_000), (42_000, false));
+    }
+
+    #[test]
+    fn usage_source_distinguishes_reported_incremental_and_fallback_counts() {
+        assert_eq!(token_count_source(true, 0), Some("provider_reported"));
+        assert_eq!(
+            token_count_source(true, 200),
+            Some("provider_reported_with_estimate")
+        );
+        assert_eq!(token_count_source(false, 0), None);
+        assert_eq!(effective_context_tokens(Some(0), 0, 100), (0, true));
     }
 
     #[test]

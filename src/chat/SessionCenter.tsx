@@ -7,6 +7,7 @@ import {
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
 } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Archive,
   ArchiveRestore,
@@ -38,8 +39,8 @@ import type {
 } from './types'
 import { conversationMarkdownFilename } from './conversationExport'
 import { IconButton, Button } from '../components/Button'
-import { Select, Toggle } from '../settings/components'
-import { useT, type Lang } from '../settings/i18n'
+import { Select, Toggle } from '../settings/public/controls'
+import { useT, type Lang } from '../components/i18n'
 import {
   conversationOwnerLabel,
   dayBucket,
@@ -50,6 +51,7 @@ import {
   type DayBucket,
 } from './sessionLibrary/format'
 import { HighlightText } from './searchHighlight'
+import { useClampedMenuPosition } from './useClampedMenuPosition'
 
 const PAGE_SIZE = 80
 
@@ -90,7 +92,11 @@ interface SessionCenterProps {
   embedded?: boolean
   currentConversationId?: string
   generatingConversationIds?: ReadonlySet<string>
-  onSelectConversation: (id: string, conversation?: ConversationSearchHit) => void
+  onSelectConversation: (
+    id: string,
+    conversation?: ConversationSearchHit,
+    scope?: { project: ChatProject | null; set: ChatSet | null },
+  ) => void
   onConversationDeleted?: (id: string) => void
   onForceDropConversation?: (id: string) => void
   onConversationsChanged?: () => void
@@ -532,6 +538,19 @@ export function SessionCenter({
   }
 
   const menuConv = menu ? state.items.find((c) => c.id === menu.id) : undefined
+
+  const selectionScope = useCallback((conversation: ConversationSearchHit) => {
+    const conversationProjectId = conversation.project_id ?? conversation.projectId ?? null
+    const conversationSetId = conversation.set_id ?? conversation.setId ?? null
+    return {
+      project: projects.find((project) => (
+        conversationProjectId
+          ? project.id === conversationProjectId
+          : Boolean(conversation.folder) && project.name === conversation.folder
+      )) ?? null,
+      set: sets.find((set) => set.id === conversationSetId) ?? null,
+    }
+  }, [projects, sets])
   const compactPad = layout.page < 640
 
   // 与 SkillStore / Knowledge / MCP 中心一致：自绘 Select，不用原生 <select>
@@ -940,10 +959,10 @@ export function SessionCenter({
                         tabIndex={0}
                         onClick={(e) => {
                           if ((e.target as HTMLElement).closest('[data-row-chrome]')) return
-                          onSelectConversation(c.id, c)
+                          onSelectConversation(c.id, c, selectionScope(c))
                         }}
                         onKeyDown={(e: ReactKeyboardEvent) => {
-                          if (e.key === 'Enter') onSelectConversation(c.id, c)
+                          if (e.key === 'Enter') onSelectConversation(c.id, c, selectionScope(c))
                         }}
                         className={`group flex cursor-pointer items-center gap-2 border-b border-neutral-50 px-3 ${rowPad} transition-colors hover:bg-neutral-50 dark:border-white/[0.04] dark:hover:bg-white/[0.04] ${
                           isSel ? 'bg-sky-50/80 dark:bg-[var(--accent-soft)]' : ''
@@ -1064,12 +1083,7 @@ export function SessionCenter({
 
       {/* Row context menu */}
       {menu && menuConv && (
-        <>
-          <div className="fixed inset-0 z-40" onClick={() => setMenu(null)} />
-          <div
-            className="fixed z-50 w-[180px] rounded-lg border border-neutral-200 bg-white py-1 shadow-xl dark:border-white/[0.09] dark:bg-[#2a2a2c]"
-            style={{ left: menu.x, top: menu.y }}
-          >
+        <PortaledRowMenu anchor={{ left: menu.x, top: menu.y }} onClose={() => setMenu(null)}>
             <MenuItem
               label={menuConv.pinned ? t.chatLibUnstar : t.chatLibStar}
               icon={menuConv.pinned ? <PinOff size={13} /> : <Pin size={13} />}
@@ -1116,10 +1130,37 @@ export function SessionCenter({
               icon={<Trash2 size={13} />}
               onClick={() => void deleteOne(menuConv.id)}
             />
-          </div>
-        </>
+        </PortaledRowMenu>
       )}
     </div>
+  )
+}
+
+function PortaledRowMenu({
+  anchor,
+  onClose,
+  children,
+}: {
+  anchor: { left: number; top: number }
+  onClose: () => void
+  children: React.ReactNode
+}) {
+  const menuRef = useRef<HTMLDivElement>(null)
+  const pos = useClampedMenuPosition(menuRef, anchor)
+
+  return createPortal(
+    <>
+      <div className="fixed inset-0 z-[199]" onClick={onClose} />
+      <div
+        ref={menuRef}
+        role="menu"
+        className="fixed z-[200] w-[180px] rounded-lg border border-neutral-200 bg-white py-1 shadow-xl dark:border-white/[0.09] dark:bg-[#2a2a2c]"
+        style={{ left: pos.left, top: pos.top }}
+      >
+        {children}
+      </div>
+    </>,
+    document.body,
   )
 }
 
@@ -1140,6 +1181,7 @@ function MenuItem({
   return (
     <button
       type="button"
+      role="menuitem"
       onClick={onClick}
       disabled={disabled}
       className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-neutral-50 disabled:cursor-default disabled:opacity-40 dark:hover:bg-white/[0.06] ${

@@ -6,28 +6,55 @@ use tokio::time::{sleep, timeout};
 
 use crate::chat::agent::execute::truncate_chars;
 use crate::chat::attachments::{compose_text_attachments_for_api, TextAttachmentInput};
-use crate::chat::{AgentPlanState, ChatMessageSegment, Conversation, ToolCallRecord};
+use crate::chat::{AgentPlanState, ChatMessageSegment, ToolCallRecord};
 use crate::state::AppState;
 
 use super::catalog::strip_transcripts_for_frontend;
 
-/// 取走外部入口排队给 Chat 前端发送的消息。
+/// 认领外部入口排队给 Chat 前端发送的消息；成功处理后必须逐条 ack。
 #[tauri::command]
 pub(crate) fn chat_take_external_sends(
     state: State<'_, AppState>,
+    owner_id: String,
 ) -> Result<serde_json::Value, String> {
-    let requests = {
-        let mut pending = state
-            .pending_chat_external_sends
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::mem::take(&mut *pending)
-    };
+    let batch = state.chat_external_send_mailbox().claim_all(&owner_id);
 
     Ok(serde_json::json!({
         "success": true,
-        "requests": requests,
+        "requests": batch.requests,
+        "pendingLeased": batch.pending_leased,
     }))
+}
+
+#[tauri::command]
+pub(crate) fn chat_ack_external_send(
+    state: State<'_, AppState>,
+    owner_id: String,
+    request_id: String,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "success": state.chat_external_send_mailbox().ack(&owner_id, &request_id),
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn chat_renew_external_sends(
+    state: State<'_, AppState>,
+    owner_id: String,
+) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({
+        "success": true,
+        "renewed": state.chat_external_send_mailbox().renew(&owner_id),
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn chat_release_external_sends(
+    state: State<'_, AppState>,
+    owner_id: String,
+) -> Result<serde_json::Value, String> {
+    state.chat_external_send_mailbox().release(&owner_id);
+    Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]
@@ -40,7 +67,11 @@ pub(crate) async fn chat_set_agent_plan_mode(
     let mut conversation = crate::chat::repository::repository(&app)
         .mutate(&app, &conversation_id, |conversation| {
             if mode != crate::chat::types::AgentPlanMode::Act {
-                if let Some(goal) = conversation.goal_state.as_mut().filter(|g| crate::chat::goal::is_running(g.status)) {
+                if let Some(goal) = conversation
+                    .goal_state
+                    .as_mut()
+                    .filter(|g| crate::chat::goal::is_running(g.status))
+                {
                     goal.version += 1;
                     goal.status = crate::chat::types::GoalStatus::Paused;
                     goal.status_reason = Some("Paused because the Agent mode changed".into());
@@ -72,59 +103,22 @@ pub(crate) async fn chat_set_agent_plan_mode(
 #[tauri::command]
 pub(crate) async fn chat_execute_agent_plan(
     app: AppHandle,
+    state: State<'_, AppState>,
     conversation_id: String,
     message_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let mut conversation = crate::chat::repository::repository(&app)
-        .mutate(&app, &conversation_id, |conversation| {
-            approve_agent_plan_for_execution(conversation, message_id.as_deref())
-        })
-        .await
-        .map_err(crate::chat::repository::repository_error)?;
-    emit_chat_plan_state(
-        &app,
-        &conversation.id,
-        conversation.revision,
-        &conversation.agent_plan_state,
-    );
-
-    strip_transcripts_for_frontend(&mut conversation);
-    Ok(serde_json::json!({
-        "success": true,
-        "conversation": conversation,
-        "planState": conversation.agent_plan_state,
-    }))
-}
-
-pub(super) fn approve_agent_plan_for_execution(
-    conversation: &mut Conversation,
-    message_id: Option<&str>,
-) -> Result<(), String> {
-    let selected_plan =
-        if let Some(message_id) = message_id.map(str::trim).filter(|id| !id.is_empty()) {
-            Some({
-                let message = conversation
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.id == message_id && message.role == "assistant")
-                    .ok_or_else(|| "计划消息不存在".to_string())?;
-                let plan_state = message
-                    .agent_plan
-                    .as_ref()
-                    .ok_or_else(|| "该消息不是可执行计划".to_string())?;
-                if crate::chat::plan::executable_plan_text(plan_state).is_none() {
-                    return Err("该消息不是可执行计划".to_string());
-                }
-                let approved = crate::chat::plan::approve(plan_state);
-                message.agent_plan = Some(approved.clone());
-                approved
-            })
-        } else {
-            None
-        };
-    conversation.agent_plan_state =
-        selected_plan.unwrap_or_else(|| crate::chat::plan::approve(&conversation.agent_plan_state));
-    Ok(())
+    // Legacy command uses the same reserved send path as the document card.
+    super::send::chat_send_message(
+        app,
+        state,
+        conversation_id,
+        "按这条计划开始执行。".into(),
+        vec![],
+        None,
+        None,
+        Some(message_id.unwrap_or_default()),
+    )
+    .await
 }
 
 /// 取消指定对话的当前 Chat 生成或工具执行。
@@ -137,7 +131,11 @@ pub(crate) async fn chat_cancel_stream(
     state.cancel_chat_generation(&conversation_id);
     if let Ok(conversation) = crate::chat::repository::repository(&app)
         .mutate(&app, &conversation_id, |conversation| {
-            if let Some(goal) = conversation.goal_state.as_mut().filter(|g| crate::chat::goal::is_running(g.status)) {
+            if let Some(goal) = conversation
+                .goal_state
+                .as_mut()
+                .filter(|g| crate::chat::goal::is_running(g.status))
+            {
                 goal.version += 1;
                 goal.status = crate::chat::types::GoalStatus::Paused;
                 goal.status_reason = Some("Paused by user".into());
@@ -145,7 +143,8 @@ pub(crate) async fn chat_cancel_stream(
                 goal.updated_at = chrono::Local::now().timestamp();
             }
             Ok(())
-        }).await
+        })
+        .await
     {
         crate::chat::goal::emit_goal_state(&app, &conversation);
     }
@@ -165,21 +164,16 @@ pub(crate) fn chat_confirm_tool_call(
     // 模式。普通审批不传。
     permission_mode: Option<String>,
 ) -> Result<(), String> {
-    let pending = state
-        .pending_chat_tool_approvals
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&tool_call_id);
-    if let Some(pending) = pending {
-        if approved && always.unwrap_or(false) {
-            state.grant_tool_always_allow(&pending.conversation_id, &pending.tool_name);
-        }
-        let _ = pending.sender.send(crate::state::ToolApprovalOutcome {
+    if state.chat_interactions().respond_tool_approval(
+        &tool_call_id,
+        crate::chat::interaction_state::ToolApprovalOutcome {
             approved,
             permission_mode: permission_mode
                 .map(|mode| mode.trim().to_string())
                 .filter(|mode| !mode.is_empty()),
-        });
+        },
+        always.unwrap_or(false),
+    ) {
         crate::chat::protocol::withdraw_tool_approval(&app, &tool_call_id);
         return Ok(());
     }
@@ -221,12 +215,7 @@ pub(crate) fn chat_list_background_tasks(
     let mut out: Vec<(std::time::SystemTime, serde_json::Value)> = Vec::new();
 
     {
-        let map = state.background_commands_handle();
-        let map = map.lock().unwrap_or_else(|e| e.into_inner());
-        for j in map.values() {
-            if wanted.is_some() && j.conversation_id.as_deref() != wanted {
-                continue;
-            }
+        for j in state.background_commands_handle().snapshots(wanted, false) {
             use crate::native_tools::BackgroundCommandStatus as S;
             let (status, exit_code) = match &j.status {
                 S::Running => ("running", None),
@@ -252,22 +241,12 @@ pub(crate) fn chat_list_background_tasks(
     }
 
     {
-        let mut map = state
-            .external_background_tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for t in map.values_mut() {
-            if wanted.is_some() && Some(t.conversation_id.as_str()) != wanted {
-                continue;
-            }
-            if t.status == "running"
-                && state
-                    .external_live_session_control_any(&t.conversation_id)
-                    .is_none()
-            {
-                t.status = "stopped".to_string();
-                t.ended_at = Some(std::time::SystemTime::now());
-            }
+        for t in state
+            .external_background_tasks()
+            .snapshot_reconciled(wanted, |id| {
+                state.external_live_sessions().control_any(id).is_some()
+            })
+        {
             let value = serde_json::json!({
                 "id": t.task_id,
                 "source": "external",
@@ -302,24 +281,8 @@ pub(crate) fn chat_clear_finished_background_tasks(
     conversation_id: Option<String>,
 ) {
     let wanted = conversation_id.as_deref();
-    {
-        let map = state.background_commands_handle();
-        let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
-        map.retain(|_, j| {
-            matches!(
-                j.status,
-                crate::native_tools::BackgroundCommandStatus::Running
-            ) || (wanted.is_some() && j.conversation_id.as_deref() != wanted)
-        });
-    }
-    state
-        .external_background_tasks
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, t| {
-            t.status == "running"
-                || (wanted.is_some() && Some(t.conversation_id.as_str()) != wanted)
-        });
+    state.background_commands_handle().clear_finished(wanted);
+    state.external_background_tasks().clear_finished(wanted);
 }
 
 /// 面板停止一条外部 CLI 后台任务：往常驻会话 actor 送 `StopTask`（claude 写
@@ -331,7 +294,7 @@ pub(crate) async fn chat_stop_external_background_task(
     conversation_id: String,
     task_id: String,
 ) -> Result<(), String> {
-    if let Some(control) = state.external_live_session_control_any(&conversation_id) {
+    if let Some(control) = state.external_live_sessions().control_any(&conversation_id) {
         let _ = control
             .send(
                 crate::external_agents::session::live::SessionCommand::StopTask {
@@ -341,7 +304,9 @@ pub(crate) async fn chat_stop_external_background_task(
             .await;
     }
     // 会话已没了 ⇒ 任务随进程消失，同样落到 stopped。
-    state.upsert_external_background_task(&conversation_id, &task_id, "stopped", None, None, None);
+    state
+        .external_background_tasks()
+        .upsert_external_background_task(&conversation_id, &task_id, "stopped", None, None, None);
     Ok(())
 }
 
@@ -364,14 +329,11 @@ pub(crate) fn chat_respond_session_consent(
     conversation_id: String,
     granted: bool,
 ) -> Result<(), String> {
-    let pending = state
-        .pending_chat_session_consents
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&conversation_id);
-    if let Some(pending) = pending {
-        crate::chat::protocol::resolve_session_consent(&app, &pending.run_id);
-        let _ = pending.sender.send(granted);
+    if let Some(run_id) = state
+        .chat_interactions()
+        .respond_session_consent(&conversation_id, granted)
+    {
+        crate::chat::protocol::resolve_session_consent(&app, &run_id);
     }
     Ok(())
 }
@@ -385,36 +347,18 @@ pub(crate) fn chat_submit_user_choice(
     answers: HashMap<String, crate::chat::ask_user::AskUserAnswer>,
     skipped: bool,
 ) -> Result<(), String> {
-    let response = {
-        let pending = state
-            .pending_chat_user_prompts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let Some(pending) = pending.get(&tool_call_id) else {
-            return Err("Clarification is no longer awaiting a response".to_string());
-        };
-        if skipped {
-            crate::chat::ask_user::skipped_response()
-        } else {
-            crate::chat::ask_user::validate_response(
-                &pending.prompt,
-                crate::chat::ask_user::AskUserResponseResult {
-                    phase: crate::chat::ask_user::ASK_USER_PHASE_ANSWERED.to_string(),
-                    answers,
-                },
-            )?
+    let response = if skipped {
+        crate::chat::ask_user::skipped_response()
+    } else {
+        crate::chat::ask_user::AskUserResponseResult {
+            phase: crate::chat::ask_user::ASK_USER_PHASE_ANSWERED.to_string(),
+            answers,
         }
     };
-    let pending = state
-        .pending_chat_user_prompts
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&tool_call_id);
-    let Some(pending) = pending else {
-        return Err("Clarification is no longer awaiting a response".to_string());
-    };
-    crate::chat::protocol::resolve_user_prompt(&app, &pending.run_id, &tool_call_id);
-    let _ = pending.sender.send(response);
+    let run_id = state
+        .chat_interactions()
+        .respond_user_prompt(&tool_call_id, response)?;
+    crate::chat::protocol::resolve_user_prompt(&app, &run_id, &tool_call_id);
     Ok(())
 }
 
@@ -443,7 +387,7 @@ pub(crate) async fn chat_steer_message(
         return Ok(false);
     };
     // 常驻 CLI 会话优先：这条对话由外部 CLI 在跑时，内置信箱根本没人来取。
-    if let Some(control) = state.external_live_session_control_any(&conversation_id) {
+    if let Some(control) = state.external_live_sessions().control_any(&conversation_id) {
         let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         let sent = control
             .send(
@@ -463,7 +407,9 @@ pub(crate) async fn chat_steer_message(
         // actor 每条命令都会答复；真丢了（actor 中途没了）按未受理处理。
         return Ok(accepted_rx.await.unwrap_or(false));
     }
-    Ok(state.push_chat_steering(&conversation_id, message))
+    Ok(state
+        .chat_runtime()
+        .push_steering(&conversation_id, message))
 }
 
 /// 原生 follow-up：把消息排到当前运行结束后，由同一个常驻会话 / 内置循环继续处理。
@@ -488,8 +434,9 @@ pub(crate) async fn chat_follow_up_message(
     let (image_paths, file_paths): (Vec<_>, Vec<_>) = paths
         .into_iter()
         .partition(|path| crate::external_agents::attachments::image_mime_for_path(path).is_some());
-    if let Some((control, image_mime_whitelist)) =
-        state.external_follow_up_live_session(&conversation_id)
+    if let Some((control, image_mime_whitelist)) = state
+        .external_live_sessions()
+        .follow_up_control(&conversation_id)
     {
         let (images, degraded_images) = crate::external_agents::attachments::load_image_blocks(
             &image_paths,
@@ -532,7 +479,9 @@ pub(crate) async fn chat_follow_up_message(
     let Some(message) = crate::chat::agent::SteeringMessage::new(follow_up_id, &content) else {
         return Ok(false);
     };
-    Ok(state.push_chat_follow_up(&conversation_id, message))
+    Ok(state
+        .chat_runtime()
+        .push_follow_up(&conversation_id, message))
 }
 
 pub(super) fn emit_chat_plan_state(
@@ -559,32 +508,26 @@ pub(super) async fn request_session_consent(
     generation: u64,
 ) -> bool {
     // Already granted for this conversation — no prompt.
-    if state.has_chat_consent(conversation_id) {
+    if state
+        .chat_interactions()
+        .has_session_consent(conversation_id)
+    {
         return true;
     }
     // Serialize prompts so concurrent first-round tools (read/grep/find/ls run
     // in parallel) don't each insert a pending sender and clobber one another.
     // Whoever wins the lock prompts once; the rest re-check consent and reuse
     // the grant without a second dialog.
-    let _prompt_guard = state.chat_consent_prompt_lock.lock().await;
-    if state.has_chat_consent(conversation_id) {
+    let _prompt_guard = state.chat_interactions().lock_consent_prompt().await;
+    if state
+        .chat_interactions()
+        .has_session_consent(conversation_id)
+    {
         return true;
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut pending = state
-            .pending_chat_session_consents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Only one outstanding consent prompt per conversation.
-        pending.insert(
-            conversation_id.to_string(),
-            crate::state::PendingSessionConsent {
-                run_id: run_id.to_string(),
-                sender: tx,
-            },
-        );
-    }
+    let rx = state
+        .chat_interactions()
+        .begin_session_consent(conversation_id, run_id);
     crate::chat::protocol::emit_run_event(
         app,
         run_id,
@@ -593,11 +536,7 @@ pub(super) async fn request_session_consent(
     let result = tokio::select! {
         result = timeout(Duration::from_secs(60), rx) => result,
         _ = wait_for_chat_cancel(state, conversation_id, generation) => {
-            state
-                .pending_chat_session_consents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(conversation_id);
+            state.chat_interactions().cancel_session_consent(conversation_id);
             crate::chat::protocol::resolve_session_consent(app, run_id);
             return false;
         }
@@ -605,15 +544,15 @@ pub(super) async fn request_session_consent(
     crate::chat::protocol::resolve_session_consent(app, run_id);
     match result {
         Ok(Ok(true)) => {
-            state.grant_chat_consent(conversation_id);
+            state
+                .chat_interactions()
+                .grant_session_consent(conversation_id);
             true
         }
         _ => {
             state
-                .pending_chat_session_consents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(conversation_id);
+                .chat_interactions()
+                .cancel_session_consent(conversation_id);
             false
         }
     }
@@ -640,30 +579,22 @@ pub(crate) async fn request_tool_approval_outcome(
     run_id: &str,
     generation: u64,
     record: &ToolCallRecord,
-) -> crate::state::ToolApprovalOutcome {
+) -> crate::chat::interaction_state::ToolApprovalOutcome {
     // 用户此前对该工具按过「总是允许」→ 本对话内直接放行，不弹卡、不占挂起表。
     // 内置 agent 与外部 CLI 都走这个函数，所以一处判断两条路同时生效。
-    if state.has_tool_always_allow(conversation_id, &record.name) {
-        return crate::state::ToolApprovalOutcome {
+    if state
+        .chat_interactions()
+        .has_tool_always_allow(conversation_id, &record.name)
+    {
+        return crate::chat::interaction_state::ToolApprovalOutcome {
             approved: true,
             permission_mode: None,
         };
     }
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut pending = state
-            .pending_chat_tool_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.insert(
-            record.id.clone(),
-            crate::state::PendingToolApproval {
-                conversation_id: conversation_id.to_string(),
-                tool_name: record.name.clone(),
-                sender: tx,
-            },
-        );
-    }
+    let rx =
+        state
+            .chat_interactions()
+            .begin_tool_approval(&record.id, conversation_id, &record.name);
     let summary = format_tool_approval_summary(record);
     crate::chat::protocol::emit_run_event(
         app,
@@ -683,27 +614,17 @@ pub(crate) async fn request_tool_approval_outcome(
     let result = tokio::select! {
         result = rx => result,
         _ = wait_for_chat_cancel(state, conversation_id, generation) => {
-            let mut pending = state
-                .pending_chat_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.remove(&record.id);
-            drop(pending);
+            state.chat_interactions().cancel_tool_approval(&record.id);
             withdraw_tool_confirm(app, &record.id);
-            return crate::state::ToolApprovalOutcome::default();
+            return crate::chat::interaction_state::ToolApprovalOutcome::default();
         }
     };
     match result {
         Ok(value) => value,
         Err(_) => {
-            let mut pending = state
-                .pending_chat_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.remove(&record.id);
-            drop(pending);
+            state.chat_interactions().cancel_tool_approval(&record.id);
             withdraw_tool_confirm(app, &record.id);
-            crate::state::ToolApprovalOutcome::default()
+            crate::chat::interaction_state::ToolApprovalOutcome::default()
         }
     }
 }
@@ -722,21 +643,9 @@ pub(crate) async fn request_user_response(
     record: &ToolCallRecord,
     prompt: crate::chat::ask_user::AskUserPromptPayload,
 ) -> crate::chat::ask_user::AskUserResponseResult {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let mut pending = state
-            .pending_chat_user_prompts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        pending.insert(
-            record.id.clone(),
-            crate::chat::ask_user::PendingAskUserPrompt {
-                run_id: run_id.to_string(),
-                prompt: prompt.clone(),
-                sender: tx,
-            },
-        );
-    }
+    let rx = state
+        .chat_interactions()
+        .begin_user_prompt(&record.id, run_id, prompt.clone());
 
     let empty_answers = HashMap::new();
     let structured_content = crate::chat::ask_user::structured_content(
@@ -759,11 +668,7 @@ pub(crate) async fn request_user_response(
     let result = tokio::select! {
         result = timeout(Duration::from_secs(600), rx) => result,
         _ = wait_for_chat_cancel(state, conversation_id, generation) => {
-            let mut pending = state
-                .pending_chat_user_prompts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.remove(&record.id);
+            state.chat_interactions().cancel_user_prompt(&record.id);
             crate::chat::protocol::resolve_user_prompt(app, run_id, &record.id);
             return crate::chat::ask_user::cancelled_response();
         }
@@ -771,19 +676,11 @@ pub(crate) async fn request_user_response(
     let response = match result {
         Ok(Ok(response)) => response,
         Ok(Err(_)) => {
-            let mut pending = state
-                .pending_chat_user_prompts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.remove(&record.id);
+            state.chat_interactions().cancel_user_prompt(&record.id);
             crate::chat::ask_user::cancelled_response()
         }
         Err(_) => {
-            let mut pending = state
-                .pending_chat_user_prompts
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            pending.remove(&record.id);
+            state.chat_interactions().cancel_user_prompt(&record.id);
             crate::chat::ask_user::timeout_response()
         }
     };
@@ -792,7 +689,10 @@ pub(crate) async fn request_user_response(
 }
 
 pub(super) async fn wait_for_chat_cancel(state: &AppState, conversation_id: &str, generation: u64) {
-    while state.is_chat_generation_active(conversation_id, generation) {
+    while state
+        .chat_runtime()
+        .is_generation_active(conversation_id, generation)
+    {
         sleep(Duration::from_millis(100)).await;
     }
 }

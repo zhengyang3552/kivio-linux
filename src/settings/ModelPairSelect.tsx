@@ -8,6 +8,7 @@ interface ModelPairSelectProps {
   providers: ModelProvider[]
   onChange: (providerId: string, model: string) => void
   inheritLabel?: string
+  offOption?: { label: string; selected: boolean; onSelect: () => void }
   className?: string
   /** 可选：只保留满足谓词的模型（如生图模型仅列 imageGeneration=true）。 */
   filterModel?: (provider: ModelProvider, model: string) => boolean
@@ -19,6 +20,7 @@ export function ModelPairSelect({
   providers,
   onChange,
   inheritLabel,
+  offOption,
   className = 'w-52',
   filterModel,
 }: ModelPairSelectProps) {
@@ -30,6 +32,7 @@ export function ModelPairSelect({
     : filtered.some(option => option.value === currentValue)
   const currentLabel = providers.find(p => p.id === providerId)?.name
   const options = [
+    ...(offOption ? [{ value: 'off', label: offOption.label }] : []),
     ...(inheritLabel ? [{ value: modelPairValue('', ''), label: inheritLabel }] : []),
     ...filtered,
     ...(hasCurrent
@@ -40,8 +43,12 @@ export function ModelPairSelect({
   return (
     <Select
       className={className}
-      value={modelPairValue(providerId, model)}
+      value={offOption?.selected ? 'off' : currentValue}
       onChange={(value) => {
+        if (value === 'off' && offOption) {
+          offOption.onSelect()
+          return
+        }
         const [nextProviderId, nextModel] = parseModelPairValue(value)
         onChange(nextProviderId, nextModel)
       }}

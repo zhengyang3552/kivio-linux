@@ -31,6 +31,7 @@ import {
 import { ChatAttachments } from './ChatAttachments'
 import { PastedTextEditorModal } from './PastedTextEditorModal'
 import { ComposerAddMenu } from './ComposerAddMenu'
+import { useComposerContextMenu, type ComposerPasteTarget } from './useComposerContextMenu'
 import { SourcesButton } from './SourcesButton'
 import { onComposerInsert, onComposerTextInsert } from './composerInsert'
 import { draftKey, getComposerDraft, migrateNewChatDraft, setComposerDraft } from './composerDraft'
@@ -42,7 +43,7 @@ import { GitStatusPill } from './dock/GitStatusPill'
 import { GitDiffChip } from './dock/GitDiffChip'
 import { AgentTodoIndicator } from './AgentTodoIndicator'
 import { Button, IconButton } from '../components/Button'
-import { useT, type I18n, type Lang } from '../settings/i18n'
+import { useT, type I18n, type Lang } from '../components/i18n'
 import { api, type ChatToolDefinition, type ChatMcpServer } from '../api/tauri'
 import { chatApi } from './api'
 import type { AdditionalDirectory, AgentPlanMode, AgentPlanState, AgentTodoState, ChatAssistant, ChatProject, ChatSet, ModelRef, PendingAttachment, WebSearchMode } from './types'
@@ -698,6 +699,27 @@ export const InputBar = memo(function InputBar({
     [t],
   )
 
+  const pendingFromPaths = useCallback(async (paths: string[]) => {
+    if (paths.length === 0) return []
+    try {
+      const inspected = await api.chatInspectAttachmentPaths(paths)
+      const next = inspected
+        .filter((item): item is typeof item & { type: PendingAttachment['type'] } => (
+          item.type === 'image' || item.type === 'file' || item.type === 'video' || item.type === 'folder'
+        ))
+        .map((item) => ({
+          id: `pending-att-${crypto.randomUUID()}`,
+          type: item.type,
+          name: item.name || t.chatAttachmentFallbackName,
+          path: item.path,
+        }))
+      if (next.length > 0) return next
+    } catch (err) {
+      console.error('Failed to classify chat attachments:', err)
+    }
+    return attachmentsFromPaths(paths)
+  }, [attachmentsFromPaths, t])
+
   const loadProjectOptions = useCallback(async () => {
     if (!projectEntryEnabled) return
     setProjectOptionsLoading(true)
@@ -833,7 +855,10 @@ export const InputBar = memo(function InputBar({
     })
   }, [])
 
-  useEffect(() => onComposerTextInsert(insertTextAtEnd), [insertTextAtEnd])
+  useEffect(
+    () => onComposerTextInsert(insertTextAtEnd, draftKeyValue),
+    [draftKeyValue, insertTextAtEnd],
+  )
 
   const syncSlashToken = useCallback((value: string, cursor: number) => {
     const token = findActiveSlashToken(value, cursor)
@@ -1128,14 +1153,14 @@ export const InputBar = memo(function InputBar({
       const paths = Array.isArray(selected) ? selected : selected ? [selected] : []
       if (paths.length === 0) return
 
-      addAttachments(attachmentsFromPaths(paths))
+      addAttachments(await pendingFromPaths(paths))
     } catch (err) {
       console.error('Failed to add chat attachment:', err)
       setAttachmentError(
         typeof err === 'string' ? err : err instanceof Error ? err.message : t.chatAttachmentAddFailed,
       )
     }
-  }, [addAttachments, attachmentsFromPaths, closeProjectMenu, composerLocked, t])
+  }, [addAttachments, closeProjectMenu, composerLocked, pendingFromPaths, t])
 
   const handleSlashCommandSelect = useCallback(async (command: SlashCommandDefinition) => {
     if (disabled) return
@@ -1469,8 +1494,12 @@ export const InputBar = memo(function InputBar({
     syncSlashToken(el.value, el.selectionStart)
   }
 
-  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    if (composerLocked || !isTauriRuntime()) return
+  const handlePaste = async (
+    e: { clipboardData: Pick<DataTransfer, 'files' | 'getData'>; preventDefault: () => void },
+    menuTarget?: ComposerPasteTarget,
+    knownNativePaths?: string[],
+  ) => {
+    if (composerLocked || optimizeBusy || (!isTauriRuntime() && !menuTarget)) return
 
     const attachableClipboardFiles = Array.from(e.clipboardData.files).filter(isAttachableClipboardFile)
     const textarea = textareaRef.current
@@ -1487,16 +1516,19 @@ export const InputBar = memo(function InputBar({
       e.preventDefault()
     }
 
-    const nativePaths: string[] = []
+    const nativePaths: string[] = knownNativePaths ?? []
     try {
-      const native = await api.chatReadClipboardFiles()
-      if (native.success && native.files?.length) {
-        nativePaths.push(...native.files.map((file) => file.path))
+      if (!knownNativePaths && isTauriRuntime()) {
+        const native = await api.chatReadClipboardFiles()
+        if (native.success && native.files?.length) {
+          nativePaths.push(...native.files.map((file) => file.path))
+        }
       }
     } catch (err) {
       console.error('Failed to read clipboard files:', err)
     }
 
+    if (menuTarget && !menuTarget.isCurrent()) return
     const hasNativeFiles = nativePaths.length > 0
     const hasClipboardFiles = attachableClipboardFiles.length > 0
 
@@ -1513,11 +1545,11 @@ export const InputBar = memo(function InputBar({
             content: clipText,
           },
         ])
-      }
+      } else if (clipText) menuTarget?.insertText(clipText)
       return
     }
 
-    if (hasNativeFiles && textarea) {
+    if (hasNativeFiles && textarea && !menuTarget) {
       // 等浏览器默认粘贴与 React onChange 完成后，只在内容完全等于“插入了文件名”时撤销。
       window.setTimeout(() => {
         undoAccidentalFilenamePaste(
@@ -1537,7 +1569,7 @@ export const InputBar = memo(function InputBar({
       const pastedAttachments: PendingAttachment[] = []
 
       if (hasNativeFiles) {
-        pastedAttachments.push(...attachmentsFromPaths(nativePaths))
+        pastedAttachments.push(...await pendingFromPaths(nativePaths))
       } else for (const [index, file] of attachableClipboardFiles.entries()) {
         const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
 
@@ -1585,7 +1617,7 @@ export const InputBar = memo(function InputBar({
         return
       }
 
-      addAttachments(pastedAttachments)
+      if (!menuTarget || menuTarget.isCurrent()) addAttachments(pastedAttachments)
     } catch (err) {
       console.error('Failed to paste chat attachment:', err)
       setAttachmentError(
@@ -1593,6 +1625,49 @@ export const InputBar = memo(function InputBar({
       )
     }
   }
+
+  const composerContextMenu = useComposerContextMenu({
+    textareaRef, scopeKey: draftKeyValue, readOnly: composerLocked || optimizeBusy,
+    onError: setAttachmentError,
+    onPaste: async (target) => {
+      // 桌面端全部走系统剪贴板；WebView 的 read/readText 会弹出网站权限请求。
+      let nativePaths: string[] = []
+      const clipboard = new DataTransfer()
+      if (isTauriRuntime()) {
+        const content = await api.chatReadClipboard()
+        if (!target.isCurrent()) return
+        if (content.kind === 'files') nativePaths = content.paths
+        if (content.kind === 'text') clipboard.setData('text/plain', content.text)
+        if (content.kind === 'image') {
+          const bytes = Uint8Array.from(atob(content.dataBase64), char => char.charCodeAt(0))
+          clipboard.items.add(new File([bytes], 'pasted-image.png', { type: 'image/png' }))
+        }
+        await handlePaste({ clipboardData: clipboard, preventDefault: () => {} }, target, nativePaths)
+        return
+      }
+      if (!target.isCurrent()) return
+      if (!nativePaths.length) {
+        if (navigator.clipboard?.read) {
+          const items = await navigator.clipboard.read()
+          for (const item of items) {
+            const imageType = item.types.find(type => type.startsWith('image/'))
+            if (imageType) {
+              const blob = await item.getType(imageType)
+              clipboard.items.add(new File([blob], `pasted-image.${imageExtensionForMime(imageType)}`, { type: imageType }))
+            } else if (item.types.includes('text/plain')) {
+              clipboard.setData('text/plain', await (await item.getType('text/plain')).text())
+            }
+          }
+        } else if (navigator.clipboard?.readText) {
+          clipboard.setData('text/plain', await navigator.clipboard.readText())
+        } else {
+          throw new Error('Clipboard is unavailable')
+        }
+      }
+      if (!target.isCurrent()) return
+      await handlePaste({ clipboardData: clipboard, preventDefault: () => {} }, target, nativePaths)
+    },
+  })
 
   const removeAttachment = (id: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id))
@@ -1752,7 +1827,7 @@ export const InputBar = memo(function InputBar({
 
       if (event.payload.type === 'drop') {
         setDragActive(false)
-        addAttachments(attachmentsFromPaths(event.payload.paths))
+        void pendingFromPaths(event.payload.paths).then(addAttachments)
       }
     }).then((handler) => {
       if (cancelled) {
@@ -1769,7 +1844,7 @@ export const InputBar = memo(function InputBar({
       setDragActive(false)
       unlisten?.()
     }
-  }, [addAttachments, attachmentsFromPaths, composerLocked])
+  }, [addAttachments, composerLocked, pendingFromPaths])
 
   const canSend = (Boolean(input.trim()) || attachments.length > 0)
     && !slashPanelOpen
@@ -2105,13 +2180,6 @@ export const InputBar = memo(function InputBar({
                 onRemove={composerLocked ? undefined : removeAttachment}
                 onEditAttachment={setEditingAttachment}
               />
-              {attachments.some(attachment => attachment.type === 'video') && (
-                <p className="mt-2 text-[12px] text-neutral-500">
-                  {gitLang === 'zh'
-                    ? (usesExternalRuntime ? '视频将作为文件路径交给外部 CLI 代理。' : '请选择支持视频输入的模型。当前上下文视频合计最多 14 MiB。')
-                    : (usesExternalRuntime ? 'Video file paths are passed to the external CLI agent.' : 'Choose a video-capable model. Videos in the current context can total up to 14 MiB.')}
-                </p>
-              )}
             </div>
           )}
           {attachmentError && (
@@ -2176,6 +2244,7 @@ export const InputBar = memo(function InputBar({
                 aria-busy={sendPending || optimizeBusy}
                 onChange={handleInput}
                 onPaste={(e) => void handlePaste(e)}
+                onContextMenu={composerContextMenu.onContextMenu}
                 onKeyDown={handleKeyDown}
                 onSelect={handleSelect}
                 onScroll={syncSlashHighlightScroll}
@@ -2206,6 +2275,7 @@ export const InputBar = memo(function InputBar({
                     : 'text-neutral-900 dark:text-neutral-100'
                 } ${optimizing ? 'is-optimizing' : ''} ${optimizeMotion === 'out' ? 'is-optimize-out' : ''} ${optimizeMotion === 'in' ? 'is-optimize-reveal' : ''}`}
               />
+              {composerContextMenu.menu}
             </div>
 
             {/* 发送 / 停止：绝对定位在输入行右侧。两按钮共存于同一槽位，做 opacity+scale

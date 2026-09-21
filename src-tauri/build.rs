@@ -1,6 +1,27 @@
+#[path = "build_support/resources.rs"]
+mod resources;
+
 fn main() {
+    // tauri-build does not track the ICO used by the Windows resource compiler.
+    // Without this, incremental builds can keep the old icon inside the EXE.
+    println!("cargo:rerun-if-changed=icons");
+
     // Tauri 构建脚本：在编译时生成 Tauri 应用所需的上下文和资源配置
     tauri_build::build();
+
+    // These directory mappings match bundle.resources in tauri.conf.json.
+    // Watch the roots as well as Tauri's individual files so additions/removals
+    // trigger a rebuild. OUT_DIR is <profile>/build/<package-hash>/out.
+    let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let target_dir = out_dir.ancestors().nth(3).expect("Cargo output directory");
+    for (source, target) in [
+        ("resources/skills", "skills"),
+        ("../docs/licenses", "licenses"),
+    ] {
+        println!("cargo:rerun-if-changed={source}");
+        resources::prune_stale(std::path::Path::new(source), &target_dir.join(target))
+            .unwrap_or_else(|err| panic!("prune bundled {target}: {err}"));
+    }
 
     // ScreenCaptureKit 桥接层依赖 Swift Concurrency runtime（libswift_Concurrency.dylib）。
     // 上游 screencapturekit crate 的 build.rs 只在装了完整 Xcode.app 的机器上能找到该 dylib

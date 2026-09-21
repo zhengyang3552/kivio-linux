@@ -70,7 +70,7 @@ Text on screen, a captured region, and coding CLIs you already installed do not 
 
 ## Features
 
-Full history: [Releases](https://github.com/ZMGID/kivio/releases) · current notes: [v2.9.9](docs/releases/v2.9.9.md)
+Full history: [Releases](https://github.com/ZMGID/kivio/releases) · current notes: [v3.0.0](docs/releases/v3.0.0.md)
 
 ### Chat & agent
 
@@ -229,7 +229,7 @@ npm run protocol:check
 - Provider adapters: OpenAI Chat, Anthropic Messages, Gemini, OpenAI Responses (including xAI Grok)
 - Settings in `settings.json` (including API keys); conversations under `conversations/`; crash drafts in a JSONL journal
 
-Module map: [CLAUDE.md](CLAUDE.md).
+Development conventions: [Engineering standards](docs/engineering-standards.md).
 
 </details>
 

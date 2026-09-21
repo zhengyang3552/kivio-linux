@@ -21,12 +21,12 @@ import OpenCode from '@lobehub/icons/es/OpenCode/components/Mono'
 import LongCat from '@lobehub/icons/es/LongCat/components/Color'
 import XiaomiMiMo from '@lobehub/icons/es/XiaomiMiMo/components/Mono'
 import OpenAI from '@lobehub/icons/es/OpenAI/components/Mono'
-import { AgentIcon } from '../chat/AgentIcon'
+import { AgentIcon } from '../components/AgentIcon'
 import { Input, Label, Select, SuggestInput, TextArea, Toggle } from './components'
 import { Button, IconButton } from '../components/Button'
 import type { SelectOption } from './utils'
-import { chatApi } from '../chat/api'
-import { i18n, type Lang } from './i18n'
+import { externalCliSettingsApi } from '../api/externalCliSettings'
+import { i18n, type Lang } from '../components/i18n'
 import type { ExternalCliProvider } from '../api/tauri'
 import {
   applyClaudePreset,
@@ -531,7 +531,7 @@ export function CliProviderModal({
     setFetching(true)
     setFetchNote('')
     try {
-      const models = await chatApi.externalCliFetchRelayModels(url, key)
+      const models = await externalCliSettingsApi.externalCliFetchRelayModels(url, key)
       setFetchedModels(models)
       if (isNative && models.length > 0 && normalizeNativeModels(nativeForm.models).length === 0) {
         setNativeForm((prev) => ({

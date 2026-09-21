@@ -117,16 +117,16 @@ pub(crate) struct RunState {
 pub(crate) const COMPACTION_THRASH_LIMIT: u32 = 2;
 
 impl RunState {
-    /// 把单次模型调用的 usage 累加进本轮总账（None 入参不改变现状）。
+    /// 把单次模型调用的 usage 累加进本轮总账；缺失实报时清除当前锚点。
     /// 同时把这次调用记为**真实用量锚点**（`last_step_usage`）——累计 `usage` 是多步之和不能当
     /// 锚点，锚点必须是单次调用的 usage。`runtime_len_at_last_call`（trailing 切点）不在这里设，
     /// 而在 `rounds.rs` push 完该次响应后设——保证 trailing = 锚点响应**之后**新增（对齐 pi、避免
     /// 与锚点里的 output 双算）。
-    /// 注：即便这次是 recovery（发送的是精简/压缩输入）导致锚点偏小，`effective_context_tokens`
-    /// 的 `max(纯估算)` 下限也会兜底，绝不会因锚点偏小而比现状更乐观。
+    /// 使用独立精简输入的 recovery 必须清除锚点，它的实报不代表完整运行上下文。
     pub(crate) fn merge_usage(&mut self, next: Option<crate::chat::model::ModelUsage>) {
+        self.last_step_usage = next.clone();
+        self.initial_anchor_valid = false;
         let Some(next) = next else { return };
-        self.last_step_usage = Some(next.clone());
         let total = self.usage.get_or_insert_with(Default::default);
         let add = |slot: &mut Option<u64>, value: Option<u64>| {
             if let Some(value) = value {

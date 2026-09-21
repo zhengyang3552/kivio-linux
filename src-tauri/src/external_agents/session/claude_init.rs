@@ -380,8 +380,8 @@ pub fn resolve_claude_cli_model(selected: &str) -> String {
     // 只对 builtin catalog id 做家族映射；用户手填 / 旧会话里的自定义 id 原样透传。
     // Existing conversations may still store the previous Fable tier. Preserve its
     // provider override semantics even though the picker now offers Fable 5.1.
-    let is_catalog = selected == "claude-fable-5"
-        || CLAUDE_BUILTIN_TIERS.iter().any(|(id, _)| *id == selected);
+    let is_catalog =
+        selected == "claude-fable-5" || CLAUDE_BUILTIN_TIERS.iter().any(|(id, _)| *id == selected);
     if !is_catalog {
         return selected.to_string();
     }

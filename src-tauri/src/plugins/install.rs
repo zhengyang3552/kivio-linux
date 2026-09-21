@@ -99,7 +99,6 @@ pub fn list_plugin_statuses_cached() -> Result<Vec<PluginStatus>, String> {
 
 /// 填充 mcp_active（settings 里该 server 是否已注册且 enabled）。纯 settings 读，无 spawn。
 fn fill_mcp_active(list: &mut [PluginStatus], state: &AppState) {
-    super::lifecycle::heal_disabled_plugin_mcp(state);
     let settings = state.settings_read();
     for status in list.iter_mut() {
         if let Some(sid) = status.mcp_server_id.as_deref() {
@@ -620,19 +619,6 @@ pub async fn uninstall_plugin(
         kill_named_processes("officecli");
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    if id == "cua-driver" {
-        if let Some(bin) = resolved.as_ref() {
-            let _ = Command::new(bin)
-                .args(["autostart", "disable"])
-                .no_console_window()
-                .output();
-        }
-        kill_named_processes("cua-driver");
-        #[cfg(target_os = "macos")]
-        kill_named_processes("CuaDriver");
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
-
     apply_disable_side_effects(app, state, id, true).await?;
 
     let mut cleaned: Vec<String> = Vec::new();
@@ -659,10 +645,6 @@ pub async fn uninstall_plugin(
     if id == "officecli" {
         cleaned.extend(remove_officecli_residuals());
     }
-    if id == "cua-driver" {
-        cleaned.extend(remove_cua_driver_residuals());
-    }
-
     refresh_process_path_for_detection();
     let status = status_for(catalog);
     let detail = if cleaned.is_empty() {
@@ -842,64 +824,6 @@ fn remove_officecli_residuals() -> Vec<String> {
     out
 }
 
-fn remove_named_dir(path: PathBuf, label: &str, out: &mut Vec<String>) {
-    if !path.exists() {
-        return;
-    }
-    match if path.is_dir() {
-        std::fs::remove_dir_all(&path)
-    } else {
-        std::fs::remove_file(&path)
-    } {
-        Ok(()) => out.push(format!("{label} {}", path.display())),
-        Err(e) => out.push(format!("{label} {} 删除失败: {e}", path.display())),
-    }
-}
-
-/// Cua Driver 配置、官方 skill 链接、Windows 安装器目录、macOS app bundle。
-fn remove_cua_driver_residuals() -> Vec<String> {
-    let mut out = Vec::new();
-    let home = match std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
-        Some(h) => PathBuf::from(h),
-        None => return out,
-    };
-
-    remove_named_dir(home.join(".cua-driver"), "配置", &mut out);
-
-    let skill_roots = [
-        home.join(".agents").join("skills"),
-        home.join(".kivio").join("skills"),
-        home.join(".claude").join("skills"),
-        home.join(".cursor").join("skills"),
-        home.join(".codex").join("skills"),
-        home.join(".hermes").join("skills"),
-        home.join(".openclaw").join("skills"),
-        home.join(".opencode").join("skills"),
-    ];
-    for root in skill_roots {
-        remove_named_dir(root.join("cua-driver"), "Skill", &mut out);
-    }
-
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        remove_named_dir(
-            PathBuf::from(local).join("Programs").join("Cua"),
-            "安装目录",
-            &mut out,
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        remove_named_dir(
-            PathBuf::from("/Applications/CuaDriver.app"),
-            "应用",
-            &mut out,
-        );
-    }
-
-    out
-}
-
 fn kill_named_processes(name: &str) {
     #[cfg(windows)]
     {
@@ -965,7 +889,6 @@ fn home_agent_skill_parents() -> Vec<PathBuf> {
         home.join(".hermes").join("skills"),
         home.join(".openclaw").join("skills"),
         home.join(".opencode").join("skills"),
-        home.join(".cua-driver").join("skills"),
     ]
 }
 
@@ -991,7 +914,6 @@ pub(crate) fn plugin_skill_present(plugin_id: &str, skill_id: &str) -> bool {
 
 fn official_skill_install_argvs(plugin: &CatalogPlugin) -> Vec<Vec<&'static str>> {
     match plugin.id {
-        "cua-driver" => vec![vec!["skills", "install", "--all-platforms"]],
         "officecli" => vec![vec!["skills", "install"]],
         _ => Vec::new(),
     }
@@ -1132,7 +1054,7 @@ fn plugin_has_any_official_or_copied_skill(catalog: &CatalogPlugin) -> bool {
 }
 
 /// 将插件附属 Skill 落到 `plugins/<id>/skills/`。
-/// 官方共享目录型（OfficeCLI / Cua Driver）不拷贝：discover 已扫 `~/.agents/skills`。
+/// 官方共享目录型（OfficeCLI）不拷贝：discover 已扫 `~/.agents/skills`。
 pub(crate) fn write_skill_files(catalog: &CatalogPlugin) -> Result<(), String> {
     if catalog.skill_ids.is_empty() || catalog.uses_shared_skill_dirs() {
         return Ok(());
@@ -1153,9 +1075,28 @@ pub(crate) fn write_skill_files(catalog: &CatalogPlugin) -> Result<(), String> {
 #[cfg(test)]
 mod skill_sync_tests {
     use super::{
-        build_status, catalog_plugin, get_install_brief, officecli_skill_folder,
+        build_status, catalog_plugin, fill_mcp_active, get_install_brief, officecli_skill_folder,
         official_install_program_args, official_skill_install_argvs, official_skills_need_install,
     };
+    use crate::settings::ChatMcpServer;
+    use crate::state::test_app_state;
+
+    #[test]
+    fn filling_plugin_status_is_read_only_for_settings() {
+        let state = test_app_state();
+        state.update_settings_for_test(|settings| {
+            settings.chat_tools.servers.push(ChatMcpServer {
+                id: "plugin-package-00000000-0000-0000-0000-000000000000".to_string(),
+                enabled: true,
+                ..ChatMcpServer::default()
+            })
+        });
+
+        let mut statuses = Vec::new();
+        fill_mcp_active(&mut statuses, &state);
+
+        assert!(state.settings_read().chat_tools.servers[0].enabled);
+    }
 
     #[test]
     fn official_install_wraps_readme_command() {
@@ -1178,16 +1119,6 @@ mod skill_sync_tests {
         assert_eq!(officecli_skill_folder("officecli-pptx"), "pptx");
         assert_eq!(officecli_skill_folder("officecli-docx"), "word");
         assert_eq!(officecli_skill_folder("officecli"), "officecli");
-        assert_eq!(officecli_skill_folder("cua-driver"), "cua-driver");
-    }
-
-    #[test]
-    fn cua_driver_brief_is_not_officecli_domain_skills() {
-        let brief = get_install_brief("cua-driver").expect("brief");
-        assert!(!brief.user_message.contains("morph-ppt"));
-        assert!(!brief.user_message.contains("pitch-deck"));
-        assert!(brief.user_message.contains("cua-driver skills install"));
-        assert!(brief.user_message.contains("plugin-cua-driver"));
     }
 
     #[test]
@@ -1198,12 +1129,7 @@ mod skill_sync_tests {
     }
 
     #[test]
-    fn cua_driver_skill_install_uses_all_platforms() {
-        let p = catalog_plugin("cua-driver").expect("cua-driver");
-        assert_eq!(
-            official_skill_install_argvs(p),
-            vec![vec!["skills", "install", "--all-platforms"]]
-        );
+    fn officecli_skill_install_uses_the_official_command() {
         let office = catalog_plugin("officecli").expect("officecli");
         assert_eq!(
             official_skill_install_argvs(office),
@@ -1217,7 +1143,7 @@ mod skill_sync_tests {
 
     #[test]
     fn plugin_status_does_not_expose_install_command() {
-        let catalog = catalog_plugin("cua-driver").expect("cua-driver");
+        let catalog = catalog_plugin("officecli").expect("officecli");
         let status = build_status(catalog, &None, None, false, None);
         let value = serde_json::to_value(&status).expect("serialize");
         assert!(value.get("installCommand").is_none());

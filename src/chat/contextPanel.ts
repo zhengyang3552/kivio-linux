@@ -1,4 +1,4 @@
-import type { I18n } from '../settings/i18n'
+import type { I18n } from '../components/i18n'
 import type { ContextUsageSegment, ConversationContextState } from './types'
 
 /** 与 `chat/agent/compaction.rs` 中 `AUTO_COMPACT_RATIO`（0.90）保持一致 */
@@ -143,9 +143,8 @@ export function buildContextBarSlices(
  * 外部 CLI 不走这条（它的占用一轮只由轮末权威计算更新一次）——曾经那条 350ms 节流的通道
  * 分子是单次请求快照、分母是上一轮的粘滞值，看着就是在跳，已删。
  *
- * 这里只动能由这两个数直接推出的字段，其余一律沿用旧值——尤其 `status` /
- * `token_count_source`：它们的判定阈值与口径在 Rust 侧，在前端再写一套就是两份口径。
- * 环形进度与「满度 N%」都读 `usage_ratio`，所以更新比例就够了。
+ * 用量来源由 Rust 随每次更新一起发送，不能沿用旧值：压缩后可能已退回估算。
+ * `status` 的阈值仍由轮末快照负责；环形进度读 `usage_ratio`。
  *
  * **分母粘滞**：`contextWindowTokens` 为 `null`/`undefined` 时保留已知的旧窗口 —— 冲掉旧值
  * 会让用量条在生成过程中退回「满度未知」。
@@ -155,7 +154,7 @@ export function buildContextBarSlices(
  */
 export function applyLiveContextUsage(
   prev: ConversationContextState | null | undefined,
-  live: { usedTokens: number; contextWindowTokens?: number | null },
+  live: { usedTokens: number; contextWindowTokens?: number | null; tokenCountSource?: string | null },
 ): ConversationContextState | null {
   if (!prev) return prev ?? null
   const used = Math.max(0, Math.round(live.usedTokens))
@@ -172,6 +171,8 @@ export function applyLiveContextUsage(
     contextWindowTokens: window,
     usage_ratio: ratio,
     usageRatio: ratio,
+    token_count_source: live.tokenCountSource ?? undefined,
+    tokenCountSource: live.tokenCountSource ?? undefined,
     segments,
   }
 }

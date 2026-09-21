@@ -58,7 +58,10 @@ impl<'a> ChatSendReservation<'a> {
     /// 尝试预留某会话的发送哨兵。返回 None 表示该会话已有 run 在跑（busy）。
     pub(super) fn try_acquire(state: &'a AppState, conversation_id: &str) -> Option<Self> {
         let run_id = format!("chat-send-reservation-{}", Uuid::new_v4());
-        if !state.try_reserve_chat_send(conversation_id, &run_id) {
+        if !state
+            .chat_runtime()
+            .try_reserve_send(conversation_id, &run_id)
+        {
             return None;
         }
         Some(Self {
@@ -72,7 +75,8 @@ impl<'a> ChatSendReservation<'a> {
 impl Drop for ChatSendReservation<'_> {
     fn drop(&mut self) {
         self.state
-            .end_chat_reply(&self.conversation_id, &self.run_id);
+            .chat_runtime()
+            .end_reply(&self.conversation_id, &self.run_id);
     }
 }
 
@@ -94,7 +98,10 @@ impl<'a> ChatReplyGuard<'a> {
         run_id: &str,
         generation: u64,
     ) -> Option<Self> {
-        if !state.try_begin_chat_reply(conversation_id, run_id) {
+        if !state
+            .chat_runtime()
+            .try_begin_reply(conversation_id, run_id)
+        {
             return None;
         }
         Some(Self {
@@ -108,14 +115,13 @@ impl<'a> ChatReplyGuard<'a> {
 
 impl Drop for ChatReplyGuard<'_> {
     fn drop(&mut self) {
-        self.state
-            .end_chat_reply(&self.conversation_id, &self.run_id);
-        self.state
-            .end_chat_generation(&self.conversation_id, self.generation);
-        // 没来得及消费的插话不能留给**下一条** run（用户是在对这一轮说话）。
-        // 丢在这里不等于丢消息：前端队列里那条要等 `user_steer` 卡才出队，收不到就按普通消息重发。
-        self.state.clear_chat_steering(&self.conversation_id);
-        self.state.clear_chat_follow_up(&self.conversation_id);
+        self.state.chat_runtime().finish_reply_generation(
+            &self.conversation_id,
+            &self.run_id,
+            self.generation,
+        );
+        // ChatRuntimeState retires pending input atomically with the final
+        // generation; a sibling run must not lose its pending input here.
     }
 }
 

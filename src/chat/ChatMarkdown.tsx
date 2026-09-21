@@ -1,4 +1,4 @@
-import { isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createContext, isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Code2, ExternalLink, Eye, Loader2 } from 'lucide-react'
 import type { BlockProps, Components, UrlTransform } from 'streamdown'
@@ -12,7 +12,10 @@ import remarkBreaks from 'remark-breaks'
 import { normalizeMarkdownForRender, preserveLocalMarkdownLinks } from './markdownUtils'
 import { MarkdownErrorBoundary } from './MarkdownErrorBoundary'
 import type { ChatToolArtifact } from './types'
-import { artifactDataUrl } from './artifacts'
+import { artifactDataUrl, isImageArtifact } from './artifacts'
+import { artifactReferenceId, inlineArtifactReferenceLinks } from './artifactReferences'
+import { artifactId } from './artifactPresentation'
+import { ArtifactFileChip } from './GeneratedFileArtifacts'
 import { loadArtifactDataUrl } from './attachmentPreview'
 import { remarkCitations, type CitationView } from './citations'
 import { citationPopoverPosition, type CitationPopoverPosition } from './citationPopover'
@@ -1111,11 +1114,33 @@ function MarkdownArtifactImage({
         src={src}
         alt={alt}
         name={artifact?.name ?? rawSrc}
+        path={artifact?.path ?? artifact?.filePath ?? artifact?.localPath ?? rawSrc}
+        conversationId={conversationId}
         onOpenViewer={openViewer}
         className="mb-2 mr-2"
       />
     </span>
   )
+}
+
+// Streamdown may memoize a settled Markdown block even when components change.
+// Resolve IDs through context so late artifact events update only these nodes.
+const ArtifactReferenceContext = createContext<{
+  artifacts: ReadonlyMap<string, ChatToolArtifact>
+  conversationId?: string | null
+  onImageClick?: ChatMarkdownProps['onImageClick']
+}>({ artifacts: new Map() })
+
+function MarkdownArtifactReference({ url, label, image }: { url: string; label: string; image: boolean }) {
+  const context = useContext(ArtifactReferenceContext)
+  const id = artifactReferenceId(url)
+  const artifact = id ? context.artifacts.get(id) : undefined
+  if (!artifact) return <span role="status" className="text-sm text-neutral-500">{label || '文件'}（文件不可用）</span>
+  if (image && isImageArtifact(artifact)) {
+    return <MarkdownArtifactImage rawSrc={artifact.name} alt={label || artifact.name}
+      artifact={artifact} conversationId={context.conversationId} onImageClick={context.onImageClick} />
+  }
+  return <ArtifactFileChip artifact={artifact} conversationId={context.conversationId} variant="inline" />
 }
 
 const streamdownPlugins = {
@@ -1165,7 +1190,7 @@ const MarkdownDocument = memo(function MarkdownDocument({
   const entry = useMemo<SettledMarkdownCacheEntry>(() => {
     const build = () => {
       const normalizedContent = preserveLocalMarkdownLinks(
-        normalizeMarkdownForRender(normalizeLegacyCliReport(normalizeLegacyErrorDetails(content))),
+        normalizeMarkdownForRender(inlineArtifactReferenceLinks(normalizeLegacyCliReport(normalizeLegacyErrorDetails(content)))),
       )
       return { normalized: normalizedContent }
     }
@@ -1282,7 +1307,8 @@ function ChatMarkdownComponent({
     return {
       ...markdownComponents,
       a: ({ href, children }) => {
-        const url = typeof href === 'string' ? href : ''
+        const url = decodeKivioInternalUrl(typeof href === 'string' ? href : '')
+        if (url.startsWith('artifact:')) return <MarkdownArtifactReference url={url} label={codeChildrenToString(children)} image={false} />
         const cite = /^#kb-cite-(\d{1,3})$/.exec(url)
         if (cite) {
           const n = Number(cite[1])
@@ -1293,6 +1319,7 @@ function ChatMarkdownComponent({
       img: ({ src, alt }) => {
         const rawSrc = decodeKivioInternalUrl(typeof src === 'string' ? src : '')
         const altText = alt ?? ''
+        if (rawSrc.startsWith('artifact:')) return <MarkdownArtifactReference url={rawSrc} label={altText} image />
         const artifact =
           rawSrc && !isExternalOrAbsoluteImageSrc(rawSrc)
             ? artifactLookup.get(artifactKey(rawSrc)) ??
@@ -1311,6 +1338,12 @@ function ChatMarkdownComponent({
     }
   }, [artifacts, conversationId, onImageClick, citations])
 
+  const artifactContext = useMemo(() => ({
+    artifacts: new Map(artifacts.filter(a => artifactId(a)).map(a => [artifactId(a), a])),
+    conversationId,
+    onImageClick,
+  }), [artifacts, conversationId, onImageClick])
+
   return (
     <div
       className={markdownShellClass(variant)}
@@ -1319,14 +1352,16 @@ function ChatMarkdownComponent({
       data-chat-outline-source-id={outlineSource && !streaming ? outlineSource.sourceId : undefined}
     >
       <MarkdownErrorBoundary fallbackText={content}>
-        <MarkdownDocument
-          content={content}
-          components={components}
-          remarkPlugins={remarkPlugins}
-          streaming={streaming}
-          outlineSource={outlineSource}
-          documentRoot={documentRoot}
-        />
+        <ArtifactReferenceContext.Provider value={artifactContext}>
+          <MarkdownDocument
+            content={content}
+            components={components}
+            remarkPlugins={remarkPlugins}
+            streaming={streaming}
+            outlineSource={outlineSource}
+            documentRoot={documentRoot}
+          />
+        </ArtifactReferenceContext.Provider>
       </MarkdownErrorBoundary>
     </div>
   )

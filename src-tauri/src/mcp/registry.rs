@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::types::{
-    list_native_builtin_tool_defs, mixer_generate_image_tool, native_skill_tools,
+    list_native_builtin_tool_defs, mixer_generate_image_tool_for, native_skill_tools,
     tool_definition_from_mcp, ChatToolDefinition, McpToolCallResult,
 };
 
@@ -96,7 +96,8 @@ pub async fn chat_mcp_list_tools(
     state: State<'_, AppState>,
     cached_only: Option<bool>,
 ) -> Result<McpListToolsResult, String> {
-    let catalog = list_enabled_tool_catalog_inner(&app, &state, cached_only.unwrap_or(false)).await;
+    let catalog =
+        list_enabled_tool_catalog_inner(&app, &state, cached_only.unwrap_or(false), None).await;
     Ok(McpListToolsResult {
         success: true,
         tools: catalog.tools,
@@ -106,13 +107,22 @@ pub async fn chat_mcp_list_tools(
 }
 
 pub async fn list_enabled_tool_catalog(app: &AppHandle, state: &AppState) -> EnabledToolCatalog {
-    list_enabled_tool_catalog_inner(app, state, false).await
+    list_enabled_tool_catalog_inner(app, state, false, None).await
+}
+
+pub async fn list_enabled_tool_catalog_for_run(
+    app: &AppHandle,
+    state: &AppState,
+    allowed_mcp_server_ids: Option<&[String]>,
+) -> EnabledToolCatalog {
+    list_enabled_tool_catalog_inner(app, state, false, allowed_mcp_server_ids).await
 }
 
 async fn list_enabled_tool_catalog_inner(
     app: &AppHandle,
     state: &AppState,
     cached_only: bool,
+    allowed_mcp_server_ids: Option<&[String]>,
 ) -> EnabledToolCatalog {
     let settings = state.settings_read().clone();
     let mut tools = list_native_builtin_tool_defs(
@@ -121,7 +131,7 @@ async fn list_enabled_tool_catalog_inner(
         crate::settings::chat_memory_tools_enabled(&settings),
     );
     if let Some((provider_id, model)) = settings.image_generation_model() {
-        let mut tool = mixer_generate_image_tool();
+        let mut tool = mixer_generate_image_tool_for(Some(&model));
         let provider_name = settings
             .get_provider(&provider_id)
             .map(|provider| {
@@ -156,7 +166,9 @@ async fn list_enabled_tool_catalog_inner(
         let (tools, pending) = collect_display_mcp_tool_defs(state, &settings).await;
         (tools, Vec::new(), pending)
     } else {
-        let (tools, unavailable) = collect_enabled_mcp_tool_defs(state, Some(app), &settings).await;
+        let (tools, unavailable) =
+            collect_enabled_mcp_tool_defs(state, Some(app), &settings, allowed_mcp_server_ids)
+                .await;
         (tools, unavailable, false)
     };
     tools.extend(mcp_tools);
@@ -197,8 +209,17 @@ pub(crate) async fn collect_enabled_mcp_tool_defs(
     state: &AppState,
     sink: super::manager::McpEventSink<'_>,
     settings: &crate::settings::Settings,
+    allowed_server_ids: Option<&[String]>,
 ) -> (Vec<ChatToolDefinition>, Vec<String>) {
-    let servers = eligible_mcp_servers(settings);
+    let servers = eligible_mcp_servers(settings)
+        .into_iter()
+        .filter(|server| {
+            allowed_server_ids.is_none_or(|ids| {
+                ids.iter()
+                    .any(|id| crate::computer_control::mcp_server_ids_equivalent(id, &server.id))
+            })
+        })
+        .collect::<Vec<_>>();
     let listings = servers.iter().map(|server| async move {
         let result = list_tools_bounded(state, sink, server).await;
         (*server, result)
@@ -1162,9 +1183,9 @@ pub fn file_mutation_tool_result(result: FileMutationResult) -> Result<McpToolCa
     if !result.warnings.is_empty() {
         content = format!("{}\n{}", content, result.warnings.join("\n"));
     }
-    // 把裁剪后的 unified diff 直接回显给模型：模型在结果里"看到"自己实际改了什么，
-    // 能立即发现写歪。完整 diff 始终在 structured_content 里给前端渲染。
-    if !result.diff.trim().is_empty() {
+    // 成功只回传摘要和警告；完整 diff 仍留在 structured_content 中用于审阅。
+    // 失败保留原有诊断回显，不修改调用参数或实际文件内容。
+    if !result.ok && !result.diff.trim().is_empty() {
         let lines: Vec<&str> = result.diff.lines().collect();
         if lines.len() > FILE_MUTATION_DIFF_MAX_LINES {
             let clipped = lines[..FILE_MUTATION_DIFF_MAX_LINES].join("\n");
@@ -1230,22 +1251,14 @@ pub fn read_file_tool_result(result: ReadFileResult) -> Result<McpToolCallResult
     })
 }
 
-/// 把 ReadFileResult 渲染成模型友好的 `cat -n` 文本：一行精简元数据头 + `右对齐行号\t原文`。
+/// 把 ReadFileResult 渲染成模型友好的 `cat -n` 文本：一行精简元数据头 + `右对齐行号\t原文`，
+/// 续读通知贴在**末尾**（对齐 pi）：模型读完一页，最后一眼看到的就是「用 offset=N 继续」，
+/// 不会被两千行正文冲掉。没截断就没有尾注。
 fn format_read_file_for_model(result: &ReadFileResult) -> String {
     let mut out = format!(
         "{} — lines {}-{} of {}",
         result.path, result.start_line, result.end_line, result.total_lines
     );
-    if result.truncated {
-        match result.next_offset {
-            Some(next) => out.push_str(&format!(" (truncated; continue with offset={next})")),
-            None => out.push_str(" (truncated)"),
-        }
-    }
-    for warning in &result.warnings {
-        out.push_str("\n! ");
-        out.push_str(warning);
-    }
     if !result.content.is_empty() {
         let start = result.start_line.max(1);
         out.push('\n');
@@ -1257,7 +1270,25 @@ fn format_read_file_for_model(result: &ReadFileResult) -> String {
             .collect();
         out.push_str(&numbered.join("\n"));
     }
+    let footer = read_continuation_footer(result);
+    if !footer.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(&footer);
+    }
     out
+}
+
+/// 尾注正文：优先用 `read_file` 产出的通知（已含触顶原因）；截断了却没通知时兜底给一句
+/// 最简的「用 offset=N 继续」，保证「截断必有下一步」这条契约不依赖上游。
+fn read_continuation_footer(result: &ReadFileResult) -> String {
+    if !result.warnings.is_empty() {
+        return result.warnings.join("\n");
+    }
+    match (result.truncated, result.next_offset) {
+        (true, Some(next)) => format!("[More lines in file. Use offset={next} to continue.]"),
+        (true, None) => "[Output truncated.]".to_string(),
+        (false, _) => String::new(),
+    }
 }
 
 async fn resolve_native_workspace(
@@ -1298,6 +1329,53 @@ async fn resolve_native_workspace(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn successful_file_receipt_omits_code_but_preserves_disk_and_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = crate::native_tools::NativeToolWorkspace::global(&[dir
+            .path()
+            .to_string_lossy()
+            .into_owned()]);
+        let source = "def answer():\n    return 42\n".repeat(100);
+        let mut mutation = crate::native_tools::write_file(
+            &workspace,
+            &serde_json::json!({
+                "path": "answer.py", "content": source,
+            }),
+        )
+        .unwrap();
+        mutation.warnings.push("retained warning".into());
+        let original_diff = mutation.diff.clone();
+        let result = super::file_mutation_tool_result(mutation).unwrap();
+        assert!(!result.is_error);
+        assert!(result.content.len() < 250);
+        assert!(!result.content.contains("def answer"));
+        assert!(result.content.contains("retained warning"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("answer.py")).unwrap(),
+            source
+        );
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["diff"],
+            original_diff
+        );
+
+        let edit = crate::native_tools::edit_file(&workspace, &serde_json::json!({
+            "path": "answer.py", "edits": [{"old_string": source, "new_string": "def answer():\n    return 43\n"}],
+        })).unwrap();
+        let result = super::file_mutation_tool_result(edit).unwrap();
+        assert!(!result.is_error);
+        assert!(!result.content.contains("return 43"));
+        assert!(result.structured_content.as_ref().unwrap()["diff"]
+            .as_str()
+            .unwrap()
+            .contains("return 43"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("answer.py")).unwrap(),
+            "def answer():\n    return 43\n"
+        );
+    }
+
     use super::*;
     use crate::native_tools::ReadFileResult;
 
@@ -1312,7 +1390,7 @@ mod tests {
             pending,
             "an undiscovered server must not look like a server with no tools"
         );
-        assert!(state.mcp_sessions.lock().await.is_empty());
+        assert!(state.mcp_test_sessions_empty().await);
 
         state.set_mcp_tool_snapshot(
             server.id.clone(),
@@ -1332,7 +1410,7 @@ mod tests {
         );
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "cached_tool");
-        assert!(state.mcp_sessions.lock().await.is_empty());
+        assert!(state.mcp_test_sessions_empty().await);
 
         let mut changed = settings.clone();
         changed.chat_tools.servers[0].command = "different-server-command".into();
@@ -1344,7 +1422,7 @@ mod tests {
         let (tools, pending) = collect_display_mcp_tool_defs(&state, &disabled).await;
         assert!(tools.is_empty());
         assert!(!pending);
-        assert!(state.mcp_sessions.lock().await.is_empty());
+        assert!(state.mcp_test_sessions_empty().await);
     }
 
     #[test]
@@ -1486,6 +1564,21 @@ mod tests {
         assert!(select_warmup_servers(&settings, None).is_empty());
     }
 
+    #[tokio::test]
+    async fn excluded_cold_server_does_not_delay_tool_collection() {
+        let state = crate::state::test_app_state();
+        let settings = settings_with_servers(vec![enabled_server("excluded")]);
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            collect_enabled_mcp_tool_defs(&state, None, &settings, Some(&[])),
+        )
+        .await
+        .expect("an excluded server must not start its transport");
+        assert!(result.0.is_empty());
+        assert!(result.1.is_empty());
+        let _ = std::fs::remove_dir_all(&state.usage_dir);
+    }
+
     /// 一快一慢（慢 = 永不应答握手）的工具收集：慢 server 不把整轮拖到全局 60s 超时，
     /// 快 server 工具照常返回。unix-gated：依赖 python3 + sleep 起 stdio 假 server。
     #[cfg(unix)]
@@ -1561,7 +1654,8 @@ while True:
             let settings = settings_with_servers(vec![fast_server(&script), hanging_server()]);
 
             let started = std::time::Instant::now();
-            let (tools, unavailable) = collect_enabled_mcp_tool_defs(&state, None, &settings).await;
+            let (tools, unavailable) =
+                collect_enabled_mcp_tool_defs(&state, None, &settings, None).await;
             let elapsed = started.elapsed();
 
             assert!(
@@ -1600,7 +1694,8 @@ while True:
             );
             let settings = settings_with_servers(vec![server]);
 
-            let (tools, unavailable) = collect_enabled_mcp_tool_defs(&state, None, &settings).await;
+            let (tools, unavailable) =
+                collect_enabled_mcp_tool_defs(&state, None, &settings, None).await;
 
             assert!(
                 tools.iter().any(|tool| tool.id == "mcp__hang__cached_tool"),
@@ -1627,11 +1722,25 @@ while True:
             next_offset: Some(12),
             warnings: Vec::new(),
         };
-        let output = read_file_tool_result(result).expect("tool result");
+        // 没有上游通知时，尾注兜底；且一定在正文**之后**。
+        let output = read_file_tool_result(result.clone()).expect("tool result");
         assert_eq!(
             output.content,
-            "src/big.txt — lines 10-11 of 100 (truncated; continue with offset=12)\n    10\tline ten\n    11\tline eleven"
+            "src/big.txt — lines 10-11 of 100\n    10\tline ten\n    11\tline eleven\n\n[More lines in file. Use offset=12 to continue.]"
         );
+
+        // 上游给了通知（触顶原因）就原样贴在末尾，不再重复头部的 truncated 标记。
+        let output = read_file_tool_result(ReadFileResult {
+            warnings: vec![
+                "[Showing lines 10-11 of 100 (50KB limit). Use offset=12 to continue.]".to_string(),
+            ],
+            ..result
+        })
+        .expect("tool result");
+        assert!(output.content.ends_with(
+            "    11\tline eleven\n\n[Showing lines 10-11 of 100 (50KB limit). Use offset=12 to continue.]"
+        ));
+        assert!(!output.content.contains("truncated;"));
     }
 
     fn temp_home(tag: &str) -> std::path::PathBuf {

@@ -7,9 +7,6 @@ use super::finalize::{
     synthesis_failed_fallback_response, RunResultBuilder,
 };
 use super::loop_::{LoopEnv, RunState};
-use super::planning::{
-    call_chat_completion_message_with_usage, stream_scoped_chat_completion_inner,
-};
 use super::recovery::{self, RecoveryAction};
 use super::stop::{
     empty_assistant_response_error, final_assistant_api_message, merge_reasoning,
@@ -80,31 +77,32 @@ pub(crate) async fn synthesis_step(
         None
     };
 
-    let stream = stream_scoped_chat_completion_inner(
-        config.state,
-        host,
-        &config.provider,
-        &config.model,
-        send_messages,
-        None,
-        config.retry_attempts,
-        config.thinking_enabled,
-        config.thinking_level.clone(),
-        config.builtin_web_search_active(),
-        config.max_output_tokens,
-        &config.conversation_id,
-        &config.run_id,
-        &config.message_id,
-        config.generation,
-        "Chat stream",
-        synthesis_stream_policy,
-        Some(response_segment.clone()),
-        Some(response_reasoning_segment.clone()),
-        None,
-        synth_web_search_tracker.clone(),
-    )
-    .await
-    .map_err(|err| err.to_string());
+    let stream = config
+        .provider_runtime
+        .stream(super::provider_runtime::StreamRequest {
+            host,
+            provider: &config.provider,
+            model: &config.model,
+            messages: send_messages,
+            tools: None,
+            retry_attempts: config.retry_attempts,
+            thinking_enabled: config.thinking_enabled,
+            thinking_level: config.thinking_level.clone(),
+            builtin_web_search: config.builtin_web_search_active(),
+            max_output_tokens: config.max_output_tokens,
+            conversation_id: &config.conversation_id,
+            run_id: &config.run_id,
+            message_id: &config.message_id,
+            generation: config.generation,
+            label: "Chat stream",
+            policy: synthesis_stream_policy,
+            text_segment: Some(response_segment.clone()),
+            reasoning_segment: Some(response_reasoning_segment.clone()),
+            tool_draft_tracker: None,
+            web_search_tracker: synth_web_search_tracker.clone(),
+        })
+        .await
+        .map_err(|err| err.to_string());
     let mut stream = match stream {
         Ok(stream) => stream,
         Err(err) if !state.tool_records.is_empty() => {
@@ -231,10 +229,22 @@ fn last_user_text(messages: &[Value]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string())
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .find_map(|message| {
+            // Tool-generated image turns carry no question. Keep looking for
+            // the user's text, including multimodal messages and steering.
+            let text = match message.get("content")? {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter(|part| part["type"] == "text")
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => return None,
+            };
+            (!text.trim().is_empty()).then_some(text)
+        })
 }
 
 /// 收集本轮成功工具产出的可读摘要(用于去敏重做的输入)。
@@ -255,11 +265,12 @@ fn gathered_previews(state: &RunState) -> Vec<String> {
 
 /// 去敏 + 精简的恢复输入:仅用「用户问题 + 工具产出摘要 + 中立指令」重做一次合成,
 /// 去掉触发审核的完整正文/历史。
-fn build_neutral_reduced_messages(state: &RunState) -> Vec<Value> {
+fn build_neutral_reduced_messages(state: &RunState, language: &str) -> Vec<Value> {
     let question = last_user_text(&state.runtime_messages).unwrap_or_default();
     let previews = gathered_previews(state).join("\n\n");
-    let system =
-        "Answer the user's question objectively and neutrally, strictly based on the search snippets below. Only organize and state information already present in the snippets; add no commentary, stance, or outside content.";
+    let system = format!(
+        "Answer the user's question objectively and neutrally, strictly based on the search snippets below. Only organize and state information already present in the snippets; add no commentary, stance, or outside content. Respond in the language of the user's question unless they request another language. If unclear, use the configured language: {language}."
+    );
     let user = format!("User question: {question}\n\nSearch snippets:\n{previews}");
     vec![
         json!({ "role": "system", "content": system }),
@@ -351,21 +362,19 @@ async fn recover_overflow_compact_and_retry(env: &LoopEnv<'_>, state: &mut RunSt
     let compacted = super::compaction::maybe_compact_send_view(env, state).await;
     // 恢复重试内部有 send_with_retry 多次退避——必须接取消，否则用户点停止后卡到重试耗尽。
     let result = tokio::select! {
-        result = call_chat_completion_message_with_usage(
-            config.state,
-            &config.provider,
-            &config.model,
-            compacted,
-            None,
-            config.retry_attempts,
-            config.thinking_enabled,
-            config.thinking_level.clone(),
-            config.builtin_web_search_active(),
-            config.max_output_tokens,
-            &config.conversation_id,
-            &config.message_id,
-            "Chat synthesis overflow recovery",
-        ) => result,
+        result = config.provider_runtime.message(super::provider_runtime::MessageRequest {
+            provider: &config.provider,
+            model: &config.model,
+            messages: compacted,
+            retry_attempts: config.retry_attempts,
+            thinking_enabled: config.thinking_enabled,
+            thinking_level: config.thinking_level.clone(),
+            builtin_web_search: config.builtin_web_search_active(),
+            max_output_tokens: config.max_output_tokens,
+            conversation_id: &config.conversation_id,
+            message_id: &config.message_id,
+            label: "Chat synthesis overflow recovery",
+        }) => result,
         _ = env.host.wait_for_generation_inactive(&config.conversation_id, config.generation) => {
             Err("cancelled".to_string())
         }
@@ -416,24 +425,22 @@ async fn recover_remediate(
     failure_message: &str,
 ) -> String {
     let config = env.config;
-    let reduced = build_neutral_reduced_messages(state);
+    let reduced = build_neutral_reduced_messages(state, &config.language);
     // 同 recover_overflow_compact_and_retry：恢复重试必须接取消。
     let result = tokio::select! {
-        result = call_chat_completion_message_with_usage(
-            config.state,
-            &config.provider,
-            &config.model,
-            reduced,
-            None,
-            config.retry_attempts,
-            config.thinking_enabled,
-            config.thinking_level.clone(),
-            config.builtin_web_search_active(),
-            config.max_output_tokens,
-            &config.conversation_id,
-            &config.message_id,
-            "Chat synthesis recovery",
-        ) => result,
+        result = config.provider_runtime.message(super::provider_runtime::MessageRequest {
+            provider: &config.provider,
+            model: &config.model,
+            messages: reduced,
+            retry_attempts: config.retry_attempts,
+            thinking_enabled: config.thinking_enabled,
+            thinking_level: config.thinking_level.clone(),
+            builtin_web_search: config.builtin_web_search_active(),
+            max_output_tokens: config.max_output_tokens,
+            conversation_id: &config.conversation_id,
+            message_id: &config.message_id,
+            label: "Chat synthesis recovery",
+        }) => result,
         _ = env.host.wait_for_generation_inactive(&config.conversation_id, config.generation) => {
             Err("cancelled".to_string())
         }
@@ -441,6 +448,9 @@ async fn recover_remediate(
     let text = match result {
         Ok((message, usage)) => {
             state.merge_usage(usage);
+            // 独立精简请求的实报仅进费用总账，不能代表仍保留的完整上下文。
+            state.last_step_usage = None;
+            state.initial_anchor_valid = false;
             sanitize_assistant_text_response(
                 message
                     .get("content")

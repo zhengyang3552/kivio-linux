@@ -26,6 +26,13 @@ pub fn home_agents_skills_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|base| base.home_dir().join(".agents").join("skills"))
 }
 
+/// Legacy Cua Driver installs placed the official Skill here. Keep it as the
+/// lowest-priority fallback so upgrades remain usable until the user refreshes
+/// the tool into `~/.kivio/skills`.
+fn legacy_cua_skills_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|base| base.home_dir().join(".cua-driver").join("skills"))
+}
+
 /// Kivio 自己的个人技能目录：`~/.kivio/skills`（对齐 `~/.claude/skills` / `~/.codex/skills`）。
 pub fn kivio_skills_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|base| base.home_dir().join(".kivio").join("skills"))
@@ -133,6 +140,9 @@ fn scan_root_entries(
     }
     if let Some(path) = home_agents_skills_dir() {
         push_root(&mut roots, path, "agents");
+    }
+    if let Some(path) = legacy_cua_skills_dir() {
+        push_root(&mut roots, path, "legacy-cua");
     }
     append_external_roots(&mut roots, extra_paths);
     Ok(roots)
@@ -585,6 +595,16 @@ description: Test skill.
         assert!(
             dir.ends_with(Path::new(".kivio").join("skills")),
             "expected ~/.kivio/skills, got {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn legacy_cua_skills_dir_keeps_the_previous_official_location() {
+        let dir = legacy_cua_skills_dir().expect("home directory");
+        assert!(
+            dir.ends_with(Path::new(".cua-driver").join("skills")),
+            "expected ~/.cua-driver/skills, got {}",
             dir.display()
         );
     }

@@ -9,9 +9,13 @@ function tryLegacyCopy(text: string): boolean {
   textarea.style.left = '-9999px'
   document.body.appendChild(textarea)
   textarea.select()
-  const result = document.execCommand('copy')
-  document.body.removeChild(textarea)
-  return result
+  try {
+    return document.execCommand('copy')
+  } catch {
+    return false
+  } finally {
+    textarea.remove()
+  }
 }
 
 export function copyToClipboard(text: string): Promise<boolean> {

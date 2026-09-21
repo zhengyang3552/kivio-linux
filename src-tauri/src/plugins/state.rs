@@ -287,8 +287,8 @@ fn path_sep() -> &'static str {
 /// 已启用插件的附属 Skill 扫描根（每个 skill 目录内含 SKILL.md）。
 /// 关闭插件后不再返回，registry 下次构建即消失。
 ///
-/// 官方共享目录型插件（OfficeCLI / Cua Driver）不拷贝：discover 已扫 `~/.agents/skills`。
-/// 这里只补插件目录残留，以及 `~/.cua-driver/skills` 等不在全局扫描列表里的官方落点。
+/// 官方共享目录型插件（OfficeCLI）不拷贝：discover 已扫 `~/.agents/skills`。
+/// 这里只补插件目录残留和其它未被全局扫描的官方落点。
 /// ego lite 仍写在插件目录，缺文件时才补下载/写入。
 pub fn enabled_skill_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -358,8 +358,8 @@ pub fn enabled_system_prompt() -> Option<String> {
         None
     } else {
         let mut out = String::from(
-            "[Kivio Plugins]\n\
-The following capability plugins are enabled. Prefer their declared entry points over ad-hoc alternatives. \
+            "[Enabled operation tools]\n\
+The following operation tools are enabled. Prefer their declared entry points over ad-hoc alternatives. \
 Do not re-install them or write MCP config for third-party IDEs.",
         );
         out.push_str("\n\n");

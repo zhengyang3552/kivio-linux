@@ -26,15 +26,8 @@ pub(crate) async fn read_images_as_tool_result(
     paths: &[std::path::PathBuf],
     overview: bool,
 ) -> Result<mcp::types::McpToolCallResult, String> {
-    vision::read_images_as_tool_result(
-        app,
-        settings,
-        conversation_id,
-        message_id,
-        paths,
-        overview,
-    )
-    .await
+    vision::read_images_as_tool_result(app, settings, conversation_id, message_id, paths, overview)
+        .await
 }
 
 /// R1：MCP 工具结果里的图片 artifact「直达模型」。通用于所有 MCP server（非

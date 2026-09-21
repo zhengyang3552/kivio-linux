@@ -12,9 +12,7 @@
 
 use std::path::Path;
 
-use image::{
-    codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, Rgb, RgbImage,
-};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, Rgb, RgbImage};
 
 use super::image_prep::{flatten_onto_white, MODEL_IMAGE_MAX_DIM};
 
@@ -230,7 +228,9 @@ fn compose_collage(tiles: &[(String, RgbImage)]) -> Option<ImageCollage> {
 
 fn contain_fit(src: &RgbImage, max_w: u32, max_h: u32) -> RgbImage {
     let (sw, sh) = (src.width().max(1), src.height().max(1));
-    let scale = (max_w as f64 / sw as f64).min(max_h as f64 / sh as f64).min(1.0);
+    let scale = (max_w as f64 / sw as f64)
+        .min(max_h as f64 / sh as f64)
+        .min(1.0);
     let tw = ((sw as f64) * scale).round().max(1.0) as u32;
     let th = ((sh as f64) * scale).round().max(1.0) as u32;
     if tw == sw && th == sh {
@@ -259,16 +259,36 @@ fn fill_rect(img: &mut RgbImage, x: u32, y: u32, w: u32, h: u32, color: Rgb<u8>)
 
 /// 5×7 点阵数字 0–9。行内低位在左。
 const DIGITS: [[u8; 7]; 10] = [
-    [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-    [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-    [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-    [0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110],
-    [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-    [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-    [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-    [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-    [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-    [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+    [
+        0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+    ],
+    [
+        0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+    ],
+    [
+        0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+    ],
+    [
+        0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110,
+    ],
+    [
+        0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+    ],
+    [
+        0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
+    ],
+    [
+        0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+    ],
+    [
+        0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+    ],
+    [
+        0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+    ],
+    [
+        0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
+    ],
 ];
 
 fn blit_index(img: &mut RgbImage, mut x: u32, y: u32, n: usize) {
@@ -287,14 +307,7 @@ fn blit_digit(img: &mut RgbImage, x: u32, y: u32, digit: usize) {
     for (row, bits) in glyph.iter().enumerate() {
         for col in 0..5u32 {
             if bits & (1 << (4 - col)) != 0 {
-                fill_rect(
-                    img,
-                    x + col * S,
-                    y + row as u32 * S,
-                    S,
-                    S,
-                    LABEL_FG,
-                );
+                fill_rect(img, x + col * S, y + row as u32 * S, S, S, LABEL_FG);
             }
         }
     }
@@ -343,7 +356,11 @@ mod tests {
         let q = Some("分析这些图片，核对 logo 拼写和葡语重音");
         assert!(!should_collage(9, q, true));
         assert!(!should_collage(9, Some("逐张核验成品"), false));
-        assert!(!should_collage(12, Some("Please analyze each image and verify spelling"), true));
+        assert!(!should_collage(
+            12,
+            Some("Please analyze each image and verify spelling"),
+            true
+        ));
     }
 
     #[test]

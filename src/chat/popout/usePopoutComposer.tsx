@@ -6,10 +6,10 @@ import {
   type ChatMcpServer,
   type ChatToolDefinition,
 } from '../../api/tauri'
-import { getSettingsCached, refreshSettings, saveSettingsCached, subscribeSettings } from '../../api/settingsCache'
-import { isPluginManagedServer, preservePluginManagedServers } from '../../settings/connectorCatalog'
-import { i18n, type Lang } from '../../settings/i18n'
-import { hasEnabledNativeBuiltinTool, hasEnabledSkillRuntime } from '../../utils/chatTools'
+import { getSettingsCached, refreshSettings, subscribeSettings, updateSettingsCached } from '../../api/settingsCache'
+import { isPluginManagedServer, preservePluginManagedServers } from '../../settings/public/connectors'
+import { i18n, type Lang } from '../../components/i18n'
+import { hasEnabledNativeBuiltinTool, hasEnabledSkillRuntime } from '../../api/chatTools'
 import { chatApi, type AgentRuntimeConfig } from '../api'
 import { insertTextIntoComposer } from '../composerInsert'
 import { mergeCompactionContextState } from '../compactionBoundary'
@@ -26,6 +26,7 @@ import {
   useDshCustomPresets,
 } from '../permissionModes'
 import { SessionUsageStrip } from '../SessionUsageStrip'
+import { resolveSendSkillId } from '../skillSelection'
 import { findUnavailableRecommendedTools } from '../toolAvailability'
 import type {
   AdditionalDirectory,
@@ -36,6 +37,7 @@ import type {
   Conversation,
   ConversationContextState,
   ModelRef,
+  PendingAttachment,
   SkillMeta,
   WebSearchMode,
 } from '../types'
@@ -110,7 +112,11 @@ type UsePopoutComposerArgs = {
   usesChatRuntime: boolean
   usesExternalRuntime: boolean
   runtime: AgentRuntimeConfig
-  onSend: InputBarProps['onSend']
+  onSend: (
+    content: string,
+    attachments: PendingAttachment[],
+    options?: { onAccepted?: () => void; attachmentSkillId?: string | null },
+  ) => ReturnType<InputBarProps['onSend']>
   onCancel: () => void
   cancelVisible: boolean
   cancelling: boolean
@@ -494,6 +500,7 @@ export function usePopoutComposer({
       const prevServers = settings.chatTools?.servers ?? []
       const current = prevServers.find((server) => server.id === serverId)
       if (current && isPluginManagedServer(current)) return
+      const desiredEnabled = !current?.enabled
       const servers = preservePluginManagedServers(
         prevServers,
         prevServers.map((server) =>
@@ -501,9 +508,17 @@ export function usePopoutComposer({
         ),
       )
       setMcpServers(servers)
-      await saveSettingsCached({
-        ...settings,
-        chatTools: { ...settings.chatTools, servers },
+      await updateSettingsCached((fresh) => {
+        const currentServers = fresh.chatTools?.servers ?? []
+        const currentServer = currentServers.find((server) => server.id === serverId)
+        if (!currentServer || isPluginManagedServer(currentServer)) return fresh
+        const nextServers = preservePluginManagedServers(
+          currentServers,
+          currentServers.map((server) => (
+            server.id === serverId ? { ...server, enabled: desiredEnabled } : server
+          )),
+        )
+        return { ...fresh, chatTools: { ...fresh.chatTools, servers: nextServers } }
       })
       await refreshToolIndicator()
     } catch (err) {
@@ -552,6 +567,12 @@ export function usePopoutComposer({
     () => skills.filter((skill) => !disabledSkillIds.includes(skill.id)),
     [disabledSkillIds, skills],
   )
+  const send = useCallback<InputBarProps['onSend']>((content, attachments, options) => onSend(
+    content, attachments, {
+      ...options,
+      attachmentSkillId: resolveSendSkillId(attachments, enabledSkills, storedActiveSkillId, usesChatRuntime),
+    },
+  ), [enabledSkills, onSend, storedActiveSkillId, usesChatRuntime])
   const slashSkills = useMemo(
     () => enabledSkills.map((skill) => ({
       id: skill.id,
@@ -656,7 +677,7 @@ export function usePopoutComposer({
   )
 
   return {
-    onSend,
+    onSend: send,
     disabled,
     onCancel,
     cancelVisible,

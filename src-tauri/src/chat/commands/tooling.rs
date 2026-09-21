@@ -6,6 +6,23 @@ use crate::settings::{SessionModel, Settings};
 use crate::skills;
 use crate::state::AppState;
 
+/// Determine which MCP servers can survive this conversation's tool filters
+/// before opening any transports. None means unrestricted; Some([]) means none.
+pub(super) fn allowed_mcp_server_ids<'a>(
+    conversation: &'a crate::chat::Conversation,
+    settings: &Settings,
+) -> Option<&'a [String]> {
+    if super::catalog::is_builder_conversation(conversation)
+        || (conversation.agent_runtime.is_chat() && !settings.chat.chat_mode.mcp_read_only)
+    {
+        return Some(&[]);
+    }
+    conversation
+        .assistant_snapshot
+        .as_ref()
+        .map(|assistant| assistant.mcp_server_ids.as_slice())
+}
+
 /// Detect a leading `/skill <args>` slash trigger in a user message and, when it
 /// matches an enabled skill, prepare its instructions for the system context.
 /// Returns `(skill_id, instructions)` with argument placeholders substituted.
@@ -155,6 +172,7 @@ pub(crate) async fn list_tools_for_chat(
     state: &AppState,
     settings: &Settings,
     session: Option<SessionModel<'_>>,
+    allowed_mcp_server_ids: Option<&[String]>,
 ) -> ChatToolList {
     if !(settings.chat_tools.enabled
         || crate::settings::chat_native_tools_enabled(&settings.chat_tools)
@@ -164,13 +182,14 @@ pub(crate) async fn list_tools_for_chat(
     {
         return ChatToolList::default();
     }
-    let catalog = mcp::registry::list_enabled_tool_catalog(app, state).await;
+    let catalog =
+        mcp::registry::list_enabled_tool_catalog_for_run(app, state, allowed_mcp_server_ids).await;
     let mut tools = catalog.tools;
     if let Some((provider_id, model)) =
         crate::chat::model_metadata::image_generation_model_for_session(settings, session)
     {
         if !tools.iter().any(|tool| tool.name == "mixer_generate_image") {
-            let mut tool = mcp::types::mixer_generate_image_tool();
+            let mut tool = mcp::types::mixer_generate_image_tool_for(Some(&model));
             let provider_name = settings
                 .get_provider(&provider_id)
                 .map(|provider| {
@@ -251,6 +270,9 @@ fn chat_mode_allows_tool(
     tool: &ChatToolDefinition,
     config: &crate::settings::ChatModeConfig,
 ) -> bool {
+    if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+        return true;
+    }
     if tool.source == "native" && crate::chat::ask_user::is_ask_user_tool_name(&tool.name) {
         return true;
     }
@@ -271,6 +293,9 @@ fn chat_mode_allows_tool(
 }
 
 fn agent_plan_allows_tool(tool: &ChatToolDefinition) -> bool {
+    if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+        return true;
+    }
     if tool.source == "native" && crate::chat::ask_user::is_ask_user_tool_name(&tool.name) {
         return true;
     }
@@ -409,7 +434,7 @@ mod discovery_tests {
             url: format!("http://{address}/mcp"),
             ..Default::default()
         }];
-        let generation = state.next_chat_generation(conversation_id);
+        let generation = state.chat_runtime().begin_generation(conversation_id);
         let reply = async {
             let _send = ChatSendReservation::try_acquire(&state, conversation_id).unwrap();
             let _reply =
@@ -417,7 +442,8 @@ mod discovery_tests {
                     .unwrap();
             await_chat_tool_discovery(&state, conversation_id, generation, async {
                 let (tools, unavailable_mcp_servers) =
-                    mcp::registry::collect_enabled_mcp_tool_defs(&state, None, &settings).await;
+                    mcp::registry::collect_enabled_mcp_tool_defs(&state, None, &settings, None)
+                        .await;
                 ChatToolList {
                     tools,
                     unavailable_mcp_servers,
@@ -443,14 +469,16 @@ mod discovery_tests {
         );
         assert!(matches!(result.unwrap(), Err(error) if error == "cancelled"));
         assert!(ChatSendReservation::try_acquire(&state, conversation_id).is_some());
-        assert!(!state.is_chat_generation_active(conversation_id, generation));
+        assert!(!state
+            .chat_runtime()
+            .is_generation_active(conversation_id, generation));
     }
 
     #[tokio::test]
     async fn cancelled_run_does_not_start_tool_discovery() {
         let state = crate::state::test_app_state();
         let id = "conv_already_cancelled";
-        let generation = state.next_chat_generation(id);
+        let generation = state.chat_runtime().begin_generation(id);
         state.cancel_chat_generation(id);
         let started = AtomicBool::new(false);
         let result = await_chat_tool_discovery(&state, id, generation, async {
@@ -466,7 +494,7 @@ mod discovery_tests {
     async fn active_run_keeps_the_discovered_tool_catalog() {
         let state = crate::state::test_app_state();
         let id = "conv_discovery_success";
-        let generation = state.next_chat_generation(id);
+        let generation = state.chat_runtime().begin_generation(id);
         let result = await_chat_tool_discovery(&state, id, generation, async {
             ChatToolList {
                 tools: vec![mcp::types::native_web_fetch_tool()],
