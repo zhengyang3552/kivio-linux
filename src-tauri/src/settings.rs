@@ -5104,15 +5104,15 @@ mod tests {
         assert_eq!(canonical.theme, "system");
         assert_eq!(canonical.theme_color, "neutral");
         assert_eq!(canonical.retry_attempts, 1);
-        assert_eq!(
-            canonical.screenshot_translation.ocr_mode,
-            Some(OcrMode::RapidOcr)
-        );
+        // macOS/Windows：RapidOcr 选择被保留。Linux：sanitize_settings 的平台分支
+        // 会把 System/RapidOcr 强制落回 CloudVision（本地 OCR 目前仅 macOS/Windows）。
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let expected_ocr_mode = Some(OcrMode::RapidOcr);
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let expected_ocr_mode = Some(OcrMode::CloudVision);
+        assert_eq!(canonical.screenshot_translation.ocr_mode, expected_ocr_mode);
         assert!(!persisted.screenshot_translation.use_system_ocr);
-        assert_eq!(
-            persisted.screenshot_translation.ocr_mode,
-            Some(OcrMode::RapidOcr)
-        );
+        assert_eq!(persisted.screenshot_translation.ocr_mode, expected_ocr_mode);
     }
 
     #[test]
