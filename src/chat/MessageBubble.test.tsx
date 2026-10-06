@@ -454,6 +454,60 @@ describe('MessageBubble timeline orphan tools', () => {
 })
 
 describe('MessageBubble timeline grouping', () => {
+  it.each(['segments', 'legacy-records', 'manual-open'])('folds a seen live thought and tool process on completion (%s), unless explicitly opened', (mode) => {
+    const message: ChatMessage = { id: 'thought-then-tools', role: 'assistant', timestamp: 1, content: '', segments: [
+      { id: 'thought', kind: 'reasoning', phase: 'tool_loop', order: 0, text: 'Plan before running tools' },
+    ] }
+    const { rerender } = render(<MessageBubble message={message} messageStreaming reasoningStreaming />)
+    expect(screen.getByTestId('reasoning-preview')).toBeVisible()
+    const work = screen.getByRole('button', { name: /^Working/ })
+    if (mode === 'manual-open') {
+      fireEvent.click(work)
+      fireEvent.click(work)
+    }
+    const answered: ChatMessage = { ...message, content: 'The final answer', stream_outcome: 'completed',
+      tool_calls: [{ id: 'read', name: 'read_file', source: 'native', status: 'completed' }],
+      segments: [
+        ...message.segments!,
+        { id: 'progress', kind: 'text', phase: 'tool_loop', order: 1, text: 'Reading the source file' },
+        ...(mode === 'legacy-records' ? [] : [{ id: 'call', kind: 'tool' as const, phase: 'tool_loop' as const, order: 2, tool_call_id: 'read' }]),
+        { id: 'answer', kind: 'text', phase: 'synthesis', order: 3, text: 'The final answer' },
+      ],
+    }
+    rerender(<MessageBubble message={answered} messageStreaming />)
+    expect(work).toHaveAttribute('aria-expanded', 'true')
+    rerender(<MessageBubble message={answered} />)
+    expect(screen.getByRole('button', { name: /^Worked/ })).toBe(work)
+    expect(work).toHaveAttribute('aria-expanded', mode === 'manual-open' ? 'true' : 'false')
+    expect(screen.getByText('The final answer')).toBeVisible()
+    if (mode !== 'manual-open') {
+      expect(screen.queryByText('Reading the source file')).not.toBeInTheDocument()
+      expect(screen.queryByLabelText('Thinking')).not.toBeInTheDocument()
+      fireEvent.click(work)
+    }
+    expect(screen.getByText('Reading the source file')).toBeVisible()
+  })
+
+  it('keeps a seen thinking preview through answer start and whole-turn completion', () => {
+    const message: ChatMessage = { id: 'seen-thinking', role: 'assistant', timestamp: 1, content: '', segments: [
+      { id: 'thought', kind: 'reasoning', phase: 'plain', order: 0, text: 'Visible live thought' },
+    ] }
+    const { rerender } = render(<MessageBubble message={message} messageStreaming reasoningStreaming />)
+    const preview = screen.getByTestId('reasoning-preview')
+    const answered: ChatMessage = { ...message, content: 'Final answer', stream_outcome: 'completed', segments: [
+      ...message.segments!, { id: 'answer', kind: 'text', phase: 'synthesis', order: 1, text: 'Final answer' },
+    ] }
+    rerender(<MessageBubble message={answered} messageStreaming />)
+    expect(preview).toBeVisible()
+    rerender(<MessageBubble message={answered} />)
+    expect(screen.getByTestId('reasoning-preview')).toBe(preview)
+    expect(preview).toBeVisible()
+    expect(screen.getByRole('button', { name: /^Worked/ })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByText('Final answer')).toBeVisible()
+    fireEvent.click(screen.getByRole('button', { name: /^Worked/ }))
+    expect(screen.queryByText('Visible live thought')).not.toBeInTheDocument()
+  })
+
   it('collapses a completed group into a one-line summary by default', () => {
     const message: ChatMessage = {
       id: 'msg-2',
@@ -576,6 +630,7 @@ describe('MessageBubble timeline grouping', () => {
     await user.click(toggle)
 
     expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    await user.click(screen.getByRole('button', { name: /^Thought/ }))
     expect(screen.getByText('planning details')).toBeInTheDocument()
     // 展开后组内工具块挂载：Cursor 式动词 Read + 目标（文件名）
     expect(screen.getByText('a.ts')).toBeInTheDocument()
@@ -711,7 +766,7 @@ describe('MessageBubble timeline grouping', () => {
     }
 
     const { rerender } = render(<MessageBubble message={message} messageStreaming />)
-    expect(screen.getByText('live details')).toBeInTheDocument()
+    expect(screen.queryByText('live details')).not.toBeInTheDocument()
     expect(screen.getByText('Run')).toBeInTheDocument()
 
     rerender(<MessageBubble message={message} messageStreaming={false} />)
