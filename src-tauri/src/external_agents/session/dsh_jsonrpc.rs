@@ -1352,6 +1352,8 @@ async fn handle_incoming_request(
             tool_name,
             input: json!({ "questions": questions }),
             requires_user_interaction: true,
+            requires_manual_approval: false,
+            permission_suggestions: None,
         })
         .await
         .is_err()

@@ -70,7 +70,7 @@ Text on screen, a captured region, and coding CLIs you already installed do not 
 
 ## Features
 
-Full history: [Releases](https://github.com/ZMGID/kivio/releases) · current notes: [v3.0.1](docs/releases/v3.0.1.md)
+Full history: [Releases](https://github.com/ZMGID/kivio/releases) · current notes: [v3.1.0](docs/releases/v3.1.0.md)
 
 ### Chat & agent
 
@@ -78,6 +78,8 @@ Full history: [Releases](https://github.com/ZMGID/kivio/releases) · current not
 - Three runtimes: Kivio Agent (full tools), Kivio Chat (search / fetch / knowledge base, read-only), external CLI
 - Hand a conversation to Claude Code, Codex, Cursor, OpenCode, Gemini, Kimi, Pi, Hermes, Grok, or DeepSeek Harness if they are installed
 - Import native CLI sessions (pinned to the original CLI and working directory)
+- Media studio: generate images and videos; video results and creation details load the first frame before playback, without autoplay
+- Progressive SVG previews in chat: `svg` blocks and SVG-only `html` blocks render during generation, with a source toggle and the last picture preserved for unfinished tags, attributes, or character entities, including Markdown-added trailing newlines. Ordinary HTML pages remain sandboxed previews after generation ends
 
 ### Translate & Lens
 
@@ -89,6 +91,24 @@ Full history: [Releases](https://github.com/ZMGID/kivio/releases) · current not
 
 - Global hotkeys (remappable, conflict-aware), tray, light / dark
 - Usage stats, lifecycle hooks, optional chat-window keep-alive (hide instead of destroy)
+- Momo desktop pet: off by default; use **Desktop pet** below **Language** in the sidebar account menu, or **Show Momo desktop pet** in the tray. Both controls stay synchronized with right-click hiding; a failed change keeps the previous state and offers a retry message in the account menu. Native drawing inside the existing app process, with no pet WebView or external process. Reflects thinking, tool work, answering, waiting for input, completion, and failure. Click to poke, drag to move, double-click to open the relevant chat, or right-click to hide. The toggle and position are saved locally; hiding stops animation. No feeding, daily check-ins, or death mechanics.
+  - The desktop pet is a left-facing blue circle that never morphs or stretches during state changes, pokes, or dragging. Its eight states use quiet breathing, thinking dots, a search magnifier, a compact keyboard, a reply bubble, a confirmation question mark, a completion check, and a failure exclamation mark. Only tool work shows the keyboard. Completion briefly acknowledges success before returning to idle; failure and its chat target remain until a new run. Waiting takes priority over other active states. Native geometry and animation live in `src-tauri/src/desktop_pet/sim.rs`; the chat mascot is unchanged.
+  - macOS and Windows share flat geometry. Visible body and prop ink accept mouse input; transparent gaps pass through. Nearby pointers attract the idle pet's gaze and stop strolls. Dragging never stretches the body; release saves and keeps the chosen position without gravity or bottom-edge snapping. Short idle strolls occur only at the work-area bottom, never while working or waiting for input. Reduced motion stops animation but keeps state markers. Hiding stops updates; showing restores the saved position.
+  - Companion behavior never replaces work state. While idle, Momo occasionally looks around, dozes, or makes a little hop; nearby pointers and taps wake it. Reduced motion disables these gestures. A tap gets a short response; sustained idle time brings one local line about every four minutes, without model calls or token charges. Speech uses a compact, content-sized, translucent dark native bubble beside Momo and disappears after ten seconds. Dragging, hiding, locking, and task-state changes dismiss old speech without queuing a replay.
+  - Today's tokens and costs appear as separate one-sentence remarks, using the statistics owner's local calendar day and accounting rules. Only calls recorded by Kivio are included; unreported external CLI usage is excluded. Costs may include estimates; missing costs never imply free usage. Read failures and incomplete records are indicated instead of inventing numbers. Reads do not block animation, and stale results cannot reopen speech.
+- Computer control: installation/update progress survives page navigation in the same window; completion refreshes tool status, and failures remain visible for retry
+- Page tasks: skill and plugin installs, model downloads, media submissions, native-session imports, conversation-library batch actions, and archive / delete / export continue in the same window. Returning shows progress, results, or failures; an in-flight operation cannot be submitted twice. Skills and Media retain their current view. Uninstalling a skill restores its store install action; retired previews, media references, and Pi install callbacks cannot overwrite newer drafts or feedback. This frontend state lasts for the current window; it is not application-restart recovery.
+- Editor drafts: note and automation saves continue across navigation. Notes snapshot editor text before navigation so delayed change notifications cannot lose trailing edits. Assistants write only on explicit Save; retired delete or duplicate callbacks cannot clear or replace another editing session. Returning through Tasks restores the automation canvas. Loading a remote version refreshes the canvas, and late reads cannot replace intervening edits, including edits already saved successfully.
+- TinyFish authorization: leaving cancels the current flow. A new visit accepts only the new authorization result, never credentials from a retired flow.
+
+### Themes
+
+- Settings → **Themes** independently manages appearance mode, translucent sidebars, and the theme library. Twelve built-ins each include light and dark palettes: Neutral, Warm, Cool; Graphite, Blossom, Grove, Ocean, Ember, and Iris adapted from T3 Code palettes; plus White, Nord, and Solarized. White uses a true `#FFFFFF` light background rather than Neutral's off-white. Nord combines cool blue-gray surfaces with icy blue accents; Solarized pairs cream / deep teal surfaces with teal accents. The original nine palettes are unchanged.
+- Theme cards show light/dark thumbnails and support arrow-key preview selection. Duplicate a built-in theme to edit grouped surfaces, text/borders, accents, and danger colors using synchronized color pickers and HEX inputs. Editing includes a live preview and adapts to a single column in narrow windows. Preview leaves the current interface unchanged; save, then choose Apply theme. Saving changes to the active custom theme updates it immediately.
+- Editor drafts survive navigation between settings pages, and failed saves can be retried. Deleting the active custom theme restores Neutral. Themes are stored with local settings and included in settings backups.
+- JSON sharing: the export dialog displays the complete document for copying; paste it into the import dialog to preview and save. Escape closes the dialog and restores focus to its trigger. Version `1` contains `theme` with `name`, `light`, and `dark`; both palettes require all 17 color fields as `#RRGGBB`. Import creates a new ID rather than overwriting a same-name theme. Arbitrary CSS is not supported.
+- Interface surfaces and text use semantic theme colors across chat messages, approval and question cards, runtime menus, Markdown diagrams, automation canvases, usage statistics, Lens controls, image viewers, and knowledge-base settings. Changes to an active custom palette propagate to these surfaces. Screenshot and image pixels, brand icons, syntax highlighting, and status indicators retain their own colors; themes do not globally replace white.
+- On refresh, the first frame restores the last applied light/dark palettes before the application bundle and backend settings load. Loading surfaces follow the theme, and System mode reevaluates the current OS appearance. The paint cache stores colors only, never providers or credentials; authoritative backend settings replace it after loading. Once the content shell mounts, the canvas returns to transparency for native materials and capture overlays. Unavailable browser storage does not prevent applying the backend theme.
 
 ## Hotkeys
 

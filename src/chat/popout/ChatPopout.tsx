@@ -21,6 +21,7 @@ import {
 import { getPopoutConversationId } from './popoutRoutes'
 import { PopoutTitlebar } from './PopoutTitlebar'
 import { usePopoutSession } from './usePopoutSession'
+import { AppDialogHost } from '../../components/AppDialog'
 
 const popoutConversationId = getPopoutConversationId()
 if (popoutConversationId) configureChatProtocolFilter(popoutConversationId)
@@ -32,7 +33,7 @@ const MessageList = lazy(() => import('../MessageList').then((module) => ({
 function MessageListLoading() {
   return (
     <div className="chat-themed-surface flex flex-1 items-center justify-center">
-      <div className="h-5 w-5 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-800 dark:border-neutral-700 dark:border-t-neutral-200" />
+      <div className="h-5 w-5 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-800 dark:border-t-neutral-200" />
     </div>
   )
 }
@@ -249,6 +250,7 @@ export default function ChatPopout({ onContentReady }: ChatPopoutProps) {
   return (
     <LangContext.Provider value={lang}>
       <ChatPopoutBody conversationId={popoutConversationId} lang={lang} />
+      <AppDialogHost />
     </LangContext.Provider>
   )
 }

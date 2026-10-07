@@ -67,13 +67,14 @@ pub(crate) struct SummaryRequest<'a> {
     pub provider: &'a ModelProvider,
     pub model: &'a str,
     pub messages: &'a [Value],
-    pub keep_tokens: usize,
-    pub window: usize,
+    pub preserve_recent: bool,
+    /// The run's tools; the summary request carries them so tool history stays valid.
+    pub tools: &'a [ChatToolDefinition],
     pub max_output_tokens: u32,
-    pub retry_attempts: usize,
     pub conversation_id: &'a str,
     pub message_id: &'a str,
     pub cancel: Option<ProviderFuture<'a, ()>>,
+    pub host: Option<&'a dyn AgentHost>,
 }
 
 pub(crate) trait ProviderRuntime: Send + Sync {
@@ -147,14 +148,13 @@ impl ProviderRuntime for AppState {
             request.provider,
             request.model,
             request.messages,
-            request.keep_tokens,
-            request.window,
+            request.preserve_recent,
+            request.tools,
             request.max_output_tokens,
-            request.retry_attempts,
             request.conversation_id,
             request.message_id,
-            None,
             request.cancel,
+            request.host,
         ))
     }
 }

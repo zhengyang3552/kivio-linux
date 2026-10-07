@@ -1,7 +1,7 @@
 import { forwardRef, useImperativeHandle, useState, useEffect, useCallback, useMemo, useRef, useSyncExternalStore, type ReactNode, type SetStateAction } from 'react'
 import {
-  X, RefreshCw, Monitor,
-  Download, Upload, ArrowLeft,
+  X, RefreshCw,
+  Download, Upload, ArrowLeft, Palette,
 } from 'lucide-react'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import {
@@ -31,7 +31,7 @@ import { applyProviderDraftIntent, type ProviderDraftIntent } from './providerDr
 import { i18n, type Lang } from '../components/i18n'
 import {
   GeneralIcon, HotkeysIcon, TranslateIcon, LensIcon, ChatIcon, MemoryIcon, MixerIcon,
-  AgentIcon, WebSearchIcon, PluginsIcon, SessionsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon,
+  CliIcon, ComputerIcon, WebSearchIcon, ConnectorsIcon, SessionsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon,
 } from './NavIcons'
 import { formatHotkeyError, getPlatform } from './utils'
 import { type ProviderPreset } from './providerPresets'
@@ -60,6 +60,9 @@ import { useSettingsOnboardingController } from './useSettingsOnboardingControll
 import { ModelDetailDrawer } from './ModelDetailDrawer'
 import { ProviderModelTestModal } from './ProviderModelTestModal'
 import { Button } from '../components/Button'
+import { confirmDialog } from '../components/dialogQueue'
+import { ThemeTab } from './tabs/ThemeTab'
+import type { ThemeDefinition } from '../theme/types'
 import { resolveModelInfo } from '../data/modelMatching'
 import { loadLastModel, resolvePreferredChatModel } from '../data/chatModelPreference'
 import { useWindowInteractionFocus } from '../api/windowFocus'
@@ -72,7 +75,7 @@ import {
 import { ConnectorsPanel } from './ConnectorsPanel'
 import { WebSearchPanel } from './WebSearchPanel'
 
-export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'computerControl' | 'hooks' | 'webSearch' | 'connectors' | 'plugins' | 'sessions' | 'usage' | 'providers' | 'about'
+export type SettingsTab = 'general' | 'themes' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'computerControl' | 'hooks' | 'webSearch' | 'connectors' | 'sessions' | 'usage' | 'providers' | 'about'
 
 type SettingsData = SettingsType
 // UI 字号：以 px 展示、以整体缩放（zoom）实现。CSS 全是 px 硬编码，做不了真正的 rem 基准字号，
@@ -91,12 +94,6 @@ export interface SettingsShellProps {
   hideNav?: boolean
   /** Chat 宿主提供的领域视图；设置只决定它们出现的位置。 */
   renderSessionCenter?: (lang: Lang) => ReactNode
-  renderPluginCenter: (input: {
-    section: 'plugins' | 'connectors'
-    onSectionChange: (section: 'plugins' | 'connectors') => void
-    lang: Lang
-    connectors: ReactNode
-  }) => ReactNode
   renderReleaseNotes: (markdown: string) => ReactNode
 }
 
@@ -175,7 +172,7 @@ function resolveEffectiveChatMaxOutput(settings: SettingsData, fallbackTokens: n
  * 设置面板主组件（standalone / embedded 双宿主）
  */
 export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>(function SettingsShell(
-  { variant, onClose, onSettingsChange, onReady, reserveTrafficLightSpace = false, initialTab, hideNav = false, renderSessionCenter, renderPluginCenter, renderReleaseNotes },
+  { variant, onClose, onSettingsChange, onReady, reserveTrafficLightSpace = false, initialTab, hideNav = false, renderSessionCenter, renderReleaseNotes },
   ref,
 ) {
   const onSettingsChangeRef = useRef(onSettingsChange)
@@ -201,21 +198,13 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     })
   }, [editorController])
   const [appVersion, setAppVersion] = useState('')
-  const [activeTab, setActiveTab] = useState<Exclude<SettingsTab, 'connectors'>>(initialTab === 'connectors' ? 'plugins' : initialTab ?? 'general')
-  const [pluginSection, setPluginSection] = useState<'plugins' | 'connectors'>(initialTab === 'connectors' ? 'connectors' : 'plugins')
-  const navigateToSettingsTab = useCallback((tab: SettingsTab) => {
-    if (tab === 'connectors') {
-      setPluginSection('connectors')
-      setActiveTab('plugins')
-    } else {
-      setActiveTab(tab)
-    }
-  }, [])
-  // 用量统计页内的二级视图：用量统计 / 请求调试（请求调试原为独立导航项，现并入用量统计）
-  const [usageView, setUsageView] = useState<'stats' | 'debug'>('stats')
+  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab ?? 'general')
+  const [themeDraft, setThemeDraft] = useState<ThemeDefinition | null>(null)
+  // 使用统计页内的视图：应用用量 / 调用明细 / 请求调试
+  const [usageView, setUsageView] = useState<'app' | 'calls' | 'debug'>('app')
   useEffect(() => {
-    if (initialTab) navigateToSettingsTab(initialTab)
-  }, [initialTab, navigateToSettingsTab])
+    if (initialTab) setActiveTab(initialTab)
+  }, [initialTab])
   // 热键被占用未能注册的警告（保存已成功，只是提醒，不阻断）。
   const [saveWarning, setSaveWarning] = useState('')
   const hotkeyRecorder = useSettingsHotkeyRecorder((update) => editorController.edit(update))
@@ -505,8 +494,15 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
    */
   const handleCloseRequest = useCallback((options?: SettingsCloseOptions) => {
     if (recordingTarget) return
-    void editorController.requestClose(onClose, options)
-  }, [editorController, onClose, recordingTarget])
+    void (async () => {
+      if (themeDraft && !await confirmDialog({
+        message: lang === 'zh' ? '自定义主题尚未保存。放弃编辑并关闭？' : 'The custom theme is not saved. Discard edits and close?',
+        danger: true,
+      })) return
+      setThemeDraft(null)
+      await editorController.requestClose(onClose, options)
+    })()
+  }, [editorController, onClose, recordingTarget, themeDraft, lang])
 
   useImperativeHandle(ref, () => ({ requestClose: handleCloseRequest }), [handleCloseRequest])
 
@@ -524,6 +520,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (recordingTarget) return
+      // 应用内确认框（原生 <dialog>）自己处理 Esc；捕获阶段在这里先接住会把整个设置页关掉。
+      if (e.target instanceof Element && e.target.closest('dialog[open]')) return
 
       if (modelPickerProviderId) {
         if (e.key === 'Escape') {
@@ -603,6 +601,28 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     })
   }, [setSettings])
 
+  const commitThemeSettings = useCallback(async (update: (current: SettingsData) => SettingsData) => {
+    const before = editorController.snapshot.settings
+    if (!before) throw new Error('Settings are not loaded')
+    const submitted = update(before)
+    editorController.edit(submitted)
+    if (!await editorController.flush()) {
+      const message = editorController.snapshot.saveError || 'Theme settings could not be saved'
+      // Keep the theme editor draft for retry, but never advertise an unconfirmed
+      // selection as active. Do not roll back edits made while the save was pending.
+      editorController.edit(current => {
+        let restored = current
+        for (const field of ['theme', 'themeColor', 'customThemes', 'translucentSidebar'] as const) {
+          if (JSON.stringify(current[field]) === JSON.stringify(submitted[field])) {
+            restored = { ...restored, [field]: before[field] }
+          }
+        }
+        return restored
+      })
+      throw new Error(message)
+    }
+  }, [editorController])
+
   // 哪些 API Key 输入框处于明文显示（按 `${providerId}-${idx}` 记），默认全部隐藏。
   const [revealedKeys, setRevealedKeys] = useState<Set<string>>(new Set())
   const [gzipInfoOpen, setGzipInfoOpen] = useState<Set<string>>(new Set())
@@ -634,10 +654,11 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     })
   }, [setSettings])
 
-  const updateChatTools = useCallback((updates: Partial<ChatToolsConfig>) => {
+  const updateChatTools = useCallback((updates: Partial<ChatToolsConfig> | ((current: ChatToolsConfig) => Partial<ChatToolsConfig>)) => {
     setSettings((prev) => {
       if (!prev) return prev
-      return { ...prev, chatTools: { ...prev.chatTools, ...updates } }
+      const patch = typeof updates === 'function' ? updates(prev.chatTools) : updates
+      return { ...prev, chatTools: { ...prev.chatTools, ...patch } }
     })
   }, [setSettings])
 
@@ -815,13 +836,13 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
 
   const loadingShellClass =
     variant === 'embedded'
-      ? 'flex min-h-0 min-w-0 flex-1 items-center justify-center bg-white dark:bg-[#212121]'
-      : 'flex items-center justify-center h-full bg-neutral-200 dark:bg-black'
+      ? 'flex min-h-0 min-w-0 flex-1 items-center justify-center bg-[var(--theme-surface)]'
+      : 'flex items-center justify-center h-full bg-[var(--theme-surface-soft)]'
 
   if (loading) {
     return (
       <div className={loadingShellClass}>
-        <div className="w-6 h-6 border-2 border-neutral-300 dark:border-neutral-700 border-t-neutral-800 dark:border-t-neutral-200 rounded-full animate-spin" />
+        <div className="w-6 h-6 border-2 border-[var(--theme-surface-border)] border-t-[var(--text)] rounded-full animate-spin" />
       </div>
     )
   }
@@ -830,31 +851,28 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     // 加载失败：显示错误 + 重试按钮，禁止用户在不知情的情况下用合成默认值 Save 覆盖磁盘
     return (
       <div className={`${loadingShellClass} p-6`}>
-        <div className="max-w-sm w-full bg-white dark:bg-[#1C1C1E] rounded-xl shadow-sm border border-black/5 dark:border-white/5 p-5 text-center">
-          <div className="text-[14px] font-semibold text-neutral-900 dark:text-neutral-100 mb-1">
+        <div className="max-w-sm w-full bg-[var(--theme-surface)] rounded-xl shadow-sm border border-[var(--theme-surface-border)] p-5 text-center">
+          <div className="text-[14px] font-semibold text-[var(--text)] mb-1">
             {lang === 'zh' ? '加载设置失败' : 'Failed to load settings'}
           </div>
-          <div className="text-[11px] text-rose-600 dark:text-rose-400 mb-4 break-all" title={loadError}>
+          <div className="text-[11px] text-[var(--danger)] mb-4 break-all" title={loadError}>
             {loadError}
           </div>
           <div className="flex gap-2 justify-center">
-            <button
-              type="button"
+            <Button variant="primary" size="sm"
               onClick={() => setReloadKey((k) => k + 1)}
-              className="flex items-center gap-1.5 text-[12px] font-medium px-3 py-1.5 rounded-md bg-neutral-900 dark:bg-white text-white dark:text-neutral-900 hover:bg-neutral-800 dark:hover:bg-neutral-100 transition-colors duration-[var(--kv-dur-fast)]"
+              className="flex items-center gap-1.5"
               data-tauri-drag-region="false"
             >
               <RefreshCw size={12} />
               {lang === 'zh' ? '重试' : 'Retry'}
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button size="sm" variant="ghost"
               onClick={onClose}
-              className="text-[12px] font-medium px-3 py-1.5 rounded-md text-neutral-600 dark:text-neutral-400 hover:bg-black/5 dark:hover:bg-white/5 transition-colors duration-[var(--kv-dur-fast)]"
               data-tauri-drag-region="false"
             >
               {t.cancel}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -868,7 +886,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const chatDefaults = defaultPrompts?.chatPrompts?.[chatLangKey]
   const chatRuntimeDefaults = defaultPrompts?.chatRuntimePrompt
   const chatConfig = settings.chat
-  const themeColor = settings.themeColor
   const chatMemory = settings.chatMemory
   const effectiveChatMaxOutput = resolveEffectiveChatMaxOutput(settings, chatConfig.maxOutputTokens)
   const chatMaxOutputSourceLabel = effectiveChatMaxOutput.source === 'override'
@@ -884,6 +901,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
 
   const navItems = [
     { id: 'general' as const, label: t.tabGeneral, icon: GeneralIcon },
+    { id: 'themes' as const, label: lang === 'zh' ? '主题' : 'Themes', icon: Palette },
     { id: 'providers' as const, label: t.tabModels, icon: ProvidersIcon },
     { id: 'hotkeys' as const, label: t.tabHotkeys, icon: HotkeysIcon },
     { id: 'translate' as const, label: t.tabTranslation, icon: TranslateIcon },
@@ -891,13 +909,13 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     { id: 'chat' as const, label: t.tabChatClient, icon: ChatIcon },
     { id: 'memory' as const, label: t.tabMemory, icon: MemoryIcon },
     { id: 'mixer' as const, label: t.tabMixer, icon: MixerIcon },
-    { id: 'externalAgents' as const, label: t.tabExternalAgents, icon: AgentIcon },
-    { id: 'computerControl' as const, label: lang === 'zh' ? '电脑操控' : 'Computer control', icon: Monitor },
+    { id: 'externalAgents' as const, label: t.tabExternalAgents, icon: CliIcon },
+    { id: 'computerControl' as const, label: lang === 'zh' ? '电脑操控' : 'Computer control', icon: ComputerIcon },
     { id: 'hooks' as const, label: t.tabHooks, icon: HooksIcon },
-    { id: 'plugins' as const, label: t.tabPlugins, icon: PluginsIcon },
+    { id: 'connectors' as const, label: t.tabConnectors, icon: ConnectorsIcon },
     { id: 'sessions' as const, label: t.tabSessions, icon: SessionsIcon },
     { id: 'webSearch' as const, label: t.tabWebSearch, icon: WebSearchIcon },
-    { id: 'usage' as const, label: lang === 'zh' ? '用量统计' : 'Usage', icon: UsageIcon },
+    { id: 'usage' as const, label: lang === 'zh' ? '使用统计' : 'Usage', icon: UsageIcon },
     // 关于固定在分类列表最末
     { id: 'about' as const, label: lang === 'zh' ? '关于' : 'About', icon: AboutIcon },
   ]
@@ -905,6 +923,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     general: {
       title: t.tabGeneral,
       subtitle: lang === 'zh' ? '外观、行为、归档和权限。' : 'Appearance, behavior, archive, and permissions.',
+    },
+    themes: {
+      title: lang === 'zh' ? '主题' : 'Themes',
+      subtitle: lang === 'zh' ? '管理明暗色板，预览、编辑与分享自定义主题。' : 'Manage light and dark palettes. Preview, edit, and share custom themes.',
     },
     translate: {
       title: t.tabTranslation,
@@ -950,9 +972,9 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       title: t.tabHooks,
       subtitle: t.hooksPageSubtitle,
     },
-    plugins: {
-      title: pluginSection === 'plugins' ? t.tabPlugins : t.tabConnectors,
-      subtitle: pluginSection === 'plugins' ? t.pluginCenterPluginsSubtitle : t.pluginCenterConnectorsSubtitle,
+    connectors: {
+      title: t.tabConnectors,
+      subtitle: t.pluginCenterConnectorsSubtitle,
     },
     sessions: {
       title: t.tabSessions,
@@ -965,10 +987,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         : 'Tavily/Exa keys; enable web search for Lens and Chat.',
     },
     usage: {
-      title: lang === 'zh' ? '用量统计' : 'Usage',
-      subtitle: lang === 'zh'
-        ? '查看本地模型请求、Token、成本估算和来源分布；请求调试并入此页。'
-        : 'Inspect local model requests, tokens, cost, and usage distribution; request debug lives here too.',
+      title: lang === 'zh' ? '使用统计' : 'Usage',
+      subtitle: '',
     },
     providers: {
       title: t.tabModels,
@@ -1052,9 +1072,36 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
             className={`kv-page-header ${variant === 'embedded' ? 'settings-embedded-header' : ''}`}
             onMouseDown={handleSettingsDragMouseDown}
           >
-            <div key={activeTab} className="settings-section-title-enter">
-              <div className="kv-page-title">{pageMeta[activeTab].title}</div>
-              <div className="kv-page-sub">{pageMeta[activeTab].subtitle}</div>
+            <div key={activeTab} className={`settings-section-title-enter${activeTab === 'usage' ? ' settings-usage-title' : ''}`}>
+              <div className="flex items-center gap-3">
+                <div className="kv-page-title">{pageMeta[activeTab].title}</div>
+                {activeTab === 'usage' && (
+                  <div className="inline-flex items-center gap-0.5 rounded-full bg-[var(--bg-input-subtle)] p-0.5" data-tauri-drag-region="false">
+                    {([
+                      { id: 'app' as const, label: lang === 'zh' ? '应用用量' : 'App usage' },
+                      { id: 'calls' as const, label: lang === 'zh' ? '调用明细' : 'Call details' },
+                      { id: 'debug' as const, label: lang === 'zh' ? '请求调试' : 'Request debug' },
+                    ]).map(option => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        className={`rounded-full px-2.5 py-0.5 text-[12px] leading-5 ${
+                          usageView === option.id
+                            ? 'bg-[var(--bg)] text-[var(--text)] shadow-sm'
+                            : 'text-[var(--text-muted)]'
+                        }`}
+                        onClick={() => setUsageView(option.id)}
+                        data-tauri-drag-region="false"
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              {pageMeta[activeTab].subtitle ? (
+                <div className="kv-page-sub">{pageMeta[activeTab].subtitle}</div>
+              ) : null}
             </div>
             <div className="kv-page-header-right">{pageMeta[activeTab].right}</div>
           </header>
@@ -1063,6 +1110,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
             key={activeTab}
             className={`kv-scroll custom-scrollbar settings-section-enter ${variant === 'embedded' ? 'settings-embedded-scroll' : ''}${activeTab === 'sessions' ? ' kv-scroll--fill' : ''}`}
           >
+            {activeTab === 'themes' && (
+              <ThemeTab settings={settings} lang={lang} draft={themeDraft}
+                onDraftChange={setThemeDraft} onCommit={commitThemeSettings} />
+            )}
             {/* ===== 基础设置标签页 ===== */}
             {activeTab === 'general' && (
               <>
@@ -1070,7 +1121,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                   settings={settings}
                   t={t}
                   lang={lang}
-                  themeColor={themeColor}
                   systemFonts={systemFonts}
                   uiFontPxInput={uiFontPxInput}
                   onUpdateSettings={updateSettings}
@@ -1234,7 +1284,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 nativeBuiltinToolsEnabled={nativeBuiltinToolsEnabled}
                 onUpdateChat={updateChat}
                 onUpdateNativeTools={updateNativeTools}
-                onNavigateTab={navigateToSettingsTab}
+                onNavigateTab={setActiveTab}
               />
             )}
 
@@ -1294,33 +1344,27 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
               />
             )}
 
-            {/* ===== 插件与连接器；第三方应用入口已删除 ===== */}
-            {activeTab === 'plugins' && (
-              renderPluginCenter({
-                section: pluginSection,
-                onSectionChange: setPluginSection,
-                lang,
-                connectors:
-                  <ConnectorsPanel
-                    servers={settings.chatTools.servers}
-                    updateChatTools={updateChatTools}
-                    obsidianVaultPath={settings?.obsidianVaultPath ?? ''}
-                    onObsidianVaultPathChange={(path) => updateSettings({ obsidianVaultPath: path })}
-                    lang={lang}
-                    testServer={async (server) => {
-                      try {
-                        const result = await api.chatMcpTestServer(server, settings?.chatTools?.toolTimeoutMs)
-                        return {
-                          ok: result.success,
-                          message: result.error || '',
-                          tools: result.tools,
-                        }
-                      } catch {
-                        return null
-                      }
-                    }}
-                  />,
-              })
+            {/* ===== 连接器；通用插件包由插件市场管理 ===== */}
+            {activeTab === 'connectors' && (
+              <ConnectorsPanel
+                servers={settings.chatTools.servers}
+                updateChatTools={updateChatTools}
+                obsidianVaultPath={settings?.obsidianVaultPath ?? ''}
+                onObsidianVaultPathChange={(path) => updateSettings({ obsidianVaultPath: path })}
+                lang={lang}
+                testServer={async (server) => {
+                  try {
+                    const result = await api.chatMcpTestServer(server, settings?.chatTools?.toolTimeoutMs)
+                    return {
+                      ok: result.success,
+                      message: result.error || '',
+                      tools: result.tools,
+                    }
+                  } catch {
+                    return null
+                  }
+                }}
+              />
             )}
 
             {activeTab === 'sessions' && renderSessionCenter?.(lang)}
@@ -1335,37 +1379,17 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
               />
             )}
 
-            {/* ===== 用量统计标签页（内含请求调试二级视图） ===== */}
+            {/* ===== 使用统计：应用用量 / 调用明细 / 请求调试 ===== */}
             {activeTab === 'usage' && (
-              <div className="space-y-3">
-                <div className="kv-seg w-fit">
-                  <button
-                    type="button"
-                    className={usageView === 'stats' ? 'active' : ''}
-                    onClick={() => setUsageView('stats')}
-                    data-tauri-drag-region="false"
-                  >
-                    {lang === 'zh' ? '用量统计' : 'Usage'}
-                  </button>
-                  <button
-                    type="button"
-                    className={usageView === 'debug' ? 'active' : ''}
-                    onClick={() => setUsageView('debug')}
-                    data-tauri-drag-region="false"
-                  >
-                    {lang === 'zh' ? '请求调试' : 'Request debug'}
-                  </button>
-                </div>
-                {usageView === 'stats' ? (
-                  <UsageStatsPanel lang={lang} />
-                ) : (
-                  <RequestDebugPanel
-                    lang={lang}
-                    enabled={settings.chatTools.requestDebugEnabled ?? false}
-                    onToggleEnabled={(v) => updateChatTools({ requestDebugEnabled: v })}
-                  />
-                )}
-              </div>
+              usageView === 'debug' ? (
+                <RequestDebugPanel
+                  lang={lang}
+                  enabled={settings.chatTools.requestDebugEnabled ?? false}
+                  onToggleEnabled={(v) => updateChatTools({ requestDebugEnabled: v })}
+                />
+              ) : (
+                <UsageStatsPanel lang={lang} view={usageView} />
+              )
             )}
 
             {/* ===== 模型管理标签页 ===== */}
@@ -1545,7 +1569,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         className={`settings-embedded kv flex min-h-0 min-w-0 flex-1 ${
           reserveTrafficLightSpace ? 'settings-embedded--traffic-safe' : ''
         }`}
-        data-theme-color={themeColor}
       >
         {!hideNav && (
           <aside className="settings-embedded-nav">
@@ -1562,7 +1585,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   }
 
   return (
-    <div className="kv kv-window" data-theme-color={themeColor} {...focusHandlers}>
+    <div className="kv kv-window" {...focusHandlers}>
       <div className="kv-titlebar" onMouseDown={handleSettingsDragMouseDown}>
         <div className="kv-titlebar-spacer" aria-hidden="true" />
         <div className="kv-title">{t.settings}</div>

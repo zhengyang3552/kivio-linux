@@ -1,0 +1,719 @@
+# Kivio 对话体验改进：ZCode 对照与实施清单
+
+更新：2026-09-29。本文统一收录 ZCode 加载、滚动、渲染与附件调查，以及 Kivio 实施、修复和复核记录；后续研究和进展在这里更新。
+
+参考：ZCode 3.14.0，提交 `328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f`；本地源码位于 `E:\ZM database\ZCode-reference`。Kivio 对照基于本次工作区源码。工程规则仍以[统一工程规范](../engineering-standards.md)为准，既有需求与验收见[渲染性能 PRD](../prd/chat-rendering-performance-prd.md)。
+
+**证据口径：第 3～8 节保留实施前的源码对照和建议，不代表当前仍缺失这些能力。第 13 节为 `b0b6c7e4` 的复核；第 14 节为基于 `143153c2` 的长任务流式卡顿调查、计划与交付记录。第 9～12 节保留实施与修复历史，第 10 节的阅读位置缺陷已在第 11 节修复。没有两款应用的同场景性能比较；性能数字来自 Kivio 合成会话。**
+
+## 1. 结论与状态
+
+| 事项 | 结论 | 当前状态 |
+| --- | --- | --- |
+| 快速滚动错位、空白与重代码块负载 | 同步提交、像素预算 overscan、真实代码占位已落地 | 合成场景已验证，见第 2 节 |
+| 回切对话重复读取 | 已有 30 秒、4 项、24 MiB 快照保温与 revision 校验 | 已实现，真实回切收益待测 |
+| 长会话首屏与补页 | 已有最近 60 条 / 512 KiB 软预算、轻量目录与按需补页 | 已补齐跨窗口 artifact 引用，见第 13.5 节 |
+| 返回原阅读位置 | 已修正卸载采样时机，并等待真实宽度后恢复 | 浏览器回切通过，误差 0～2px，见第 11 节 |
+| 选择/粘贴附件期间切会话 | 异步结果绑定发起草稿，显式迁移新会话 | 已补齐重挂后移除与迟到操作组合回归 |
+| 图片重复读取与解码 | 已有在途复用、有界缓存、artifact 列表缩略图与按需原图 | 已修复无磁盘路径的内联图片复制/另存 |
+| 原生滚动条被重新钉底 | 无明确手势时，跟随纠正规则可能与用户定位冲突 | 待 Tauri 实机验证 |
+| 整套 UI 替换 | 协议、宿主和产品语义耦合大，按能力适配更合适 | 不建议整包替换 |
+
+阅读入口：[最新复核](#13-当前版本对照复核b0b6c7e4) · [已完成修复与实测](#2-已完成的滚动修复与实测) · [会话加载](#3-会话加载切换与恢复) · [滚动与渲染](#4-滚动与渲染几何) · [附件](#5-附件与图片生命周期) · [实施清单](#6-移植清单与实施顺序) · [许可](#7-依赖与许可) · [源码范围](#8-源码覆盖与验证边界)。
+
+## 2. 已完成的滚动修复与实测
+
+本节迁入原滚动专项笔记。使用 Edge、真实 MessageList/Markdown/应用样式和合成数据，不调用模型；没有进行 Tauri 原生窗口验收。以下测试成绩为当时记录，本次文档整理没有重跑。
+
+### 2.1 修复内容
+
+1. **同步提交位置和测量结果。** 滚动事件同步挂载新可见范围；ResizeObserver 测高同步更新兄弟行位置。React ref 挂载阶段单独降为普通通知，避免在 commit 内递归 flushSync。保留已有导航、跟随和宽度锚点的职责。
+2. **按像素限制屏外渲染。** 每侧以两屏高度为预算，最多六条；长回复通常仅需一条相邻回复，短消息仍保留原有缓冲。导航和宽度恢复的强制挂载邻域继续保留。
+3. **保持代码占位的真实布局。** 延迟高亮时继续显示完整纯文本；移除渲染岛的浏览器 intrinsic-size 替代布局，代码块不再受 112px 最小高度约束。Mermaid、HTML 等未知高度内容仍可保留各自的最小占位高度。
+
+### 2.2 测量结果
+
+普通负载为 F2：20 轮问答、200 个代码块。压力负载在同一数据中将每个代码块扩为约 52 行。每 40ms 向上滚动一次，共 30 次，步长分别为 750px 和 9000px。逐 rAF 记录视口内锚点、反向移动、空白帧、挂载节点数量及帧间隔。
+
+原始普通负载可见约 470px 的反向跳动，缩到 8 轮也能复现。单独减少预渲染虽然减少节点，但极快滚动仍暴露出占位高度失真和空白帧，因此最终同时修复布局与提交时序。
+
+| 测试 | 修改前/隔离对照 | 最终复测 |
+| --- | --- | --- |
+| 普通负载反向跳帧 | 可重复复现，原始一次扫描 19 帧 | 0 |
+| 普通负载空白帧 | 未记录完整原始基线 | 0 |
+| 普通负载挂载节点峰值 | 2043 | 1023 |
+| 压力负载挂载节点峰值 | 21897（仅修同步、固定六条缓冲） | 11088 |
+| 压力负载 P95 帧间隔 | 20.8ms（同上） | 8.4ms |
+| 压力负载最大帧间隔 | 37.5ms（同上） | 33.3ms |
+| 压力负载反向跳帧 / 空白帧 | 中间版本仍会出现空白 | 0 / 0 |
+
+以上是本机开发模式、带测量探针的合成数据结果，受调度、缓存和硬件影响；P95 改善不代表完全消除冷挂载的长帧。连续向下滚动普通负载也通过，未见反向跳帧或空白。6 个消息导航落点误差 0px；另加标题的临时负载中，5 次标题跳转距预期 16px 顶部留白的误差均为 0.5px。未复现独立的导航目标选错问题。
+
+### 2.3 回归入口
+
+单元/组件回归 `src/chat/MessageList.scrolling.test.tsx` 使用真实虚拟列表：验证同一 observer delivery 中滚动补偿与 transform 一致、快速滚动同一 delivery 挂载目标范围，以及长短消息不同的缓冲预算。同步位置和缓冲预算用例均验证过修改前失败。
+
+浏览器回归保留为 `scripts/fixtures/chat-scroll.html` 和 `scripts/probe-chat-scroll.playwright.js`。真实布局不能由 jsdom 的虚拟尺寸可靠覆盖，浏览器探针直接断言反向跳帧和空白帧为零；耗时仅记录，不设置依赖机器性能的硬阈值。
+
+先启动 `npm run dev:ui`（已有桌面开发服务时无需再启动），再运行：
+
+```powershell
+playwright-cli -s=chat-scroll open http://localhost:5713/scripts/fixtures/chat-scroll.html --browser=msedge
+playwright-cli -s=chat-scroll run-code --filename=scripts/probe-chat-scroll.playwright.js
+playwright-cli -s=chat-scroll eval "window.chatScrollReport"
+playwright-cli -s=chat-scroll close
+```
+
+此探针依赖独立安装的 playwright-cli，不是 npm test 的隐式依赖。
+
+最终检查：16 个相关测试文件、206 项测试通过；typecheck（含协议检查）、lint、architecture:check 和 git diff --check 通过。首次高并发运行中 F3 渲染测试超过 5 秒，单独重跑通过；随后限制为两个 worker 重跑全部 16 个文件，206 项全部通过，未放宽测试超时阈值。
+
+## 3. 会话加载、切换与恢复
+
+### 3.1 两边的现状
+
+| 观察到的实现 | ZCode | Kivio |
+| --- | --- | --- |
+| 初始读取范围 | 协议常量 `snapshotTailWindowRows: 60`，历史通过 `loadOlder` 按游标补拉；首个窗口若截断了一个 turn，会自动补齐其开头。已加载的旧行合并进投影，故内存并非始终只有 60 行。[协议限制](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/shared/src/zcode-protocol-v4/core.ts#L75-L76)、[补拉](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L981-L1014)、[SessionPane](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/SessionPane.tsx#L3653-L3673) | 每次选择经 `chat_get_conversation` 取完整 `Conversation`，然后交给当前视图；前端消息虚拟化不会减少这次后端读取和跨 IPC 传输。[导航](../../src/chat/chatNavigationController.ts#L213-L253)、[API](../../src/chat/api.ts#L1139-L1150) |
+| 短时间回切 | `SessionDataLayer` 以 session 为键共享投影 store，引用归零后默认 30 秒再关闭订阅；回切可能复用暖态。[数据层](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/sessionDataLayer.ts#L24-L39)、[acquire/release](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/sessionDataLayer.ts#L67-L95) | 当前 `selectConversation` 每次仍调用 `readConversation`；`ChatRouteKeepAlive` 保的是聊天/设置页面实例，不是每条会话的数据缓存。[导航](../../src/chat/chatNavigationController.ts#L213-L253)、[KeepAlive](../../src/chat/ChatRouteKeepAlive.tsx#L7-L39) |
+| 展示时机 | 订阅 ACK 后仍须等目标 session 的 snapshot；`timelineSnapshot` 校验 lease/session 身份，防止旧会话内容污染新会话滚动恢复。错误态有重连面板。[SessionPane](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/SessionPane.tsx#L3675-L3702)、[展示](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/SessionPane.tsx#L4720-L4753) | 请求代号隔离迟到结果；读完后 `startTransition` 提交，遮罩直到 `MessageList` 的媒体、字体、异步块和布局连续稳定，或到达截止时间才移除。大于 12 条消息的侧栏提示会立即显示 Logo，其余 150ms 后才显示。[导航](../../src/chat/chatNavigationController.ts#L234-L259)、[过渡状态](../../src/chat/conversationTransitionStore.ts#L41-L60)、[布局完成判定](../../src/chat/MessageList.tsx#L357-L460) |
+
+**推断，待测：** 对长历史，Kivio 的整条 JSON 读取、IPC 传输与前端对象构建可能是切换延迟的一部分；`listPopouts` 已缓存结果并合并在途请求，缓存有效时不产生额外 IPC；遮罩等待图片/字体/布局稳定可能增加可见等待。[导航顺序](../../src/chat/chatNavigationController.ts#L234-L253)、[弹窗归属缓存](../../src/chat/chatPopoutOwnershipOwner.ts#L39-L95)。不能从代码推断各环节占比，也不能断言 ZCode 一定更快。建议先分别计时 `listPopouts`、`chat_get_conversation`、`applyConversation` 到首屏 commit、遮罩结束，并按消息数、工具卡数量、附件数分组。若读取/传输占主因，可在现有对话存储负责人中设计尾页读取与更早历史分页；若回切占主因，再评估有容量和失效规则的短期快照缓存。不得绕过 Kivio 对原生会话导入快照的 [ADR-0002](../adr/0002-imported-history-is-a-snapshot.md) 语义。
+
+### 3.2 显示状态与读取成本
+
+ZCode 把运行记录转换成面向产品的时间线行，界面消费快照和增量。文本、推理、工具调用、用户输入和边界有自己的身份，再按 turn 组装成一轮可见内容。滚动负责几何，投影负责内容事实，命令展示作为临时 overlay。这使“打开历史”和“继续流式输出”能够落在同一份显示状态上。[投影策略](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/shared/src/conversation-message-projection-policy.ts)、[轮次结构](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationTurnRenderUnits.ts#L30-L78)、[store 约定](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L1-L27)
+
+```mermaid
+flowchart LR
+    Runtime[运行记录] --> Projection[显示投影：稳定行身份]
+    Projection --> Initial[首批尾部窗口]
+    Projection --> Delta[后续增量与历史补页]
+    Initial --> Store[每条会话的显示状态]
+    Delta --> Store
+    Store --> Turns[按轮组装显示内容]
+    Turns --> View[虚拟历史区与实时尾部]
+    Media[独立附件资源读取] --> View
+```
+
+Kivio 已有会话 revision、run 序号、断档恢复、独立流式 store 和自适应刷新，不缺这些基础能力。[协议恢复](../../src/api/chatProtocol.ts#L454-L514)、[流式展示负责人](../../src/chat/streamPreviewOwner.ts#L43-L147)。主要差距在稳定历史：切换依赖整份 Conversation；模型转录在出口剥离，列表随后派生分组、几何与导航数据。[后端出口](../../src-tauri/src/chat/commands/catalog.rs#L143-L173)、[前端接收](../../src/chat/Chat.tsx#L585-L611)。
+
+适合 Kivio 的方向是逐步给现有读取接口增加“界面首屏需要的数据”，保留后端完整历史和现有运行协议。一次 assistant 消息可能含大量工具卡，仅机械地截取最后 60 条 ChatMessage 并不能限制负载。窗口设计还需处理多答组、压缩边界、搜索落点和超大单轮；问题导航宜单独返回轻量索引，避免为了显示目录重新拉全量正文。
+
+这里存在两种不同收益：后端先完整解析 JSON 再切尾页，能减少 IPC、前端堆和派生计算，却不能省去完整读盘/解析。若测得后者占主因，再考虑由现有 repository 管理显示快照缓存或索引；不能把“前端分页”写成“磁盘已分页”。
+
+### 3.3 冷打开到退出的生命周期
+
+**冷打开并不只读取几条消息。** renderer 先复用/建立 handshake；宿主获取只读 CLI，等待 provider 配置同步、读取必要元数据。gateway 对冷会话恢复运行时并做历史 materialization，历史与同时到达的 live events 按源水位衔接。publisher 先在候选对象中重建，再原子替换旧投影；批量 replay 将昂贵派生集中到末尾。最后才切出 60 行下发。这种“候选构建成功后提交”可用于 Kivio 的大型派生计算，但没有理由为此整体换掉 JSON 存储。[宿主订阅](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/services/src/zcode-agent/zcodeAgentService.ts#L4939-L5034)、[cold resume](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/cold-session-resume.ts)、[gateway hydration](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts#L2895-L3156)、[候选重建](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/conversation-topic-publisher.ts#L607-L747)。
+
+**ACK 不等于数据到齐，也不等于画面可交互。** 即使服务端先发送 ACK，通知回调仍可能先于 await 的 continuation 执行。ZCode 用 activation barrier 暂存物理帧，等 store 记录 subscriptionId 后才释放；每个 pending subscription 限 1024 帧/32 MiB，溢出整批作废并触发恢复。宿主 outbox、renderer barrier、逻辑帧 decoder 共同保证首帧交接。Kivio 普通 getConversation 是单个 Promise，不需要额外套这整套订阅握手；只有现有事件通道存在同类交接竞态时才值得提取。[barrier](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ackActivationBarrier.ts)、[connect](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L393-L488)、[snapshot gate](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/SessionPane.tsx#L3675-L3702)。
+
+**出错恢复有阶梯，且不重发用户命令。** 旧 subscription/generation 的结果失效；重复 delta 忽略，`fromSeq` 不连续时保留最后合法快照。通常先向同订阅请求 resync，失败升级一次强制 snapshot，再失败暴露错误。恢复 ACK 与有效恢复帧都到达才结束；ACK 后等待帧有 30 秒期限。runtime unavailable 保留画面，换代重连有 250/1000/3000ms 的有限重试。accepted send 后若 2 秒仍没有对应 userInput/queue 投影，再请求状态恢复，不重复发送内容。Kivio 已有序号/断档恢复，应对照补边界，不能另起第二套流式事实来源。[应用边界](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L602-L757)、[恢复](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L803-L946)、[Kivio 协议](../../src/api/chatProtocol.ts#L454-L514)。
+
+**保温的是实时状态，不是一次读取的结果。** 引用归零后 30 秒仍收帧；回切取消释放定时器，第二 pane 可共享 store。超时关闭投影订阅并不停止 agent 运行。renderer 新建 store 的 cold 与后端 runtime cold 是两个维度。它没有统一 entry/字节上限，而宽屏可能已拉完整历史，因此照搬 30 秒会同时引入潜在内存峰值。Kivio 应在已有导航/会话数据负责人内实现容量、revision 与编辑/删除/后台完成失效规则。[SessionDataLayer](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/sessionDataLayer.ts)、[transport 换代](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/replaceableConversationTransport.ts)。
+
+请求归属与换代还要保留这些约束：
+
+- workspace/connection/topic 管订阅归属，connect generation 隔离旧请求，runtime generation 隔离旧进程 ACK，subscriptionId 拒绝旧订阅帧；epoch/seq 管投影连续性，逻辑帧 ordinal 管迟到分片。这些身份不能压成一个请求序号。
+- 冷恢复与 hydration 分别合并在途请求；重建期间暂存 live events，按源水位去重衔接。候选重建失败保留旧投影，避免让半成品进入界面。
+- transport 代理替换保留当前 base，由服务端决定 resume/snapshot；真实 runtime 重启则强制 snapshot。旧代理的迟到 ACK 在旧 transport 上清理，避免误取消新进程同名订阅。
+- ACK barrier 的 1024 帧/32 MiB 是每个 pending subscription 的限制，并非全局预算；首批溢出重试一次强制快照。目录失败按 250/1000ms 有限重试，终态缓存还依赖 query 目录 revision。
+
+依据：[订阅与恢复状态](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts)、[transport 换代](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/replaceableConversationTransport.ts)、[gateway](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts)。
+
+分页还有几个必须一起知道的限制：
+
+- 普通 `loadOlder` 默认 60 行，共享 `loadingOlder` 在途锁；核对未关闭、epoch 未变、首 cursor 未变后提交。返回的 atSeq/atRevision 没有作为该处版本比较条件，不能声称它实现了完整版本 CAS。
+- `loadAllOlder` 每页 200、顺序获取，最后一次提交，减少每页重建轮次；若完整历史不足两个真实 query，通常丢弃补拉页并缓存终态，但补齐截断首轮的必要情况例外。这个分支仍可能先付出全量读取成本。
+- 普通补页失败不会把整个会话切到 error，可再次触发；目录失败有限重试。首窗缺 turnHeader 时由 SessionPane 自动补齐，避免“内容不足以滚动，所以永远触发不了 loadOlder”。
+- subscribe/resync/rowsRange 的失效主要是撤销结果提交权，不会取消已经开始的历史 I/O。不要把 generation guard 叫作真实取消。
+
+依据：[普通补页与全量目录补齐](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L981-L1175)、[首轮补齐](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/SessionPane.tsx#L3649-L3673)。
+
+### 3.4 搜索和目录的后台加载
+
+- 问题导航不等用户点击：容器达到 864px 时可以自动全量补历史，一次提交给视图；目录自身另用小行虚拟列表，避免上千个导航按钮全挂载。**目录 DOM 虚拟化没有消除正文数据补全成本。**
+- 会话查找在非 running/prewarming 时自动补页，触发前判断已加载行数小于 1200；这个值是触发阈值，不是精确截断，更不是全局内存上限。另一条宽屏目录补齐路径不受它约束。
+- 查找按稳定 turn 缓存结果，运行 turn 重新索引；先挂载目标 turn，再对 DOM Text Range 做 CSS Highlights。不会为了着色改写 Markdown 文本树，但原始文本索引与按单个 Text node 匹配的 DOM 高亮并非天然一一对应，跨格式节点匹配必须另测。
+- 导航活动项仍会扫描已挂载 `[data-row-id]` 并调用 `getBoundingClientRect()`；`syncTurnNavigatorViewport` 在 scroll 路径上运行，前面还写 mask。不能把 ZCode 描述为“不读 DOM、无同步布局成本”。Kivio 当前对应扫描有 120ms 节流，是否要改应由 trace 决定。
+
+依据：[目录补齐](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L615-L685)、[目录组件](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTurnNavigator.tsx)、[查找 hook](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/useConversationTimelineFind.ts)、[DOM 高亮](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationFindHighlightDom.ts)、[导航扫描](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L914-L948)、[Kivio 扫描](../../src/chat/MessageList.tsx#L1696-L1768)。
+
+## 4. 滚动与渲染几何
+
+### 4.1 三类成本
+
+1. **数据加载量**：尾窗快照限制首帧传输；补页继续增加 renderer 中的历史。后端已有全量投影，`rowsRange` 在其上选取行，不能把它称为磁盘分页。
+2. **DOM 挂载量**：历史按 product turn 虚拟化，overscan 为 8 个 turn；当前运行轮放在虚拟历史后面的正常文档流中。一个 turn 仍可能很大，虚拟化不等于对该 turn 内全部内容分页。
+3. **位置稳定**：动态高度只是输入，还要决定用户意图、恢复、前插、导航、宽度变化的优先级，以及何时写入 scrollTop。任何一个分支越权都会产生回弹或跳位。
+
+源码：[尾窗](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/conversation-topic-publisher.ts#L304-L334)、[虚拟器](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L695-L769)、[历史与 live DOM](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1812-L1882)。
+
+### 4.2 各类滚动事件
+
+| 场景 | ZCode 实际规则 | 对 Kivio 的判断 |
+| --- | --- | --- |
+| 首次打开 | 无阅读记忆或原先贴底，则立即到底；有离底记忆则恢复。会话切换清测高缓存和 prepend 基线，防跨会话 rowId 重用 | Kivio 新绑定默认贴底，缺的是跨会话阅读位置恢复，不是基本贴底 |
+| A → B → A | scope 变化前用 `getSnapshotBeforeUpdate` 读取旧 DOM；普通 layout cleanup 此时可能已经看到新 DOM。卸载另行保存；最多保留 200 份记忆 | 值得借鉴“保存发生在哪个生命周期”。Kivio MessageList 按 conversationId 重挂，可在旧实例清理时保存，不必为此照搬 class 组件 |
+| 数据还没来 | 保留 pending restore，临时 scrollTop 被 clamp 到 0 时不覆盖旧记忆；rows 到达和测高后再校正 | 恢复必须跨过“数据未到”和“高度未就绪”，只存一个数值不足以完成产品行为 |
+| 用户开始上滚 | wheel/touch/key 捕获先交出 following，再等 scroll 事件；解决同帧 stream commit 抢先贴底的竞态 | Kivio 已有手势先解除跟随，且处理横向滚动、嵌套代码滚动和拖选；保留这些保护 |
+| 内容或图片长高 | layout effect 与 live tail 的 ResizeObserver 都先核对跟随权；只在 following 时贴底。历史尺寸补偿只处理完全位于视口上方的行 | Kivio 已有 RO、单一写入口和用户脱离标记；不能增加第二套跟随 hook |
+| 流式结束 | 运行轮移回虚拟历史，同时可能折叠过程区；这些几何回退按 layout 处理，不等同于用户上滚 | 必须测 running → completed/interrupted/tool error 的交接；只测持续输出覆盖不到这里 |
+| 改变窗口/侧栏宽度 | 宽度变化期间暂停逐行补偿和贴底，静止 120ms 后仅在仍 following 时最终贴底 | Kivio 已有宽度桶、布局独立缓存和阅读行锚定，更适合保留。ZCode 的暂停策略并未替离底用户完整重建语义阅读锚点 |
+| 向上补历史 | 距顶两个视口便预取；先保存稳定 turn key 及相对视口偏移，前插后恢复。找不到 key 才退回总高度差补偿 | 若 Kivio 引入分页，这个算法可适配；纯粹 `scrollTop += 新旧 scrollHeight 差` 对同帧其他测高变化不够可靠 |
+| 恢复与前插同时发生 | pending detached restore 拥有锚点时，prepend 不再叠加位移；避免对临时 clamp 坐标补两次 | 这是移植分页时必须一起带入的约束 |
+| 程序写入后虚拟窗未更新 | 读回浏览器 clamp 后的 scrollTop；在 commit 后微任务派发 scroll 通知，使虚拟器更新窗口 | 学习“滚动坐标和挂载窗口需一起提交”。不要无条件把合成 scroll 加到 Kivio；已有同步提交的路径应先实测 |
+| 问题导航跳转 | 先定位所属虚拟 turn，再按 rowId 找真实 DOM；最多 12 个 rAF 等待锚点挂载 | Kivio 已有 prepare/hold、强制挂载和稳定判定；ZCode 更短的代码不代表处理更全 |
+| 清空、切换、卸载 | 清前插基线、测高、导航 rAF、延迟目录重试、width timer 和 observers；旧 action ref 只清自己的登记 | 引入缓存和恢复必须带上这些退出条件 |
+
+依据：[读取旧 DOM](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L210-L234)、[输入捕获](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L806-L875)、[宽度与 live RO](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1058-L1143)、[预取](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1183-L1253)、[导航](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1283-L1352)、[恢复/前插/跟随](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1435-L1685)。Kivio 对照：[scroll owner](../../src/chat/scroll/useScrollFollow.ts)、[width owner](../../src/chat/hooks/useChatWidthLayout.ts)、[虚拟器同步与补偿](../../src/chat/MessageList.tsx#L872-L995)。
+
+还有两项布局细节：导入的只读 header 高度通过 RO 进入 `scrollMargin`，虚拟行 transform 再减去该高度；正文子树禁用浏览器 `overflow-anchor`，防止原生锚点和应用恢复争夺滚动位置。composer 是同一视口中的 sticky dock，ZCode 为其留白增加了动态消息 mask，带来额外几何同步。Kivio 若保持自己的 composer 布局，就没有必要一起搬入这些定位和 mask 代码。[header 测量](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L391-L415)、[mask](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L877-L912)、[原生锚点](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1772-L1775)。
+
+### 4.3 Kivio 尚需验证的问题
+
+**Kivio 原生滚动条/外部定位可能被重新钉底。** 当前 `reduceFollowEvent` 在 following=true、pointerHeld=false 时，即使 scroll 的 source 为 user，只要 gap 超过 12px 仍返回 pin=true；现有单测明确要求这个行为。它是避免测高噪声误解除跟随的设计选择，但用户没有 wheel/touch/key、也未触发 pointerHeld 的真实滚动会进入相同分支。ZCode 会区分 programmatic/layout/user，再允许 user 落点解除跟随。应在 Tauri WebView 录制拖原生滚动条、浏览器查找/焦点定位的实际事件序列，再决定如何兼顾；不能直接删除 Kivio 的纠正逻辑，更不能把这个条件路径说成已复现的根因。[当前规则](../../src/chat/scroll/scrollFollowCore.ts#L162-L180)、[现有期望](../../src/chat/scroll/scrollFollowCore.test.ts#L70-L74)、[ZCode 分类](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1183-L1219)。
+
+**首屏已能看见内容与遮罩结束要分开计时。** Kivio 等图片、字体、异步重内容与至少 80ms 的稳定期，最长 2 秒。它保证揭开时的稳定性，也可能掩盖“正文已经可读、某张图还没完成”的时间。要学习 ZCode 的首屏窗口和阶段计时，不能简单删掉等待。后续可以在真实比例占位可靠的前提下，让非关键媒体独立完成。[首屏判定](../../src/chat/MessageList.tsx#L357-L460)。
+
+**ZCode 的记忆算法也不是理想答案。** 它保存像素 scrollTop、总高度和是否贴底，没有保存消息身份与布局版本；不同宽度、不同历史窗口、内容编辑后，同一个像素不一定是同一句话。适合 Kivio 的恢复记录应包含稳定消息/轮次 key 与相对偏移，沿用现有布局和 revision 校验；不存在该目标时明确回退。
+
+### 4.4 统一滚动控制的约束
+
+在 Kivio 现有 scroll owner 内定义优先级即可，不另建平行控制器：
+
+1. 新用户手势取消旧恢复、导航保持和宽度修正。
+2. 有效导航请求或会话阅读位置恢复拥有一个明确目标；分页补偿不重复叠加。
+3. 离底阅读时，只补偿锚点上方的高度变化；展开当前内容不把点击处推走。
+4. 仍处于跟随状态时，内容增长才可以贴底；终态折叠和布局补偿本身不代表用户改变意图。
+5. 所有 scrollTop 写入仍通过 `ScrollFollowHandle`，同时让虚拟器在绘制前得到一致的坐标和测量结果。
+
+ZCode 的数值（48px 底部阈值、1200ms 输入意图寿命、250ms layout guard、120ms resize settle、8 turn overscan）是其实现选项，不是应复制的性能标准。Kivio 已有 12px 贴底阈值、显式布局补偿票据及按像素预算的 overscan，移植应围绕行为用例，而不是统一这些常量。
+
+### 4.5 轮次、Markdown 与重内容
+
+渲染层也追到了最终内容：rows 先按稳定 turnId 组装，补齐更早 turnHeader 不改变该轮 key；过滤不展示的 reasoning/tool 状态之后才做连续工具分组，组 key 取第一项稳定身份。空工作组在创建折叠容器前返回 null，折叠间距放在被测量内容内部，防止关动画后再掉一段 padding。最终轮次还包含 workflow/automation、文件总结、截图、操作栏与边界标记，都会影响高度，不能只对 Markdown 正文做测量。[组轮](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationTurnRenderUnits.ts#L360-L480)、[工具分组](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationAssistantWorkItems.ts#L283-L425)、[折叠几何](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTurnGroup.tsx#L645-L675)、[轮次尾部](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTurnGroup.tsx#L1383-L1445)。
+
+- ZCode 完成态采用 Streamdown static、实时态采用 streaming；Kivio 的 ChatMarkdown 有明确的固定 streaming 模式兼容策略，也已有历史解析缓存、延迟代码高亮和重内容占位。可以做局部试验，但切一个 mode 不是已经证实的性能修复。[ZCode message](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/components/ai-elements/message.tsx#L1561-L1655)、[Kivio](../../src/chat/ChatMarkdown.tsx#L1255-L1281)
+- ZCode 代码块的 `content-visibility:auto` / `contain-intrinsic-size:auto 200px` 不宜照抄。第 2 节已记录 Kivio屏外长代码块占位高度污染测量的问题，现有真实文本占位应保留。[ZCode code-block](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/components/ai-elements/code-block.tsx#L147-L165)、[已有复现](#2-已完成的滚动修复与实测)
+- ZCode 的 turn/work 分组是合理的产品结构，但依赖它的 row、workflow、hook 与工具 display 协议；Kivio 已有工具过程折叠、memo 和收起内容卸载。照搬 TurnGroup 会连带迁移大量产品语义。适合借鉴“先裁掉不展示的行，再按稳定轮次组装”的规则，接到现有消息展示模型。[ZCode 工作项](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationAssistantWorkItems.ts#L272-L300)、[Kivio 分组](../../src/chat/MessageBubble.tsx#L727-L820)
+
+## 5. 附件与图片生命周期
+
+### 5.1 草稿、发送与预览现状
+
+| 观察到的实现 | ZCode | Kivio |
+| --- | --- | --- |
+| 草稿归属 | 按 workspace/scope 键保留附件状态；等待会话、排队、上传、提交、就绪、失败有明确状态，切 task/composer 不丢内存 File/object URL。[store](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/store/composerAttachmentUploadStore.ts#L6-L46)、[hook](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/composer/useComposerAttachments.ts#L206-L218) | 按会话键把输入、引用和 `PendingAttachment[]` 存在进程内 Map，切换后恢复；同样不会因普通切换立刻丢草稿。[草稿](../../src/chat/composerDraft.ts#L1-L36)、[InputBar](../../src/chat/InputBar.tsx#L561-L623) |
+| 传输与发送 | 本地文件路径可直接作为 ref；内联 File 走 put，远端本地文件先 stage，带进度、取消、重试及发送后 adopt；未就绪时 `prepareForSend` 拒绝提交。[附件派发](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/composer/attachmentUpload.ts#L39-L79)、[远端暂存](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/composer/useComposerAttachments.ts#L315-L393)、[发送边界](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/composer/useComposerAttachments.ts#L1032-L1059) | 选择路径时先分类、按路径去重；发送时后端把文件复制到对话附件目录，目录保留原路径。粘贴的无路径文件在发送前保存为临时文件。[InputBar](../../src/chat/InputBar.tsx#L685-L721)、[去重](../../src/chat/InputBar.tsx#L1035-L1058)、[粘贴](../../src/chat/InputBar.tsx#L1568-L1612)、[后端复制](../../src-tauri/src/chat/attachments.rs#L820-L875) |
+| 图片预览 | File 附件建 object URL 并在移除时 revoke；路径附件未必有 object URL，不能概括成所有图片都零拷贝预览。[附件对象](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/lib/chatAttachments.ts#L83-L106)、[释放](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/lib/chatAttachments.ts#L134-L137) | 图片卡片挂载时调用 `chat_read_attachment`，后端读取整文件并编码 data URL，预览上限 12 MiB；组件只用 `cancelled` 抑制迟到 setState，不取消这次读取。已落盘 artifact 有内联缩略图占位，但 `ArtifactImage` 挂载时仍主动读整图。[卡片](../../src/chat/ChatAttachments.tsx#L37-L65)、[读取](../../src/chat/attachmentPreview.ts#L11-L34)、[后端](../../src-tauri/src/chat/commands/attachments.rs#L11-L24)、[上限/编码](../../src-tauri/src/chat/attachments.rs#L238-L250)、[artifact](../../src/chat/MessageBubble.tsx#L159-L170) |
+
+**推断，待测：** 同一会话反复打开或虚拟行反复挂载时，Kivio 已发送图片可能重复发生磁盘读取、Base64 编码、IPC 传输与解码；这是可测的潜在卡顿来源，不代表所有附件都存在问题。先记录一次切换期间 `chat_read_attachment` 次数、字节数、耗时与重挂载次数；若显著，再考虑受限缩略图缓存或统一缩略图路径，保持现有附件目录和路径校验。ZCode 的远端 stage/adopt 解决的是跨主机可读性，Kivio 当前本地路径模型不应直接照搬该状态机。
+
+### 5.2 异步附件归属风险
+
+Kivio 的 InputBar 在已有对话之间可保持挂载，`draftKeyValue` 变化后恢复新草稿。文件选择 `openAttachmentPicker` 在 await 对话框和 `pendingFromPaths` 之后直接 `addAttachments`；普通 Ctrl+V 也在等待临时文件保存后直接添加，只有菜单目标路径检查 `isCurrent()`。[切换草稿](../../src/chat/InputBar.tsx#L587-L623)、[文件选择](../../src/chat/InputBar.tsx#L1142-L1164)、[粘贴](../../src/chat/InputBar.tsx#L1572-L1624)、[挂载位置](../../src/chat/ChatConversationPane.tsx#L274)
+
+由此静态可达的场景是：在 A 粘贴图片 → 临时文件保存尚未完成 → 切到 B → 完成回调把附件加到 B。尚未运行回归用例确认，但比“附件可能慢”更具体。ZCode 的价值是异步入口捕获 scope，完成时对该 scope 提交。落地应先用可控延迟复现，再决定原草稿保留结果及新建占位键迁移规则，同时让错误提示也归属于原操作；只给最后一个 setState 加 isCurrent 会丢失原草稿中的操作结果。
+
+具体借鉴位置是 ZCode 的 `updateScope(targetScopeKey)` 与选择文件闭包，不必导入它整套上传 store。[scope 更新](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/composer/useComposerAttachments.ts#L239-L257)、[选择文件](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/composer/useComposerAttachments.ts#L706-L726)
+
+### 5.3 缓存、缩略图与资源释放
+
+ZCode gateway 的缓存键包含 session、message、attachmentIndex 与 ref；先把 Promise 放入 Map，所以并发分块读取可以共用一次文件读取，失败会删除项。已完成字节按最近访问时间淘汰，常量为 30 秒/30 MiB。这个数值是源码事实，不是建议照抄的 Kivio 预算：pending 请求未计入已完成字节上限，TTL 淘汰不取消底层 I/O，因此还不是严格的峰值内存上限。[缓存实现](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/v4-gateway.ts#L2263-L2333)、[限制](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/shared/src/zcode-protocol-v4/core.ts#L83-L94)、[媒体上限](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/shared/src/zcode-media-policy.ts#L2)
+
+Kivio 已发送附件会复制成独立 UUID 文件，已有稳定的持久身份，缓存应复用它。对尚未发送的绝对路径，需要内容版本/文件元数据或短期失效策略，避免文件被覆盖后继续展示旧图。[持久副本](../../src-tauri/src/chat/attachments.rs#L841-L855)
+
+更进一步可学习 ZCode 的媒体结果联合类型：本地 URL、Host range URL 和 inline bytes 是明确不同的资源形式；本地协议先授权精确路径，再交给媒体栈处理。[结果类型](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/services/src/media-preview/mediaPreview.ts#L4-L31)、[本地协议](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/desktop/src/main/localMediaPreviewProtocol.ts#L47-L175)。Electron 的 registerFileProtocol 不能直接搬到 Tauri；需要保持现有路径校验的 Rust/Tauri 实现。Kivio 图片查看器的复制和保存目前从 data URL 提取 base64，替换 src 时必须一起适配这些行为，不能只验证图片能显示。[查看器](../../src/chat/ChatImageViewer.tsx#L22-L46)
+
+近期更小的动作是让 Kivio **已有真实缩略图用于列表展示**，需要时再升级原图。后端已经有缩略图生成器，当前 artifact 和部分 Markdown 图片挂载后主动取整图，缩略图仅用于占位；可以先收拢这条资源生命周期，之后再决定是否增加 URL 协议。[缩略图](../../src-tauri/src/chat/attachments.rs#L766-L773)、[Markdown 原图读取](../../src/chat/ChatMarkdown.tsx#L1087-L1106)
+
+ZCode 附件取消有边界：已发送媒体组件传入 AbortSignal；transport 在分块请求前后检查它，停止后续块，已经发出的 IPC 请求没有因此被中断。当前本地 URL 快路限定在该读取路径的视频；图片仍可经过分块 Base64 → bytes → Blob。名叫 thumbnail 的 URL 也不保证服务端给的是缩略图。[组件](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationRowView.tsx#L347-L419)、[transport](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/agentConversationTransport.ts#L424-L470)
+
+## 6. 移植清单与实施顺序
+
+### 6.1 候选与接入位置
+
+以下是代码级候选，不代表本次已经实施。每项移植应在 Kivio 原负责人中替换或补齐一项能力，避免保留两套滚动权或数据协议。
+
+| 候选 | ZCode 源码 | Kivio 接入点与价值 | 移植方式 |
+| --- | --- | --- | --- |
+| 会话阅读位置记忆 | `packages/ui/src/lib/chatSessionScrollMemory.ts`：有界 Map，区分原先贴底与阅读中 | `MessageList`/现有 scroll owner；A → B → A 恢复阅读处，用户开始滚动后让出恢复权 | 纯数据部分可直接移植并适配键；恢复协调须接现有 scroll owner。宽度变化时宜用消息 key + 相对偏移，不能只照搬 scrollTop |
+| 附件异步操作绑定草稿 | `v4/composer/useComposerAttachments.ts` 的 scopeKey + updateScope | `InputBar`、`composerDraft`；选择/粘贴耗时期间切会话，结果仍归原草稿 | 移植归属规则；本地应用无需把远端上传事务一起搬来 |
+| Excel 剪贴板优先采用表格文本 | `lib/chatAttachmentMetadata.ts` 的 shouldPreferSpreadsheetClipboardText | `InputBar` 粘贴入口；Excel 同时提供文本、HTML、PNG 时优先保留可读可编辑的单元格内容 | 约 12 行纯函数，无外部依赖，可直接移植并补混合剪贴板用例 |
+| 图片资源状态跟随 src | `components/ai-elements/markdown-image.tsx` 的 src key、加载/失败占位 | `ChatInlineImage` 已有比例缓存，补上来源变化和失败态，失败后仍允许重试 | 小范围适配；复用 Kivio 图片组件和全局样式 |
+| 附件读取复用与容量限制 | ZCode gateway 的在途 Promise/短期 payload 缓存 | `attachmentPreview` + Rust 附件负责人；虚拟行重挂时少做重复读盘/编码/传输 | 学规则并按 Kivio 路径权限实现；按字节限制，失败清理，预览与原图分开 |
+| 会话显示状态短期保温 | `v4/sessionDataLayer.ts`：引用计数、延迟释放、共享 store | 现有导航读取流程；减少 A → B → A 重新读取与构建对象 | 适配而非原文件直拷。缓存必须接 revision、删除/编辑/清空、后台完成及弹窗归属失效 |
+| 用命令身份认领发送占位 | `v4/conversationProjectionStore.ts` 的 sourceCommandId | `optimisticUserPresentation`、发送契约；占位与落盘消息可靠一一对应 | 学协议约定，跨前后端适配，保留已有发送预占与迟到结果保护 |
+| 增量合并保持最终状态等价 | `shared/src/zcode-protocol-v4/coalesce.ts` | 已有流式协议与合并路径；减少更新时保证删除、替换、终态不被合并越过 | 规则和性质测试值得借鉴，ZCode 专属 delta 类型无需整体引入 |
+
+阅读位置缓存本身无 React/DOM import，移植成本低；ZCode 的行高缓存也较独立，但 Kivio 的 [messageListVirtualization](../../src/chat/messageListVirtualization.ts) 已按会话、布局和内容版本缓存测量，直接换成 ZCode 的 turnId 缓存会丢掉已有保护。参考：[阅读位置缓存](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/lib/chatSessionScrollMemory.ts)、[行高缓存](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/timelineRowHeightCache.ts)。
+
+Excel 粘贴规则检查制表符或 Excel/table HTML 标记。Kivio 当前发现剪贴板 File 就进入附件处理，尚未找到该优先级判断；这项是直接可用的产品细节，不以性能测量为前置条件。[ZCode 函数](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/lib/chatAttachmentMetadata.ts#L1-L12)、[Kivio 入口](../../src/chat/InputBar.tsx#L1504-L1520)
+
+### 6.2 发送与增量协议
+
+命令身份是值得长期吸收的一点。ZCode 通过 `sourceCommandId` 确认权威 userInput/队列项已经出现，再撤去发送占位；Kivio 目前除了临时 id，还用相同文本的数量增长判断消息已保存。这不等于已经复现重复消息缺陷，但在重复文本、不同附件、队列与重试场景中，稳定关联 id 比内容猜测更易验证。[ZCode 占位认领](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L1293-L1323)、[Kivio 现状](../../src/chat/optimisticUserPresentation.ts#L25-L61)。
+
+增量合并也有可直接借用的测试思想：逐条 apply 与合并后 apply 应得到相同终态；删除/分支截断是不能越过的屏障，整行替换能吞掉此前同一行的追加。它比“降低刷新频率”多解决了一层正确性问题。[coalesce](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/shared/src/zcode-protocol-v4/coalesce.ts#L1-L14)
+
+### 6.3 交付顺序与验收
+
+| 顺序 | 可独立交付的结果 | 关键验证 |
+| --- | --- | --- |
+| 1 | 附件操作绑定草稿；图片来源变化/失败态；预览读取去重与有界缓存 | A 粘贴期间切 B、新建草稿迁移、移除后迟到、失败再试；同图往返滚动的读取次数；缓存字节上限 |
+| 2 | 会话阅读位置恢复与稳定历史短期缓存 | A → B → A、A 在后台完成、编辑/删除/清空、多窗口；不同宽度下恢复；用户滚动立即打断恢复 |
+| 3 | 首屏显示窗口、历史分页、轻量导航目录 | 大单轮工具卡、搜索跳到未加载历史、多答组、压缩边界、分页在途编辑/截断；分别记录读盘/解析、IPC、首屏 commit |
+| 4 | 发送占位的贯穿关联 id；按需试验 Markdown static | 重复文本不同附件、排队/重试/取消；链接/表格/代码跨块语义与流式转完成态一致 |
+
+前两批有明确局部边界，第三批触及读取契约和领域形态，应保留 ADR 对导入快照、原生会话续聊及多答的既有语义。采集性能应复用已有 chatPerformanceProbe 与浏览器 fixture，补真实桌面会话切换和附件样本；已有合成滚动成绩不能代替这些场景。
+
+## 7. 依赖与许可
+
+两边都使用 React、TanStack Virtual 与 Streamdown，局部纯函数和行为模式移植可行。但 ZCode UI 声明 React 19、Zod/Zustand、Lexical、Radix、`@zcode/shared/services/rpc/provider` 等依赖，Kivio 当前为 React 18 + Tauri/Rust 与自己的生成协议。整个 `packages/ui` 或 `SessionPane` 不能作为替换 Chat.tsx 的独立组件：宿主、协议、主题和产品能力都要适配。[ZCode UI package](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/package.json)、[Kivio package](../../package.json)
+
+ZCode 第一方源码为 Apache-2.0，Kivio 声明 GPL-3.0-or-later；Apache 官方确认 Apache-2.0 与 GPLv3 兼容，因此第一方适用代码可纳入 GPLv3 项目，同时履行原许可要求。实际拷贝时保留许可证、适用归属声明、修改说明和有关 NOTICE；第三方组件按各自声明判断，不把根许可证套到字体、图标和所有 vendored 代码上。本次没有复制源码。[ZCode NOTICE](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/NOTICE.md)、[兼容性](https://www.apache.org/licenses/GPL-compatibility.html)、[Apache-2.0 第 4 条](https://www.apache.org/licenses/LICENSE-2.0.html)
+
+## 8. 源码覆盖与验证边界
+
+借用时也要补 ZCode 自身没有证明完整的边界：find 缓存按 query/feature/turn key，query 改变才清除，而 Timeline 在同 pane 切 session 时不重挂；同一非空搜索词跨会话且 turn key 碰撞时，有复用旧索引的条件风险，应加入 session/epoch/内容版本。另 store 对恢复首帧有超时，但 `connect` 本身没有独立的“ACK 后始终零首片”计时，不能声称任意首帧丢失都由这段自动修复。两项均为静态边界，未做故障注入，不作为已复现故障报告。[find 缓存](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/useConversationTimelineFind.ts#L81-L112)、[Timeline 挂载](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/SessionPane.tsx#L4735-L4744)、[connect](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/conversationProjectionStore.ts#L393-L488)。
+
+以下路径相对 ZCode 根目录；“全文件”包含函数主体、调用出口与清理，不只是符号搜索。
+
+| 范围 | 全文件阅读 | 大型文件中追踪的相关段落 |
+| --- | --- | --- |
+| renderer 加载 | `v4/sessionDataLayer.ts`、`conversationProjectionStore.ts`、`agentConversationTransport.ts`、`replaceableConversationTransport.ts`、`ackActivationBarrier.ts`、`topicWireDecoder.ts`、`agentV4ConnectionHandshake.ts`、`useConversationProjection.ts`（均位于 `packages/ui/src/`） | `SessionPane.tsx` lease、首轮补页、加载门控、timeline props；`zcodeAgentService.ts`、`zcodeAgentConnectionScope.ts` 的订阅与归属 |
+| 滚动与恢复 | `packages/ui/src/v4/ConversationTimeline.tsx`、`timelineScrollAnchor.ts`、`timelineRowHeightCache.ts`；`packages/ui/src/lib/chatSessionScrollMemory.ts` | 相关 JSX、header/dock、分享背景锁定也在 Timeline 全文范围内；分享导出流程未整体审计 |
+| 查找与导航 | `v4/ConversationTurnNavigator.tsx`、`conversationTurnNavigatorHelpers.ts`、`useConversationTimelineFind.ts`、`conversationFindIndex.ts`、`conversationFindHighlightDom.ts`、`promptScrollFocusPolicy.ts`；`lib/sessionOpenArmsTelemetry.ts`（均位于 `packages/ui/src/`） | App/TaskFindDialog 搜索状态清理与 SessionPane 传参 |
+| 轮次与重内容 | `v4/conversationTurnRenderUnits.ts`、`conversationTimelineLiveTail.ts`、`conversationAssistantWorkItems.ts`、`ConversationTurnGroup.tsx`、`V4ConversationContext.tsx`；`components/ai-elements/message.tsx`、`code-block.tsx`、`markdown-image.tsx`（均位于 `packages/ui/src/`） | ConversationRowView 已发送媒体、composer 附件生命周期、共享媒体返回类型与宿主缓存 |
+| backend 历史和输出 | `apps/zcode-cli/packages/bootstrap/src/zcode-protocol-v4/cold-session-resume.ts` | publisher 的 wire snapshot、rowsRange、candidate hydration、subscribe/flush/resync/admission；gateway 的冷恢复、hydration、订阅输出、关闭；protocol server/transport 的 ACK/outbox 顺序；v4-bridge 和 cold-event-merge 的持久历史 materialization |
+
+未声称完整阅读：整个 SessionPane 的业务操作、所有工具卡/插件内部、全部持久化 reducer、所有宿主进程管理和物理帧 assembler 内部。已沿其相关接口追通加载与滚动，不将范围外内部正确性当作已验证事实。
+
+开源检出中按 `.test/.spec` 文件名只找到 4 个测试文件，涉及 provider 迁移、非 CLI ACP 退役、Claude 导入恢复；没有找到以上加载/滚动链的专项测试。源码存在测试钩子和历史修复注释，不能据此声称相关用例随仓库提供或已经通过。本次没有运行 ZCode/Kivio 新测试或桌面性能比较；第 2 节的旧测试成绩只适用于其中所列场景。
+
+ZCode 的阶段计时字段值得借鉴：renderer prepare、host prepare、provider sync、CLI bootstrap/restore、首帧 encode/transport、snapshot apply、React render、paint-to-interactive。字段存在不代表本次拿到了数据；gateway 的 snapshotRowCount 取自后端完整 snapshot，并非必然等于下发 60 行。Kivio 可扩展已有 `chatPerformanceProbe`，同时记录**冷读首屏、保温回切、背景补页结束、附件完成**四个时间点，避免把后台全拉成本藏到“首屏更快”之外。[计时定义](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/lib/sessionOpenArmsTelemetry.ts)、[现有 probe](../../src/chat/chatPerformanceProbe.ts)。
+## 9. 当前实施状态（2026-09-24，后续开发）
+
+第 6.3 节第 1、2 批已落地：附件归属、Excel 文本优先、图片状态及预览缓存、阅读位置记忆、带 revision 校验的会话保温。第 3 批已增加首屏/补页的条数与载荷预算、轻量导航目录、按需历史读取及大单轮历史过程的渐进展开。第 4 批贯穿消息 ID 已落地，Markdown static 保留为按需试验，不强行改变已有跨块语法兼容策略。
+
+本轮补上了输入历史按需读取、已有会话搜索未加载消息、A→B→A 分页重试、实时过程读者不被裁掉，以及不同发布批次下最终状态等价验证。原先打开会话即全量补读的后台路径已删除。后端仍完整读取 JSON 后裁切，不宣称已做磁盘分页。
+
+[本轮完整验收记录与测量](../perf/chat-acceptance-2026-09-24.md)包含测试命令、F1～F4 浏览器结果和未完成项。代码和浏览器回归已验证；F3 长任务、Tauri 原生窗口、真实附件/多窗口和旧版本同机性能对照尚未完成验收，因此整份性能 PRD 仍不能标为全部达标。
+
+## 10. 实施后复核（3e102b3e）
+
+2026-09-24 复核 `54b43bc4 → 3e102b3e` 的五个提交，共 52 个变更文件。ZCode 仍对照本文固定提交。此次为代码审查与验证，产品源码未修改，范围外的工作区修改不在本次结论内。
+
+### 10.1 已确认问题：离开会话时保存了失效的滚动位置
+
+**P1 · 功能正确性 · 审查时复现，后续已修复（第 11 节）。** 审查版本的 [MessageList.tsx](../../src/chat/MessageList.tsx) 在普通 `useEffect` 的卸载清理中调用 `saveMeasurementSnapshotRef.current()`。真实浏览器中，此时视口已从文档移除，读取到的 `scrollTop` 为 0；虚拟行仍可能保留之前的测量，因此还会组合出错误的大负数 `rowOffset`。A → B → A 后，阅读位置恢复到顶部，直接破坏本批新增的阅读位置记忆。
+
+在现有 `chat-performance.html`、真实 MessageList、Edge、合成 F1/F2 上复现：
+
+| 阶段 | 观察值 |
+| --- | --- |
+| F1 滚到历史中部并解除跟随 | `scrollTop = 8451`，`scrollHeight = 17629` |
+| 切到 F2，F1 DOM 已卸载 | 原视口 `scrollTop = 0` |
+| 读取 F1 阅读位置缓存 | `following = false`，`scrollTop = 0`，`rowOffset = -7868` |
+| 切回 F1 并等待布局 | `scrollTop = 0` |
+
+现有 `MessageList.scrolling.test.tsx` 的恢复测试直接预置阅读位置，没有经过真实 DOM 卸载后的保存过程，因此此次 254 项回归全部通过仍会漏掉此缺陷。
+
+**ZCode 可借鉴的具体实现：** [ConversationTimeline.tsx](https://github.com/zai-org/ZCode/blob/328c1a0c0ffaa5a4f65e8fa199af5e4c20706e5f/packages/ui/src/v4/ConversationTimeline.tsx#L1421-L1429) 用 layout cleanup 在 DOM 尚有效时保存；同实例切 scope 则在 DOM mutation 前采样，同时保留最近一次有效状态。Kivio 应把有效采样接入现有 scroll owner，并避免卸载后的零值覆盖有效记录。
+
+浏览器内临时拦截模块响应，仅把这一处 cleanup 改成 `useLayoutEffect` 后，保存值恢复为 `8479`、`rowOffset = 18`，回切为 `8500`，不再跳到顶部。该实验没有写入产品源码，也不代表完整修复验收：仍有 21px 差异，后续应检查测高完成后的同一行相对位置，并覆盖不同宽度、迟到图片和用户打断恢复。
+
+复现步骤：启动 `npm run dev:ui`，打开 `/scripts/fixtures/chat-performance.html`；在浏览器中运行以下代码，再读取 `window.reviewResult`。必须使用原始模块响应，不带上述实验拦截。
+
+```js
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+window.chatAcceptance.show('F1');
+await wait(600);
+const viewport = document.querySelector('.chat-scroll-viewport');
+viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -500, bubbles: true }));
+viewport.scrollTop = Math.floor((viewport.scrollHeight - viewport.clientHeight) / 2);
+viewport.dispatchEvent(new Event('scroll'));
+await wait(500);
+const before = viewport.scrollTop;
+window.chatAcceptance.show('F2');
+await wait(100);
+const { recallChatReadingPosition } = await import('/src/chat/chatReadingPosition.ts');
+const saved = recallChatReadingPosition('F1');
+window.chatAcceptance.show('F1');
+await wait(800);
+window.reviewResult = {
+  before, saved,
+  restored: document.querySelector('.chat-scroll-viewport').scrollTop,
+};
+```
+
+### 10.2 与 ZCode 的当前差距
+
+| 能力 | 本次 Kivio 实现与判断 | 接下来值得借鉴的部分 |
+| --- | --- | --- |
+| 首屏和补页 | 已有尾部 60 条、512 KiB 软预算，兼顾多答组；轻量目录避免为目录加载全文。分页核对 revision/total/end，并隔离失效导航。这批方向正确 | 两边冷打开都可能完整处理后端历史；下一步按阶段测量读盘、准备、IPC、commit、遮罩结束，不能把窗口接口当作磁盘分页 |
+| 按需加载 | 已删除打开即全量补读；补页有去重与重试。未加载目标的搜索/目录跳转、输入历史 ↑ 仍可触发全量读取 | 显式补页与全文目标读取是当前取舍；若目标跳转测得昂贵，再优化定位窗口。ZCode 宽屏目录也可能拉全量，不照搬其自动全拉行为 |
+| 短期回切 | 30 秒、4 项、24 MiB 快照缓存，命中前核对 repository revision；完整读取不会误用部分窗口 | ZCode 保温的是继续接收事件的共享 store。Kivio 当前快照方案更小，先测命中率和回切耗时，无需为一致的时长引入第二套状态 store |
+| 阅读位置 | key、内容版本、相对偏移及历史前插锚点均已实现；保存时机有上述已复现缺陷 | 优先补 DOM mutation 前采样、待测高恢复、用户输入撤销。保留 Kivio 现有布局/内容版本测量缓存 |
+| 大单轮过程 | 历史过程跨组先显示最近 20 项，每次再加 20；实时已展示过程保持，完成后重新展开才重置预算。最终正文和交付产物保留 | 当前限制的是挂载过程卡数量，完整单条消息与派生数据仍可能很大；先测真实大单轮，再决定是否需要更细的显示数据边界 |
+| 附件归属 | 文件选择、粘贴、拖入结果绑定发起草稿；新建会话显式迁移，迟到结果/移除有回归；Excel 文本优先已落地 | 继续验证原生剪贴板、文件选择器和跨窗口生命周期，不能用 mock 成功替代桌面验收 |
+| 图片 | 已有在途请求合并；稳定已发送路径可短期缓存，绝对路径不长期缓存。artifact 列表用缩略图；查看器和右键导出按需原图，失败不会默默导出缩略图 | 用户图片附件仍可能完整 data URL 读取；尚无分块传输或消费者取消读取。应先测重复读取、编码、解码和峰值内存，再决定借鉴 ZCode 的分块/取消边界 |
+| 发送和流式结果 | 用户消息 ID 从乐观占位贯穿后端保存，去掉按相同文本数量猜测；不同刷新批次的终态等价已有回归 | 保留现有运行协议，继续以删除、替换、取消和终态边界约束合并，不复制 ZCode 专有协议类型 |
+
+建议下一批顺序：先修复并补浏览器回切保存回归；再完成 Tauri 冷打开、缓存回切、历史目标跳转、真实图片的分阶段测量；根据测量决定是否投入后端读取缓存、目标窗口或分块媒体。当前 F3 长任务与压力负载长帧仍在，不应宣称滚动和加载整体已经验收完成。
+
+### 10.3 本次检查清单与验证边界
+
+OCR delegate preview 列出 31 个可审查文件；以下均已检查变更及相关调用，共 **31/31（100%），跳过 0**。另外 21 个被工具规则排除的路径为 18 个前端测试、2 篇文档和 1 个 HTML fixture；测试已运行，文档与 fixture 用作验收证据，不把工具过滤误报为代码审查遗漏。
+
+| 分组 | 已检查路径 |
+| --- | --- |
+| 验收（2） | `docs/perf/chat-acceptance-2026-09-24.json`；`scripts/probe-chat-acceptance.playwright.js` |
+| 后端（7） | `src-tauri/src/chat/commands/{attachments,catalog,interaction,send,tests}.rs`；`src-tauri/src/chat/repository.rs`；`src-tauri/src/lib.rs` |
+| 接口（3） | `src/api/tauri.ts`；`src/chat/{api,types}.ts` |
+| 页面与渲染（8） | `src/chat/{Chat,ChatImageContextMenu,ChatImageViewer,ChatInlineImage,ChatMarkdown,InputBar,MessageBubble,MessageList}.tsx` |
+| 状态与资源（9） | `src/chat/{attachmentPreview,chatExecutionOwner,chatNavigationController,chatReadingPosition,chatSendController,composerDraft,conversationHistoryWindow,conversationWarmCache,optimisticUserPresentation}.ts` |
+| 弹窗与跟随（2） | `src/chat/popout/usePopoutSession.ts`；`src/chat/scroll/useScrollFollow.ts` |
+
+本次实际重跑：18 个变更测试文件，254 项全部通过，限制为两个 worker。命令：
+
+```powershell
+$reviewTests = @(git diff --name-only 54b43bc4..3e102b3e -- 'src/**/*.test.ts' 'src/**/*.test.tsx')
+npx vitest run @reviewTests --maxWorkers 2 --minWorkers 1
+```
+
+额外进行了上述 Edge 回切复现与浏览器内单点对照实验。没有重新运行全量 2426 项、Rust 测试、构建和原生桌面验收；第 9 节所链接记录中的成绩属于前次实施验收。现有浏览器验收脚本测量的是同步 UI 提交，不能当作冷读/IPC/可交互的完整切换耗时。
+
+## 11. 阅读位置修复与回归（2026-09-24）
+
+在用户确认修复后，修改现有 MessageList 和宽度测量 hook，未增加新的滚动负责人：
+
+1. **在 DOM 移除前保存。** 把保存阅读位置和测量快照的卸载清理改为 `useLayoutEffect`，避免 detached DOM 的零值污染记录。
+2. **在真实宽度就绪后恢复。** `useChatWidthLayout` 暴露当前内容元素是否完成首次宽度测量；MessageList 等该状态就绪再恢复一次。仅改 cleanup 后，文本场景仍偏移约 30px，代码场景约 282px；定位发现恢复使用的是初始 `704px` 布局，随后切成实测 `864px` 布局。这是第 10.1 节小幅偏移的同类原因。后续宽度变化仍由已有宽度锚点处理。
+
+新增 [浏览器回归脚本](../../scripts/probe-chat-reading-position.playwright.js)，复用现有合成 fixture。先在原实现上观察到保存为 0、目标行消失的失败，再在修复后通过：
+
+| 场景 | 离开 / 保存 scrollTop | 回切后同一行相对视口偏差 |
+| --- | --- | ---: |
+| F1 文本，同宽回切 | 8371 / 8371 | 2px |
+| F2 代码，同宽回切 | 17636 / 17636 | 0px |
+| F1 文本，窗口 1280 → 760px 后回切 | 8350 / 8350 | 0px |
+| F2 代码，窗口 1280 → 760px 后回切 | 17635 / 17635 | 0px |
+
+脚本另外断言恢复后的新滚动不会被拉回、离开时在底部的会话回切仍贴底。缩窄宽度低于消息列最大宽度，确实发生列宽变化。测量使用 Edge 和真实组件，无模型请求、无用户对话。
+
+验证结果：5 个相关测试文件、63 项通过；`npx tsc --noEmit`、两个修改源码文件的 ESLint、`npm run architecture:check` 通过。既有 `probe-chat-scroll.playwright.js` 的普通/压力负载也通过，反向跳帧和空白帧均为 0。本次只修复阅读位置，未做 Tauri 原生窗口、真实附件和完整冷加载性能验收。
+
+复现回归入口（先启动 `npm run dev:ui`，测试期间避免其他编辑触发 Vite 整页刷新）：
+
+```powershell
+playwright-cli -s=chat-reading open http://127.0.0.1:5713/scripts/fixtures/chat-performance.html --browser=msedge
+playwright-cli -s=chat-reading run-code --filename=scripts/probe-chat-reading-position.playwright.js
+playwright-cli -s=chat-reading eval "window.chatReadingPositionReport"
+playwright-cli -s=chat-reading close
+```
+
+## 12. 图片引用与查看计数修复（2026-09-25）
+
+用户截图包含 `present_artifacts` 参数 `artifact_ids: ["dummy"]` 与有效本地 PNG 路径，以及“已查看 3 张图像”但仅一张缩略图。本次分别建立失败回归后修复：
+
+- **图片引用注册失败：** 本地文件已被读取，但后续 `prepare_output` 又解析原始参数里的 `dummy`，以 `Invalid artifact ID` 中止整次结果。现在原生工具复用 artifact 负责人既有的 ID 格式校验，保留有效文件并明确报告忽略的无效 ID；后续注册使用工具筛选后的 ID 集合。全部输入无效仍返回错误，合法 ID 的会话归属校验保持生效。工具 schema 和字段提示允许未使用的列表为 `[]`，提示路径调用不要伪造占位 ID。
+- **张数与缩略图不一致：** 缩略图已经按路径去重，标题却累加每次读取数量。同一路径读取三次因此显示为三张。现在标题与缩略图共用去重结果；没有路径时优先按 artifact ID 区分，同名不同 ID 的图片不会被误合并。缺少图片身份的旧记录仍使用其报告数量。
+
+前端 5 个相关测试文件、166 项通过；Rust `present_artifacts` 相关 13 项通过，包含实际临时 PNG 加 `dummy` 的重放、仅无效 ID 的纠错提示及 prepare/preview 两种模式；另用刚编译的测试程序通过 12 项 artifact 存储测试及 1 项最终引用 ID 补齐测试，共 26 项 Rust 回归。TypeScript、修改文件 ESLint、架构检查通过。此次未在正在运行的 Tauri 窗口重放真实会话；后端修复需重新构建/启动开发版生效，历史失败的工具调用不会自动重跑。
+
+### 12.1 再次检查图片链路
+
+对读取、注册、展示选择、正文引用、缩略图和原图查看继续检查，补充回归并确认以下遗漏：
+
+- **读取状态被隐藏：** 失败、取消和跳过的图片读取仍被归入“已查看”。现在保留普通工具卡片及错误详情；待执行的读取也不再提前宣称已查看。去重仍仅作用于图片展示组。
+- **跨轮展示缺少文件：** 前端只从会话索引补齐正文 `artifact:` 引用，遗漏 `present_artifacts` 明确选中的旧 ID。现在 prepare 的交付入口和 preview 的预览都能解析上一轮图片，不要求正文再引用一次；重挂载回归也覆盖此场景。
+- **历史图片丢失会话信息：** 读图缩略图和原图查看入口固定传空会话 ID，无法解析只保存文件名的外置附件。现在从消息气泡传递所属会话 ID，绝对路径仍由既有附件读取入口处理。
+
+上述场景先出现失败回归，再修正为通过。复查覆盖 6/6 个源码变更文件，跳过 0，覆盖率 100%；OCR 默认排除的两个测试文件和本文也已人工检查。本次前端 7 个测试文件、181 项通过，TypeScript、修改文件 ESLint、架构检查均通过；本轮没有继续修改 Rust，Rust 验证沿用上一段的记录。桌面原生窗口尚未实机重放，自动化覆盖不等同于桌面验收。
+
+### 12.2 读图参数与结果注册的一致性
+
+后续截图和会话工具记录确认还有两条独立失败路径：`artifact_ids: ["art_…"]` 与 `paths: ["dummy"]` 同传时，read 拒绝执行；`artifact_ids: [""]` 与有效图片路径同传时，读取阶段忽略空 ID，结果注册阶段却重新使用空 ID，最终报 `Invalid artifact ID`。此前只修展示工具，未覆盖这条读取链路。
+
+- 读取、结果注册和展示工具复用 artifact 模块的 ID 规范化：忽略空白，去掉首尾空格，按原顺序去重。避免上游成功、下游又解析另一份 ID 集合。
+- read 明确定义非空 ID 选择优先于路径字段，解析为实际路径后同时清理两个旧路径字段，避免占位路径混入批量读取。ID 解析仍经过当前会话归属检查；未知 ID 不回退读取别的文件，错误提示给出改用磁盘路径的正确参数。
+- read、present_artifacts、图片生成/编辑工具的未使用来源数组都允许 `[]`，说明中禁止伪造占位值。生成/编辑仍允许组合真实的文件与 artifact 参考图，其语义不改成 read 的单一来源选择。
+- 将 read 的来源解析留在原生工具负责人内部，以文件解析闭包隔离桌面上下文，回归可直接重放截图参数，并读取临时真实 PNG；未增加跨层编排或自动重试。
+
+先验证截图参数和空数组约束的回归失败，再修复通过。Rust 读取相关 41 项、artifact 存储 13 项、工具定义 23 项、展示工具相关 13 项均通过（分组有重叠）；架构检查通过。
+
+桌面程序重编译后，使用隔离的 `Chat Probe` 会话实际执行了三步：路径读取（两个未使用数组均为 `[]`）→ 同一真实 ID 加 `paths: ["dummy"]` 再读取 → prepare 引用。三次工具调用全部成功，两次 read 的 artifact ID 相同，最终正文生成了该 ID 的图片引用。记录在本机 `chat_probe/result-image-read-selection-20260925.json`，测试会话 `conv_d1dec47c-bd08-4119-bbd7-c6b9d786a996`。这验证的是桌面后端实际调用链，未据此宣称 UI 已截图验收。
+
+测试还暴露了一个验证边界：模型把红蓝测试图描述为“两侧都是蓝色”。已核对两条模型图片消息都引用同一图片，消息外置图片与原文件 SHA-256 完全相同，文件本身仍是左红右蓝；未将该回答计为视觉识别正确，也没有为此修改图片颜色或模型回答。工具读取成功与模型识别准确须分别判断。
+
+### 12.3 扩查其他工具的契约问题（审查记录，已在 12.4 修复）
+
+覆盖当前 3/3 个改动源码文件，跳过 0，覆盖率 100%；另检查 `image_generation.rs`、`native_tools/files.rs`、`native_tools/shell.rs`、`native_tools/fetch.rs` 和 `agent/execute.rs` 的相关调用路径。本文也已人工检查；覆盖率只针对这批改动清单，不代表全仓审查。
+
+| 优先级 | 问题与触发条件 | 归属及修正方向 |
+|---|---|---|
+| P1 | 批量 read 的图片路径全部不存在时，错误被拼成普通文本，外层仍返回 `is_error: false`。实际工具状态为 success，前端仍能按参数路径显示“已查看”。 | `mcp/native_registry.rs:614`、`:723`；批量读取应区分全部失败、部分成功和完整成功，不能仅用成功文本封装错误。 |
+| P2 | `present_artifacts` 的 preview 模式不验证 ID 是否存在。传 `art_probe_missing_20260925` 实测仍返回 `Displayed 1 file`，并向模型宣称该 ID 已注册。 | `chat/artifacts.rs:463`、`:476`、`:492`；prepare/preview 都应解析并检查选择的 ID，是否标记交付单独处理。 |
+| P2 | grep 的 `query: ""` 会挡住有效的 `pattern` 别名。当前先取存在的字段，再判断空值；实测空 query + 有效 pattern 报缺少查询，同一文本放入 query 则命中。 | `native_tools/files.rs:1174`；先确认主字段是有效值，再回退别名。 |
+| P2 | 图片编辑的输入 ID 会去空白、去重，产物版本归属却取原始数组。`[" art_a "]` 或 `["art_a", "art_a"]` 均可成为单张参考图，但 parent 解析失败或直接缺失，结果作为新作品而非已有作品的新版本注册。 | `chat/artifacts.rs:471`、`:510` 对照 `chat/image_generation.rs:1653`、`:1713`；输入选择和版本归属应复用同一组规范化 ID。 |
+
+前三项通过桌面后端隔离会话实际复现，并有正常 grep 对照。证据：本机 `chat_probe/result-tool-contract-review-20260925.json`，会话 `conv_9997b81d-ab73-426c-8595-7978c00d4349`；工具状态依次为 error、success、success、success，后三个 success 中批量读图与无效 ID 预览均不应视为成功。最后一项为代码路径确认，未调用付费图片生成进行复现。本轮只记录审查发现，未修改生产代码。
+
+### 12.4 工具契约修复与回归
+
+用户确认修复后，在各自现有负责人中完成上述四项修复：
+
+- **批量读取：** 统计实际成功项；全部失败返回错误，部分成功明确报告成功数量并保留失败详情，全部成功保持原内容格式。目录读取错误也由同一批次汇总。前端已有错误状态判断，因此全部失败不再进入“已查看”图片组。
+- **引用预览：** prepare 和 preview 都先解析并验证全部选中的 ID，再处理交付状态；仅 prepare 标记交付，preview 不改变作品交付状态。不存在或不属于当前会话的引用不能返回成功。
+- **搜索别名：** grep 先使用非空 query，再回退非空 pattern；两个都为空仍报错。保留非空主字段优先级及搜索文本本身的空格。
+- **图片编辑版本：** 参考图输入和产物父版本选择共用 artifact 模块的 ID 规范化，空白或重复 ID 表示同一张参考图时，保留原作品与父版本；不同会话和真正的多 ID 输入保持原有边界。
+
+新增批量失败、搜索别名和父版本选择三个回归用例，先确认原实现全部失败，再修复为通过。随后通过 82 项相关 Rust 测试、49 项前端工具展示测试，以及架构检查、`git diff --check`。图片版本归属通过临时 artifact 记录验证，未额外调用付费图片生成。
+
+开发版重编译后，桌面后端隔离会话重放同样参数，并加入正常图片读取与预览对照：
+
+| 场景 | 实际工具状态 |
+|---|---|
+| 空 query + 有效 pattern | success，命中目标文本 |
+| 有效 query + 空 pattern | success，命中目标文本 |
+| 两个不存在的图片路径 | error |
+| 不存在的 artifact ID 预览 | error |
+| 正常本地图片读取 | success |
+| 上一步真实 ID 的预览 | success |
+
+证据：本机 `chat_probe/result-tool-contract-fixed-20260925.json`，会话 `conv_abf4e76d-c030-45f3-b628-939d9b3ca955`。另核对预览后的 artifact 持久记录，`delivered` 仍为 false，确认预览不会误发布到作品。这是桌面后端调用与持久化验收，未将其当作 UI 截图验收。
+
+## 13. 当前版本对照复核（b0b6c7e4）
+
+复核日期：2026-09-25。固定比较范围为 `54b43bc43bcf93cfb1dd76758a129e611c3d70f8..b0b6c7e4785475841a9ad7f3f3dd98c8419ff118` 中的聊天加载、滚动、渲染和附件链路；ZCode 仍采用本文开头的固定版本。未审阅无关的用量页面改版。第 13.1～13.4 节记录当时的审查结果；用户随后确认优化，三项修复与验证见第 13.5 节。
+
+### 13.1 相比原调查，已经落实了什么
+
+| 能力 | 当前 Kivio | 与 ZCode 的对照判断 |
+| --- | --- | --- |
+| 首屏加载与历史 | 最近 60 条 / 512 KiB 软预算，保留单条超大消息和多答组边界；返回全局轻量目录，显式补页；远端目录目标和搜索等需求才读取完整历史 | 已落实“先显示最近内容，再按需取历史”。ZCode 的 60 行为协议行，不能直接视为相同负载；其宽屏自动拉全量也不必照搬 |
+| 回切缓存 | 30 秒 TTL、4 项、24 MiB 序列化字符串估算预算；命中前检查 revision；局部历史不会被误当成完整会话 | 已有自己的有界实现。ZCode 的订阅式保温不是必须复制的前提；实际磁盘/IPC收益仍待测 |
+| 阅读位置 | DOM 移除前用 layout cleanup 保存行锚点，按内容 revision 匹配，等待真实宽度后恢复；补页保持可见行 | 已修好第 10 节旧缺陷；相较仅保存像素位置，当前行锚点与宽度处理值得保留 |
+| 滚动与列表 | 单一位置写入负责人、像素预算 overscan、测量补偿、代码块真实占位；新手势中止旧导航 | 本轮浏览器未复现反向跳动或空白帧；压力场景仍有长帧，不能宣称完全流畅 |
+| 重型历史过程 | 默认显示最近 20 项，继续展开；实时已见过程和正文交付保留 | 已覆盖大工具过程的首屏渲染负担；静态 Markdown 模式仍属可选后续优化 |
+| 附件异步与图片 | 草稿 scope、显式新会话迁移、Excel 文本优先；在途读取复用、有界预览缓存、列表缩略图、按需读取原图 | 主链路已落地；以下三个组合边界尚未闭合 |
+
+**当前判断：原来值得借鉴的主要机制已经进入 Kivio。下一步应补齐组合场景并测量真实加载瓶颈，现有证据不足以支持为了性能替换整套对话 UI。**
+
+### 13.2 Standards：窗口接口遗漏引用依赖
+
+**[P2] 长会话尾部再次引用早期 artifact，冷打开时显示“文件不可用”。**
+
+- 位置：`src-tauri/src/chat/commands/catalog.rs:199`；`src/chat/MessageList.tsx:261`。
+- 链路：窗口接口裁掉早期消息，却未附带窗口正文引用的 artifact 元数据；`conversationArtifactsById` 只扫描已加载消息，`MessageBubble` 的跨轮查找因此无法补齐引用，最终 `ChatMarkdown` 显示“文件不可用”。完整历史中可用的引用不应因为传输分窗失效。这是工程规范要求的调用结果契约完整性问题。
+- 复现：合成 66 条消息，首条持有图片，最后一条引用相同 ID。真实 MessageList 在完整历史下显示 1 张图片、无“文件不可用”；按当前 `historyWindowStart` 裁切后 `start=6`，图片数变为 0，并显示“文件不可用”。已在 Edge 复现；后端裁切契约经源码核对，未调用桌面原生窗口接口。
+- 修正方向：窗口和补页由现有读取负责人补齐实际引用所需的最小 artifact 元数据，或按 ID 懒加载。不要为了找一个附件恢复为自动拉取全部历史。
+
+其余所查 scope 归属、迟到导航隔离、分页 revision 校验和滚动写入责任总体符合工程规范，未因文件较长或模块数量报告问题。
+
+### 13.3 Spec：两处组合行为未满足验收
+
+**[P2] 无磁盘来源的内联图片不能右键复制，另存也受同一分支影响。**
+
+- 位置：`src/chat/ChatInlineImage.tsx:130`，调用来源为 `ChatMarkdown.tsx:1122`。对应第 5 节“预览与原图分开”和第 9 节按需原图实现。
+- 原因：`path` 会回退为 Markdown 原始来源或 artifact 显示名称；新逻辑只要见到 `path + data URL` 就强制读磁盘原图。只有完整 `data_url`、没有磁盘路径的图片也进入这条分支。读取失败后菜单停止导出。
+- 复现：渲染只有 `data_url` 的 artifact，图片正常显示；点击“复制图片”，本应提交现有 base64，但实际复制 API 调用为 0，菜单显示“无法读取原图”。临时组件回归按正确预期失败。另存与复制共用 `actionImage`，另存结论来自同一代码路径，未执行系统保存对话框。
+- 修正方向：明确区分可读取的原图路径与显示名称；完整内联图直接使用现有字节。有真实原图路径的缩略图仍应在原图读取失败时报告错误。
+
+**[P2] 欢迎页草稿迁移并重挂后，已移除附件可被旧请求重新加回。**
+
+- 位置：`src/chat/InputBar.tsx:1771`，迟到回写在 `:1089`。对应第 5 节验收中的“新建草稿迁移、移除后迟到”。
+- 原因：附件移除只标记当前 InputBar 实例的 pending scopes；迁移前发起的操作仍存在于已卸载实例的 ref，新实例无法标记它的 `removedPaths`。
+- 复现顺序：草稿已有 X → 再粘贴 X 并延迟读取结果 → `migrateNewChatDraft` → 欢迎页输入框卸载、会话输入框挂载 → 移除 X → 旧读取返回。临时组件回归确认移除后列表为空，但旧结果返回后 X 再次出现在会话草稿中。
+- 修正方向：待处理操作的移除/失效状态应由草稿负责人管理，随迁移与重挂保持一致；继续允许未被移除的旧操作回填原草稿。
+
+### 13.4 本轮验证与仍需测量的部分
+
+- 现有差异相关前端回归：**22 文件、332 项全部通过**，使用 `--minWorkers=1 --maxWorkers=2`。首次仅设置 maxWorkers 与现有最小 worker 配置冲突，未执行测试；修正参数后完成。
+- 两个新增临时组件复现分别确认上述内联图复制和重挂后移除缺陷；临时用例已清理，不混入 332 项通过数。历史引用问题改用真实浏览器验证，避免 jsdom 无真实布局时未挂载末行造成误判。
+- 阅读位置探针：F1/F2 同宽回切误差分别 **2px / 0px**，1280→760px 缩窄回切均 **0px**；恢复后新手势保持控制、回到底部后回切继续跟随，均通过。误差指相同行的屏幕偏移，宽度改变时绝对 scrollTop 可以变化。
+- 快滚探针：普通与压力场景均 **0 反向帧、0 空白帧**；P95 帧间隔分别 **13.8 / 31.6ms**，最长帧 **39 / 70.2ms**，DOM 峰值 **1023 / 7478**。沿用第 2 节脚本，Edge 开发模式合成数据；这是本轮样本，不作为跨日性能提升比例。
+- 本轮未重跑 Rust 测试，未重放第 12 节工具后端修复，也未验收 Tauri 原生滚动条、真实大量图片、多窗口。
+- **冷加载仍先完整读取/解析会话，历史补页也会完整读取后再切片。** 当前窗口化主要减少返回体与前端处理量，不能视为磁盘真正分页。下一步先测磁盘解析、IPC、首屏可交互与回切延迟，再决定是否改存储布局；现有同步 UI 耗时不覆盖这些阶段。
+
+本轮汇总：Standards 1 项，最高 P2；Spec 2 项，最高 P2。第 10 节已修好的阅读位置缺陷不计入本轮发现。
+
+### 13.5 三项修复与验收
+
+用户确认优化后，在现有负责人中修复以上三项：
+
+- **历史引用依赖：** 窗口/补页继续按原预算返回消息，同时以 `history_artifacts` 补齐当前窗口缺少、正文/分段/prepare/preview 实际引用的附件信息与已有缩略图。后端 artifact 模块负责投影，API、分页合并和 MessageList 传递同一结果；不改消息原始归属、不标记交付、不读取原图、不回退到全量加载。全局引用索引保留已加载消息优先，跨页结果按 ID 去重。复用的引用正则改为进程内编译一次。
+- **内联图片导出：** Markdown 图片只有真实文件来源才传入磁盘路径；完整内联图直接使用已有字节。复制与另存均有回归，同时保留“原图读取失败不得导出缩略图”的约束。
+- **重挂后的附件移除：** 待处理附件操作的失效状态从 InputBar 实例移到 `composerDraft`，删除组件内部重复 pending 集合。迁移和重挂后，移除操作仍能拦住旧结果；后续明确重新粘贴同一路径可以正常添加。正常切会话回填原草稿的行为保留。
+
+先确认内联图复制/另存、重挂移除、窗口接口缺依赖、分页丢依赖的回归失败，再完成修复。最终 **16 个前端测试文件、213 项通过**；Rust **3 项历史窗口测试与 14 项 artifact 测试通过**。TypeScript、修改文件 ESLint、协议生成一致性、架构检查与差异检查通过。
+
+Edge 使用真实 MessageList 与开发 API 合成会话验证：130 条历史中，首次只加载 60 条、补页后只加载 120 条，两次都只补充 1 条早期图片引用，图片正常显示且无“文件不可用”。本轮临时浏览器夹具已清理，长期回归保存在现有 API、分页、MessageList 和 Rust 测试中。阅读位置脚本（含宽度变化、用户接管和重新跟随）通过；快滚普通/压力场景均 0 反向帧、0 空白帧。本次快滚 P95 为 10.8/36.4ms、最长帧 46.6/87.8ms，仍有长帧，不能据此宣称帧率已提升。
+
+本轮未在 Tauri 原生窗口执行 UI 验收；后端修复需要重新构建/启动开发版后生效。磁盘全量解析与真实冷加载测量仍是第 13.4 节列出的后续工作。
+
+## 14. 长任务流式卡顿：ZCode 对照与实施计划（2026-09-29）
+
+用户报告内置运行时与外部 CLI 代理都会出现：运行越久，滚动、侧栏折叠和右侧文件展开越慢；结束并折叠后改善。**14.1～14.5 保留先前调查和计划，14.6 记录用户要求一次完成后的实际修复与验收。**
+
+### 14.1 证据与优先级
+
+两种运行时最终进入共享渲染路径。当前首要缺陷位于 MessageBubble → TimelineSegments → ChatMarkdown：
+
+- `streamApply.ts` 已保留未变化 segment/tool 对象，`ChatMarkdown` 和 `ToolCallBlock` 也已有 memo。
+- `TimelineSegments` 随 segments 变化重建整个 prepared，其中每次生成新的 citations Map；MessageBubble 的 prepared 随整条 message 变化，每次生成新的 renderArtifacts 数组。
+- 这些引用传给未变化的旧文本，导致 Markdown memo、remarkPlugins 和 components 缓存失效。主线程重复处理旧内容，其他 UI 操作也受影响。
+- 已有 F4 是单篇 20k 字符输出；500 项工具夹具是历史过程展开。二者都未覆盖“同一活动消息积累几百段文本与工具后继续输出”。既有 M3 主要保护历史消息，需补充活动消息内部旧段落的边界。
+
+生产构建浏览器隔离实验，真实 MessageList/MessageBubble/ChatMarkdown，300 步全部展开，末段连续追加 12 次；仅稳定 citations/artifacts 引用，不减少节点：
+
+| 场景 | DOM 节点 | 同步更新中位数 | 最大同步更新 | >50 ms 长任务 |
+| --- | ---: | ---: | ---: | ---: |
+| 原版，第一轮 | 10,886 | 250.3 ms | 299.5 ms | 12 |
+| 实验版，第一轮 | 10,886 | 3.6 ms | 4.5 ms | 0 |
+| 实验版，交换运行顺序 | 10,886 | 2.8 ms | 3.6 ms | 0 |
+| 原版，交换运行顺序 | 10,886 | 217.4 ms | 303.3 ms | 12 |
+| 实验版，1,000 步 | 36,086 | 9.0 ms | 11.5 ms | 0 |
+
+这证明应先阻止旧 Markdown 重渲染。此早期实验仅导入基础 index.css，未覆盖完整 app.css；完整样式中的合成层瓶颈在 14.6 补充发现并修复。实验保持 toolCalls 引用不变，尚未证明工具输出、引用迟到等路径正确。同步提交耗时不等于用户点击到下一次绘制的延迟，浏览器也不能代替 Tauri WebView2。原始实验归档在本机 `%TEMP%/kivio-stream-audit-20260929-2238/zcode-followup/`；正式交付的复现入口见现有性能基线文档。
+
+### 14.2 借鉴边界
+
+| ZCode 做法与源码入口（参考仓库相对路径） | Kivio 的适配决定 |
+| --- | --- |
+| `packages/shared/src/zcode-protocol-v4/apply.ts` 保留旧行引用；`packages/ui/src/v4/ConversationRowView.tsx` 与 `components/ai-elements/message.tsx` 在行和 Markdown 两层缓存 | 优先让现有 memo 有效，依赖只随实际内容改变；不新增另一套流式 store 或协议 |
+| MessageResponse 比较实际文本、状态、主题、回调等输入 | 稳定引用与附件依赖；不可用“只比较正文”的 comparator 忽略引用和图片更新 |
+| 每行独立 streaming 状态，完成文本使用 static | 保留当前 parser identity。当前 Kivio 明确依赖流式到完成时的同一解析结构；按段状态作为后续独立实验 |
+| `conversationAssistantWorkItems.ts` 聚合同类工具；ToolLayout 的 renderContent 延迟挂载 | 可借鉴摘要和按需详情，但第一批不改变用户看到的过程布局 |
+| 30 ms 合批、初始尾部行窗口、终端输出头尾预算 | Kivio 已有合批和历史窗口；本次不通过继续降频掩盖渲染成本，不截断原始消息 |
+| 动态测量、宽度变化收敛、代码/差异 Worker | 保留现有滚动负责人；只有正式复测仍定位到这些成本时再做独立改动 |
+
+ZCode 仍有全 store 订阅与轮次结构重算，不是整棵树都只更新一行；初始 60 行也不是运行期间的永久上限。本计划借鉴其昂贵组件的渲染边界，不以完整移植 ZCode 为目标。
+
+### 14.3 第一批实施：局部更新与完整验收
+
+**步骤 1：补齐能失败的回归与基线。**
+
+- 扩展 `performanceFixtures.ts` 和 `scripts/fixtures/chat-performance.html`，加入 F5：同一活动消息交错积累 300/1,000 个文本与工具步骤。分别重放末段文字追加、工具输出追加、工具状态切换、引用和附件到达；通过已有 streamPreviewOwner 的真实事件入口发布，避免只用手写 snapshot 绕过更新流程。
+- 在 MessageBubble/streamingStore 渲染回归中计数昂贵 Markdown 渲染：追加末段时旧段落为 0；不影响来源和附件的工具更新时，旧 Markdown 同样为 0。先观察原版失败。
+- 正确性使用真实 Markdown 组件验证；渲染次数探针可以使用保持 memo 行为的轻量替身，但不能拿替身耗时作性能结论。
+- 同机、同窗口、同构建模式保存修改前后的生产构建数据；分别记录初始挂载与稳态输出。开发模式 Profiler 只作热点定位，不混入生产耗时比较。
+
+**步骤 2：收窄派生依赖，保持现有归属。**
+
+- `MessageBubble.tsx`：把 tool 索引、引用派生从依赖 segments 的大 prepared 中分离；使用稳定的空值，避免无工具/无附件时每帧新建空数组。
+- `citations.ts` 与调用处：缓存按实际引用来源失效。普通终端/read 工具的输出、状态变化不应重建语义相同的引用索引；保留 KB 优先、后来的 Web 来源覆盖同编号等既有规则。若需比较，只比较规范化的引用字段，不对整个工具输出做 JSON.stringify 或深比较。
+- 附件列表仍由 MessageBubble 选择，保留本条附件、工具附件及被实际引用的早期附件；成员、顺序和对象内容不变时保持引用。相同 ID 的内容替换、新增引用、附件迟到必须失效，不能仅比较 ID。保留相对图片路径解析与交付去重语义。
+- `ChatMarkdown.tsx`：沿用现有 memo 和 document/block identity；检查默认数组、outline 元数据及回调的引用稳定性。内容、实际引用/附件、主题或会话归属变化仍需正确刷新。
+- 不增加通用缓存框架、平行状态容器或每段独立订阅。局部稳定派生值放在现有组件，只有纯引用规则需要复用时才留在现有 citations 模块；组件卸载/会话变化时不得复用到另一消息。
+
+**步骤 3：验证状态转换与真实交互。**
+
+| 场景 | 必须保持的结果 |
+| --- | --- |
+| 末段文字、思考更新；普通工具输出/状态变化 | 旧 Markdown 不因无关依赖重渲染，当前内容持续可见 |
+| 引用新增、同编号替换、来源消失、KB/Web 冲突 | 角标及弹层展示当前正确来源，没有因缓存停留在旧内容 |
+| 附件迟到、同 ID 替换、跨历史窗口引用、相对图片路径 | 图片/文件正确刷新，原图不退化为缩略图，无重复交付 |
+| 完成、停止、错误、取消失败后恢复、再次运行 | 保留全部已接收内容，live→历史不重复、不闪回、不重置展开状态 |
+| 切换会话、并行模型、子代理更新 | 旧任务迟到结果不污染新会话，引用与附件归属正确 |
+| 边输出边上翻、侧栏折叠、右侧文件树/预览展开 | 用户阅读锚点不被夺走，跟随时保持底部，输入和点击能及时响应 |
+
+运行对应的 MessageBubble、ChatMarkdown.stream、streamingStore.render、citations、deliveries、滚动与历史附件测试，以及新 F5 回归。完成后运行 `npm run test`、`npm run typecheck`、`npm run lint`、`npm run architecture:check`、`npm run build:ui`、`git diff --check`；没有后端行为改动时不额外扩大为 Rust 全套测试，typecheck 自带协议一致性检查。
+
+浏览器复测 F1～F5，保存脚本与结果到既有性能入口。Tauri 实机分别运行内置运行时和外部 CLI 代理，至少覆盖“长任务继续输出→操作两侧栏→停止→同会话再次运行”。浏览器合成数据通过不能标记此项完成。
+
+### 14.4 验收指标与完成定义
+
+- **确定性门槛：** 无关更新不触发旧 Markdown 的昂贵渲染；引用、附件真正变化时可见内容正确；现有流式、滚动、历史、错误恢复回归全部通过。
+- **同机性能目标：** F5 300 步稳态更新中位数较原版降低至少 80%，预热后的更新 P95 目标低于 16 ms；同时记录 1,000 步结果和长任务。此为本次目标设备的验收目标，不写成所有机器通用的单元测试硬阈值。未达标则继续采样定位，不能只以总测试通过收尾。
+- **交互：** 原生窗口记录侧栏折叠、文件展开从输入到下一次可见更新的 P50/P95、长任务和滚动情况；同机前后比较，确认不存在随持续输出反复出现的百毫秒级主线程阻塞。冷文件读取耗时与流式渲染阻塞分开记录。
+- **探针限制：** 现有 `probe:chat-performance` 只提供 64 rows、12,000 DOM、250 ms 长任务的宽松护栏，不能代替上述验收。F5 1,000 步节点数可能超过现有护栏，应如实报告第一批只解决更新成本、尚未解决 DOM 规模，不能调高预算把它写成通过。
+- **交付：** 一批局部生产修改、能复现旧缺陷的回归、F5 固定夹具、同机前后报告和原生验收记录；工程与性能状态继续更新本节及既有性能文档。
+
+### 14.5 第二批候选及明确前置条件
+
+第一批完成后，按 F5 的剩余布局/挂载成本决定第二批范围。候选为 ZCode 式相邻探索/终端摘要和按需详情，必要时再设计步骤级视口窗口。后者必须共用现有滚动容器与滚动负责人，不能再加内层独立滚动条。
+
+这里存在明确的产品约束：`docs/perf/chat-acceptance-2026-09-24.md` 及 `MessageBubble.test.tsx` 要求“实时输出不移除已见步骤，显式展开延续到完成”。直接把 Infinity 改为最近 20 项会改变已验收行为；本计划不这样做。分组或窗口若需要改变此语义，应先呈现具体交互方案并明确调整原验收，而不是静默修改测试。
+
+分组必须保持文本/产物/用户补充消息之间的顺序边界、稳定 key，以及用户已经打开的详情；不能因第二个工具到达而把用户正在读的第一个工具收起。活动工具、失败结果和需要输入的操作必须可发现，全部历史仍可访问。
+
+按段 streaming/static、代码/差异 Worker、传输输出预算均为后续独立候选：只有复测指出相关瓶颈并能保持现有语义时进入实施。本批不调整模型输入、持久化、CLI 原生历史读取、已有节流频率或已验收解析模式。
+
+### 14.6 一次交付结果：渲染缓存与合成层同时修复
+
+用户随后要求使用 implement 技能一次完成。本次没有把渲染修复与复测中发现的绘制瓶颈拆成待办，两处都已处理：
+
+- **Markdown 边界：** 参考 ZCode 的 MessageResponse，在现有 ChatMarkdown memo 处比较实际正文、引用字段、附件成员引用、会话、回调与目录归属。TimelineSegments 的引用索引和工具索引只随工具变化派生。普通工具输出更新也能跳过旧 Markdown，不依赖父组件容器引用恰好不变。
+- **迟到依赖：** 复用并扩展现有 Markdown 引用 Context，让缓存块中的相对路径图片、来源角标、文件链接读取最新数据；组件类型和解析插件保持稳定。引用候选始终保留，缺少来源时显示原文字面量，来源到达/替换/消失时局部更新。图片异步读取按路径和会话校验，保留取消保护；替换文件读取失败不再显示旧图。
+- **结束后的动画层：** 完整 app.css 复测发现，仅修 Markdown 后，1,000 步虽然同步更新约 9 ms，主线程排队仍约 307 ms。CDP 跟踪显示 1.8 秒样本内 Layerize 约 1.4 秒、Paint 约 0.55 秒；已结束的入场动画仍给约 272,000px 高的气泡保留 transform，运行指示器的动画反复带动整个层重绘。将 `.chat-motion-bubble-in` 的 fill 从 both 改为 backwards，保留入场效果、结束后释放 transform；同节点消融实验的排队延迟降为约 20 ms、长任务为 0。
+
+当前实现保留完整过程、用户展开状态、原有解析模式和滚动负责人。没有通过截断历史、隐藏已见步骤、降低推送频率或换协议取得这些结果。本次不需要引入工具聚合、步骤虚拟化或新 Worker 框架。
+
+**正式生产构建对照：** Windows、Edge 154、1280×900，使用完整应用样式；同一 F5 夹具，经既有 preview owner 应用文本和工具事件。每组预热后测 20 次更新；不含冷挂载和节流等待。基线使用 `143153c2` 的三个渲染/引用模块及聊天样式，其他代码与依赖一致。
+
+| 场景 | DOM | 同步更新中位数 / P95 | 排队延迟中位数 | >50 ms 长任务 |
+| --- | ---: | ---: | ---: | ---: |
+| 基线 300 步，文字 | 10,895 | 236.0 / 279.1 ms | 260.0 ms | 25 |
+| 修复后 300 步，文字 | 10,895 | 3.3 / 5.7 ms | 6.8 ms | 0 |
+| 基线 300 步，工具 | 10,895 | 217.7 / 237.2 ms | 245.0 ms | 20 |
+| 修复后 300 步，工具 | 10,895 | 3.2 / 4.6 ms | 6.1 ms | 0 |
+| 修复后 1,000 步，文字 | 36,095 | 8.9 / 13.7 ms | 19.7 ms | 0 |
+| 修复后 1,000 步，工具 | 36,095 | 7.9 / 9.7 ms | 18.5 ms | 0 |
+
+4 组修复后样本均断言全部文本段存在、动画结束后 transform 为 none，改变宽度后的底部偏差为 0px。节点仍随步骤增长，1,000 步也仍超过原 12,000 DOM 护栏；没有上调护栏或宣称内存有硬上限。这里证明的是给定规模下的持续更新与绘制成本改善。
+
+**回归和审查：** 新回归先观察到旧 30 段重复渲染失败；覆盖真实 Streamdown、真实流事件 owner、普通工具进度、迟到/替换/移除引用、字面量零前缀、同 ID 图片替换及读取失败、目录归属。最终 294 个测试文件、2,525 项通过；typecheck（含协议检查）、lint、架构检查、生产 UI 构建和差异检查通过。CSS 后续修复另经完整生产夹具验证。既有 F1～F4 浏览器验收和历史工具 20→40 项按需展示通过；宽度变化后 F1～F4 底部偏差均 0px。code-review 的 Standards 与 Spec 两轴审查提出的字面量和图片边界问题均已修复、复核，无遗留发现。
+
+**原生窗口：** 实际 Tauri WebView2 开发窗口中，通过共享 preview owner 投入 300 步合成流，持续追加期间连续三轮收起/展开侧栏、打开/关闭右侧面板、切换文件页均成功。12 次有标签按钮从点击处理开始到第二次 rAF 为约 49～99 ms，采样有 1 次 59 ms 长任务。测试后恢复原来的预览状态及面板，不写入合成历史、不调用模型。这不是真实模型/CLI 长任务的端到端验收；当前会话文件目录为空，未覆盖实际文件树子目录展开或大文件冷读，未做原生窗口旧版本的同场景耗时对照。
+
+原始结果见 [chat-streaming-2026-09-29.json](../perf/chat-streaming-2026-09-29.json)。长期复现入口为 [性能基线](../perf/chat-rendering-baseline.md)、`scripts/build-chat-performance.mjs` 和 `scripts/probe-chat-long-run.playwright.js`；原生测试用的是临时脚本，数值和测试边界已保存在原始结果中。已完成的局部更新修复不依赖这些临时文件。
+
+### 14.7 2026-09-30：真实模型、CLI 与文件树实机验收
+
+用户要求补齐实际测试。本次直接操作正在运行的 Tauri / WebView2 开发窗口，新建「长对话实测20260930」项目，使用临时目录内 60 份公开合成 Markdown 文件。消息由输入框发送，模型、工具执行、持久化和界面更新均走实际路径，没有注入聊天事件或伪造工具结果。
+
+- **内置运行时：** 前两轮各读一份就结束，不作为长任务样本；随后用 deepseek-flash 完成 28 次读取及长报告，再在同一会话中完成 30 次读取及长报告。持久化记录共 60 次成功调用、29,142 字符回答，覆盖长历史完成后再次运行。
+- **外部 CLI：** Codex CLI / GPT-5.6-Sol 连续完成 60 次独立只读调用，每次读取后输出 Markdown 表格和分析，持久化为 121 个分段、9,527 字符。界面过程计时 7m 19s。之后同一会话续跑两轮，每轮 10 次成功调用；累计 80 次成功调用。第一轮续跑期间开发重载清除了探针，其耗时不计入结果；最终修复后的第二轮重新独立采样。
+- **真实交互：** 在工具执行和文字持续输出期间，完成 24 轮带结果断言的左侧栏收起/展开、右侧栏关闭/打开、目录折叠/展开、文件预览与滚轮操作。读取的预览确实显示 `# Case 2`，关闭后消失。CLI 第 46 次调用附近还拖动左右栏宽度并恢复，宽度变化与恢复值均通过断言。
+
+| 运行样本 | 流式期间有标签点击数 | 点击处理到第二次 rAF 中位数 / P95 / 最大值 | 事件时间戳到处理器 P95 | >50 ms 长任务 |
+| --- | ---: | --- | ---: | --- |
+| 内置运行时（含同会话续跑） | 72 | 25.5 / 67.1 / 87.5 ms | 5.6 ms | 3 次：55、65、86 ms |
+| CLI 60 次调用长任务 | 107 | 22.0 / 51.5 / 62.9 ms | 5.3 ms | 0 |
+| CLI 最终版本续跑 10 次 | 55 | 24.9 / 47.5 / 56.6 ms | 4.3 ms | 0 |
+
+这些样本未复现持续输出时秒级的整页卡顿。指标是处理器与帧调度时间，**不等同于完整输入到屏幕呈现、文件读取完成时间**；异步内容可见性另由断言确认。测试期间窗口尺寸有变化，两种运行时不能互相当作同尺寸性能对照。没有测试多小时运行或巨大文件冷读，1,000 步规模仍参考 14.6 的生产夹具。
+
+**实测发现并修复的文件树问题：** 切换会话/重新进入项目时，展开集合会恢复，节点内容却只加载根目录，出现“目录显示已展开但里面为空”。在原有 `useFileTree` 内逐层补载可见的已展开目录，沿用既有请求去重和错误展示；隐藏面板、折叠祖先、失败节点不自动重试。额外修正请求编号在树重置后复用的问题：编号跨重置单调增长，旧请求的 finally 只清理属于自身的标记，避免隐藏项切换或 A→B→A 时旧结果覆盖新树。先观察到恢复测试失败，再观察到两条乱序响应测试失败；修复后 6 项回归及 34 项相关测试通过。原生窗口重载后无需再次点击目录，子文件自动出现，预览内容正确。
+
+**仍有一个独立的取消恢复失败样本：** CLI 在启动、尚未收到工具事件时立即停止，再立即发送新消息，返回 `thread-start: ... already has an active writer`。稍后再次发送可以恢复回答。这不是已复现的页面卡顿，也未在本次渲染/文件树修改中修复；不能把“取消后立即续跑”标为通过。首次取消脚本错误使用 async 轮询条件，实际没有等到预期的两次工具调用，因此该样本只能证明**启动阶段取消**的恢复冲突，不能冒充执行中取消的验收。
+
+**最终工程检查：** 295 个测试文件、2,531 项测试通过；TypeScript、lint、架构检查（0 临时例外）、生产 UI 构建和差异检查通过。规范与需求两轴复核均无本次修改的遗留发现。测试项目和会话保留供复查，探针已清理，任务均已结束。
+
+测量值、逐次点击和交互断言见 [chat-native-streaming-2026-09-30.json](../perf/chat-native-streaming-2026-09-30.json)。复现脚本及方法见[性能基线](../perf/chat-rendering-baseline.md)。
+
+### 14.8 2026-09-30 过程段局部更新与基线修正
+
+整体复审后继续对照 ZCode 的 `ConversationRowView` 行级 memo：在现有 `TimelineSegmentNode` 上比较各类段真正使用的输入，工具段只接收自身工具记录，思考展开回调保持稳定。已结束的思考和未变化的文字、工具段不再随无关输出重新渲染。沿用原有 key、解析模式、实时过程数量和用户展开状态；没有新增 store，也没有实施同类工具聚合或步骤虚拟化。
+
+先建立失败回归，确认无关文字更新确实重复渲染已结束思考，再修复。新增用例覆盖时长变化、思考结束、展开状态跨完成保留、工具记录迟到及同 ID 结果替换；原有引用、图片替换与冻结帧回归继续通过。
+
+**基线构建修正：** Vite/PostCSS 的 CSS `@import` 直接读取磁盘，原来的 `load` 钩子实际只替换三个 TS 模块。产物断言在旧实现上复现 `expected both, got backwards`。现在入口引用同目录的临时历史 CSS，构建结束或失败均清理；对 `143153c2`、`442f53c4` 和当前源码分别校验产物的动画填充模式，均通过。此修正保证之后可复现完整的渲染隔离基线，不直接否定此前已保存的测量。
+
+**本轮生产对照：** 基线为 `442f53c4`，Edge 1280×900，每组 20 次更新，前后各两轮串行测量。每次宽度验收后恢复原宽度；排除两次重叠执行的探索样本。下表为两轮同步提交中位数的范围，单位 ms：
+
+| 场景 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 300 步，文字更新 | 3.3–3.9 | 2.1–2.4 |
+| 300 步，工具更新 | 3.3–3.8 | 2.0–3.0 |
+| 1,000 步，文字更新 | 7.5–9.0 | 5.0–5.4 |
+| 1,000 步，工具更新 | 8.0–8.2 | 4.9–5.6 |
+
+过程正文数量、DOM 数量保持一致，宽度变化后的底部偏差均为 0px。收益主要在稳态更新；峰值仍有波动，其中一轮千步工具更新 P95 为 30.8ms，原样保留。新增 `mountCommitMs` 测量包含旧列表卸载与新 key 挂载，并保留模块缓存，**不是应用冷启动**。千步重新挂载约 1.2–1.5s，本轮未证明这部分有稳定改善。同步提交与第二个动画帧也不能等同于实际屏幕呈现延迟。
+
+**桌面功能复测：** 在原有长历史测试会话中，内置运行时新增 8 次读取、CLI 新增 5 次读取；从持久化确认均成功且回答完成。内置运行时的三轮侧栏、文件预览和滚动操作分别发生在 3/5/8 个工具记录时；CLI 的三轮操作覆盖启动/初始文字输出，另三轮覆盖完成态。滚轮探针新增必须实际向上移动的断言。内置探针的后续导出因开发重载丢失，保留工具返回的功能断言和持久化核对，不补造时延样本。原生功能复测与工程检查并行，本轮不据此给出原生性能降幅。
+
+全量 295 个测试文件、2,534 项测试通过；TypeScript、lint、架构检查（0 临时例外）、生产 UI 构建通过。规范与需求两轴复审均无可行动发现。执行中取消后立即续跑、应用冷启动及原生同条件旧新时延对照仍未闭合；已有 active-writer 冲突未在本轮修改。详见[本轮原始记录](../perf/chat-streaming-followup-2026-09-30.json)。

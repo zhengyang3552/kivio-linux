@@ -117,6 +117,7 @@ pub(crate) async fn chat_execute_agent_plan(
         None,
         None,
         Some(message_id.unwrap_or_default()),
+        None,
     )
     .await
 }
@@ -171,6 +172,7 @@ pub(crate) fn chat_confirm_tool_call(
             permission_mode: permission_mode
                 .map(|mode| mode.trim().to_string())
                 .filter(|mode| !mode.is_empty()),
+            always: false,
         },
         always.unwrap_or(false),
     ) {
@@ -382,6 +384,9 @@ pub(crate) async fn chat_steer_message(
     content: String,
     text_attachments: Option<Vec<TextAttachmentInput>>,
 ) -> Result<bool, String> {
+    if defer_command_injection(&content) {
+        return Ok(false);
+    }
     let content = compose_text_attachments_for_api(&content, &text_attachments.unwrap_or_default());
     let Some(message) = crate::chat::agent::SteeringMessage::new(steer_id, &content) else {
         return Ok(false);
@@ -412,6 +417,39 @@ pub(crate) async fn chat_steer_message(
         .push_steering(&conversation_id, message))
 }
 
+// Commands need the normal send path's skill/protocol resolution. Returning false
+// preserves the queue item for that path instead of injecting an unexpanded token.
+// Inspect only the user's draft, before attachments add quoted source material.
+fn defer_command_injection(content: &str) -> bool {
+    !crate::chat::slash_commands::command_ranges(content).is_empty()
+}
+
+#[cfg(test)]
+mod command_injection_tests {
+    use super::defer_command_injection;
+
+    #[test]
+    fn explicit_commands_wait_for_normal_send() {
+        for content in ["/wizard task", "请用/skill:wizard task", "/unknown task"] {
+            assert!(defer_command_injection(content), "{content}");
+        }
+    }
+
+    #[test]
+    fn literal_commands_and_paths_still_allow_injection() {
+        for content in [
+            "ordinary task",
+            "https://host/wizard",
+            "C:/wizard",
+            "`/wizard`",
+            "```\n/wizard\n```",
+            "> /wizard",
+        ] {
+            assert!(!defer_command_injection(content), "{content}");
+        }
+    }
+}
+
 /// 原生 follow-up：把消息排到当前运行结束后，由同一个常驻会话 / 内置循环继续处理。
 ///
 /// 外部 CLI：Pi RPC `follow_up`；dsh 官方 `session/prompt` → `agent.followup()`。
@@ -428,6 +466,9 @@ pub(crate) async fn chat_follow_up_message(
     attachments: Vec<String>,
     text_attachments: Option<Vec<TextAttachmentInput>>,
 ) -> Result<bool, String> {
+    if defer_command_injection(&content) {
+        return Ok(false);
+    }
     let mut content =
         compose_text_attachments_for_api(&content, &text_attachments.unwrap_or_default());
     let paths: Vec<std::path::PathBuf> = attachments.into_iter().map(Into::into).collect();
@@ -589,6 +630,7 @@ pub(crate) async fn request_tool_approval_outcome(
         return crate::chat::interaction_state::ToolApprovalOutcome {
             approved: true,
             permission_mode: None,
+            always: false,
         };
     }
     let rx =
@@ -785,7 +827,7 @@ pub(super) fn format_tool_approval_summary(record: &ToolCallRecord) -> ToolAppro
     // 的话外部 CLI 的审批卡永远落进 `_` 分支、只剩一坨截断的 JSON（与 spec 第 23 条前端
     // 工具卡踩过的是同一个坑）。字段名同理：claude 用 `file_path`，我们用 `path`。
     match record.name.to_ascii_lowercase().as_str() {
-        "bash" | "run_command" => {
+        "bash" | "run_command" | "write_stdin" => {
             if let Some(command) = field(&["command"]) {
                 target = Some(truncate_chars(
                     command.lines().next().unwrap_or(&command),
@@ -795,6 +837,19 @@ pub(super) fn format_tool_approval_summary(record: &ToolCallRecord) -> ToolAppro
             }
             if let Some(cwd) = field(&["cwd", "working_directory"]) {
                 lines.push(format!("Working directory: {cwd}"));
+            }
+        }
+        // claude 转来的 MCP URL 请求（如登录）：卡片要露出完整链接和是哪个服务器在要。
+        "open_url" => {
+            if let Some(url) = field(&["url"]) {
+                target = Some(truncate_chars(&url, 120));
+                lines.push(url);
+            }
+            if let Some(server) = field(&["server"]) {
+                lines.push(format!("MCP server: {server}"));
+            }
+            if let Some(reason) = field(&["reason"]) {
+                lines.push(truncate_chars(&reason, 400));
             }
         }
         "write" | "edit" | "read" | "write_file" | "edit_file" | "read_file" | "notebookedit" => {

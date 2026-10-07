@@ -18,6 +18,7 @@ import { mergeClearContextState } from '../contextClearBoundary'
 import { ContextIndicator } from '../ContextIndicator'
 import { dockApi } from '../dock/api'
 import { useTauriEvent } from '../hooks/useTauriEvent'
+import { keepNewerTodoState } from '../agentTodoState'
 import type { InputBarProps } from '../InputBar'
 import {
   deriveDshPresetModes,
@@ -98,7 +99,7 @@ function applyConversationMeta(
   setConversation((prev) => {
     if (!prev || prev.id !== updated.id) return updated
     if (updated.revision < prev.revision) return prev
-    return { ...updated, messages: prev.messages }
+    return { ...keepNewerTodoState(updated, prev), messages: prev.messages }
   })
 }
 
@@ -397,13 +398,17 @@ export function usePopoutComposer({
   useTauriEvent(api.onChatCompaction, (payload) => {
     if (payload.conversationId !== conversationIdRef.current) return
     if (payload.trigger !== 'manual') {
-      setContextCompressing(payload.phase === 'started')
+      setContextCompressing(payload.phase === 'started' || payload.phase === 'retrying')
     }
   }, [])
 
   const handleRefreshContext = useCallback(() => {
     void refreshContextStats()
   }, [refreshContextStats])
+
+  const handleStopCompression = useCallback(() => {
+    void chatApi.cancelStream(conversationId).catch((err) => setContextError(String(err)))
+  }, [conversationId])
 
   const handleCompressContext = useCallback(async () => {
     if (contextCompressing) return
@@ -633,6 +638,7 @@ export function usePopoutComposer({
         usesExternalRuntime={usesExternalRuntime}
         onRefresh={handleRefreshContext}
         onCompress={handleCompressContext}
+        onStopCompression={handleStopCompression}
         onClear={usesExternalRuntime ? undefined : handleClearContext}
         lang={lang}
       />
@@ -645,6 +651,7 @@ export function usePopoutComposer({
       displayMessages,
       handleClearContext,
       handleCompressContext,
+      handleStopCompression,
       handleRefreshContext,
       lang,
       streaming,
@@ -678,7 +685,7 @@ export function usePopoutComposer({
 
   return {
     onSend: send,
-    disabled,
+    disabled: disabled || contextCompressing,
     onCancel,
     cancelVisible,
     cancelling,

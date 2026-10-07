@@ -15,6 +15,18 @@ pub trait AgentHost: Send + Sync {
         false
     }
     fn run_ended(&self, _conversation_id: &str) {}
+    /// At a normal answer boundary, keep the current parent turn alive for its
+    /// outstanding children. True means results or user input should be checked
+    /// again; false means this turn has no remaining child work. Never starts a
+    /// new parent turn. Child hosts and hosts without collaboration return false.
+    fn wait_for_child_results<'a>(
+        &'a self,
+        _conversation_id: &'a str,
+        _run_id: &'a str,
+        _generation: u64,
+    ) -> AgentHostFuture<'a, Result<bool, String>> {
+        Box::pin(async { Ok(false) })
+    }
     /// Failed workers preserve pending input for an explicit continuation.
     fn close_runtime_input(&self) -> Result<(), String> {
         Ok(())
@@ -50,6 +62,14 @@ pub trait AgentHost: Send + Sync {
         message_id: &str,
         record: &ToolCallRecord,
     );
+
+    /// Consecutive automatic compaction failures remembered for the conversation, so the
+    /// ZCode circuit breaker outlives one run. Default: nothing is remembered between runs.
+    fn auto_compact_failures(&self, _conversation_id: &str) -> u32 {
+        0
+    }
+
+    fn set_auto_compact_failures(&self, _conversation_id: &str, _failures: u32) {}
 
     /// Live compaction progress for chat timeline UI. Default no-op.
     fn emit_compaction_status(

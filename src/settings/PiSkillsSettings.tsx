@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 import {
   ArrowLeft,
   BookOpen,
@@ -12,59 +12,32 @@ import { open } from '@tauri-apps/plugin-dialog'
 import {
   externalCliSettingsApi as piSkillsSettingsApi,
   type PiSkillEntry,
-  type PiSkillInventory,
 } from '../api/externalCliSettings'
 import { Button, IconButton } from '../components/Button'
 import { Input, Toggle } from './components'
 import { i18n, type Lang } from '../components/i18n'
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message.trim()) return error.message
-  if (typeof error === 'string' && error.trim()) return error
-  return String(error)
-}
+import { confirmDialog } from '../components/dialogQueue'
+import {
+  refreshPiSkillsNow,
+  refreshPiSkillsOnVisit,
+  runPiSkillAction,
+  usePiSkillsOperation,
+} from './piSkillsOperation'
 
 const SOURCE_ORDER: PiSkillEntry['sourceKind'][] = ['pi', 'agents', 'package', 'configured']
 
 export function PiSkillsSettings({ lang, onBack }: { lang: Lang; onBack: () => void }) {
   const t = i18n[lang]
-  const [inventory, setInventory] = useState<PiSkillInventory | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
-  const [query, setQuery] = useState('')
-  const [busy, setBusy] = useState<string | null>(null)
-  const [result, setResult] = useState<string | null>(null)
-
-  const reload = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      setInventory(await piSkillsSettingsApi.piSkillsInventory())
-    } catch (nextError) {
-      setError(errorMessage(nextError))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const [{ inventory, loading, error, query, busy, result }, setOperation] = usePiSkillsOperation()
+  const setQuery = (value: string) => setOperation((current) => ({ ...current, query: value }))
 
   useEffect(() => {
-    void reload()
-  }, [reload])
+    void refreshPiSkillsOnVisit()
+  }, [])
 
-  const runAction = async (key: string, action: () => Promise<void>, success?: string) => {
-    setBusy(key)
-    setError(null)
-    setResult(null)
-    try {
-      await action()
-      if (success) setResult(success)
-      await reload()
-    } catch (nextError) {
-      setError(errorMessage(nextError))
-    } finally {
-      setBusy(null)
-    }
-  }
+  const reload = () => refreshPiSkillsNow()
+  const runAction = (key: string, action: () => Promise<void>, success?: string) =>
+    runPiSkillAction(key, action, success)
 
   const pickScanPath = async () => {
     const picked = await open({
@@ -282,9 +255,9 @@ function SkillRow({
   onRemove: () => Promise<void>
 }) {
   const t = i18n[lang]
-  const remove = () => {
-    const message = t.externalAgentsPiSkillsDeleteConfirm.replace('{name}', skill.name)
-    if (window.confirm(message)) void onRemove()
+  const remove = async () => {
+    const message = t.externalAgentsPiSkillsDeleteConfirm.replace('{name}', () => skill.name)
+    if (await confirmDialog({ message, confirmLabel: t.dialogDelete, danger: true })) void onRemove()
   }
 
   return (
@@ -314,7 +287,7 @@ function SkillRow({
             size="xs"
             label={t.externalAgentsPiSkillsDelete}
             disabled={busy !== null}
-            onClick={remove}
+            onClick={() => void remove()}
           >
             <Trash2 size={12} />
           </IconButton>

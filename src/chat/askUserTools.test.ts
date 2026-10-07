@@ -1,19 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { foldToolName, hasAskUserStructuredContent, isAskUserToolName } from './askUserTools'
+import { hasAskUserStructuredContent, isAskUserToolName } from './askUserTools'
 
 describe('askUserTools', () => {
-  it('folds claude and dsh ask-user names onto the same key', () => {
-    expect(foldToolName('AskUserQuestion')).toBe('askuserquestion')
-    expect(foldToolName('ask_user_question')).toBe('askuserquestion')
-    expect(foldToolName('ask_user')).toBe('askuser')
-  })
 
   it('recognizes ask-user tools without treating claude ExitPlanMode as one', () => {
     expect(isAskUserToolName('ask_user')).toBe(true)
     expect(isAskUserToolName('AskUserQuestion')).toBe(true)
     expect(isAskUserToolName('ask_user_question')).toBe(true)
     expect(isAskUserToolName('requestUserInput')).toBe(true)
-    expect(isAskUserToolName('cursor/ask_question')).toBe(true)
+    expect(isAskUserToolName('cursor/ask_question')).toBe(false)
     expect(isAskUserToolName('elicitation/create')).toBe(true)
     expect(isAskUserToolName('cursor/create_plan')).toBe(false)
     expect(isAskUserToolName('exit_plan_mode')).toBe(true)

@@ -7,6 +7,10 @@ type ReasoningBlockProps = {
   reasoning: string
   /** 思维链正在流式写入 */
   streaming?: boolean
+  /** 当前轮仍在生成，重挂时恢复最近思考的预览。 */
+  previewActive?: boolean
+  /** 用户主动展开全文时，让包含它的过程组保留阅读状态。 */
+  onExpand?: () => void
   /** 已知思考耗时，用于流式完成后继续展示 */
   durationMs?: number | null
 }
@@ -20,7 +24,7 @@ function formatThinkingDuration(durationMs: number | null | undefined): string {
   return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`
 }
 
-export function ReasoningBlock({ reasoning, streaming = false, durationMs = null }: ReasoningBlockProps) {
+export function ReasoningBlock({ reasoning, streaming = false, previewActive = streaming, onExpand, durationMs = null }: ReasoningBlockProps) {
   const collapsible = reasoning.trim().length > 0
   const previewEnabled = useContext(ReasoningPreviewContext)
   const [expanded, setExpanded] = useState(false)
@@ -39,9 +43,9 @@ export function ReasoningBlock({ reasoning, streaming = false, durationMs = null
 
   // Remember only a preview shown in this mounted conversation. Loading old
   // history stays collapsed; finishing a live thought must not shrink the row.
-  if (streaming && collapsible && previewEnabled && !sawLivePreview) setSawLivePreview(true)
+  if (previewActive && collapsible && previewEnabled && !sawLivePreview) setSawLivePreview(true)
   const open = collapsible && previewEnabled && expanded
-  const showPreview = collapsible && previewEnabled && !open && (streaming || sawLivePreview)
+  const showPreview = collapsible && previewEnabled && !open && (previewActive || sawLivePreview)
 
   useEffect(() => {
     if (!showPreview) return
@@ -107,7 +111,7 @@ export function ReasoningBlock({ reasoning, streaming = false, durationMs = null
   }, [open])
 
   const titleClass =
-    'mb-1 flex h-6 w-full min-w-0 items-center gap-2 text-left text-[11.5px] font-medium text-neutral-700 transition-colors dark:text-neutral-200'
+    'mb-1 flex h-6 w-full min-w-0 items-center gap-2 text-left text-[11.5px] font-medium text-neutral-700 transition-colors'
   const thinkingDuration = formatThinkingDuration(durationMs ?? liveDurationMs)
   const titleText = streaming ? 'Thinking…' : 'Thought'
   const label = <span className="inline-flex shrink-0 items-baseline gap-1.5 whitespace-nowrap">
@@ -123,8 +127,11 @@ export function ReasoningBlock({ reasoning, streaming = false, durationMs = null
       {collapsible ? (
         <button
           type="button"
-          onClick={() => setExpanded(!open)}
-          className={`${titleClass} hover:text-neutral-900 dark:hover:text-neutral-50`}
+          onClick={() => {
+            setExpanded(!open)
+            if (!open) onExpand?.()
+          }}
+          className={`${titleClass} hover:text-neutral-900`}
           aria-expanded={open}
           title={open ? '收起完整思考' : '展开完整思考'}
           data-chat-disclosure

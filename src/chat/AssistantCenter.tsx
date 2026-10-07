@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import {
   ArrowLeft,
   BookOpen,
@@ -25,6 +25,19 @@ import { builtinAssistantGlyph } from './assistantIcons'
 import { AgentIcon } from '../settings/public/icons'
 import { chatApi } from './api'
 import type { ChatAssistant, SkillMeta } from './types'
+import { confirmDialog } from '../components/dialogQueue'
+import { useWindowStore } from '../utils/windowStore'
+import {
+  abandonAssistantEdit,
+  assistantDraftStore,
+  assistantSaveLanded,
+  beginAssistantEdit,
+  blockAssistantSave,
+  forgetAssistantLanding,
+  joinAssistantSave,
+  saveAssistantDraft,
+  updateAssistantDraft,
+} from './assistantDraftStore'
 
 interface AssistantCenterProps {
   skills: SkillMeta[]
@@ -60,38 +73,6 @@ function toggleId(list: string[], id: string): string[] {
   return list.includes(id) ? list.filter((item) => item !== id) : [...list, id]
 }
 
-function normalizeStringList(values?: string[], limit = 64): string[] {
-  const out: string[] = []
-  for (const value of values ?? []) {
-    const item = value.trim()
-    if (!item || out.includes(item)) continue
-    out.push(item)
-    if (out.length >= limit) break
-  }
-  return out
-}
-
-function normalizeAssistantForDraft(assistant: ChatAssistant): AssistantDraft {
-  return {
-    ...assistant,
-    description: assistant.description ?? '',
-    icon: assistant.icon ?? 'bot',
-    color: assistant.color ?? '#6A8FBD',
-    source: assistant.source ?? (assistant.built_in ?? assistant.builtIn ? 'builtin' : 'user'),
-    system_prompt: assistant.system_prompt ?? assistant.systemPrompt ?? '',
-    provider_id: assistant.provider_id ?? assistant.providerId ?? '',
-    model: assistant.model ?? '',
-    mcp_server_ids: assistantMcpIds(assistant),
-    skill_ids: assistantSkillIds(assistant),
-    enabled: assistant.enabled ?? true,
-    installed: assistant.installed ?? true,
-    archived: assistant.archived ?? false,
-    built_in: assistant.built_in ?? assistant.builtIn ?? false,
-    created_at: assistant.created_at ?? assistant.createdAt ?? nowSeconds(),
-    updated_at: assistant.updated_at ?? assistant.updatedAt ?? nowSeconds(),
-  }
-}
-
 function createBlankAssistant(): AssistantDraft {
   const now = nowSeconds()
   return {
@@ -112,28 +93,6 @@ function createBlankAssistant(): AssistantDraft {
     built_in: false,
     created_at: now,
     updated_at: now,
-  }
-}
-
-function draftPayload(draft: AssistantDraft): ChatAssistant {
-  return {
-    ...draft,
-    name: draft.name.trim(),
-    description: draft.description?.trim() ?? '',
-    icon: draft.icon?.trim() || 'bot',
-    color: draft.color?.trim() || '#6A8FBD',
-    source: draft.source || (draft.built_in ?? draft.builtIn ? 'builtin' : 'user'),
-    system_prompt: (draft.system_prompt ?? draft.systemPrompt ?? '').trim(),
-    provider_id: (draft.provider_id ?? draft.providerId ?? '').trim(),
-    model: draft.provider_id ? (draft.model ?? '').trim() : '',
-    mcp_server_ids: normalizeStringList(assistantMcpIds(draft)),
-    skill_ids: normalizeStringList(assistantSkillIds(draft)),
-    enabled: draft.enabled ?? true,
-    installed: draft.installed ?? true,
-    archived: false,
-    built_in: draft.built_in ?? draft.builtIn ?? false,
-    created_at: draft.created_at,
-    updated_at: nowSeconds(),
   }
 }
 
@@ -190,22 +149,22 @@ function AssistantSuiteCard({
       data-tauri-drag-region="false"
       aria-label={t.chatAssistantOpenNamed.replace('{name}', assistant.name)}
       style={{ '--chat-motion-delay': `${Math.min(index, 8) * 24}ms` } as CSSProperties}
-      className="chat-motion-fade-up group flex h-full min-w-0 cursor-pointer flex-col rounded-xl border border-neutral-200 bg-white p-3.5 text-left shadow-sm transition-[border-color,box-shadow,transform] duration-[var(--kv-dur-fast)] ease-[var(--kv-ease-standard)] hover:-translate-y-0.5 hover:border-neutral-300 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/15 dark:border-neutral-800 dark:bg-neutral-950/40 dark:hover:border-neutral-700 dark:focus-visible:ring-white/20"
+      className="chat-motion-fade-up group flex h-full min-w-0 cursor-pointer flex-col rounded-xl border border-neutral-200 bg-neutral-50 p-3.5 text-left shadow-sm transition-[border-color,box-shadow,transform] duration-[var(--kv-dur-fast)] ease-[var(--kv-ease-standard)] hover:-translate-y-0.5 hover:border-neutral-300 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-900/15"
     >
       <div className="flex items-start justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2.5">
           <span
-            className="grid size-9 shrink-0 place-items-center rounded-lg border border-neutral-200 bg-white text-[15px] font-semibold dark:border-neutral-700 dark:bg-neutral-950"
+            className="grid size-9 shrink-0 place-items-center rounded-lg border border-neutral-200 bg-neutral-50 text-[15px] font-semibold"
             style={{ color: assistant.color || '#6A8FBD' }}
           >
             {builtinAssistantGlyph(assistant.id, 18) ?? (assistant.name.trim().slice(0, 1) || t.chatAssistantAvatarFallback)}
           </span>
-          <span className="truncate text-[13.5px] font-semibold leading-tight text-neutral-950 dark:text-neutral-50">
+          <span className="truncate text-[13.5px] font-semibold leading-tight text-neutral-950">
             {assistant.name}
           </span>
         </div>
         {!builtIn && (
-          <span className="shrink-0 rounded-full bg-neutral-100 px-2 py-0.5 text-[10.5px] font-medium text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+          <span className="shrink-0 rounded-full bg-neutral-100 px-2 py-0.5 text-[10.5px] font-medium text-neutral-500 dark:text-neutral-400">
             {t.chatAssistantCustom}
           </span>
         )}
@@ -213,7 +172,7 @@ function AssistantSuiteCard({
       <p className="mt-1.5 line-clamp-2 min-h-[2.4em] flex-1 text-[12px] leading-[1.45] text-neutral-500 dark:text-neutral-400">
         {assistant.description || t.chatAssistantNoDescription}
       </p>
-      <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-neutral-100 pt-2.5 dark:border-neutral-800/70">
+      <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-neutral-100 pt-2.5">
         <div className="flex min-w-0 items-center gap-1.5 text-[11px] tabular-nums text-neutral-400 dark:text-neutral-500">
           <span className="shrink-0">{stats.mcp} MCP</span>
           <span className="shrink-0 opacity-50">·</span>
@@ -266,17 +225,30 @@ export function AssistantCenter({
   onApplyAssistant,
 }: AssistantCenterProps) {
   const t = useT()
+  const [session] = useWindowStore(assistantDraftStore)
   const [assistants, setAssistants] = useState<ChatAssistant[]>([])
   const [providers, setProviders] = useState<ModelProvider[]>([])
   const [mcpServers, setMcpServers] = useState<Array<{ id: string; name: string }>>([])
-  const [selectedId, setSelectedId] = useState<string | null>(currentAssistantId ?? null)
-  const [draft, setDraft] = useState<AssistantDraft | null>(null)
+  const [selectedId, setSelectedId] = useState<string | null>(
+    () => assistantDraftStore.getSnapshot().draft?.id ?? currentAssistantId ?? null,
+  )
   const [query, setQuery] = useState('')
-  const [view, setView] = useState<CenterView>('list')
+  const [localView, setView] = useState<CenterView>('list')
   const [tab, setTab] = useState<SuiteTab>('installed')
   const [loading, setLoading] = useState(false)
-  const [saving, setSaving] = useState(false)
+  const [working, setWorking] = useState(false)
   const [error, setError] = useState('')
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+  const navigation = useRef({ selectedId, localView })
+  navigation.current = { selectedId, localView }
+  const draft = session.draft
+  const saving = session.status === 'saving' || working
+  const view: CenterView = session.editing ? 'edit' : localView === 'edit' ? 'list' : localView
+  const bannerError = (session.editing ? session.error : '') || error
 
   const loadAssistants = useCallback(async (preferredId?: string | null) => {
     setLoading(true)
@@ -284,10 +256,14 @@ export function AssistantCenter({
     try {
       const data = await chatApi.getAssistants()
       setAssistants(data)
+      const open = assistantDraftStore.getSnapshot()
+      if (open.editing && open.draft) {
+        setSelectedId(open.draft.id)
+        return
+      }
       const nextSelectedId = preferredId ?? currentAssistantId ?? data[0]?.id ?? null
       const selected = data.find((assistant) => assistant.id === nextSelectedId) ?? null
       setSelectedId(selected?.id ?? null)
-      setDraft(selected ? normalizeAssistantForDraft(selected) : null)
     } catch (err) {
       setError(typeof err === 'string' ? err : (err as Error).message || t.chatAssistantLoadFailed)
     } finally {
@@ -352,88 +328,128 @@ export function AssistantCenter({
   const installedCount = assistants.filter((assistant) => assistant.installed !== false).length
 
   const updateDraft = <K extends keyof AssistantDraft>(key: K, value: AssistantDraft[K]) => {
-    setDraft((prev) => (prev ? { ...prev, [key]: value } : prev))
+    updateAssistantDraft((prev) => ({ ...prev, [key]: value }))
   }
 
   const openDetail = (assistant: ChatAssistant) => {
     setSelectedId(assistant.id)
-    setDraft(normalizeAssistantForDraft(assistant))
     setView('detail')
     setError('')
   }
 
   const handleCreate = () => {
     const blank = createBlankAssistant()
-    setSelectedId(null)
-    setDraft(blank)
-    setView('edit')
+    beginAssistantEdit(blank, false)
+    setSelectedId(blank.id)
     setError('')
   }
 
+  const leaveEditIfSettled = (saved: ChatAssistant | null, editingSession: number) => {
+    if (!saved || !mounted.current) return false
+    const snap = assistantDraftStore.getSnapshot()
+    if (snap.session !== editingSession || snap.draft?.id !== saved.id || !snap.editing || snap.status === 'error' || snap.revision !== snap.acknowledgedRevision) return false
+    abandonAssistantEdit()
+    setSelectedId(saved.id)
+    return true
+  }
+
   const saveDraft = async (): Promise<ChatAssistant | null> => {
-    if (!draft) return null
-    const payload = draftPayload(draft)
-    if (!payload.name) {
-      setError(t.chatAssistantNameRequired)
-      return null
-    }
-    setSaving(true)
-    setError('')
-    try {
-      const exists = assistants.some((assistant) => assistant.id === payload.id)
-      const saved = exists
-        ? await chatApi.updateAssistant(payload)
-        : await chatApi.createAssistant(payload)
-      await loadAssistants(saved.id)
-      setSelectedId(saved.id)
-      setDraft(normalizeAssistantForDraft(saved))
-      return saved
-    } catch (err) {
-      setError(typeof err === 'string' ? err : (err as Error).message || t.chatAssistantSaveFailed)
-      return null
-    } finally {
-      setSaving(false)
-    }
+    const editingSession = assistantDraftStore.getSnapshot().session
+    const saved = await saveAssistantDraft(t.chatAssistantNameRequired)
+    if (!saved || !mounted.current || assistantDraftStore.getSnapshot().session !== editingSession) return null
+    if (assistantDraftStore.getSnapshot().editing) await loadAssistants(saved.id)
+    const snap = assistantDraftStore.getSnapshot()
+    if (!mounted.current || snap.session !== editingSession || snap.status === 'error' || (snap.editing && snap.revision !== snap.acknowledgedRevision)) return null
+    return saved
   }
 
   const handleDuplicate = async (assistant?: ChatAssistant | null) => {
     const target = assistant ?? draft
     if (!target || !assistants.some((item) => item.id === target.id)) return
-    setSaving(true)
+    const editingSession = assistantDraftStore.getSnapshot().session
+    const originSelectedId = navigation.current.selectedId
+    const originView = navigation.current.localView
+    const navigationHeld = () => {
+      const place = navigation.current
+      return mounted.current
+        && assistantDraftStore.getSnapshot().session === editingSession
+        && place.selectedId === originSelectedId
+        && place.localView === originView
+    }
+    setWorking(true)
     setError('')
     try {
       const copy = await chatApi.duplicateAssistant(target.id)
-      await loadAssistants(copy.id)
+      if (!mounted.current) return
+      const data = await chatApi.getAssistants()
+      if (!mounted.current) return
+      setAssistants(data)
+      if (!navigationHeld()) return
       setSelectedId(copy.id)
-      setDraft(normalizeAssistantForDraft(copy))
-      setView('edit')
+      beginAssistantEdit(copy, true)
     } catch (err) {
+      if (!mounted.current) return
       setError(typeof err === 'string' ? err : (err as Error).message || t.chatAssistantDuplicateFailed)
     } finally {
-      setSaving(false)
+      if (mounted.current) setWorking(false)
     }
   }
 
   const handleDelete = async () => {
-    if (!draft) return
-    const exists = assistants.some((assistant) => assistant.id === draft.id)
+    const current = assistantDraftStore.getSnapshot().draft
+    if (!current) return
+    const capturedId = current.id
+    const editingSession = assistantDraftStore.getSnapshot().session
+    const ownsEdit = () => {
+      if (!mounted.current) return false
+      const snap = assistantDraftStore.getSnapshot()
+      return snap.editing && snap.session === editingSession && snap.draft?.id === capturedId
+    }
+    const exists = assistants.some((assistant) => assistant.id === capturedId) || assistantSaveLanded(capturedId)
     if (!exists) {
-      setDraft(null)
-      setSelectedId(null)
-      setView('list')
+      const release = blockAssistantSave(capturedId)
+      try {
+        await joinAssistantSave(capturedId)
+        if (assistantSaveLanded(capturedId)) {
+          await chatApi.deleteAssistant(capturedId)
+          forgetAssistantLanding(capturedId)
+        }
+        if (!ownsEdit()) return
+        abandonAssistantEdit()
+        setSelectedId(null)
+        setView('list')
+      } catch (err) {
+        if (!mounted.current) return
+        setError(typeof err === 'string' ? err : (err as Error).message || t.chatAssistantDeleteFailed)
+      } finally {
+        release()
+      }
       return
     }
-    if (!window.confirm(t.chatAssistantDeleteConfirm.replace('{name}', draft.name))) return
-    setSaving(true)
-    setError('')
+    if (!(await confirmDialog({ message: t.chatAssistantDeleteConfirm.replace('{name}', () => current.name), confirmLabel: t.dialogDelete, danger: true }))) return
+    const release = blockAssistantSave(capturedId)
     try {
-      await chatApi.deleteAssistant(draft.id)
+      if (mounted.current) setError('')
+      await joinAssistantSave(capturedId)
+      await chatApi.deleteAssistant(capturedId)
+      forgetAssistantLanding(capturedId)
+      if (!mounted.current) return
+      if (!ownsEdit()) {
+        const data = await chatApi.getAssistants()
+        if (!mounted.current) return
+        setAssistants(data)
+        return
+      }
+      abandonAssistantEdit()
+      const leftSession = assistantDraftStore.getSnapshot().session
       await loadAssistants(null)
+      if (!mounted.current || assistantDraftStore.getSnapshot().session !== leftSession) return
       setView('list')
     } catch (err) {
+      if (!mounted.current) return
       setError(typeof err === 'string' ? err : (err as Error).message || t.chatAssistantDeleteFailed)
     } finally {
-      setSaving(false)
+      release()
     }
   }
 
@@ -442,8 +458,9 @@ export function AssistantCenter({
       onStartAssistantChat(assistant)
       return
     }
+    const editingSession = assistantDraftStore.getSnapshot().session
     const saved = await saveDraft()
-    if (saved) onStartAssistantChat(saved)
+    if (saved && leaveEditIfSettled(saved, editingSession)) onStartAssistantChat(saved)
   }
 
   const handleApplyAssistant = async (assistant?: ChatAssistant | null) => {
@@ -464,7 +481,7 @@ export function AssistantCenter({
 
   const renderList = () => (
     <div className="space-y-4">
-      <div className="assistant-center-tabs flex min-w-0 items-center gap-1 border-b border-neutral-200 pb-2 dark:border-neutral-800">
+      <div className="assistant-center-tabs flex min-w-0 items-center gap-1 border-b border-neutral-200 pb-2">
           {[
             ['installed', t.chatAssistantTabInstalled, installedCount],
             ['plaza', t.chatAssistantTabPlaza, builtInCount],
@@ -476,12 +493,12 @@ export function AssistantCenter({
               onClick={() => setTab(value as SuiteTab)}
               className={`flex h-8 items-center gap-2 rounded-md px-2.5 text-[13px] font-medium transition-colors ${
                 tab === value
-                  ? 'bg-neutral-100 text-neutral-950 dark:bg-neutral-800 dark:text-neutral-50'
-                  : 'text-neutral-500 hover:bg-neutral-50 hover:text-neutral-800 dark:text-neutral-400 dark:hover:bg-neutral-900 dark:hover:text-neutral-200'
+                  ? 'bg-neutral-100 text-neutral-950'
+                  : 'text-neutral-500 hover:bg-neutral-50 hover:text-neutral-800 dark:text-neutral-400'
               }`}
             >
               {label}
-              <span className="rounded-full bg-white px-1.5 py-0.5 text-[11px] text-neutral-500 dark:bg-neutral-950 dark:text-neutral-400">
+              <span className="rounded-full bg-neutral-50 px-1.5 py-0.5 text-[11px] text-neutral-500 dark:text-neutral-400">
                 {count}
               </span>
             </button>
@@ -500,7 +517,7 @@ export function AssistantCenter({
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder={t.chatAssistantSearch}
-            className="h-10 w-full rounded-md border border-neutral-200 bg-white pl-10 pr-4 text-[14px] outline-none placeholder:text-neutral-400 focus:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+            className="h-10 w-full rounded-md border border-neutral-200 bg-neutral-50 pl-10 pr-4 text-[14px] outline-none placeholder:text-neutral-400 focus:border-neutral-300 text-neutral-900"
             data-tauri-drag-region="false"
           />
         </div>
@@ -523,7 +540,7 @@ export function AssistantCenter({
       {loading ? (
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
           {Array.from({ length: 6 }, (_, i) => (
-            <div key={i} className="flex flex-col rounded-xl border border-neutral-200/80 p-3.5 dark:border-neutral-800/70">
+            <div key={i} className="flex flex-col rounded-xl border border-neutral-200/80 p-3.5">
               <div className="kv-skeleton h-4 w-2/5 rounded" />
               <div className="kv-skeleton mt-2.5 h-3 w-full rounded" />
               <div className="kv-skeleton mt-1.5 h-3 w-3/4 rounded" />
@@ -532,7 +549,7 @@ export function AssistantCenter({
           ))}
         </div>
       ) : filteredAssistants.length === 0 ? (
-        <div className="grid min-h-[220px] place-items-center rounded-md border border-dashed border-neutral-200 text-[13px] text-neutral-400 dark:border-neutral-800">
+        <div className="grid min-h-[220px] place-items-center rounded-md border border-dashed border-neutral-200 text-[13px] text-neutral-400">
           {tab === 'installed' && !query.trim()
             ? t.chatAssistantEmptyFavorites
             : t.chatAssistantNoMatch}
@@ -564,7 +581,7 @@ export function AssistantCenter({
     const systemPrompt = assistant.system_prompt ?? assistant.systemPrompt ?? ''
     return (
       <div className="space-y-7">
-        <div className="flex flex-col gap-4 border-b border-neutral-200 pb-5 dark:border-neutral-800 lg:flex-row lg:items-start lg:justify-between">
+        <div className="flex flex-col gap-4 border-b border-neutral-200 pb-5 lg:flex-row lg:items-start lg:justify-between">
           <div className="flex min-w-0 gap-4">
             <IconButton
               size="md"
@@ -581,13 +598,13 @@ export function AssistantCenter({
               {builtinAssistantGlyph(assistant.id, 32) ?? (assistant.name.trim().slice(0, 1) || t.chatAssistantAvatarFallbackDetail)}
             </div>
             <div className="min-w-0">
-              <h2 className="truncate text-[28px] font-semibold tracking-normal text-neutral-950 dark:text-neutral-50">
+              <h2 className="truncate text-[28px] font-semibold tracking-normal text-neutral-950">
                 {assistant.name}
               </h2>
               <div className="mt-1 text-[13px] font-medium text-neutral-500">
                 {(assistant.installed ?? true) === false ? t.chatAssistantNotInFavorites : t.chatAssistantInFavorites}
               </div>
-              <p className="mt-6 max-w-5xl text-[16px] leading-8 text-neutral-700 dark:text-neutral-300">
+              <p className="mt-6 max-w-5xl text-[16px] leading-8 text-neutral-700">
                 {assistant.description || t.chatAssistantDetailNoDescription}
               </p>
             </div>
@@ -606,8 +623,8 @@ export function AssistantCenter({
             )}
             <Button
               onClick={() => {
-                setDraft(normalizeAssistantForDraft(assistant))
-                setView('edit')
+                beginAssistantEdit(assistant, true)
+                setSelectedId(assistant.id)
               }}
             >
               <Pencil size={15} />
@@ -640,15 +657,15 @@ export function AssistantCenter({
         </div>
 
         <section className="space-y-3">
-          <h3 className="text-[17px] font-semibold text-neutral-950 dark:text-neutral-50">{t.chatSystemPrompt}</h3>
-          <div className="rounded-md border border-neutral-200 px-4 py-3 text-[13px] leading-relaxed whitespace-pre-wrap text-neutral-700 dark:border-neutral-800 dark:text-neutral-300">
+          <h3 className="text-[17px] font-semibold text-neutral-950">{t.chatSystemPrompt}</h3>
+          <div className="rounded-md border border-neutral-200 px-4 py-3 text-[13px] leading-relaxed whitespace-pre-wrap text-neutral-700">
             {systemPrompt || t.chatAssistantNoSystemPrompt}
           </div>
         </section>
 
         <div className="grid gap-6 md:grid-cols-2">
           <section className="space-y-3">
-            <h3 className="flex items-center gap-2 text-[17px] font-semibold text-neutral-950 dark:text-neutral-50">
+            <h3 className="flex items-center gap-2 text-[17px] font-semibold text-neutral-950">
               <Wrench size={16} className="text-neutral-400" />
               MCP <span className="text-neutral-400">({mcpNames.length})</span>
             </h3>
@@ -656,7 +673,7 @@ export function AssistantCenter({
               {mcpNames.length === 0 ? (
                 <span className="text-[13px] text-neutral-400">{t.chatAssistantNoMcp}</span>
               ) : mcpNames.map((name) => (
-                <span key={name} className="rounded-md bg-neutral-100 px-2.5 py-1 text-[12px] text-neutral-700 dark:bg-neutral-800 dark:text-neutral-200">
+                <span key={name} className="rounded-md bg-neutral-100 px-2.5 py-1 text-[12px] text-neutral-700">
                   {name}
                 </span>
               ))}
@@ -664,7 +681,7 @@ export function AssistantCenter({
           </section>
 
           <section className="space-y-3">
-            <h3 className="flex items-center gap-2 text-[17px] font-semibold text-neutral-950 dark:text-neutral-50">
+            <h3 className="flex items-center gap-2 text-[17px] font-semibold text-neutral-950">
               <BookOpen size={16} className="text-neutral-400" />
               {t.chatAssistantSkills} <span className="text-neutral-400">({skillNames.length})</span>
             </h3>
@@ -672,7 +689,7 @@ export function AssistantCenter({
               {skillNames.length === 0 ? (
                 <span className="text-[13px] text-neutral-400">{t.chatAssistantNoSkills}</span>
               ) : skillNames.map((name) => (
-                <span key={name} className="rounded-md bg-neutral-100 px-2.5 py-1 text-[12px] text-neutral-700 dark:bg-neutral-800 dark:text-neutral-200">
+                <span key={name} className="rounded-md bg-neutral-100 px-2.5 py-1 text-[12px] text-neutral-700">
                   {name}
                 </span>
               ))}
@@ -687,17 +704,20 @@ export function AssistantCenter({
     if (!draft) return renderList()
     return (
       <div className="space-y-6">
-        <div className="flex flex-col gap-4 border-b border-neutral-200 pb-4 dark:border-neutral-800 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex flex-col gap-4 border-b border-neutral-200 pb-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <IconButton
               size="md"
-              onClick={() => setView(selectedAssistant ? 'detail' : 'list')}
+              onClick={() => {
+                abandonAssistantEdit()
+                setView(selectedAssistant ? 'detail' : 'list')
+              }}
               label={t.chatAssistantBack}
             >
               <ArrowLeft size={18} />
             </IconButton>
             <div className="min-w-0">
-              <h2 className="truncate text-[24px] font-semibold text-neutral-950 dark:text-neutral-50">{t.chatAssistantEditTitle}</h2>
+              <h2 className="truncate text-[24px] font-semibold text-neutral-950">{t.chatAssistantEditTitle}</h2>
               <p className="mt-1 truncate text-[13px] text-neutral-500">
                 {draft.built_in ? t.chatAssistantBuiltinTemplate : t.chatAssistantCustomSuite}
               </p>
@@ -708,7 +728,7 @@ export function AssistantCenter({
               size="sm"
               variant="danger"
               onClick={() => void handleDelete()}
-              disabled={saving}
+              disabled={working}
               label={t.chatAssistantDeleteTitle}
               title={t.chatDelete}
             >
@@ -716,9 +736,12 @@ export function AssistantCenter({
             </IconButton>
             <Button
               variant="ghost"
-              onClick={() => void saveDraft().then((saved) => {
-                if (saved) setView('detail')
-              })}
+              onClick={() => {
+                const editingSession = assistantDraftStore.getSnapshot().session
+                void saveDraft().then((saved) => {
+                  if (leaveEditIfSettled(saved, editingSession)) setView('detail')
+                })
+              }}
               disabled={saving}
             >
               <Save size={15} />
@@ -739,81 +762,81 @@ export function AssistantCenter({
           <section className="space-y-5">
             <div className="grid gap-3 sm:grid-cols-[7rem_minmax(0,1fr)]">
               <label className="block">
-                <span className="mb-1.5 block text-[12px] font-medium text-neutral-600 dark:text-neutral-300">{t.chatAssistantIcon}</span>
+                <span className="mb-1.5 block text-[12px] font-medium text-neutral-600">{t.chatAssistantIcon}</span>
                 <input
                   type="text"
                   value={draft.icon ?? ''}
                   onChange={(event) => updateDraft('icon', event.target.value)}
-                  className="h-10 w-full rounded-md border border-neutral-200 bg-white px-3 text-[13px] outline-none focus:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+                  className="h-10 w-full rounded-md border border-neutral-200 bg-neutral-50 px-3 text-[13px] outline-none focus:border-neutral-300 text-neutral-900"
                 />
               </label>
               <label className="block">
-                <span className="mb-1.5 block text-[12px] font-medium text-neutral-600 dark:text-neutral-300">{t.chatAssistantName}</span>
+                <span className="mb-1.5 block text-[12px] font-medium text-neutral-600">{t.chatAssistantName}</span>
                 <input
                   type="text"
                   value={draft.name}
                   onChange={(event) => updateDraft('name', event.target.value)}
-                  className="h-10 w-full rounded-md border border-neutral-200 bg-white px-3 text-[15px] font-medium outline-none focus:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+                  className="h-10 w-full rounded-md border border-neutral-200 bg-neutral-50 px-3 text-[15px] font-medium outline-none focus:border-neutral-300 text-neutral-900"
                 />
               </label>
             </div>
             <label className="block">
-              <span className="mb-1.5 block text-[12px] font-medium text-neutral-600 dark:text-neutral-300">{t.chatAssistantDescription}</span>
+              <span className="mb-1.5 block text-[12px] font-medium text-neutral-600">{t.chatAssistantDescription}</span>
               <input
                 type="text"
                 value={draft.description ?? ''}
                 onChange={(event) => updateDraft('description', event.target.value)}
-                className="h-10 w-full rounded-md border border-neutral-200 bg-white px-3 text-[13px] outline-none focus:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+                className="h-10 w-full rounded-md border border-neutral-200 bg-neutral-50 px-3 text-[13px] outline-none focus:border-neutral-300 text-neutral-900"
               />
             </label>
             <label className="block">
-              <span className="mb-1.5 block text-[12px] font-medium text-neutral-600 dark:text-neutral-300">{t.chatSystemPrompt}</span>
+              <span className="mb-1.5 block text-[12px] font-medium text-neutral-600">{t.chatSystemPrompt}</span>
               <textarea
                 value={draft.system_prompt ?? ''}
                 onChange={(event) => updateDraft('system_prompt', event.target.value)}
                 rows={9}
-                className="custom-scrollbar w-full resize-none rounded-md border border-neutral-200 bg-white px-3 py-2.5 text-[13px] leading-relaxed text-neutral-900 outline-none focus:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+                className="custom-scrollbar w-full resize-none rounded-md border border-neutral-200 bg-neutral-50 px-3 py-2.5 text-[13px] leading-relaxed text-neutral-900 outline-none focus:border-neutral-300"
               />
             </label>
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-[12px] font-medium text-neutral-600 dark:text-neutral-300">{t.chatAssistantMcpServers}</span>
+                  <span className="text-[12px] font-medium text-neutral-600">{t.chatAssistantMcpServers}</span>
                   <span className="text-[11px] text-neutral-400">{t.chatAssistantSelectedCount.replace('{n}', String(draftMcpIds.length))}</span>
                 </div>
-                <div className="custom-scrollbar max-h-56 space-y-1 overflow-y-auto rounded-md border border-neutral-200 p-2 dark:border-neutral-700">
+                <div className="custom-scrollbar max-h-56 space-y-1 overflow-y-auto rounded-md border border-neutral-200 p-2">
                   {mcpServers.length === 0 ? (
                     <div className="px-1 py-2 text-[12px] text-neutral-400">{t.chatAssistantNoMcpConfigured}</div>
                   ) : mcpServers.map((server) => (
-                    <label key={server.id} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1.5 text-[13px] hover:bg-neutral-50 dark:hover:bg-neutral-800">
+                    <label key={server.id} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1.5 text-[13px] hover:bg-neutral-50">
                       <input
                         type="checkbox"
                         checked={draftMcpIds.includes(server.id)}
                         onChange={() => updateDraft('mcp_server_ids', toggleId(draftMcpIds, server.id))}
                         className="size-4 accent-neutral-900 dark:accent-neutral-100"
                       />
-                      <span className="min-w-0 truncate text-neutral-700 dark:text-neutral-200">{server.name}</span>
+                      <span className="min-w-0 truncate text-neutral-700">{server.name}</span>
                     </label>
                   ))}
                 </div>
               </div>
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-[12px] font-medium text-neutral-600 dark:text-neutral-300">{t.chatAssistantSkills}</span>
+                  <span className="text-[12px] font-medium text-neutral-600">{t.chatAssistantSkills}</span>
                   <span className="text-[11px] text-neutral-400">{t.chatAssistantSelectedCount.replace('{n}', String(draftSkillIds.length))}</span>
                 </div>
-                <div className="custom-scrollbar max-h-56 space-y-1 overflow-y-auto rounded-md border border-neutral-200 p-2 dark:border-neutral-700">
+                <div className="custom-scrollbar max-h-56 space-y-1 overflow-y-auto rounded-md border border-neutral-200 p-2">
                   {skills.length === 0 ? (
                     <div className="px-1 py-2 text-[12px] text-neutral-400">{t.chatAssistantNoAvailableSkills}</div>
                   ) : skills.map((skill) => (
-                    <label key={skill.id} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1.5 text-[13px] hover:bg-neutral-50 dark:hover:bg-neutral-800">
+                    <label key={skill.id} className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1.5 text-[13px] hover:bg-neutral-50">
                       <input
                         type="checkbox"
                         checked={draftSkillIds.includes(skill.id)}
                         onChange={() => updateDraft('skill_ids', toggleId(draftSkillIds, skill.id))}
                         className="size-4 accent-neutral-900 dark:accent-neutral-100"
                       />
-                      <span className="min-w-0 truncate text-neutral-700 dark:text-neutral-200">{skill.name}</span>
+                      <span className="min-w-0 truncate text-neutral-700">{skill.name}</span>
                     </label>
                   ))}
                 </div>
@@ -822,8 +845,8 @@ export function AssistantCenter({
           </section>
 
           <section className="grid gap-4 lg:grid-cols-3">
-            <section className="space-y-3 rounded-md border border-neutral-200 p-3 dark:border-neutral-800">
-              <div className="text-[12px] font-semibold text-neutral-700 dark:text-neutral-200">{t.chatAssistantRunSettings}</div>
+            <section className="space-y-3 rounded-md border border-neutral-200 p-3">
+              <div className="text-[12px] font-semibold text-neutral-700">{t.chatAssistantRunSettings}</div>
               <label className="block">
                 <span className="mb-1 block text-[11px] text-neutral-500 dark:text-neutral-400">{t.chatAssistantModelProvider}</span>
                 <Select
@@ -856,8 +879,8 @@ export function AssistantCenter({
               </label>
             </section>
 
-            <section className="space-y-3 rounded-md border border-neutral-200 p-3 dark:border-neutral-800">
-              <div className="text-[12px] font-semibold text-neutral-700 dark:text-neutral-200">{t.chatAssistantColor}</div>
+            <section className="space-y-3 rounded-md border border-neutral-200 p-3">
+              <div className="text-[12px] font-semibold text-neutral-700">{t.chatAssistantColor}</div>
               <div className="flex flex-wrap gap-1.5">
                 {assistantColors.map((color) => (
                   <button
@@ -876,8 +899,8 @@ export function AssistantCenter({
               </div>
             </section>
 
-            <section className="space-y-2 rounded-md border border-neutral-200 p-3 dark:border-neutral-800">
-              <div className="text-[12px] font-semibold text-neutral-700 dark:text-neutral-200">{t.chatAssistantCurrentConfig}</div>
+            <section className="space-y-2 rounded-md border border-neutral-200 p-3">
+              <div className="text-[12px] font-semibold text-neutral-700">{t.chatAssistantCurrentConfig}</div>
               <div className="space-y-1 text-[11px] text-neutral-500 dark:text-neutral-400">
                 <div className="truncate">{t.chatAssistantConfigModel.replace('{name}', draft.model || t.chatAssistantFollowChatDefault)}</div>
                 <div className="truncate">{t.chatAssistantConfigMcp.replace('{n}', String(draftMcpIds.length))}</div>
@@ -896,14 +919,14 @@ export function AssistantCenter({
   }
 
   return (
-    <div className="assistant-center-root flex h-full min-h-0 flex-col text-neutral-900 dark:text-neutral-100">
+    <div className="assistant-center-root flex h-full min-h-0 flex-col text-neutral-900">
       {/* 顶栏：与聊天主区同底色、无分隔，可拖拽，右侧避开窗口按钮 */}
 
       {/* 内容区：直接坐在白底上，与聊天主区无缝 */}
       <main className="custom-scrollbar min-h-0 flex-1 overflow-y-auto px-6 py-6">
           <div className="mx-auto max-w-7xl space-y-4">
-            <header className="border-b border-neutral-200 pb-5 dark:border-neutral-800">
-              <h1 className="flex items-center gap-2.5 truncate text-[28px] font-semibold tracking-normal text-neutral-950 dark:text-neutral-50">
+            <header className="border-b border-neutral-200 pb-5">
+              <h1 className="flex items-center gap-2.5 truncate text-[28px] font-semibold tracking-normal text-neutral-950">
                 <AgentIcon size={24} className="shrink-0 text-neutral-500" />
                 {t.chatAssistantTitle}
               </h1>
@@ -923,9 +946,9 @@ export function AssistantCenter({
               </div>
             </header>
 
-            {error && (
+            {bannerError && (
               <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
-                {error}
+                {bannerError}
               </div>
             )}
 

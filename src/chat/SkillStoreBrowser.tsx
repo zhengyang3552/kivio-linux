@@ -8,23 +8,20 @@ import { Button, IconButton } from '../components/Button'
 import { Select } from '../settings/public/controls'
 import { useT } from '../components/i18n'
 import {
-  buildClawHubDownloadUrl,
   CLAWHUB_SORT_OPTIONS,
   listClawHubSkills,
-  resolveClawHubSkillOwner,
   searchClawHubSkills,
   type ClawHubSkillCard,
   type ClawHubSort,
 } from '../settings/public/skills'
-
-type Props = {
-  onInstalled: () => void
-}
+import { useWindowStore } from '../utils/windowStore'
+import { installStoreSkill, isStoreSlugInstalled, skillLifecycleStore } from './skillLifecycle'
 
 const PAGE_LIMIT = 24
 
-export function SkillStoreBrowser({ onInstalled }: Props) {
+export function SkillStoreBrowser() {
   const t = useT()
+  const [ops] = useWindowStore(skillLifecycleStore)
   const [sort, setSort] = useState<ClawHubSort>('downloads')
   const [queryInput, setQueryInput] = useState('')
   const [query, setQuery] = useState('')
@@ -33,8 +30,6 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
   const [loading, setLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState('')
-  const [busySlug, setBusySlug] = useState<string | null>(null)
-  const [installed, setInstalled] = useState<ReadonlySet<string>>(new Set())
 
   useEffect(() => {
     const timer = setTimeout(() => setQuery(queryInput.trim()), 400)
@@ -85,25 +80,7 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
       })
   }, [cursor, loadingMore, query, sort])
 
-  const handleInstall = useCallback(
-    async (card: ClawHubSkillCard) => {
-      setBusySlug(card.slug)
-      setError('')
-      try {
-        const resolved = await resolveClawHubSkillOwner(card)
-        const downloadUrl = resolved.downloadUrl ?? buildClawHubDownloadUrl(resolved.slug, resolved.ownerHandle)
-        const result = await api.chatSkillsInstallFromUrl(downloadUrl)
-        if (!result.success) throw new Error(result.error || t.chatSkillInstallFailed)
-        setInstalled((prev) => new Set(prev).add(card.slug))
-        onInstalled()
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err))
-      } finally {
-        setBusySlug(null)
-      }
-    },
-    [onInstalled, t],
-  )
+  const banner = ops.storeInstallError || error
 
   const sortLabels: Record<ClawHubSort, string> = {
     downloads: t.chatSkillSortDownloads,
@@ -125,7 +102,7 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
             value={queryInput}
             onChange={(e) => setQueryInput(e.target.value)}
             placeholder={t.chatSkillSearchPlaceholder}
-            className="h-10 w-full rounded-md border border-neutral-200 bg-white pl-10 pr-4 text-[14px] outline-none placeholder:text-neutral-400 focus:border-neutral-300 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-100"
+            className="h-10 w-full rounded-md border border-neutral-200 bg-neutral-50 pl-10 pr-4 text-[14px] outline-none placeholder:text-neutral-400 focus:border-neutral-300 text-neutral-900"
             data-tauri-drag-region="false"
           />
         </div>
@@ -142,9 +119,9 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
         />
       </div>
 
-      {error && (
+      {banner && (
         <div className="mb-3 rounded-md border border-red-300/60 bg-red-50 px-3 py-2 text-[12px] text-red-700 dark:border-red-800/60 dark:bg-red-950/40 dark:text-red-300">
-          {error}
+          {banner}
         </div>
       )}
 
@@ -152,7 +129,7 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
         {loading ? (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 6 }, (_, i) => (
-              <div key={i} className="flex flex-col rounded-xl border border-neutral-200/80 p-3.5 dark:border-neutral-800/70">
+              <div key={i} className="flex flex-col rounded-xl border border-neutral-200/80 p-3.5">
                 <div className="kv-skeleton h-4 w-2/5 rounded" />
                 <div className="kv-skeleton mt-2.5 h-3 w-full rounded" />
                 <div className="kv-skeleton mt-1.5 h-3 w-3/4 rounded" />
@@ -165,17 +142,18 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
         ) : (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {items.map((card, idx) => {
-              const done = installed.has(card.slug)
+              const done = isStoreSlugInstalled(ops, card.slug)
+              const busy = ops.busyKeys.includes(`store:${card.slug}`)
               return (
                 <div
                   key={`${card.slug}-${idx}`}
                   style={{ '--chat-motion-delay': `${Math.min(idx % PAGE_LIMIT, 8) * 24}ms` } as CSSProperties}
-                  className="chat-motion-fade-up group flex flex-col rounded-xl border border-neutral-200 bg-white p-3.5 shadow-sm transition-[border-color,box-shadow,transform] duration-[var(--kv-dur-fast)] ease-[var(--kv-ease-standard)] hover:-translate-y-0.5 hover:border-neutral-300 hover:shadow-md dark:border-neutral-800 dark:bg-neutral-950/40 dark:hover:border-neutral-700"
+                  className="chat-motion-fade-up group flex flex-col rounded-xl border border-neutral-200 bg-neutral-50 p-3.5 shadow-sm transition-[border-color,box-shadow,transform] duration-[var(--kv-dur-fast)] ease-[var(--kv-ease-standard)] hover:-translate-y-0.5 hover:border-neutral-300 hover:shadow-md"
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <span className="truncate text-[13.5px] font-semibold leading-tight text-neutral-950 dark:text-neutral-50">{card.displayName}</span>
+                    <span className="truncate text-[13.5px] font-semibold leading-tight text-neutral-950">{card.displayName}</span>
                     {card.latestVersion && (
-                      <span className="shrink-0 rounded-full bg-neutral-100 px-2 py-0.5 text-[10.5px] tabular-nums text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+                      <span className="shrink-0 rounded-full bg-neutral-100 px-2 py-0.5 text-[10.5px] tabular-nums text-neutral-500 dark:text-neutral-400">
                         v{card.latestVersion}
                       </span>
                     )}
@@ -183,7 +161,7 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
                   <p className="mt-1 line-clamp-2 min-h-[2.4em] text-[12px] leading-[1.45] text-neutral-500 dark:text-neutral-400">
                     {card.summary || t.chatSkillNoSummary}
                   </p>
-                  <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-neutral-100 pt-2.5 dark:border-neutral-800/70">
+                  <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-neutral-100 pt-2.5">
                     <div className="flex items-center gap-3 text-[11px] tabular-nums text-neutral-400 dark:text-neutral-500">
                       <span className="inline-flex items-center gap-1"><Download size={11} />{card.downloads.toLocaleString()}</span>
                       <span className="inline-flex items-center gap-1"><Star size={11} />{card.stars.toLocaleString()}</span>
@@ -199,8 +177,13 @@ export function SkillStoreBrowser({ onInstalled }: Props) {
                       {done ? (
                         <span className="chat-motion-pop inline-flex items-center gap-1 rounded-md bg-emerald-500/15 px-2 py-1 text-[12px] font-medium text-emerald-600 dark:text-emerald-400"><Check size={13} />{t.chatSkillInstalled}</span>
                       ) : (
-                        <Button size="sm" onClick={() => void handleInstall(card)} disabled={busySlug === card.slug}>
-                          {busySlug === card.slug ? <Loader2 size={12} className="animate-spin" /> : t.chatSkillInstall}
+                        <Button
+                          size="sm"
+                          aria-label={busy ? t.chatSkillInstalling : t.chatSkillInstall}
+                          onClick={() => void installStoreSkill(card, t.chatSkillInstallFailed)}
+                          disabled={busy}
+                        >
+                          {busy ? <Loader2 size={12} className="animate-spin" /> : t.chatSkillInstall}
                         </Button>
                       )}
                     </div>

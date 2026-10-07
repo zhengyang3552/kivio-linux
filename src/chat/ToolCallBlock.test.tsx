@@ -22,8 +22,9 @@ vi.mock('./attachmentPreview', () => ({
   openAttachment: () => Promise.resolve(),
 }))
 
-import { ToolCallBlock } from './ToolCallBlock'
+import { ImageReadCluster, ToolCallBlock } from './ToolCallBlock'
 import type { ToolCallRecord } from './types'
+import { LangContext } from '../components/i18n'
 
 function buildToolCall(overrides: Partial<ToolCallRecord> = {}): ToolCallRecord {
   return {
@@ -36,6 +37,52 @@ function buildToolCall(overrides: Partial<ToolCallRecord> = {}): ToolCallRecord 
 }
 
 describe('ToolCallBlock', () => {
+  it.each(['pending', 'running'] as const)('does not claim a %s image read is already viewed', status => {
+    render(<ToolCallBlock toolCall={buildToolCall({
+      toolName: 'read', status, arguments: { path: '/tmp/one.png' },
+    })} />)
+    expect(screen.queryByText(/已查看/)).not.toBeInTheDocument()
+  })
+
+  it.each(['error', 'cancelled', 'skipped'] as const)('does not claim a %s image read succeeded', async status => {
+    render(<ToolCallBlock toolCall={buildToolCall({
+      toolName: 'read', status, arguments: { path: '/tmp/missing.png' },
+      error: 'Image file was not read',
+    })} />)
+    expect(screen.queryByText(/已查看/)).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /Read/ }))
+    expect(screen.getByText('Image file was not read')).toBeVisible()
+  })
+
+  it('counts one image when the same path was read three times', async () => {
+    render(<ImageReadCluster toolCalls={Array.from({ length: 3 }, (_, index) => buildToolCall({
+      id: `read-${index}`, toolName: 'read',
+      arguments: { path: '/tmp/board.png' },
+      structured_content: { type: 'image_read', count: 1 },
+      artifacts: [{ id: `art_${index}`, name: 'board.png', path: '/tmp/board.png', mime_type: 'image/png', data_url: PNG }],
+    }))} />)
+    const header = screen.getByRole('button', { name: /已查看 1 张图像/ })
+    await userEvent.click(header)
+    expect(screen.getAllByRole('button', { name: '预览图片' })).toHaveLength(1)
+  })
+
+  it('keeps distinct images with the same filename when only artifact IDs are available', async () => {
+    render(<ImageReadCluster toolCalls={['art_a', 'art_b', 'art_a'].map(id => buildToolCall({
+      id: `read-${id}`, toolName: 'read',
+      artifacts: [{ id, name: 'image.png', mime_type: 'image/png', data_url: PNG }],
+    }))} />)
+    await userEvent.click(screen.getByRole('button', { name: /已查看 2 张图像/ }))
+    expect(screen.getAllByRole('button', { name: '预览图片' })).toHaveLength(2)
+  })
+
+  it('retains counts for older image reads without thumbnail identities', () => {
+    render(<ImageReadCluster toolCalls={[
+      buildToolCall({ id: 'old', toolName: 'read', structured_content: { type: 'image_read', count: 2 } }),
+      buildToolCall({ id: 'new', toolName: 'read', arguments: { path: '/tmp/one.png' } }),
+    ]} />)
+    expect(screen.getByRole('button', { name: /已查看 3 张图像/ })).toBeInTheDocument()
+  })
+
   it('renders a capitalized verb + basename target, dropping status/source/duration', () => {
     render(<ToolCallBlock toolCall={buildToolCall({ arguments: { path: 'src/a/README.md' } })} />)
     const button = screen.getByRole('button', { name: /Read/ })
@@ -129,6 +176,36 @@ describe('ToolCallBlock', () => {
     await user.click(screen.getByRole('button', { name: /Read/ }))
     expect(screen.getByText('参数')).toBeInTheDocument()
     expect(screen.getAllByText(/README\.md/).length).toBeGreaterThan(0)
+  })
+
+  it('labels details in the UI language instead of hardcoded Chinese', async () => {
+    const user = userEvent.setup()
+    render(
+      <LangContext.Provider value="en">
+        <ToolCallBlock
+          toolCall={buildToolCall({
+            arguments: { path: 'README.md' },
+          })}
+          defaultOpen={false}
+        />
+      </LangContext.Provider>,
+    )
+    await user.click(screen.getByRole('button', { name: /Read/ }))
+    expect(screen.getByText('Arguments')).toBeInTheDocument()
+    expect(screen.queryByText('参数')).not.toBeInTheDocument()
+  })
+
+  it('keeps $ sequences from tool arguments intact in localized previews', async () => {
+    const user = userEvent.setup()
+    const query = "printf $'a\\n' $$ $&"
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({ toolName: 'grep', result_preview: '', arguments: { query } })}
+        defaultOpen={false}
+      />,
+    )
+    await user.click(screen.getByRole('button', { name: /Grep/ }))
+    expect(screen.getByText(`搜索 ${query}`)).toBeInTheDocument()
   })
 
   it('uses the search pattern as the grep target', () => {
@@ -857,6 +934,29 @@ describe('ToolCallBlock', () => {
     const button = screen.getByRole('button')
     expect(within(button).getByText('Update todos')).toBeInTheDocument()
     expect(within(button).getByText('1/2')).toBeInTheDocument()
+  })
+
+  it('shows a cleared native todo_write as all done, counting from its arguments', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'todo_write',
+          source: 'native',
+          status: 'success',
+          arguments: JSON.stringify({
+            todos: [
+              { content: '读协议', status: 'completed' },
+              { content: '接线', status: 'completed' },
+              { content: '旧方案', status: 'cancelled' },
+            ],
+          }),
+          structured_content: { todoState: { items: [], updated_at: 1 }, cleared: true },
+        })}
+      />,
+    )
+    const button = screen.getByRole('button')
+    expect(within(button).getByText('Update todos')).toBeInTheDocument()
+    expect(within(button).getByText('2/2')).toBeInTheDocument()
   })
 
   it('renders claude TaskCreate / TaskUpdate as readable task rows', () => {

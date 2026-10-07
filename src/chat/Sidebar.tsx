@@ -6,19 +6,17 @@ import {
   Folder,
   FolderPlus,
   Layers,
-  LayoutGrid,
   MoreHorizontal,
-  NotebookPen,
   Plus,
   Search,
   Settings,
   SquarePen,
-  Workflow,
 } from 'lucide-react'
 import type { ChatAssistant, ChatProject, ChatSet, ConversationListItem, ConversationSearchHit } from './types'
 import { HighlightText } from './searchHighlight'
-import { AgentIcon, KnowledgeIcon, McpIcon, SkillIcon, WorksIcon } from '../settings/public/icons'
+import { AgentIcon, ComposeIcon, ExtensionsIcon, KnowledgeIcon, MediaIcon, NotesIcon, PluginIcon, PortfolioIcon, TasksIcon, SearchNavIcon } from '../settings/public/icons'
 import { ConversationList } from './ConversationList'
+import { useScheduledTasks } from './scheduledTasks/useScheduledTasks'
 import { ChatSectionMenu } from './ChatSectionMenu'
 import { ProjectContextMenu } from './ProjectContextMenu'
 import { ProjectDialog } from './ProjectDialog'
@@ -43,6 +41,7 @@ import { i18n, useT, type I18n, type Lang } from '../components/i18n'
 import { conversationMarkdownFilename } from './conversationExport'
 import { displayConversationTitle, isPlaceholderTitle, isProvisionalTitle } from './conversationTitle'
 import { SwapTitle } from './SwapTitle'
+import { alertDialog, confirmDialog } from '../components/dialogQueue'
 
 function resolveChatUserProfile(
   chat?: { userDisplayName?: string; userAvatar?: string } | null,
@@ -71,14 +70,12 @@ export interface ConversationSelectionScope {
 const extensionSubItems: Array<{
   id: ExtensionsNavItem
   label: (t: I18n) => string
-  icon: (props: { size?: number; className?: string }) => React.JSX.Element
+  icon: (props: { size?: number; strokeWidth?: number; className?: string }) => React.JSX.Element
 }> = [
   { id: 'assistants', label: (t) => t.chatNavAssistants, icon: AgentIcon },
-  { id: 'skill', label: () => 'Skill', icon: SkillIcon },
-  { id: 'mcp', label: () => 'MCP', icon: McpIcon },
   { id: 'knowledge', label: (t) => t.chatNavKnowledge, icon: KnowledgeIcon },
-  { id: 'notes', label: (t) => t.chatNavNotes, icon: (props) => <NotebookPen size={props.size} className={props.className} strokeWidth={1.75} /> },
-  { id: 'automations', label: (t) => t.chatNavAutomations, icon: (props) => <Workflow size={props.size} className={props.className} strokeWidth={1.75} /> },
+  { id: 'media', label: (t) => t.chatNavMedia, icon: MediaIcon },
+  { id: 'notes', label: (t) => t.chatNavNotes, icon: NotesIcon },
 ]
 
 const PROJECT_PREVIEW_LIMIT = 5
@@ -258,15 +255,15 @@ function SidebarUserFooter({
 
   return (
     <div
-      className="shrink-0 border-t border-neutral-200/60 p-1.5 dark:border-neutral-800/80"
+      className="shrink-0 border-t border-neutral-200/60 p-1.5"
       data-tauri-drag-region="false"
     >
       <div
         ref={rowRef}
         className={`flex w-full items-center gap-1 rounded-lg px-1.5 py-1 transition-colors ${
           menuRect || settingsActive
-            ? 'bg-black/[0.06] dark:bg-white/[0.1]'
-            : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+            ? 'bg-neutral-900/[0.06]'
+            : 'hover:bg-neutral-900/[0.04]'
         }`}
       >
         <button
@@ -278,7 +275,7 @@ function SidebarUserFooter({
         >
           <UserAvatar profile={profile} size={22} />
           <span
-            className="min-w-0 flex-1 truncate text-[12.5px] text-neutral-700 dark:text-neutral-300"
+            className="min-w-0 flex-1 truncate text-[12.5px] text-neutral-700"
             title={profile.displayName || undefined}
           >
             {profile.displayName || 'Kivio'}
@@ -315,24 +312,22 @@ interface NavRowProps {
   onClick?: () => void
   disabled?: boolean
   active?: boolean
-  /** 图标在 hover 时的微动效（group-hover transform 工具类） */
-  iconMotion?: string
 }
 
-function NavRow({ icon, label, onClick, disabled, active, iconMotion }: NavRowProps) {
+function NavRow({ icon, label, onClick, disabled, active }: NavRowProps) {
   return (
     <button
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={`group flex w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] transition-colors disabled:cursor-default disabled:opacity-40 ${
+      className={`kv-nav-motion group flex w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] transition-colors disabled:cursor-default disabled:opacity-40 ${
         active
-          ? 'bg-black/[0.06] font-medium text-neutral-900 dark:bg-white/[0.1] dark:text-neutral-50'
-          : 'text-neutral-800 hover:bg-black/[0.04] dark:text-neutral-200 dark:hover:bg-white/[0.06]'
+          ? 'bg-neutral-900/[0.06] font-medium text-neutral-900'
+          : 'text-neutral-800 hover:bg-neutral-900/[0.04]'
       }`}
     >
       <span
-        className={`flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 group-active:scale-90 dark:text-neutral-400 dark:group-hover:text-neutral-200 ${iconMotion ?? ''}`}
+        className={`flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 dark:text-neutral-400`}
       >
         {icon}
       </span>
@@ -362,15 +357,15 @@ function ExtensionsNav({
       <button
         type="button"
         onClick={() => setExpanded((open) => !open)}
-        className={`group flex w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] font-medium transition-colors ${
+        className={`kv-nav-motion group flex w-full items-center gap-2.5 rounded-lg px-3 py-1.5 text-left text-[13px] font-medium transition-colors ${
           highlighted
-            ? 'bg-black/[0.06] text-neutral-900 dark:bg-white/[0.1] dark:text-neutral-50'
-            : 'text-neutral-800 hover:bg-black/[0.04] dark:text-neutral-200 dark:hover:bg-white/[0.06]'
+            ? 'bg-neutral-900/[0.06] text-neutral-900'
+            : 'text-neutral-800 hover:bg-neutral-900/[0.04]'
         }`}
         aria-expanded={expanded}
       >
-        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 group-active:scale-90 group-hover:rotate-3 group-hover:scale-110 dark:text-neutral-400 dark:group-hover:text-neutral-200">
-          <LayoutGrid size={17} strokeWidth={1.75} />
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 dark:text-neutral-400">
+          <ExtensionsIcon size={18} strokeWidth={1.75} />
         </span>
         <span className="min-w-0 flex-1 truncate">{t.chatNavExtensions}</span>
         <ChevronRight
@@ -393,14 +388,14 @@ function ExtensionsNav({
                 onClick={() => onSelectItem(item.id)}
                 className={`flex items-center gap-2 rounded-md py-1.5 pl-2 pr-1 text-left text-[13px] transition-colors ${
                   active
-                    ? 'font-medium text-neutral-900 dark:text-neutral-100'
-                    : 'text-neutral-700 hover:bg-black/[0.04] hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-white/[0.06] dark:hover:text-neutral-100'
+                    ? 'font-medium text-neutral-900'
+                    : 'text-neutral-700 hover:bg-neutral-900/[0.04] hover:text-neutral-900'
                 }`}
               >
                 <span className={`flex h-4 w-4 shrink-0 items-center justify-center ${
-                  active ? 'text-neutral-700 dark:text-neutral-200' : 'text-neutral-400 dark:text-neutral-500'
+                  active ? 'text-neutral-700' : 'text-neutral-400 dark:text-neutral-500'
                 }`}>
-                  <Icon size={15} />
+                  <Icon size={15} strokeWidth={1.75} />
                 </span>
                 <span className="min-w-0 flex-1 truncate">{item.label(t)}</span>
               </button>
@@ -461,12 +456,12 @@ function SearchDialog({
     >
       <div
         ref={dialogRef}
-        className="chat-motion-popover flex max-h-[62vh] w-full max-w-[560px] flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-2xl shadow-black/25 dark:border-neutral-700 dark:bg-[#242426]"
+        className="chat-motion-popover flex max-h-[62vh] w-full max-w-[560px] flex-col overflow-hidden rounded-xl border border-neutral-200 bg-neutral-50 shadow-2xl shadow-black/25"
         role="dialog"
         aria-modal="true"
         aria-label={t.chatSearchConversations}
       >
-        <div className="flex items-center gap-2 border-b border-neutral-200/80 px-3 py-2 dark:border-neutral-700/80">
+        <div className="flex items-center gap-2 border-b border-neutral-200/80 px-3 py-2">
           <Search size={15} strokeWidth={1.75} className="shrink-0 text-neutral-400" />
           <input
             ref={inputRef}
@@ -485,7 +480,7 @@ function SearchDialog({
               }
             }}
             placeholder={t.chatSearchConversations}
-            className="min-w-0 flex-1 bg-transparent text-[14px] font-medium text-neutral-900 outline-none placeholder:text-neutral-400 dark:text-neutral-100 dark:placeholder:text-neutral-500"
+            className="min-w-0 flex-1 bg-transparent text-[14px] font-medium text-neutral-900 outline-none placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
           />
         </div>
 
@@ -520,8 +515,8 @@ function SearchDialog({
                   }}
                   className={`chat-motion-row group/search-result flex w-full min-w-0 items-start gap-2 rounded-md px-2.5 py-1.5 text-left transition-colors ${
                     active
-                      ? 'bg-black/[0.07] dark:bg-white/[0.1]'
-                      : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.07]'
+                      ? 'bg-neutral-900/[0.07]'
+                      : 'hover:bg-neutral-900/[0.04]'
                   }`}
                 >
                   <div className="min-w-0 flex-1">
@@ -532,8 +527,8 @@ function SearchDialog({
                           query={normalizedQuery}
                           className={`min-w-0 flex-1 truncate text-[13px] font-medium ${
                             active
-                              ? 'text-neutral-950 dark:text-neutral-50'
-                              : 'text-neutral-800 dark:text-neutral-200'
+                              ? 'text-neutral-950'
+                              : 'text-neutral-800'
                           }${
                             generatingConversationIds.has(conversation.id)
                             && isProvisionalTitle(listedTitle, conversation.preview)
@@ -547,8 +542,8 @@ function SearchDialog({
                           title={listedTitle}
                           className={`min-w-0 flex-1 truncate text-[13px] font-medium ${
                             active
-                              ? 'text-neutral-950 dark:text-neutral-50'
-                              : 'text-neutral-800 dark:text-neutral-200'
+                              ? 'text-neutral-950'
+                              : 'text-neutral-800'
                           }${
                             generatingConversationIds.has(conversation.id)
                             && isProvisionalTitle(listedTitle, conversation.preview)
@@ -688,6 +683,18 @@ export const Sidebar = memo(function Sidebar({
     [onWidthChange, width],
   )
   const [conversations, setConversations] = useState<ConversationListItem[]>([])
+  const { tasks: scheduledTasks } = useScheduledTasks()
+  const scheduledTaskNamesByConversation = useMemo(() => {
+    const names = new Map<string, string[]>()
+    for (const task of scheduledTasks ?? []) {
+      const id = task.conversationId
+      if (!task.enabled || task.status !== 'active') continue
+      const existing = names.get(id)
+      if (existing) existing.push(task.name)
+      else names.set(id, [task.name])
+    }
+    return names
+  }, [scheduledTasks])
   const [projects, setProjects] = useState<ChatProject[]>([])
   const [sets, setSets] = useState<ChatSet[]>([])
   // 集/项目里对话的钉住位置：group_id → 钉子表。底座仍是时间序，见 conversationPins.ts。
@@ -715,7 +722,7 @@ export const Sidebar = memo(function Sidebar({
   const [expandedSetConversationIds, setExpandedSetConversationIds] = useState<Set<string>>(
     () => new Set(),
   )
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [sectionMenuAnchor, setSectionMenuAnchor] = useState<ConversationMenuAnchor | null>(null)
   const [projectMenuState, setProjectMenuState] = useState<{
     projectId: string
@@ -733,7 +740,6 @@ export const Sidebar = memo(function Sidebar({
   const [setDialogSaving, setSetDialogSaving] = useState(false)
   const [setDialogError, setSetDialogError] = useState('')
   const sectionMenuButtonRef = useRef<HTMLButtonElement>(null)
-  const sidebarLoadedRef = useRef(false)
   const [userProfile, setUserProfile] = useState(() => resolveChatUserProfile())
   useChatPerfRenderProbe('Sidebar', {
     collapsed,
@@ -754,55 +760,93 @@ export const Sidebar = memo(function Sidebar({
     }
   }, [profileRefreshKey])
 
-  const loadSidebarData = useCallback(async (options?: { silent?: boolean; projectOverride?: ChatProject | null; setOverride?: ChatSet | null }) => {
-    const projectForLoad = options?.projectOverride === undefined ? selectedProject : options.projectOverride
-    const setForLoad = options?.setOverride === undefined ? selectedSet : options.setOverride
-    const silent = options?.silent ?? false
-    if (!silent) setLoading(true)
-    try {
-      const conversationsPromise = chatApi.getConversations(0, 80)
-      const extrasPromise = Promise.all([
-        chatApi.getProjects(),
-        chatApi.getSets(),
-        chatApi.getAssistants(),
-        chatApi.getConversationPins(),
-      ])
-      const conversationData = await conversationsPromise
-      setConversations(conversationData)
-      // 真实列表已落地：通知父组件剪掉已被接管的乐观条目。必须在 setConversations 同一批
-      // 更新里发出，两个 state 才会在同一次 commit 中切换——行实例（key=id）无缝从乐观
-      // 条目换到真实条目，SwapTitle 不重挂。
-      onConversationsLoaded?.()
-      if (!silent) setLoading(false)
-
-      const [projectData, setData, assistantData, pinData] = await extrasPromise
-      setProjects(projectData)
-      setSets(setData)
-      setConversationPins(pinData)
-      setAssistants(assistantData)
-      if (projectForLoad && !projectData.some((project) => project.id === projectForLoad.id)) {
-        onSelectProject(null)
-      }
-      if (setForLoad && !setData.some((set) => set.id === setForLoad.id)) {
-        onSelectSet(null)
-      }
-    } catch (err) {
-      console.error('Failed to load chat sidebar data:', err)
-    } finally {
-      if (!silent) setLoading(false)
+  // Selection/callbacks are navigation state, not catalog invalidations. Read the
+  // latest committed props when a request finishes without restarting it.
+  const sidebarInputsRef = useRef({ selectedProject, selectedSet, onSelectProject, onSelectSet, onConversationsLoaded })
+  useLayoutEffect(() => {
+    sidebarInputsRef.current = { selectedProject, selectedSet, onSelectProject, onSelectSet, onConversationsLoaded }
+  })
+  type LoadOptions = { silent?: boolean }
+  const sidebarRequestRef = useRef<{ promise: Promise<void>; queued?: LoadOptions } | null>(null)
+  const sidebarMountedRef = useRef(false)
+  useEffect(() => {
+    sidebarMountedRef.current = true
+    return () => {
+      sidebarMountedRef.current = false
+      sidebarRequestRef.current = null
     }
-  }, [onConversationsLoaded, onSelectProject, onSelectSet, selectedProject, selectedSet])
+  }, [])
+
+  const loadSidebarData = useCallback((options: LoadOptions = {}): Promise<void> => {
+    if (!sidebarMountedRef.current) return Promise.resolve()
+    const pending = sidebarRequestRef.current
+    if (pending) {
+      // Mutations arriving during a read need one fresh snapshot afterwards,
+      // not an unbounded number of concurrent IPC requests.
+      pending.queued = options
+      return pending.promise
+    }
+    const request: { promise: Promise<void>; queued?: LoadOptions } = { promise: Promise.resolve() }
+    sidebarRequestRef.current = request
+    const isCurrent = () => sidebarRequestRef.current === request && sidebarMountedRef.current
+    request.promise = (async () => {
+      let next: LoadOptions | undefined = options
+      while (next && isCurrent()) {
+        const silent = next.silent ?? false
+        request.queued = undefined
+        if (!silent) setLoading(true)
+        try {
+          const results = await Promise.allSettled([
+            chatApi.getConversations(0, 80).then(conversationData => {
+              if (!isCurrent() || request.queued) return
+              setConversations(conversationData)
+              // Keep optimistic-row handoff in the same React batch.
+              sidebarInputsRef.current.onConversationsLoaded?.()
+              setLoading(false)
+            }),
+            Promise.allSettled([
+              chatApi.getProjects(), chatApi.getSets(),
+              chatApi.getAssistants(), chatApi.getConversationPins(),
+            ]).then(([projectResult, setResult, assistantResult, pinResult]) => {
+              if (!isCurrent() || request.queued) return
+              // A failed read must not release the batch while its siblings
+              // are still running, or retries can pile up behind them.
+              if (projectResult.status === 'rejected') throw projectResult.reason
+              if (setResult.status === 'rejected') throw setResult.reason
+              if (assistantResult.status === 'rejected') throw assistantResult.reason
+              if (pinResult.status === 'rejected') throw pinResult.reason
+              setProjects(projectResult.value)
+              setSets(setResult.value)
+              setConversationPins(pinResult.value)
+              setAssistants(assistantResult.value)
+              // A late response must never clear the group the user has since
+              // selected using a closure from a previous navigation.
+              const inputs = sidebarInputsRef.current
+              if (inputs.selectedProject && !projectResult.value.some(project => project.id === inputs.selectedProject?.id)) {
+                inputs.onSelectProject(null)
+              }
+              if (inputs.selectedSet && !setResult.value.some(set => set.id === inputs.selectedSet?.id)) {
+                inputs.onSelectSet(null)
+              }
+            }),
+          ])
+          for (const result of results) if (result.status === 'rejected') throw result.reason
+        } catch (err) {
+          console.error('Failed to load chat sidebar data:', err)
+        } finally {
+          if (isCurrent()) setLoading(false)
+        }
+        next = request.queued
+      }
+    })().finally(() => {
+      if (sidebarRequestRef.current === request) sidebarRequestRef.current = null
+    })
+    return request.promise
+  }, [])
 
   useEffect(() => {
-    // 侧栏数据与 selectedProject 无关（loadSidebarData 始终拉全部项目+对话，仅用 selectedProject
-    // 判断项目是否被删）。切项目时拉到的是相同数据，不该进 loading 态白闪一下；首次加载非静默
-    // 显 loading，之后（含跨项目切换）一律静默后台刷新，消除切换对话时的侧栏闪烁。
-    void loadSidebarData({ silent: sidebarLoadedRef.current })
-    sidebarLoadedRef.current = true
-  }, [loadSidebarData, selectedProject?.id])
-
-  useEffect(() => {
-    if (refreshKey === 0) return
+    // Initial state already shows the skeleton. Subsequent invalidations keep
+    // the current rows visible, including after a StrictMode effect restart.
     void loadSidebarData({ silent: true })
   }, [loadSidebarData, refreshKey])
 
@@ -848,7 +892,7 @@ export const Sidebar = memo(function Sidebar({
       await loadSidebarData({ silent: true })
     } catch (err) {
       console.error('Failed to regenerate conversation title:', err)
-      window.alert(
+      void alertDialog(
         t.chatRegenerateTitleFailed + (err instanceof Error ? err.message : String(err)),
       )
     } finally {
@@ -916,7 +960,7 @@ export const Sidebar = memo(function Sidebar({
   }
 
   const handleDeleteConversation = async (id: string) => {
-    if (!window.confirm(t.chatDeleteConversationConfirm)) return
+    if (!(await confirmDialog({ message: t.chatDeleteConversationConfirm, confirmLabel: t.dialogDelete, danger: true }))) return
     // B3：删"generating"会话先强制清父组件 in-flight/乐观状态，
     // 让乐观合并（visibleConversations）不再保留它。
     if (generatingConversationIds.has(id)) {
@@ -932,12 +976,12 @@ export const Sidebar = memo(function Sidebar({
       // 对话本身已删掉，只是副产物没清干净（典型：工作区里还有进程占着目录）。
       // 以前这类情况整个删除会中止、对话又冒回来，现在只提示一句。
       if (warnings.length > 0) {
-        window.alert(t.chatDeleteConversationPartial + warnings.join('\n'))
+        void alertDialog(t.chatDeleteConversationPartial + warnings.join('\n'))
       }
     } catch (err) {
       console.error('Failed to delete conversation:', err)
       const message = err instanceof Error ? err.message : String(err)
-      window.alert(t.chatDeleteConversationFailed + message)
+      void alertDialog(t.chatDeleteConversationFailed + message)
     } finally {
       // 无论后端删除成功或抛错，都本地剔除该 id 并刷新侧栏，确保 ghost 立即消失。
       setConversations((items) => items.filter((item) => item.id !== id))
@@ -960,7 +1004,7 @@ export const Sidebar = memo(function Sidebar({
     } catch (err) {
       const prefix = t.chatExportFailed
       const message = err instanceof Error ? err.message : String(err)
-      window.alert(`${prefix}${message}`)
+      void alertDialog(`${prefix}${message}`)
     }
   }
 
@@ -1018,7 +1062,7 @@ export const Sidebar = memo(function Sidebar({
         ? await chatApi.updateSet(dialogSet.id, { name, systemPrompt, defaultAssistantId, color })
         : await chatApi.createSet(name, systemPrompt, defaultAssistantId, color)
       onSelectSet(set)
-      await loadSidebarData({ silent: true, setOverride: set })
+      await loadSidebarData({ silent: true })
       setDialogSet(undefined)
     } catch (err) {
       setSetDialogError(typeof err === 'string' ? err : (err as Error).message || t.chatSetSaveFailed)
@@ -1028,7 +1072,7 @@ export const Sidebar = memo(function Sidebar({
   }
 
   const handleDeleteSet = async (set: ChatSet) => {
-    if (!window.confirm(t.chatDeleteSetConfirm.replace('{name}', set.name))) {
+    if (!(await confirmDialog({ message: t.chatDeleteSetConfirm.replace('{name}', () => set.name), confirmLabel: t.dialogDelete, danger: true }))) {
       return
     }
     try {
@@ -1077,7 +1121,7 @@ export const Sidebar = memo(function Sidebar({
         ? await chatApi.updateProject(dialogProject.id, { name, rootPath })
         : await chatApi.createProject(name, null, null, rootPath)
       onSelectProject(project)
-      await loadSidebarData({ silent: true, projectOverride: project })
+      await loadSidebarData({ silent: true })
       setDialogProject(undefined)
     } catch (err) {
       setProjectError(typeof err === 'string' ? err : (err as Error).message || t.chatProjectSaveFailed)
@@ -1090,12 +1134,12 @@ export const Sidebar = memo(function Sidebar({
     try {
       await chatApi.openProjectFolder(project.id)
     } catch (err) {
-      window.alert(typeof err === 'string' ? err : (err as Error).message || t.chatOpenProjectFolderFailed)
+      void alertDialog(typeof err === 'string' ? err : (err as Error).message || t.chatOpenProjectFolderFailed)
     }
   }
 
   const handleDeleteProject = async (project: ChatProject) => {
-    if (!window.confirm(t.chatDeleteProjectConfirm.replace('{name}', project.name))) {
+    if (!(await confirmDialog({ message: t.chatDeleteProjectConfirm.replace('{name}', () => project.name), confirmLabel: t.dialogDelete, danger: true }))) {
       return
     }
     try {
@@ -1116,9 +1160,9 @@ export const Sidebar = memo(function Sidebar({
       : conversations
     if (targetConversations.length === 0) return
     const confirmText = selectedProject
-      ? t.chatDeleteAllInProjectConfirm.replace('{name}', selectedProject.name)
+      ? t.chatDeleteAllInProjectConfirm.replace('{name}', () => selectedProject.name)
       : t.chatDeleteAllConfirm
-    if (!window.confirm(confirmText.replace('{count}', String(targetConversations.length)))) return
+    if (!(await confirmDialog({ message: confirmText.replace('{count}', String(targetConversations.length)), confirmLabel: t.dialogDelete, danger: true }))) return
     try {
       await Promise.all(targetConversations.map((conv) => chatApi.deleteConversation(conv.id)))
       if (currentConversationId && targetConversations.some((conv) => conv.id === currentConversationId)) {
@@ -1408,32 +1452,50 @@ export const Sidebar = memo(function Sidebar({
         className={`shrink-0 space-y-0.5 px-2 pb-2 ${usesNativeTitlebar ? '' : 'pt-2'}`}
         data-tauri-drag-region="false"
       >
+        <div className="flex items-center gap-1 pr-1">
+          <div className="min-w-0 flex-1">
+            <NavRow
+              icon={<ComposeIcon size={18} strokeWidth={1.75} />}
+              label={t.chatNewChat}
+              onClick={onNewConversation}
+            />
+          </div>
+          <IconButton
+            size="md"
+            variant="ghost"
+            className="kv-nav-motion"
+            label={t.chatSearch}
+            aria-expanded={searchOpen}
+            onClick={() => onSearchOpenChange(true)}
+          >
+            <SearchNavIcon size={18} strokeWidth={1.75} />
+          </IconButton>
+        </div>
         <NavRow
-          icon={<SquarePen size={17} strokeWidth={1.75} />}
-          label={t.chatNewChat}
-          onClick={onNewConversation}
-          iconMotion="group-hover:-rotate-6 group-hover:scale-110"
+          icon={<PluginIcon size={18} strokeWidth={1.75} />}
+          label={t.chatNavPlugins}
+          onClick={() => onOpenExtensionsItem('plugins')}
+          active={extensionsActive === 'plugins'}
         />
         <NavRow
-          icon={<Search size={17} strokeWidth={1.75} />}
-          label={t.chatSearch}
-          onClick={() => onSearchOpenChange(true)}
-          active={searchOpen}
-          iconMotion="group-hover:scale-110"
+          icon={<TasksIcon size={18} strokeWidth={1.75} />}
+          label={t.chatNavTasks}
+          onClick={() => onOpenExtensionsItem('tasks')}
+          active={extensionsActive === 'tasks'}
         />
         <NavRow
-          icon={<WorksIcon size={17} strokeWidth={1.75} />}
+          icon={<PortfolioIcon size={18} strokeWidth={1.75} />}
           label={t.chatNavArtifacts}
           onClick={() => onOpenExtensionsItem('artifacts')}
           active={extensionsActive === 'artifacts'}
         />
         <ExtensionsNav
-          activeItem={extensionsActive === 'artifacts' ? null : extensionsActive}
+          activeItem={extensionsActive === 'artifacts' || extensionsActive === 'plugins' || extensionsActive === 'tasks' ? null : extensionsActive}
           onSelectItem={onOpenExtensionsItem}
         />
       </nav>
 
-      <div className="mx-2 border-t border-neutral-200/90 dark:border-neutral-800" />
+      <div className="mx-2 border-t border-neutral-200/90" />
 
       <div className="flex min-h-0 flex-1 flex-col" data-tauri-drag-region="false">
         {loading ? (
@@ -1458,8 +1520,8 @@ export const Sidebar = memo(function Sidebar({
                       onClick={() => setActiveTab(tab)}
                       className={`rounded-md px-1.5 py-0.5 transition-colors ${
                         activeTab === tab
-                          ? 'text-neutral-900 dark:text-neutral-100'
-                          : 'text-neutral-400 hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300'
+                          ? 'text-neutral-900'
+                          : 'text-neutral-400 hover:text-neutral-600 dark:text-neutral-500'
                       }`}
                       aria-current={activeTab === tab}
                     >
@@ -1482,7 +1544,7 @@ export const Sidebar = memo(function Sidebar({
                     ref={sectionMenuButtonRef}
                     size="sm"
                     onClick={openSectionMenu}
-                    className={sectionMenuAnchor ? 'bg-black/[0.06] text-neutral-600 dark:bg-white/[0.1] dark:text-neutral-200' : ''}
+                    className={sectionMenuAnchor ? 'bg-neutral-900/[0.06] text-neutral-600' : ''}
                     label={t.chatConversationListActions}
                     aria-haspopup="menu"
                     aria-expanded={sectionMenuAnchor !== null}
@@ -1595,8 +1657,8 @@ export const Sidebar = memo(function Sidebar({
                         <div
                           className={`kv-sidebar-group-row group flex min-w-0 items-center rounded-lg ${
                             active
-                              ? 'bg-black/[0.04] dark:bg-white/[0.08]'
-                              : 'hover:bg-black/[0.035] dark:hover:bg-white/[0.06]'
+                              ? 'bg-neutral-900/[0.04]'
+                              : 'hover:bg-neutral-900/[0.035]'
                           }`}
                         >
                           <button
@@ -1611,8 +1673,8 @@ export const Sidebar = memo(function Sidebar({
                             }}
                             className={`flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left text-[13px] ${
                               active
-                                ? 'font-semibold text-neutral-900 dark:text-neutral-100'
-                                : 'font-medium text-neutral-600 dark:text-neutral-300'
+                                ? 'font-semibold text-neutral-900'
+                                : 'font-medium text-neutral-600'
                             }`}
                             title={(collapsedProject ? t.chatExpandNamed : t.chatCollapseNamed).replace('{name}', project.name)}
                             aria-expanded={!collapsedProject}
@@ -1672,6 +1734,7 @@ export const Sidebar = memo(function Sidebar({
                           currentConversationId={currentConversationId}
                           generatingConversationIds={generatingConversationIds}
                           titleGeneratingConversationIds={titleGeneratingIds}
+                          scheduledTaskNamesByConversation={scheduledTaskNamesByConversation}
                           projects={projects}
                           sets={sets}
                           lang={lang}
@@ -1704,7 +1767,7 @@ export const Sidebar = memo(function Sidebar({
                               return next
                             })
                           }}
-                          className="ml-8 rounded-md px-2.5 py-0.5 text-left text-[13px] font-medium text-neutral-400 transition-colors hover:bg-black/[0.035] hover:text-neutral-600 dark:text-neutral-500 dark:hover:bg-white/[0.06] dark:hover:text-neutral-300"
+                          className="ml-8 rounded-md px-2.5 py-0.5 text-left text-[13px] font-medium text-neutral-400 transition-colors hover:bg-neutral-900/[0.035] hover:text-neutral-600 dark:text-neutral-500"
                         >
                           {expanded ? t.chatShowLess : t.chatShowMore}
                         </button>
@@ -1723,7 +1786,7 @@ export const Sidebar = memo(function Sidebar({
                     <button
                       type="button"
                       onClick={openCreateSetDialog}
-                      className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[13px] text-neutral-400 transition-colors hover:bg-black/[0.035] hover:text-neutral-600 dark:text-neutral-500 dark:hover:bg-white/[0.06] dark:hover:text-neutral-300"
+                      className="flex w-full items-center gap-1.5 rounded-lg px-2 py-1 text-left text-[13px] text-neutral-400 transition-colors hover:bg-neutral-900/[0.035] hover:text-neutral-600 dark:text-neutral-500"
                     >
                       <Plus size={14} strokeWidth={2} className="shrink-0" />
                       {t.chatNewSetHint}
@@ -1748,8 +1811,8 @@ export const Sidebar = memo(function Sidebar({
                           <div
                             className={`kv-sidebar-group-row group flex min-w-0 items-center rounded-lg ${
                               active
-                                ? 'bg-black/[0.04] dark:bg-white/[0.08]'
-                                : 'hover:bg-black/[0.035] dark:hover:bg-white/[0.06]'
+                                ? 'bg-neutral-900/[0.04]'
+                                : 'hover:bg-neutral-900/[0.035]'
                             }`}
                           >
                             <button
@@ -1764,8 +1827,8 @@ export const Sidebar = memo(function Sidebar({
                               }}
                               className={`flex min-w-0 flex-1 items-center gap-1.5 px-2 py-1 text-left text-[13px] ${
                                 active
-                                  ? 'font-semibold text-neutral-900 dark:text-neutral-100'
-                                  : 'font-medium text-neutral-600 dark:text-neutral-300'
+                                  ? 'font-semibold text-neutral-900'
+                                  : 'font-medium text-neutral-600'
                               }`}
                               title={(collapsedSet ? t.chatExpandNamed : t.chatCollapseNamed).replace('{name}', set.name)}
                               aria-expanded={!collapsedSet}
@@ -1824,6 +1887,7 @@ export const Sidebar = memo(function Sidebar({
                               currentConversationId={currentConversationId}
                               generatingConversationIds={generatingConversationIds}
                               titleGeneratingConversationIds={titleGeneratingIds}
+                              scheduledTaskNamesByConversation={scheduledTaskNamesByConversation}
                               projects={projects}
                               sets={sets}
                               lang={lang}
@@ -1856,7 +1920,7 @@ export const Sidebar = memo(function Sidebar({
                                   return next
                                 })
                               }}
-                              className="ml-8 rounded-md px-2.5 py-0.5 text-left text-[13px] font-medium text-neutral-400 transition-colors hover:bg-black/[0.035] hover:text-neutral-600 dark:text-neutral-500 dark:hover:bg-white/[0.06] dark:hover:text-neutral-300"
+                              className="ml-8 rounded-md px-2.5 py-0.5 text-left text-[13px] font-medium text-neutral-400 transition-colors hover:bg-neutral-900/[0.035] hover:text-neutral-600 dark:text-neutral-500"
                             >
                               {expanded ? t.chatShowLess : t.chatShowMore}
                             </button>
@@ -1890,6 +1954,7 @@ export const Sidebar = memo(function Sidebar({
                       currentConversationId={currentConversationId}
                       generatingConversationIds={generatingConversationIds}
                       titleGeneratingConversationIds={titleGeneratingIds}
+                      scheduledTaskNamesByConversation={scheduledTaskNamesByConversation}
                       projects={projects}
                       sets={sets}
                       lang={lang}

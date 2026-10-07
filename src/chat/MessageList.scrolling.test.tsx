@@ -2,6 +2,7 @@ import { act, fireEvent, render } from '@testing-library/react'
 import type { Virtualizer } from '@tanstack/react-virtual'
 import { afterEach, expect, it, vi } from 'vitest'
 import { MessageList } from './MessageList'
+import { clearChatReadingPositions, rememberChatReadingPosition } from './chatReadingPosition'
 import { reset } from './streamingStore'
 
 let list: Virtualizer<Element, Element>
@@ -16,7 +17,161 @@ vi.mock('@tanstack/react-virtual', async (importOriginal) => {
   }
 })
 
-afterEach(() => { act(() => reset()); vi.restoreAllMocks() })
+afterEach(() => { act(() => reset()); clearChatReadingPositions(); vi.restoreAllMocks() })
+
+it('renders a cross-window image from supplied history dependencies', async () => {
+  const { container } = render(<MessageList conversationId="window-image" historyStart={70}
+    messages={[{ id: 'tail-reference', role: 'assistant', timestamp: 1, content: '![earlier](artifact:art_early)' }]}
+    historyArtifacts={[{ id: 'art_early', name: 'early.png', mime_type: 'image/png', data_url: 'data:image/png;base64,AAAA' }]} />)
+  await act(async () => { await Promise.resolve() })
+  expect(container.textContent).not.toContain('文件不可用')
+  expect(container.querySelector('img')).toHaveAttribute('src', 'data:image/png;base64,AAAA')
+})
+
+it('restores an earlier row when reopening a conversation that ends in a user message', async () => {
+  rememberChatReadingPosition('restore-reading', {
+    following: false, rowKey: 'short-20', rowOffset: 18,
+    scrollTop: 200, layoutKey: 'older-layout',
+  })
+  const { container } = render(<MessageList conversationId="restore-reading" messages={
+    Array.from({ length: 40 }, (_, index) => ({
+      id: `short-${index}`, role: 'user' as const, content: 'Short', timestamp: index,
+    }))
+  } />)
+  await act(async () => { await Promise.resolve() })
+  const viewport = container.querySelector<HTMLElement>('.chat-scroll-viewport')!
+  const index = Array.from({ length: list.options.count }, (_, value) => value)
+    .find((value) => String(list.options.getItemKey(value)).endsWith(':short-20'))!
+  expect(viewport.scrollTop).toBe((list.measurementsCache[index]?.start ?? list.getOffsetForIndex(index, 'start')?.[0])! + 18)
+})
+
+it('falls back to the latest position when the saved row content changed', async () => {
+  rememberChatReadingPosition('edited-reading', {
+    following: false, rowKey: 'old', rowRevision: 'obsolete',
+    rowOffset: 18, scrollTop: 200, layoutKey: 'same-layout',
+  })
+  const { container } = render(<MessageList conversationId="edited-reading" messages={[
+    { id: 'old', role: 'user', content: 'edited', timestamp: 1 },
+  ]} />)
+  await act(async () => { await Promise.resolve() })
+  expect(container.querySelector<HTMLElement>('.chat-scroll-viewport')!.scrollTop).toBe(0)
+})
+
+it('uses the lightweight directory to open a turn outside the first window', async () => {
+  const focus = vi.fn()
+  const { container } = render(<MessageList
+    conversationId="directory"
+    messages={[{ id: 'recent', role: 'user', content: 'Recent', timestamp: 3 }]}
+    historyStart={2}
+    historyDirectory={[
+      { kind: 'turn', id: 'turn-old', message_id: 'old', message_index: 0, title: 'Old question' },
+      { kind: 'compaction', id: 'compaction-middle', message_id: 'middle', message_index: 1, title: '已压缩此前上下文' },
+      { kind: 'turn', id: 'turn-recent', message_id: 'recent', message_index: 2, title: 'Recent question' },
+    ]}
+    onFocusHistoryMessage={focus}
+    onLoadOlder={vi.fn()}
+  />)
+  await act(async () => { await Promise.resolve() })
+  fireEvent.click(container.querySelector('[data-message-navigator-id="turn-old"]')!)
+  expect(focus).toHaveBeenCalledWith('directory', 'old', expect.any(AbortSignal))
+  const firstSignal = focus.mock.calls[0][2] as AbortSignal
+  fireEvent.click(container.querySelector('[data-message-navigator-id="compaction-middle"]')!)
+  expect(firstSignal.aborted).toBe(true)
+  expect(focus).toHaveBeenCalledWith('directory', 'compaction-summary-middle', expect.any(AbortSignal))
+  const secondSignal = focus.mock.calls[1][2] as AbortSignal
+  fireEvent.wheel(container.querySelector('.chat-scroll-viewport')!, { deltaY: -100 })
+  expect(secondSignal.aborted).toBe(true)
+})
+
+it('keeps the visible row anchored when an older page is prepended', async () => {
+  const older = Array.from({ length: 2 }, (_, index) => ({
+    id: `old-${index}`, role: 'user' as const, content: 'Old', timestamp: index,
+  }))
+  const recent = Array.from({ length: 8 }, (_, index) => ({
+    id: `recent-${index}`, role: 'user' as const, content: 'Recent', timestamp: index + 2,
+  }))
+  const load = vi.fn()
+  const { container, rerender } = render(<MessageList conversationId="page-anchor"
+    messages={recent} historyStart={2} onLoadOlder={load} />)
+  await act(async () => { await Promise.resolve() })
+  const viewport = container.querySelector<HTMLElement>('.chat-scroll-viewport')!
+  const originalStart = list.measurementsCache.find((item) => String(list.options.getItemKey(item.index)).endsWith(':recent-0'))!.start
+  fireEvent.click([...container.querySelectorAll('button')].find((button) => button.textContent === '加载更早消息')!)
+  expect(load).toHaveBeenCalledOnce()
+  rerender(<MessageList conversationId="page-anchor" messages={[...older, ...recent]}
+    historyStart={0} onLoadOlder={load} />)
+  await act(async () => { await Promise.resolve() })
+  const index = Array.from({ length: list.options.count }, (_, value) => value)
+    .find((value) => String(list.options.getItemKey(value)).endsWith(':recent-0'))!
+  expect(viewport.scrollTop).toBe(list.measurementsCache[index].start - originalStart)
+})
+
+it('keeps a detached reader on the same row when background history hydration prepends messages', async () => {
+  const recent = Array.from({ length: 8 }, (_, index) => ({
+    id: `recent-${index}`, role: 'user' as const, content: 'Recent', timestamp: index + 2,
+  }))
+  const older = Array.from({ length: 2 }, (_, index) => ({
+    id: `old-${index}`, role: 'user' as const, content: 'Old', timestamp: index,
+  }))
+  const { container, rerender } = render(<MessageList conversationId="background-anchor"
+    messages={recent} historyStart={2} onLoadOlder={vi.fn()} />)
+  await act(async () => { await Promise.resolve() })
+  const viewport = container.querySelector<HTMLElement>('.chat-scroll-viewport')!
+  const original = list.measurementsCache.find((item) => String(list.options.getItemKey(item.index)).endsWith(':recent-3'))!
+  act(() => {
+    fireEvent.wheel(viewport, { deltaY: -100 })
+    viewport.scrollTop = original.start + 12
+    fireEvent.scroll(viewport)
+  })
+  rerender(<MessageList conversationId="background-anchor" messages={[...older, ...recent]}
+    historyStart={0} onLoadOlder={vi.fn()} />)
+  await act(async () => { await Promise.resolve() })
+  const index = Array.from({ length: list.options.count }, (_, value) => value)
+    .find((value) => String(list.options.getItemKey(value)).endsWith(':recent-3'))!
+  expect(viewport.scrollTop).toBe(list.measurementsCache[index].start + 12)
+})
+
+it('shows a failed history page request and lets the reader retry', async () => {
+  const load = vi.fn()
+  const props = {
+    conversationId: 'page-error',
+    messages: [{ id: 'recent', role: 'user' as const, content: 'Recent', timestamp: 2 }],
+    historyStart: 2,
+    onLoadOlder: load,
+  }
+  const { rerender } = render(<MessageList {...props} />)
+  fireEvent.click([...document.querySelectorAll('button')].find((button) => button.textContent === '加载更早消息')!)
+  expect(load).toHaveBeenCalledOnce()
+  rerender(<MessageList {...props} historyLoadError="加载更早消息失败，请重试。" />)
+  expect(document.querySelector('[role="alert"]')).toHaveTextContent('加载更早消息失败，请重试。')
+  fireEvent.click([...document.querySelectorAll('button')].find((button) => button.textContent === '加载更早消息')!)
+  expect(load).toHaveBeenCalledTimes(2)
+})
+
+it('keeps following after returning to the bottom while history is still loading', async () => {
+  const recent = Array.from({ length: 8 }, (_, index) => ({
+    id: `follow-${index}`, role: 'user' as const, content: 'Recent', timestamp: index + 2,
+  }))
+  const { container, rerender } = render(<MessageList conversationId="hydrate-follow"
+    messages={recent} historyStart={2} onLoadOlder={vi.fn()} />)
+  await act(async () => { await Promise.resolve() })
+  const viewport = container.querySelector<HTMLElement>('.chat-scroll-viewport')!
+  Object.defineProperty(viewport, 'scrollHeight', { configurable: true, value: 3000 })
+  Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 600 })
+  fireEvent.wheel(viewport, { deltaY: -100 })
+  viewport.scrollTop = 100
+  fireEvent.scroll(viewport)
+  fireEvent.click(container.querySelector('[aria-label="回到底部"]')!)
+  expect(list.options.anchorTo).toBe('end')
+  // Let the temporary bottom hold finish before the delayed read resolves.
+  for (let frame = 0; frame < 45; frame += 1) {
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(resolve)) })
+  }
+  rerender(<MessageList conversationId="hydrate-follow" historyStart={0}
+    messages={[{ id: 'older', role: 'user', content: 'Old', timestamp: 1 }, ...recent]} />)
+  await act(async () => { await Promise.resolve() })
+  expect(list.options.anchorTo).toBe('end')
+})
 
 it('mounts a distant scroll range before the scroll delivery can paint', async () => {
   const { container } = render(<MessageList conversationId="fast-scroll-range" messages={

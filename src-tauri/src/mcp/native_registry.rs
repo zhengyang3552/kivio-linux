@@ -495,6 +495,56 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         requires_session_consent: false,
         call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
     },
+    // Scheduled-task tools are conversation-bound; appended in chat reply
+    // preparation (`scheduled_tasks::tools::append_tools`) when enabled.
+    NativeToolEntry {
+        name: crate::scheduled_tasks::tools::LIST_TOOL,
+        def: crate::scheduled_tasks::tools::list_tool,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: true,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(
+            crate::scheduled_tasks::tools::handle_conversation_tool_call,
+        ),
+    },
+    NativeToolEntry {
+        name: crate::scheduled_tasks::tools::CREATE_TOOL,
+        def: crate::scheduled_tasks::tools::create_tool,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(
+            crate::scheduled_tasks::tools::handle_conversation_tool_call,
+        ),
+    },
+    NativeToolEntry {
+        name: crate::scheduled_tasks::tools::UPDATE_TOOL,
+        def: crate::scheduled_tasks::tools::update_tool,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(
+            crate::scheduled_tasks::tools::handle_conversation_tool_call,
+        ),
+    },
+    NativeToolEntry {
+        name: crate::scheduled_tasks::tools::DELETE_TOOL,
+        def: crate::scheduled_tasks::tools::delete_tool,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(
+            crate::scheduled_tasks::tools::handle_conversation_tool_call,
+        ),
+    },
     NativeToolEntry {
         name: crate::chat::ask_user::ASK_USER_TOOL_NAME,
         def: crate::chat::ask_user::ask_user_tool,
@@ -562,31 +612,14 @@ pub fn text_tool_result(content: String) -> McpToolCallResult {
 
 fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     Box::pin(async move {
-        let artifact_ids = string_list_argument(ctx.arguments, "artifact_ids")?;
-        let mut resolved_arguments = ctx.arguments.clone();
-        if !artifact_ids.is_empty() {
-            let extra_paths = string_list_argument(ctx.arguments, "paths")?;
-            if nonempty_path_arg(ctx.arguments).is_some() || !extra_paths.is_empty() {
-                return Err("Use artifact_ids or path/paths, not both".into());
-            }
+        let resolved_arguments = resolve_read_arguments(ctx.arguments, |id| {
             let nc = ctx
                 .native_ctx
                 .ok_or("artifact_ids require an active conversation")?;
-            let paths = artifact_ids
-                .iter()
-                .map(|id| {
-                    let artifact =
-                        crate::chat::artifacts::resolve(ctx.app, &nc.conversation_id, id)?;
-                    crate::chat::artifacts::file_path(ctx.app, &nc.conversation_id, &artifact)
-                        .map(|p| p.to_string_lossy().into_owned())
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            if paths.len() == 1 {
-                resolved_arguments["path"] = serde_json::json!(paths[0]);
-            } else {
-                resolved_arguments["paths"] = serde_json::json!(paths);
-            }
-        }
+            let artifact = crate::chat::artifacts::resolve(ctx.app, &nc.conversation_id, id)?;
+            crate::chat::artifacts::file_path(ctx.app, &nc.conversation_id, &artifact)
+                .map(|p| p.to_string_lossy().into_owned())
+        })?;
         let ctx = NativeCallCtx {
             arguments: &resolved_arguments,
             ..ctx
@@ -683,6 +716,34 @@ fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     })
 }
 
+// Keep source selection separate from conversation/filesystem resolution so the
+// exact model arguments can be replayed without starting a desktop app.
+fn resolve_read_arguments(
+    arguments: &Value,
+    mut resolve_id: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Value, String> {
+    let artifact_ids = crate::chat::artifacts::input_artifact_ids(arguments)?;
+    let mut resolved = arguments.clone();
+    if !artifact_ids.is_empty() {
+        if artifact_ids.len() > 12 {
+            return Err("read accepts at most 12 artifact IDs".into());
+        }
+        // A known ID is the explicit selection. Do not let unused placeholder
+        // paths add files or block it; failed ID resolution never falls back.
+        let paths = artifact_ids.iter().map(|id| resolve_id(id).map_err(|error| format!(
+            "Could not read artifact {id}: {error}. Use exact IDs returned by tools. To read a disk file instead, pass artifact_ids: [], path: the actual file path, paths: []. Do not invent placeholder IDs or repeat the same failed selection."
+        ))).collect::<Result<Vec<_>, _>>()?;
+        resolved["path"] = serde_json::json!("");
+        resolved["paths"] = serde_json::json!([]);
+        if paths.len() == 1 {
+            resolved["path"] = serde_json::json!(paths[0]);
+        } else {
+            resolved["paths"] = serde_json::json!(paths);
+        }
+    }
+    Ok(resolved)
+}
+
 fn nonempty_path_arg(arguments: &Value) -> Option<String> {
     arguments
         .get("path")
@@ -697,24 +758,40 @@ fn read_non_image_paths(
     requested: &[String],
 ) -> Result<String, String> {
     let mut parts = Vec::with_capacity(requested.len());
+    let mut succeeded = 0;
     for raw in requested {
         let args = serde_json::json!({ "path": raw });
-        if let Ok(path) = crate::native_tools::resolve_tool_read_path(workspace, raw) {
-            if path.is_dir() {
-                parts.push(crate::native_tools::list_dir(workspace, &args)?);
-                continue;
+        let result: Result<String, String> = (|| {
+            if let Ok(path) = crate::native_tools::resolve_tool_read_path(workspace, raw) {
+                if path.is_dir() {
+                    return crate::native_tools::list_dir(workspace, &args);
+                }
+                if let Some(hint) = skill_backed_document_hint(&path) {
+                    return Ok(hint);
+                }
             }
-            if let Some(hint) = skill_backed_document_hint(&path) {
-                parts.push(hint);
-                continue;
+            let result = crate::native_tools::read_file(workspace, &args)?;
+            Ok(super::registry::read_file_tool_result(result)?.content)
+        })();
+        match result {
+            Ok(content) => {
+                succeeded += 1;
+                parts.push(content);
             }
-        }
-        match crate::native_tools::read_file(workspace, &args) {
-            Ok(result) => parts.push(super::registry::read_file_tool_result(result)?.content),
             Err(err) => parts.push(format!("{raw}: {err}")),
         }
     }
-    Ok(parts.join("\n\n"))
+    let content = parts.join("\n\n");
+    if succeeded == 0 {
+        return Err(content);
+    }
+    if succeeded < requested.len() {
+        return Ok(format!(
+            "Read {succeeded} of {} requested entries; the remaining entries failed.\n\n{content}",
+            requested.len()
+        ));
+    }
+    Ok(content)
 }
 
 /// PDF/Word/Excel 由内置 skill + 主机命令解析；read 工具不读二进制文档；命中时返回引导提示而非 UTF-8 报错。
@@ -1266,7 +1343,7 @@ fn call_present_artifacts(
                 .to_string(),
         );
     }
-    let artifact_ids = string_list_argument(arguments, "artifact_ids")?;
+    let artifact_ids = crate::chat::artifacts::input_artifact_ids(arguments)?;
     let paths = string_list_argument(arguments, "paths")?;
     if artifact_ids.is_empty() && paths.is_empty() {
         return Err("present_artifacts requires artifact_ids or paths".to_string());
@@ -1274,6 +1351,17 @@ fn call_present_artifacts(
     if artifact_ids.len() + paths.len() > 16 {
         return Err("present_artifacts accepts at most 16 files".to_string());
     }
+    let (artifact_ids, invalid_ids): (Vec<_>, Vec<_>) = artifact_ids
+        .into_iter()
+        .partition(|id| crate::chat::artifacts::is_valid_artifact_id(id));
+    let invalid_id_notice = if invalid_ids.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Invalid artifact ID(s): {}. Use exact art_ IDs returned by tools. For local files, pass paths and omit artifact_ids or use artifact_ids: []; never invent placeholder IDs.",
+            invalid_ids.join(", "),
+        ))
+    };
 
     // 模型常把生成图的 artifact 名（generated-image-1.png）当成 path 一起传进来。
     // 单个 path 读不到不能废掉整次调用，否则同一调用里的 artifact_ids 也一起丢，图就不显示了。
@@ -1286,6 +1374,9 @@ fn call_present_artifacts(
         }
     }
     if artifacts.is_empty() && artifact_ids.is_empty() {
+        if let Some(notice) = invalid_id_notice {
+            skipped.push(notice);
+        }
         return Err(skipped.join("; "));
     }
     let caption = arguments
@@ -1324,6 +1415,11 @@ fn call_present_artifacts(
             skipped.join("; "),
         ));
     }
+    if let Some(notice) = invalid_id_notice {
+        content.push_str(&format!(
+            "\n\n{notice} These IDs were ignored; the valid files listed above are unaffected."
+        ));
+    }
     Ok(McpToolCallResult {
         content,
         is_error: false,
@@ -1357,6 +1453,79 @@ mod tests {
     }
 
     #[test]
+    fn read_artifact_selection_ignores_placeholder_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("actual.png");
+        image::RgbaImage::new(2, 2).save(&image).unwrap();
+        let args = serde_json::json!({
+            "artifact_ids": ["art_existing"], "path": "", "paths": ["dummy"],
+            "offset": 0, "limit": 0, "overview": false
+        });
+        let resolved = resolve_read_arguments(&args, |id| {
+            assert_eq!(id, "art_existing");
+            Ok(image.to_string_lossy().into_owned())
+        })
+        .expect("known artifact must be readable even when an unused path is filled");
+        let (images, non_image, skipped) = resolve_requested_read_paths(
+            &NativeToolWorkspace::standalone(),
+            &[nonempty_path_arg(&resolved).unwrap()],
+        );
+        assert_eq!(images.len(), 1);
+        assert!(!non_image);
+        assert!(skipped.is_empty());
+        assert_eq!(resolved["paths"], serde_json::json!([]));
+        assert_eq!(image::open(&images[0]).unwrap().width(), 2);
+    }
+
+    #[test]
+    fn read_source_selection_keeps_disk_reads_and_rejects_unknown_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.txt");
+        std::fs::write(&path, "selected local file").unwrap();
+        let args = serde_json::json!({"artifact_ids": ["", " "], "path": path, "paths": []});
+        let resolved =
+            resolve_read_arguments(&args, |_| panic!("blank IDs must not resolve")).unwrap();
+        assert!(
+            crate::native_tools::read_file(&NativeToolWorkspace::standalone(), &resolved)
+                .unwrap()
+                .content
+                .contains("selected local file")
+        );
+        let error = resolve_read_arguments(
+            &serde_json::json!({
+                "artifact_ids": ["art_missing"], "path": path, "paths": []
+            }),
+            |_| Err("Unknown artifact".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("Unknown artifact"));
+        assert!(error.contains("artifact_ids: []"));
+    }
+
+    #[test]
+    fn read_multiple_ids_clear_both_path_fields_and_preserve_order() {
+        let mut calls = Vec::new();
+        let result = resolve_read_arguments(
+            &serde_json::json!({
+                "artifact_ids": [" art_a ", "", "art_b", "art_a"],
+                "path": "unused.png", "paths": ["dummy"], "overview": true
+            }),
+            |id| {
+                calls.push(id.to_string());
+                Ok(format!("{id}.png"))
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, vec!["art_a", "art_b"]);
+        assert_eq!(result["path"], "");
+        assert_eq!(
+            result["paths"],
+            serde_json::json!(["art_a.png", "art_b.png"])
+        );
+        assert_eq!(result["overview"], true);
+    }
+
+    #[test]
     fn empty_path_fields_do_not_count_as_explicit_paths() {
         assert!(nonempty_path_arg(&serde_json::json!({})).is_none());
         assert!(nonempty_path_arg(&serde_json::json!({ "path": "" })).is_none());
@@ -1365,6 +1534,19 @@ mod tests {
             nonempty_path_arg(&serde_json::json!({ "path": "a.txt" })).as_deref(),
             Some("a.txt")
         );
+    }
+
+    #[test]
+    fn tool_contract_batch_read_reports_total_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = NativeToolWorkspace::conversation(dir.path().to_path_buf());
+        let error = read_non_image_paths(
+            &workspace,
+            &["missing-a.png".into(), "missing-b.png".into()],
+        )
+        .expect_err("zero readable files must not become a successful read");
+        assert!(error.contains("missing-a.png"));
+        assert!(error.contains("missing-b.png"));
     }
 
     #[test]
@@ -1396,6 +1578,10 @@ mod tests {
         .unwrap();
         assert!(with_gap.contains("alpha"), "{with_gap}");
         assert!(with_gap.contains("missing.txt"), "{with_gap}");
+        assert!(
+            with_gap.contains("Read 1 of 2 requested entries"),
+            "{with_gap}"
+        );
     }
 
     #[test]
@@ -1462,6 +1648,10 @@ mod tests {
         "goal_complete",
         "goal_blocked",
         "goal_wait",
+        "schedule_list",
+        "schedule_create",
+        "schedule_update",
+        "schedule_delete",
         "ask_user",
         "agent",
         "agent_control",
@@ -1573,6 +1763,7 @@ mod tests {
                 "goal_complete",
                 "goal_blocked",
                 "goal_wait",
+                "schedule_list",
                 "ask_user",
                 "agent",
                 "agent_control",
@@ -1607,6 +1798,7 @@ mod tests {
                 "memory_read",
                 "memory_search",
                 "get_goal",
+                "schedule_list",
             ],
             "memory_read/memory_search are read-only but deliberately not parallel-safe"
         );
@@ -1624,6 +1816,7 @@ mod tests {
             run_command: true,
             knowledge_search: true,
             automation: true,
+            scheduled_tasks: true,
             working_directory: String::new(),
             workspace_roots: Vec::new(),
         };
@@ -1673,6 +1866,7 @@ mod tests {
             run_command: false,
             knowledge_search: false,
             automation: false,
+            scheduled_tasks: false,
             working_directory: String::new(),
             workspace_roots: Vec::new(),
         };
@@ -1742,6 +1936,7 @@ mod tests {
             run_command: true,
             knowledge_search: true,
             automation: true,
+            scheduled_tasks: true,
             working_directory: String::new(),
             workspace_roots: Vec::new(),
         };
@@ -1775,6 +1970,67 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn present_artifacts_keeps_local_image_when_model_adds_dummy_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.png");
+        image::RgbaImage::new(2, 2).save(&path).unwrap();
+        let result = call_present_artifacts(
+            &NativeToolWorkspace::standalone(),
+            &serde_json::json!({
+                "artifact_ids": ["dummy"], "paths": [path], "mode": "prepare", "caption": ""
+            }),
+        )
+        .expect("valid local image must remain usable");
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["artifactIds"],
+            serde_json::json!([])
+        );
+        assert!(
+            result.content.contains("Prepared 1 file"),
+            "{}",
+            result.content
+        );
+        assert!(result.content.contains("dummy"));
+    }
+
+    #[test]
+    fn present_artifacts_reports_invalid_ids_and_retains_valid_selection() {
+        let workspace = NativeToolWorkspace::standalone();
+        for mode in ["prepare", "preview"] {
+            let result = call_present_artifacts(
+                &workspace,
+                &serde_json::json!({
+                    "artifact_ids": ["dummy", "art_existing"], "paths": [], "mode": mode
+                }),
+            )
+            .unwrap();
+            assert_eq!(
+                result.structured_content.unwrap()["artifactIds"],
+                serde_json::json!(["art_existing"])
+            );
+            assert!(result.content.contains("1 file"));
+            assert!(result.content.contains("dummy"));
+        }
+        let error = call_present_artifacts(
+            &workspace,
+            &serde_json::json!({
+                "artifact_ids": ["dummy"], "paths": []
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("artifact_ids: []"), "{error}");
+        assert!(!error.contains("Prepared"));
+        assert!(call_present_artifacts(
+            &workspace,
+            &serde_json::json!({
+                "artifact_ids": [], "paths": []
+            })
+        )
+        .is_err());
+    }
+
     #[test]
     fn present_artifacts_returns_deduplicated_structured_ids() {
         let workspace = NativeToolWorkspace::standalone();

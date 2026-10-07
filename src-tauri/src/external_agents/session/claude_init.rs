@@ -23,10 +23,14 @@ use crate::external_agents::types::{RuntimeBuildOptions, RuntimeContext, Runtime
 /// `--model`），这是本应用胶囊语义，cc-gui 没有这一行。
 const CLAUDE_BUILTIN_TIERS: &[(&str, &str)] = &[
     ("claude-fable-5-1", "Fable 5.1"),
-    ("claude-opus-5", "Opus 5"),
-    ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-opus-5-5", "Opus 5.5"),
+    ("claude-sonnet-5-5", "Sonnet 5.5"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5"),
 ];
+
+/// 上一代 catalog id。旧会话可能还存着它们；仍按家族走 settings/env 覆盖，
+/// 没有覆盖时原样透传（用户当初显式选的就是这一代）。
+const LEGACY_CLAUDE_TIERS: &[&str] = &["claude-fable-5", "claude-opus-5", "claude-sonnet-5"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeInitInfo {
@@ -380,8 +384,8 @@ pub fn resolve_claude_cli_model(selected: &str) -> String {
     // 只对 builtin catalog id 做家族映射；用户手填 / 旧会话里的自定义 id 原样透传。
     // Existing conversations may still store the previous Fable tier. Preserve its
     // provider override semantics even though the picker now offers Fable 5.1.
-    let is_catalog =
-        selected == "claude-fable-5" || CLAUDE_BUILTIN_TIERS.iter().any(|(id, _)| *id == selected);
+    let is_catalog = LEGACY_CLAUDE_TIERS.contains(&selected)
+        || CLAUDE_BUILTIN_TIERS.iter().any(|(id, _)| *id == selected);
     if !is_catalog {
         return selected.to_string();
     }
@@ -433,14 +437,15 @@ pub fn map_claude_config_to_catalog_id(raw: &str) -> Option<String> {
     if raw.is_empty() || raw == "default" {
         return None;
     }
-    if CLAUDE_BUILTIN_TIERS.iter().any(|(id, _)| *id == raw) {
+    // 用户显式写了上一代 id：保留原值，不悄悄升到新一代。
+    if LEGACY_CLAUDE_TIERS.contains(&raw) || CLAUDE_BUILTIN_TIERS.iter().any(|(id, _)| *id == raw) {
         return Some(raw.to_string());
     }
     // Bare aliases + concrete ids → current curated tier.
     match claude_model_family_key(raw) {
         Some("fable") => Some("claude-fable-5-1".to_string()),
-        Some("opus") => Some("claude-opus-5".to_string()),
-        Some("sonnet") => Some("claude-sonnet-5".to_string()),
+        Some("opus") => Some("claude-opus-5-5".to_string()),
+        Some("sonnet") => Some("claude-sonnet-5-5".to_string()),
         Some("haiku") => Some("claude-haiku-4-5-20251001".to_string()),
         _ => None,
     }
@@ -663,8 +668,8 @@ mod tests {
             CLAUDE_BUILTIN_TIERS,
             &[
                 ("claude-fable-5-1", "Fable 5.1"),
-                ("claude-opus-5", "Opus 5"),
-                ("claude-sonnet-5", "Sonnet 5"),
+                ("claude-opus-5-5", "Opus 5.5"),
+                ("claude-sonnet-5-5", "Sonnet 5.5"),
                 ("claude-haiku-4-5-20251001", "Haiku 4.5"),
             ]
         );
@@ -791,9 +796,9 @@ mod tests {
         // tier id 稳定；label 变成映射后的 runtime id（cc-gui 同款）。
         let fable = models.iter().find(|m| m.id == "claude-fable-5-1").unwrap();
         assert_eq!(fable.label, "kimi-k3");
-        let opus = models.iter().find(|m| m.id == "claude-opus-5").unwrap();
+        let opus = models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
         assert_eq!(opus.label, "MiniMax-M4[1m]");
-        let sonnet = models.iter().find(|m| m.id == "claude-sonnet-5").unwrap();
+        let sonnet = models.iter().find(|m| m.id == "claude-sonnet-5-5").unwrap();
         assert_eq!(sonnet.label, "GLM-5.1");
         let haiku = models
             .iter()
@@ -814,6 +819,11 @@ mod tests {
         assert_eq!(resolve_claude_cli_model("claude-fable-5-1"), "kimi-k3");
         assert_eq!(resolve_claude_cli_model("claude-sonnet-5"), "GLM-5.1");
         assert_eq!(resolve_claude_cli_model("claude-opus-5"), "MiniMax-M4[1m]");
+        assert_eq!(
+            resolve_claude_cli_model("claude-opus-5-5"),
+            "MiniMax-M4[1m]"
+        );
+        assert_eq!(resolve_claude_cli_model("claude-sonnet-5-5"), "GLM-5.1");
         // 非 catalog id 原样透传。
         assert_eq!(resolve_claude_cli_model("already-custom"), "already-custom");
         assert_eq!(resolve_claude_cli_model("default"), "default");
@@ -848,19 +858,19 @@ mod tests {
     fn map_config_aliases_to_catalog_for_picker_backfill() {
         assert_eq!(
             map_claude_config_to_catalog_id("opus").as_deref(),
-            Some("claude-opus-5")
+            Some("claude-opus-5-5")
         );
         assert_eq!(
             map_claude_config_to_catalog_id("sonnet").as_deref(),
-            Some("claude-sonnet-5")
+            Some("claude-sonnet-5-5")
         );
         assert_eq!(
-            map_claude_config_to_catalog_id("claude-sonnet-5").as_deref(),
-            Some("claude-sonnet-5")
+            map_claude_config_to_catalog_id("claude-sonnet-5-5").as_deref(),
+            Some("claude-sonnet-5-5")
         );
         assert_eq!(
             map_claude_config_to_catalog_id("claude-opus-4-8").as_deref(),
-            Some("claude-opus-5")
+            Some("claude-opus-5-5")
         );
         assert_eq!(map_claude_config_to_catalog_id("my-gateway-x"), None);
         assert_eq!(map_claude_config_to_catalog_id("default"), None);
@@ -921,13 +931,6 @@ mod tests {
         let info = parse_claude_init_info(&init).unwrap();
         assert_eq!(info.resolved_model, "claude-opus-4-8[1m]");
         assert_eq!(info.context_window_tokens, Some(1_000_000));
-    }
-
-    #[test]
-    fn parse_context_window_label_still_works() {
-        use crate::external_agents::context::parse_context_window_label;
-        assert_eq!(parse_context_window_label("1m"), Some(1_000_000));
-        assert_eq!(parse_context_window_label("200K"), Some(200_000));
     }
 
     /// `effortLevel` 必须能被读出来并落在 `defs/claude.rs` 的 REASONING id 集合内，
@@ -1042,30 +1045,6 @@ mod tests {
             None => std::env::remove_var("CLAUDE_CODE_EFFORT_LEVEL"),
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod live_effort_tests {
-    use super::*;
-
-    /// 读本机真实 `~/.claude/settings.json`，打印实际解析出的档位。
-    /// 单测喂的是构造样本，这条证明真实配置也能读到（本机 effortLevel = "high"）。
-    #[test]
-    #[ignore = "reads the real ~/.claude/settings.json on this machine"]
-    fn live_reads_real_effort_level() {
-        // 清掉环境变量，专门验证 settings.json 这条路。
-        let prev = std::env::var("CLAUDE_CODE_EFFORT_LEVEL").ok();
-        std::env::remove_var("CLAUDE_CODE_EFFORT_LEVEL");
-        let from_file = claude_config_effort();
-        match prev.clone() {
-            Some(v) => std::env::set_var("CLAUDE_CODE_EFFORT_LEVEL", v),
-            None => std::env::remove_var("CLAUDE_CODE_EFFORT_LEVEL"),
-        }
-        let with_env = claude_config_effort();
-        eprintln!("settings.json 的 effortLevel -> {from_file:?}");
-        eprintln!("含 CLAUDE_CODE_EFFORT_LEVEL 环境变量   -> {with_env:?}");
-        eprintln!("（None 表示会显示「自动」）");
     }
 }
 

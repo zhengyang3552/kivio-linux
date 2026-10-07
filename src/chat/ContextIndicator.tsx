@@ -1,9 +1,10 @@
-import { Archive, Eraser, RefreshCw } from 'lucide-react'
+import { Button } from '../components/Button'
+import { Archive, Eraser, RefreshCw, Square } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   buildContextBarSlices,
-  CONTEXT_AUTO_COMPRESS_PERCENT,
+  autoCompactPercent,
   CONTEXT_CRITICAL_PERCENT,
   CONTEXT_FREE_SEGMENT_ID,
   CONTEXT_WARNING_PERCENT,
@@ -13,6 +14,7 @@ import {
 import { i18n, type I18n, type Lang } from '../components/i18n'
 import { formatTokensK } from '../utils/tokens'
 import type { ConversationContextState } from './types'
+import { usePopoverMenu } from './usePopoverMenu'
 
 const PANEL_WIDTH = 280
 const PANEL_GAP = 8
@@ -34,6 +36,7 @@ interface ContextIndicatorProps {
   usesExternalRuntime?: boolean
   onRefresh?: () => void
   onCompress?: () => void
+  onStopCompression?: () => void
   onClear?: () => void
   placement?: 'up' | 'down'
   lang?: Lang
@@ -70,12 +73,6 @@ function messageCountLabel(messageCount: number, compressedMessageCount: number,
   return t.contextMessages.replace('{count}', String(messageCount))
 }
 
-function freeSliceClassName(isDark: boolean): string {
-  return isDark
-    ? 'bg-neutral-700'
-    : 'bg-neutral-200'
-}
-
 export function ContextIndicator({
   contextState,
   messageCount = 0,
@@ -87,6 +84,7 @@ export function ContextIndicator({
   usesExternalRuntime = false,
   onRefresh,
   onCompress,
+  onStopCompression,
   onClear,
   placement: _placement = 'down',
   lang = 'zh',
@@ -99,6 +97,7 @@ export function ContextIndicator({
   const [pos, setPos] = useState<{ bottom: number; right: number; maxH: number; width: number } | null>(null)
   const triggerRef = useRef<HTMLDivElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
+  usePopoverMenu(open, () => setOpen(false), popoverRef)
 
   const estimatedInputTokens = valueFrom(
     contextState?.estimated_input_tokens,
@@ -179,9 +178,12 @@ export function ContextIndicator({
   const compressLabel = isExternalContext
     ? (compressing ? t.contextCliCompacting : t.contextCliCompact)
     : (compressing ? t.contextCompressing : t.contextCompress)
-  const autoHint = isExternalContext
+  // Automatic compaction runs inside a generation, and stopping it stops that generation.
+  const stopLabel = generating ? t.contextStopGeneration : t.contextStopCompression
+  const autoPercent = autoCompactPercent(contextState)
+  const autoHint = isExternalContext || autoPercent == null
     ? null
-    : t.contextPanelAutoCompress.replace('{auto}', String(CONTEXT_AUTO_COMPRESS_PERCENT))
+    : t.contextPanelAutoCompress.replace('{auto}', String(autoPercent))
   // 只在真正压过时露出次数；自动压缩阈值放压缩按钮 title，不占正文。
   const compressMeta = compressionCount > 0
     ? t.contextCompressionCount.replace('{count}', String(compressionCount))
@@ -256,7 +258,7 @@ export function ContextIndicator({
         >
           <div className="mb-1.5 flex items-center gap-1">
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[12px] font-semibold text-neutral-800 dark:text-neutral-100">
+              <div className="truncate text-[12px] font-semibold text-neutral-800">
                 {t.contextPanelTitle}
               </div>
               <div className="mt-0.5 truncate text-[11px] tabular-nums leading-none text-neutral-500 dark:text-neutral-400">
@@ -265,7 +267,7 @@ export function ContextIndicator({
             </div>
             <button
               type="button"
-              className="grid size-7 shrink-0 place-items-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-800 disabled:opacity-40 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+              className="grid size-7 shrink-0 place-items-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-800 disabled:opacity-40 dark:text-neutral-400"
               aria-label={t.contextRefreshAria}
               title={t.contextRefresh}
               onClick={onRefresh}
@@ -273,21 +275,21 @@ export function ContextIndicator({
             >
               <RefreshCw size={13} strokeWidth={1.9} className={loading ? 'animate-spin' : ''} />
             </button>
-            <button
-              type="button"
-              className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] font-semibold text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-neutral-200 dark:hover:bg-neutral-800"
-              aria-label={t.contextCompressAria}
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label={compressing && onStopCompression ? stopLabel : t.contextCompressAria}
               title={autoHint ? `${compressLabel} · ${autoHint}` : compressLabel}
-              onClick={onCompress}
-              disabled={!canCompress}
+              onClick={compressing && onStopCompression ? onStopCompression : onCompress}
+              disabled={compressing ? !onStopCompression : !canCompress}
             >
-              <Archive size={13} strokeWidth={1.9} />
-              <span>{compressLabel}</span>
-            </button>
+              {compressing ? <Square size={13} /> : <Archive size={13} strokeWidth={1.9} />}
+              <span>{compressing && onStopCompression ? stopLabel : compressLabel}</span>
+            </Button>
             {onClear && (
               <button
                 type="button"
-                className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] font-semibold text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-neutral-200 dark:hover:bg-neutral-800"
+                className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md px-1.5 text-[11px] font-semibold text-neutral-700 transition-colors hover:bg-neutral-100 disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label={t.contextClearAria}
                 title={t.contextClearAria}
                 onClick={() => {
@@ -303,14 +305,14 @@ export function ContextIndicator({
           </div>
 
           <div className="relative mb-1">
-            <div className="flex h-1.5 overflow-hidden rounded-full bg-neutral-100 dark:bg-neutral-800">
+            <div className="flex h-1.5 overflow-hidden rounded-full bg-neutral-100">
               {barSlices.length === 0 ? (
-                <div className="h-full w-full bg-neutral-200/80 dark:bg-neutral-700" />
+                <div className="h-full w-full bg-neutral-200/80" />
               ) : (
                 barSlices.map((slice) => (
                   <div
                     key={slice.id}
-                    className={`h-full min-w-[1px] ${slice.id === CONTEXT_FREE_SEGMENT_ID ? freeSliceClassName(document.documentElement.classList.contains('dark')) : ''}`}
+                    className={`h-full min-w-[1px] ${slice.id === CONTEXT_FREE_SEGMENT_ID ? 'bg-[var(--theme-surface-border)]' : ''}`}
                     style={{
                       width: `${slice.widthPercent}%`,
                       backgroundColor: slice.id === CONTEXT_FREE_SEGMENT_ID ? undefined : slice.color,
@@ -333,7 +335,7 @@ export function ContextIndicator({
                     className="size-1.5 shrink-0 rounded-full"
                     style={{ backgroundColor: slice.color }}
                   />
-                  <span className="min-w-0 flex-1 truncate text-neutral-600 dark:text-neutral-300">
+                  <span className="min-w-0 flex-1 truncate text-neutral-600">
                     {slice.label}
                   </span>
                   <span className="shrink-0 tabular-nums text-neutral-400 dark:text-neutral-500">
@@ -351,7 +353,7 @@ export function ContextIndicator({
           )}
 
           {error && (
-            <p className="mt-1 text-[10px] text-[#C24135] dark:text-[#F08A80]">
+            <p className="mt-1 text-[10px] text-danger">
               {error}
             </p>
           )}
@@ -364,7 +366,7 @@ export function ContextIndicator({
     <div className="relative" ref={triggerRef} data-tauri-drag-region="false">
       <button
         type="button"
-        className="grid size-7 shrink-0 place-items-center rounded-full text-neutral-600 transition-colors hover:bg-neutral-100 active:scale-[0.97] dark:text-neutral-300 dark:hover:bg-neutral-800"
+        className="grid size-7 shrink-0 place-items-center rounded-full text-neutral-600 transition-colors hover:bg-neutral-100 active:scale-[0.97]"
         aria-label={t.contextTriggerAria}
         title={loading
           ? t.contextTriggerLoading

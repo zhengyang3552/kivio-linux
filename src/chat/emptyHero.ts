@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Lang } from '../components/i18n'
-import type { BlobAntic } from './kivioBlobSim'
+import type { StreamCoarse } from './streamingStore'
+
+/** 空态只在没有历史消息或实时展示内容时出现。 */
+export function isEmptyChatPresentation(messageCount: number, stream: StreamCoarse): boolean {
+  // 首轮结束会先撤掉临时用户消息；冻结预览要等 React 提交正式历史后才释放。
+  // 此时切回欢迎页会卸载整份消息列表，丢掉正文节点、测量缓存和滚动位置。
+  return messageCount === 0 && !stream.streaming && !stream.streamFrozen && !stream.streamError
+}
 
 /** 空会话标题：短、跟墨团配。换句间隔随机，大约一分钟上下。 */
 export const EMPTY_HERO_ROTATE_MIN_MS = 45_000
@@ -68,19 +75,6 @@ export function emptyHeroPinnedLine(opts: {
   const set = opts.setName?.trim()
   if (set) return opts.lang === 'zh' ? `在「${set}」` : `In “${set}”`
   return null
-}
-
-export function emptyHeroLine(opts: {
-  lang: Lang
-  assistantName?: string | null
-  projectName?: string | null
-  setName?: string | null
-  seed?: string | null
-}): string {
-  const pinned = emptyHeroPinnedLine(opts)
-  if (pinned) return pinned
-  const list = GREETINGS[opts.lang]
-  return list[greetingIndex(opts.seed, list.length)]
 }
 
 /** 空态闲置时轮换问候；助手 / 项目 / 集名钉住不转。 */
@@ -161,61 +155,6 @@ export function emptyHeroJab(
   const choices = last ? pool.filter((line) => line !== last) : pool
   const list = choices.length > 0 ? choices : pool
   return list[Math.floor(random() * list.length)]
-}
-
-/** 闲置小动作时嘟囔一句（变云 / 变方 / 蹦一下），说完收回。多数时候不说：
- *  蹦是最常见的小动作，几乎不配词；变形态本身就稀罕，也只有一半不到会念一句。 */
-export const EMPTY_HERO_MUTTER_MS = 3200
-export const EMPTY_HERO_MUTTER_CHANCE = 0.45
-export const EMPTY_HERO_MUTTER_HOP_CHANCE = 0.15
-
-const MUTTERS: Record<Lang, Partial<Record<BlobAntic, readonly string[]>>> = {
-  zh: {
-    cloud: ['走神了', '飘一会', '在想别的', '云一下'],
-    squircle: ['今天装方的', '方一下', '换个形状', '有棱有角'],
-    pebble: ['稳一会', '圆润点', '石头模式', '安静待着'],
-    bean: ['横着待会', '豆一下', '换个姿势', '躺会'],
-    hop: ['活动一下', '蹦', '腿麻了', '抖抖'],
-  },
-  en: {
-    cloud: ['Zoning out.', 'Drifting.', 'Elsewhere.', 'Cloud mode.'],
-    squircle: ['Boxy today.', 'Squared up.', 'New shape.', 'Edgy.'],
-    pebble: ['Steady.', 'Smooth mode.', 'Rock mode.', 'Sitting quietly.'],
-    bean: ['Going sideways.', 'Bean mode.', 'New pose.', 'Lying down.'],
-    hop: ['Stretching.', 'Boing.', 'Legs asleep.', 'Shake it off.'],
-  },
-}
-
-export function emptyHeroMutter(
-  lang: Lang,
-  kind: BlobAntic,
-  random = Math.random,
-): string | null {
-  const pool = MUTTERS[lang][kind]
-  if (!pool || pool.length === 0) return null
-  if (random() >= (kind === 'hop' ? EMPTY_HERO_MUTTER_HOP_CHANCE : EMPTY_HERO_MUTTER_CHANCE)) return null
-  return pool[Math.min(pool.length - 1, Math.floor(random() * pool.length))]
-}
-
-export function useEmptyHeroMutter(lang: Lang) {
-  const [mutter, setMutter] = useState<string | null>(null)
-  const timerRef = useRef(0)
-
-  useEffect(() => () => window.clearTimeout(timerRef.current), [])
-
-  useEffect(() => {
-    setMutter(null)
-  }, [lang])
-
-  const onAntic = useCallback((kind: BlobAntic) => {
-    const line = emptyHeroMutter(lang, kind)
-    if (!line) return
-    setMutter(line)
-    window.clearTimeout(timerRef.current)
-    timerRef.current = window.setTimeout(() => setMutter(null), EMPTY_HERO_MUTTER_MS)
-  }, [lang])
-
-  return { mutter, onAntic }
 }
 
 export function useEmptyHeroJab(lang: Lang) {

@@ -198,6 +198,36 @@ pub(crate) async fn run_external_cli_reply_in(
         );
     }
 
+    // Use the picker's discovery directory: projectless conversations discover
+    // global skills there but execute in their own per-conversation directory.
+    let slash_cwd =
+        crate::external_agents::workspace::resolve_detection_cwd(app, Some(&conversation.id))?;
+    let slash_catalog = state
+        .external_discovery()
+        .get_cached_external_slash_commands(
+            &slash::cache_key(&agent_id, slash_cwd.to_string_lossy().as_ref()),
+            slash::SLASH_COMMANDS_CACHE_TTL,
+            slash::SLASH_COMMANDS_EMPTY_CACHE_TTL,
+        );
+    let slash_catalog = match slash_catalog {
+        Some(commands) if !commands.is_empty() => commands,
+        _ if !crate::chat::slash_commands::command_ranges(latest_user_message).is_empty() => {
+            let (supported, commands, reason) = slash::list_external_cli_slash_commands(
+                app,
+                state,
+                &agent_id,
+                Some(&conversation.id),
+            )
+            .await?;
+            if supported && commands.is_empty() {
+                return Err(reason.unwrap_or_else(|| "斜杠命令列表尚未加载，请刷新后重试。".into()));
+            }
+            commands
+        }
+        _ => Vec::new(),
+    };
+    let inline_prompt = slash::inline_command_prompt(latest_user_message, &slash_catalog)?;
+    let latest_user_message = inline_prompt.as_deref().unwrap_or(latest_user_message);
     let is_slash = is_cli_slash_input(latest_user_message);
 
     let skill_detail = if is_slash {
@@ -245,6 +275,8 @@ pub(crate) async fn run_external_cli_reply_in(
     // `skip_instructions`（内容没变就不重发）保证了**永远不会补发** ⇒ 长会话跑一阵子后
     // 用户配置的系统提示与 Memory 静默失效，没有任何可观测信号。
     // 启动 flag 每次进程启动都重新注入，与对话历史无关，压缩影响不到。
+    // （2.1.267 起 CLI 默认把首轮系统提示录下来复用；指令变了的续接轮要额外关掉快照，
+    // 见 `defs::claude::system_prompt_snapshot_off_args`。）
     let instructions_via_flag = instructions_via_launch_flag(def);
     let system_prompt_file = if instructions_via_flag && !is_slash {
         match write_system_prompt_file(&conversation.id, daemon_instructions.trim()) {
@@ -259,6 +291,27 @@ pub(crate) async fn run_external_cli_reply_in(
         None
     };
 
+    // A rewind truncated only Kivio's copy; the CLI's native session still holds the removed
+    // turns. Decide how to bring it back to the visible history before this prompt is sent.
+    use crate::external_agents::session::PendingRewind;
+    let rewind = (!is_slash && matches!(entry, AgentRunEntry::Send))
+        .then(|| crate::external_agents::session::pending_rewind(app, &conversation.id))
+        .flatten()
+        .map(|pending| match pending {
+            PendingRewind::Replay => NativeRewind::Replay,
+            PendingRewind::Native => plan_native_rewind(
+                app,
+                def,
+                &conversation.id,
+                &visible_user_prompts(conversation),
+            ),
+        });
+    if rewind == Some(NativeRewind::Replay) {
+        // Dropped before resolving the resume context, so this turn opens a fresh native session
+        // and sends the session instructions again.
+        crate::external_agents::session::forget_native_session(app, &conversation.id);
+    }
+
     let resume_ctx = resolve_agent_resume_context(
         app,
         &conversation.id,
@@ -266,6 +319,12 @@ pub(crate) async fn run_external_cli_reply_in(
         def.resumes_session_via_cli,
         &daemon_instructions,
         conversation.agent_runtime.external_model.as_deref(),
+    );
+    let pi_realign = realigns_native_history(
+        def.run.regenerate,
+        entry,
+        rewind == Some(NativeRewind::PiFork),
+        is_slash,
     );
 
     let skill_dir = skill_detail.as_ref().and_then(|d| d.meta.path.clone());
@@ -297,13 +356,31 @@ pub(crate) async fn run_external_cli_reply_in(
         )
     };
     let mut composed = composed;
-    // Pi's native `fork` excludes the selected user message. When regenerating the very first
-    // turn, that leaves a blank native session, so the resubmitted prompt must carry the session
-    // instructions again. Non-root forks already retain the original first-turn instruction
-    // wrapper and use the ordinary resume prompt.
-    let mut pi_regenerate_root_prompt = (matches!(def.run.regenerate, RegenerateStrategy::PiRpc)
-        && matches!(entry, AgentRunEntry::Regenerate))
+    // A fresh native session that replaces a rewound one carries the remaining visible history
+    // once. Codex tries a native revert first and only uses this prompt if that fails.
+    let mut rewind_first_prompt = matches!(
+        rewind,
+        Some(NativeRewind::Replay | NativeRewind::CodexRevert)
+    )
     .then(|| {
+        crate::external_agents::prompt::compose_external_prompt_with_history(
+            composed.clone(),
+            &crate::external_agents::prompt::rewind_history_block(history_before_request(
+                &conversation.messages,
+            )),
+            latest_user_message,
+        )
+    });
+    if rewind == Some(NativeRewind::Replay) {
+        if let Some(prompt) = rewind_first_prompt.take() {
+            composed = prompt;
+        }
+    }
+    // Pi's native `fork` excludes the selected user message. When regenerating (or sending after
+    // a rewind to) the very first turn, that leaves a blank native session, so the resubmitted
+    // prompt must carry the session instructions again. Non-root forks already retain the
+    // original first-turn instruction wrapper and use the ordinary resume prompt.
+    let mut pi_regenerate_root_prompt = pi_realign.then(|| {
         if is_slash {
             compose_external_prompt_passthrough(latest_user_message)
         } else {
@@ -318,12 +395,14 @@ pub(crate) async fn run_external_cli_reply_in(
         }
     });
 
-    // 附件（slash 命令不带附件，保持 passthrough 语义）。图片：支持原生图片块的协议按白名单
+    // Skill commands are model requests and may carry files/images. Control commands
+    // retain their existing passthrough behavior. 图片：支持原生图片块的协议按白名单
     // 加载为 base64 块，其余（不支持 / 超白名单 / 读失败）降级为路径文本；文件：一律路径说明块。
+    let include_attachments = accepts_prompt_attachments(def.stream_format, latest_user_message);
     let (image_blocks, degraded_image_paths): (
         Vec<crate::external_agents::attachments::ImageBlock>,
         Vec<std::path::PathBuf>,
-    ) = if is_slash {
+    ) = if !include_attachments {
         (Vec::new(), Vec::new())
     } else if def.supports_native_image {
         crate::external_agents::attachments::load_image_blocks(
@@ -333,7 +412,7 @@ pub(crate) async fn run_external_cli_reply_in(
     } else {
         (Vec::new(), image_paths.to_vec())
     };
-    if !is_slash {
+    if include_attachments {
         let image_note = crate::external_agents::attachments::image_paths_note_for(
             Some(&resolved_bin),
             &degraded_image_paths,
@@ -344,15 +423,18 @@ pub(crate) async fn run_external_cli_reply_in(
         );
         composed.full_prompt.push_str(&image_note);
         composed.full_prompt.push_str(&file_note);
-        if let Some(root_prompt) = pi_regenerate_root_prompt.as_mut() {
-            root_prompt.full_prompt.push_str(&image_note);
-            root_prompt.full_prompt.push_str(&file_note);
+        for prompt in pi_regenerate_root_prompt
+            .iter_mut()
+            .chain(rewind_first_prompt.iter_mut())
+        {
+            prompt.full_prompt.push_str(&image_note);
+            prompt.full_prompt.push_str(&file_note);
         }
     }
 
     let mut extra_dirs = extra_allowed_dirs_for_agent(def, &settings.chat_tools.skill_scan_paths);
     // 降级图片 / 文件需要 CLI 自己从磁盘读 → 把本会话附件目录加进 allowed-dir。
-    if !is_slash && (!degraded_image_paths.is_empty() || !file_paths.is_empty()) {
+    if include_attachments && (!degraded_image_paths.is_empty() || !file_paths.is_empty()) {
         if let Ok(dir) = crate::chat::storage::conversation_attachments_dir(app, &conversation.id) {
             extra_dirs.push(dir.to_string_lossy().to_string());
         }
@@ -447,16 +529,35 @@ pub(crate) async fn run_external_cli_reply_in(
             let mut args = args;
             let cli_path = crate::external_agents::wsl::path_for_cli(&resolved_bin, path);
             args.extend(append_system_prompt_file_args(&cli_path));
+            // 续接的会话录下的系统提示与当前指令不同：关掉快照，否则新文件不生效。按「创建时
+            // 录的那份」判断而不是「上一轮」：快照只录首个请求，改过一次之后的每次重连都得关。
+            if resume_ctx.is_resuming && resume_ctx.recorded_prompt_stale {
+                args.extend(
+                    crate::external_agents::defs::claude::system_prompt_snapshot_off_args(
+                        crate::external_agents::spawn::cached_cli_version(&resolved_bin).as_deref(),
+                    ),
+                );
+            }
             args
         }
         None => args,
     };
+    // Claude trims natively: resume a fork of the session that ends at the kept entry. The fork
+    // leaves the original transcript intact; its id is persisted once the turn completes.
+    let args = match &rewind {
+        Some(NativeRewind::ClaudeResumeAt(entry_id)) => {
+            crate::external_agents::defs::claude::claude_args_rewound_fork(
+                &args,
+                entry_id,
+                &Uuid::new_v4().to_string(),
+            )
+        }
+        _ => args,
+    };
 
     let extra_env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
-    let pi_regenerate = (matches!(def.run.regenerate, RegenerateStrategy::PiRpc)
-        && matches!(entry, AgentRunEntry::Regenerate))
-    .then(|| PiRegenerateRequest {
+    let pi_regenerate = pi_realign.then(|| PiRegenerateRequest {
         visible_users: conversation
             .messages
             .iter()
@@ -644,7 +745,11 @@ pub(crate) async fn run_external_cli_reply_in(
             conversation.agent_runtime.external_agent_preset.clone(),
             persistent_mcp,
             &launch_config,
-            &composed.full_prompt,
+            rewind_first_prompt
+                .as_ref()
+                .map_or(composed.full_prompt.as_str(), |prompt| {
+                    prompt.full_prompt.as_str()
+                }),
             persistent_turn_prompt(
                 def.stream_format,
                 &composed.full_prompt,
@@ -654,6 +759,19 @@ pub(crate) async fn run_external_cli_reply_in(
             &extra_writable_roots,
             &additional_cli_dirs,
             pi_regenerate.as_ref(),
+            PersistentRewind {
+                // The live process still holds the removed turns in memory.
+                reconnect: matches!(
+                    rewind,
+                    Some(
+                        NativeRewind::Replay
+                            | NativeRewind::ClaudeResumeAt(_)
+                            | NativeRewind::CodexRevert
+                    )
+                ),
+                codex_visible_users: (rewind == Some(NativeRewind::CodexRevert))
+                    .then(|| visible_user_prompts(conversation)),
+            },
             &mut emit_event,
             &cancel_check,
             approval_host.as_ref(),
@@ -796,13 +914,16 @@ pub(crate) async fn run_external_cli_reply_in(
         }
     }
 
-    let actual_native_session_id = matches!(
+    let rewind_settled = rewind.is_some() && stream_outcome == "completed";
+    // A Claude rewind resumed into a fork with a new id; keep resuming that fork from now on.
+    let claude_forked = rewind_settled && matches!(rewind, Some(NativeRewind::ClaudeResumeAt(_)));
+    let actual_native_session_id = (matches!(
         def.stream_format,
         StreamFormat::PiRpc | StreamFormat::AntigravityStreamJson
-    )
-    .then(|| crate::external_agents::session::load_live_handle(app, &conversation_id))
-    .flatten()
-    .map(|handle| handle.native_id);
+    ) || claude_forked)
+        .then(|| crate::external_agents::session::load_live_handle(app, &conversation_id))
+        .flatten()
+        .map(|handle| handle.native_id);
     persist_delivered_session(
         app,
         &conversation_id,
@@ -814,6 +935,19 @@ pub(crate) async fn run_external_cli_reply_in(
         &daemon_instructions,
         is_slash,
     )?;
+    // Only a completed turn proves the native history now matches; otherwise retry next send.
+    // A failed native attempt is not retried as is: the next send replays instead. (Codex
+    // already falls back to a fresh thread within the turn.)
+    if rewind_settled {
+        crate::external_agents::session::clear_history_rewound(app, &conversation_id);
+    } else if stream_outcome == "error"
+        && matches!(
+            rewind,
+            Some(NativeRewind::PiFork | NativeRewind::ClaudeResumeAt(_))
+        )
+    {
+        crate::external_agents::session::require_rewind_replay(app, &conversation_id);
+    }
 
     // A7：把 CLI 自压的边界落到会话上。此前只发了实时压缩更新、从不落盘，
     // 于是「已压缩 N 次」永远不涨、刷新或重开会话后分隔线消失（那条注释说要记一次压缩，
@@ -931,6 +1065,117 @@ impl StreamSegmentTracker {
     }
 }
 
+/// How this CLI's native history is brought back to the visible history after a rewind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeRewind {
+    /// Pi forks its own session tree (the regenerate path).
+    PiFork,
+    /// The native history already matches the visible history.
+    Aligned,
+    /// Claude resumes a fork of its session that ends at this transcript entry.
+    ClaudeResumeAt(String),
+    /// Codex reverts the resumed thread; a fresh thread carrying the history is the fallback.
+    CodexRevert,
+    /// Start a fresh native session that carries the remaining visible history once.
+    Replay,
+}
+
+fn plan_native_rewind(
+    app: &AppHandle,
+    def: &RuntimeAgentDef,
+    conversation_id: &str,
+    visible_users: &[String],
+) -> NativeRewind {
+    let stored = crate::external_agents::session::load_session(app, conversation_id)
+        .filter(|stored| stored.agent_id == def.id);
+    if matches!(def.run.regenerate, RegenerateStrategy::PiRpc) {
+        // Without a native session there is nothing to fork; a fresh one carries the history.
+        return if stored.is_some() {
+            NativeRewind::PiFork
+        } else {
+            NativeRewind::Replay
+        };
+    }
+    match def.stream_format {
+        StreamFormat::CodexAppServer => NativeRewind::CodexRevert,
+        StreamFormat::ClaudeStreamJson => stored
+            .and_then(|stored| {
+                crate::external_agents::import::claude_transcript_prompts(&stored.session_id)
+            })
+            .map_or(NativeRewind::Replay, |prompts| {
+                claude_rewind_from_prompts(&prompts, visible_users)
+            }),
+        _ => NativeRewind::Replay,
+    }
+}
+
+/// Rewinding the first prompt keeps nothing, so a fresh session is the exact equivalent. An
+/// unreadable or compacted transcript cannot be trimmed safely and falls back to replay.
+fn claude_rewind_from_prompts(
+    prompts: &[crate::external_agents::import::ClaudeTranscriptPrompt],
+    visible_users: &[String],
+) -> NativeRewind {
+    use crate::external_agents::session::{native_rewind_point, NativeRewindPoint};
+    let native: Vec<String> = prompts.iter().map(|prompt| prompt.text.clone()).collect();
+    match native_rewind_point(&native, visible_users) {
+        NativeRewindPoint::Aligned => NativeRewind::Aligned,
+        NativeRewindPoint::DropFrom(index) => prompts[index]
+            .parent_uuid
+            .clone()
+            .map_or(NativeRewind::Replay, NativeRewind::ClaudeResumeAt),
+        NativeRewindPoint::Unmatched => NativeRewind::Replay,
+    }
+}
+
+/// Kivio's user prompts, oldest first, ending with the one being sent.
+fn visible_user_prompts(conversation: &Conversation) -> Vec<String> {
+    conversation
+        .messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| message.content.clone())
+        .collect()
+}
+
+/// The visible history before the request being sent (everything before the last user message).
+fn history_before_request(
+    messages: &[crate::chat::types::ChatMessage],
+) -> &[crate::chat::types::ChatMessage] {
+    let end = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(messages.len());
+    &messages[..end]
+}
+
+/// Rewind work that must happen while the persistent connection is established.
+struct PersistentRewind {
+    /// Replace the live process: it still holds the removed turns in memory.
+    reconnect: bool,
+    /// Codex: revert the resumed thread to these visible prompts before the turn.
+    codex_visible_users: Option<Vec<String>>,
+}
+
+/// Pi moves its native session back to the visible Kivio history before regenerating, and before
+/// the first send after a rewind: rewinding only truncates Kivio's copy, while Pi resumes its own
+/// full transcript. Slash turns are not user messages and keep the rewind pending for the next
+/// ordinary send.
+fn realigns_native_history(
+    strategy: RegenerateStrategy,
+    entry: AgentRunEntry,
+    pi_fork_rewind: bool,
+    is_slash: bool,
+) -> bool {
+    matches!(strategy, RegenerateStrategy::PiRpc)
+        && match entry {
+            AgentRunEntry::Regenerate => true,
+            AgentRunEntry::Send => pi_fork_rewind && !is_slash,
+        }
+}
+
+/// Error prefix: Codex resumed the thread but could not revert it to the rewound history.
+const CODEX_REWIND_UNAVAILABLE: &str = "codex rewind unavailable: ";
+
 struct PiRegenerateRequest {
     visible_users: Vec<crate::external_agents::session::pi_rpc::PiRegenerateUserMessage>,
     root_prompt: String,
@@ -962,6 +1207,7 @@ async fn run_persistent_turn<E, C>(
     extra_writable_roots: &[String],
     additional_directories: &[String],
     pi_regenerate: Option<&PiRegenerateRequest>,
+    rewind: PersistentRewind,
     emit: &mut E,
     cancel: &C,
     // 本轮的工具审批出口。`None` = 不接（协议不支持 / 用户没选会询问的权限档位）——
@@ -1001,8 +1247,9 @@ where
     // ⇒ 丢弃条目（actor 自行关停旧进程）并走下面的连接分支**带原生 resume**，于是新 flag
     // 生效而上下文不丢（spec 第 8 条：UI 所见必须与会话实际配置一致）。
     let force_pi_fork = matches!(protocol, StreamFormat::PiRpc) && pi_regenerate.is_some();
+    let force_reconnect = force_pi_fork || rewind.reconnect;
     let previous_control = state.external_live_sessions().control_any(conversation_id);
-    let reusable_control = if force_pi_fork {
+    let reusable_control = if force_reconnect {
         None
     } else {
         state.external_live_sessions().reusable_control(
@@ -1018,7 +1265,7 @@ where
             // native session log. Close the actor and wait for its receiver to disappear first.
             close_live_control(&stale).await?;
         }
-        if force_pi_fork {
+        if force_reconnect {
             state.external_live_sessions().remove(conversation_id);
         }
     }
@@ -1036,7 +1283,7 @@ where
             Ok(forked) => forked,
             Err(error) => {
                 session.close().await;
-                return Err(format!("Pi 重新生成前无法回退原生会话：{error}"));
+                return Err(format!("Pi 无法把原生会话回退到当前可见历史：{error}"));
             }
         };
         let native_id = forked.session_id.clone();
@@ -1087,7 +1334,7 @@ where
                 // We intended to continue an existing native session iff a matching handle was
                 // persisted. If the resume then fails and we fall back to fresh, the prior context
                 // is lost and the user must be told (R4) rather than silently getting a blank slate.
-                let intended_resume = resume_native.is_some();
+                let mut intended_resume = resume_native.is_some();
                 let connected = match connect_persistent_session(
                     protocol,
                     resolved_bin,
@@ -1103,6 +1350,7 @@ where
                     Some(background_task_sink(app, conversation_id)),
                     Some(dsh_idle_sink(app, conversation_id)),
                     dsh_idle_approvals_for(protocol, app, conversation_id),
+                    rewind.codex_visible_users.as_deref(),
                 )
                 .await
                 {
@@ -1134,6 +1382,33 @@ where
                             Some(background_task_sink(app, conversation_id)),
                             Some(dsh_idle_sink(app, conversation_id)),
                             dsh_idle_approvals_for(protocol, app, conversation_id),
+                            None,
+                        )
+                        .await?
+                    }
+                    // Codex could not revert its thread to the rewound history. Start a fresh
+                    // thread instead: `first_prompt` carries the visible history, so this is not
+                    // a context reset.
+                    Err(err) if err.starts_with(CODEX_REWIND_UNAVAILABLE) => {
+                        eprintln!("[external-agent] {err}; starting a fresh thread");
+                        intended_resume = false;
+                        crate::external_agents::session::clear_live_handle(app, conversation_id);
+                        connect_persistent_session(
+                            protocol,
+                            resolved_bin,
+                            &turn_args,
+                            cwd,
+                            model.as_deref(),
+                            reasoning.as_deref(),
+                            sandbox.as_deref(),
+                            preset.as_deref(),
+                            &mcp_servers,
+                            None,
+                            additional_directories,
+                            Some(background_task_sink(app, conversation_id)),
+                            Some(dsh_idle_sink(app, conversation_id)),
+                            dsh_idle_approvals_for(protocol, app, conversation_id),
+                            None,
                         )
                         .await?
                     }
@@ -1395,6 +1670,7 @@ async fn reconnect_fresh(
         Some(background_task_sink(app, conversation_id)),
         Some(dsh_idle_sink(app, conversation_id)),
         dsh_idle_approvals_for(protocol, app, conversation_id),
+        None,
     )
     .await?;
     let _ = save_live_handle(
@@ -1497,8 +1773,8 @@ fn launch_config_for_turn(
         return LaunchConfig::for_pi(model, reasoning);
     }
     if matches!(protocol, StreamFormat::CodexAppServer) {
-        // sandbox / approvalPolicy 只在 `thread/start` 生效；`turn/start` 不能改 kebab
-        // `sandbox`。不进指纹的话，底栏从「工作区写」切到「完全」胶囊变了、进程还是旧档。
+        // sandbox 进入进程配置，握手解析出的 sandboxPolicy 每轮显式发送。
+        // 切档必须重连并续接同一原生会话，重新解析配置中的网络权限和可写目录。
         // model / effort 每轮都能带，不进指纹。
         return LaunchConfig {
             flags: crate::external_agents::session::codex_app_server::normalize_codex_sandbox(
@@ -1560,18 +1836,49 @@ fn launch_config_for_turn(
 /// 静默消失（dsh 没有 file ContentBlock，非图片只能靠这段路径说明）。
 ///
 /// 其余持久协议（codex / ACP）的 full_prompt 首轮**含**指令，复用轮只发最新用户消息，
-/// 保持现有行为。
+/// 保持现有行为。Codex 显式 Skill 使用无指令包装的 passthrough 正文，需保留附件说明。
 fn persistent_turn_prompt<'a>(
     protocol: StreamFormat,
     composed_prompt: &'a str,
     latest_user_message: &'a str,
 ) -> &'a str {
     match protocol {
+        StreamFormat::CodexAppServer
+            if crate::external_agents::session::codex_app_server::codex_skill_command(
+                latest_user_message,
+            )
+            .is_some() =>
+        {
+            composed_prompt
+        }
         StreamFormat::ClaudeStreamJson
         | StreamFormat::DshJsonRpc
         | StreamFormat::PiRpc
         | StreamFormat::AntigravityStreamJson => composed_prompt,
         _ => latest_user_message,
+    }
+}
+
+fn accepts_prompt_attachments(protocol: StreamFormat, prompt: &str) -> bool {
+    if !is_cli_slash_input(prompt) {
+        return true;
+    }
+    match protocol {
+        StreamFormat::CodexAppServer => {
+            crate::external_agents::session::codex_app_server::codex_skill_command(prompt).is_some()
+        }
+        StreamFormat::PiRpc => {
+            let prompt = prompt.trim_start();
+            crate::chat::slash_commands::command_ranges(prompt)
+                .first()
+                .is_some_and(|range| {
+                    range.start == 0
+                        && prompt[range.clone()]
+                            .strip_prefix("/skill:")
+                            .is_some_and(|name| !name.is_empty())
+                })
+        }
+        _ => false,
     }
 }
 
@@ -1752,6 +2059,21 @@ fn cancel_should_escalate(
 /// 更不容易分叉 —— 那份规则的唯一副本在 `defs::claude::claude_permission_prompt_args`。
 fn turn_asks_for_permission(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--permission-prompt-tool")
+}
+
+/// claude URL 模式 elicitation 的目标链接；只认 http(s)，别的 scheme 一律不开。
+fn claude_elicitation_url(
+    agent_id: &str,
+    ask: &crate::external_agents::session::live::ApprovalAsk,
+) -> Option<String> {
+    if agent_id != "claude"
+        || ask.tool_name != crate::external_agents::session::claude_stream::CLAUDE_ELICITATION
+        || ask.input.get("mode").and_then(|v| v.as_str()) != Some("url")
+    {
+        return None;
+    }
+    let url = ask.input.get("url")?.as_str()?.trim();
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_string())
 }
 
 /// 本轮要不要建审批 / 问用户宿主。claude 看 argv 上的 `--permission-prompt-tool`；
@@ -1988,6 +2310,41 @@ impl ApprovalHost<'_> {
                     })
                     .await;
             }
+            // claude 的 URL 模式 elicitation（2.1.287：MCP 服务器要用户去浏览器登录）。
+            // 表单卡装不下它：问一句「打开链接？」，同意就用系统浏览器打开并回 accept
+            // （MCP 规范：accept 表示用户同意前往，完成与否由服务器自己的回调确认）。
+            if let Some(url) = claude_elicitation_url(self.agent_id, &ask) {
+                let mut record = record;
+                record.name = "open_url".to_string();
+                record.arguments = serde_json::json!({
+                    "url": url,
+                    "server": ask.input.get("mcp_server_name"),
+                    "reason": ask.input.get("message"),
+                })
+                .to_string();
+                let approved = crate::chat::commands::interaction::request_tool_approval(
+                    self.app,
+                    self.state,
+                    self.conversation_id,
+                    self.run_id,
+                    self.generation,
+                    &record,
+                )
+                .await;
+                let opened = approved && {
+                    use tauri_plugin_shell::ShellExt;
+                    #[allow(deprecated)]
+                    let result = self.app.shell().open(&url, None);
+                    result.is_ok()
+                };
+                return crate::external_agents::session::live::ApprovalDecision {
+                    request_id: ask.request_id,
+                    approved: opened,
+                    updated_input: opened.then(|| serde_json::json!({ "action": "accept" })),
+                    set_permission_mode: None,
+                    updated_permissions: None,
+                };
+            }
             if matches!(
                 codec.unknown_shape,
                 crate::external_agents::ask_user::UnknownAskShape::Reject
@@ -1998,6 +2355,7 @@ impl ApprovalHost<'_> {
                     approved: false,
                     updated_input: None,
                     set_permission_mode: None,
+                    updated_permissions: None,
                 };
             }
             // FallbackApproval：退回普通审批卡，别静默吞掉这次询问。
@@ -2041,6 +2399,7 @@ impl ApprovalHost<'_> {
                 approved: outcome.approved,
                 updated_input: None,
                 set_permission_mode: mode,
+                updated_permissions: None,
             };
         }
         // `EnterPlanMode` = claude 自己要求「先探索、出方案，别急着改」。**放行就够** ——
@@ -2064,22 +2423,27 @@ impl ApprovalHost<'_> {
                 approved,
                 updated_input: None,
                 set_permission_mode: None,
+                updated_permissions: None,
             };
         }
         // 「完全」档：通道之所以接上只为了上面那两张卡，普通工具原地放行。
         // 少了这一条，选了「全自动放行」的用户会突然开始每个工具都被问一次。
-        if self
-            .auto_allow_tools
-            .load(std::sync::atomic::Ordering::Relaxed)
+        // 例外是 CLI 标了必须人工确认的安全检查（危险 `rm` 等）：bypass 下 CLI 仍然问，
+        // 正是要等一个人，宿主替他点「允许」就把这道保护拆了。
+        if !ask.requires_manual_approval
+            && self
+                .auto_allow_tools
+                .load(std::sync::atomic::Ordering::Relaxed)
         {
             return crate::external_agents::session::live::ApprovalDecision {
                 request_id: ask.request_id,
                 approved: true,
                 updated_input: None,
                 set_permission_mode: None,
+                updated_permissions: None,
             };
         }
-        let approved = crate::chat::commands::interaction::request_tool_approval(
+        let outcome = crate::chat::commands::interaction::request_tool_approval_outcome(
             self.app,
             self.state,
             self.conversation_id,
@@ -2088,11 +2452,21 @@ impl ApprovalHost<'_> {
             &record,
         )
         .await;
+        // 「总是允许」也告诉 claude 自己（t3code 同款），否则它在本会话里照样每次都来问，
+        // 只是被 Kivio 这侧的 always-allow 静默放行。
+        let updated_permissions = (outcome.approved && outcome.always && self.agent_id == "claude")
+            .then(|| {
+                crate::external_agents::session::claude_stream::session_permission_updates(
+                    &ask.tool_name,
+                    ask.permission_suggestions.as_ref(),
+                )
+            });
         crate::external_agents::session::live::ApprovalDecision {
             request_id: ask.request_id,
-            approved,
+            approved: outcome.approved,
             updated_input: None,
             set_permission_mode: None,
+            updated_permissions,
         }
     }
 
@@ -2149,6 +2523,7 @@ impl ApprovalHost<'_> {
             approved,
             updated_input: approved.then(|| encode(&prompt, &answered)),
             set_permission_mode: None,
+            updated_permissions: None,
         }
     }
 
@@ -2612,6 +2987,9 @@ async fn connect_persistent_session(
     >,
     dsh_idle_sink: Option<crate::external_agents::session::dsh_jsonrpc::DshIdleSink>,
     dsh_idle_approvals: Option<crate::external_agents::session::live::ApprovalBridge>,
+    // Codex only: after resuming, revert the thread to these visible prompts (see
+    // `CODEX_REWIND_UNAVAILABLE`).
+    codex_rewind: Option<&[String]>,
 ) -> Result<PersistentConnection, String> {
     use crate::external_agents::session::acp::{spawn_acp_session_actor, AcpSession};
     use crate::external_agents::session::claude_stream::{
@@ -2708,6 +3086,13 @@ async fn connect_persistent_session(
                     eprintln!("[external-agent] codex resume failed (thread {tid}): {err}");
                     err
                 })?;
+                let mut session = session;
+                if let Some(visible_users) = codex_rewind {
+                    if let Err(err) = session.revert_to_visible(visible_users).await {
+                        session.close().await;
+                        return Err(format!("{CODEX_REWIND_UNAVAILABLE}{err}"));
+                    }
+                }
                 let id = session.thread_id().to_string();
                 let child_pid = session.child_pid();
                 return Ok(PersistentConnection {
@@ -3630,6 +4015,79 @@ fn truncate_for_preview(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn claude_rewind_resumes_at_the_entry_before_the_first_removed_prompt() {
+        use crate::external_agents::import::ClaudeTranscriptPrompt;
+        let prompts: Vec<ClaudeTranscriptPrompt> =
+            [(None, "1"), (Some("a1"), "2"), (Some("a2"), "3")]
+                .into_iter()
+                .map(|(parent, text)| ClaudeTranscriptPrompt {
+                    text: text.to_string(),
+                    parent_uuid: parent.map(str::to_string),
+                })
+                .collect();
+        let visible = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            claude_rewind_from_prompts(&prompts, &visible(&["1", "2", "new"])),
+            NativeRewind::ClaudeResumeAt("a2".into())
+        );
+        // Rewinding the first prompt keeps nothing: a fresh session is exact.
+        assert_eq!(
+            claude_rewind_from_prompts(&prompts, &visible(&["new"])),
+            NativeRewind::Replay
+        );
+        assert_eq!(
+            claude_rewind_from_prompts(&prompts, &visible(&["1", "2", "3", "4"])),
+            NativeRewind::Aligned
+        );
+        // A compacted or unrelated transcript is not trimmed.
+        assert_eq!(
+            claude_rewind_from_prompts(&prompts, &visible(&["other", "new"])),
+            NativeRewind::Replay
+        );
+    }
+
+    #[test]
+    fn history_before_request_stops_at_the_last_user_message() {
+        let message = |role: &str, content: &str| -> crate::chat::types::ChatMessage {
+            serde_json::from_value(serde_json::json!({
+                "id": content, "role": role, "content": content, "timestamp": 0
+            }))
+            .unwrap()
+        };
+        let messages = vec![
+            message("user", "1"),
+            message("assistant", "a"),
+            message("user", "2"),
+        ];
+        let kept: Vec<&str> = history_before_request(&messages)
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(kept, ["1", "a"]);
+        assert!(history_before_request(&[]).is_empty());
+    }
+
+    #[test]
+    fn pi_realigns_on_the_first_ordinary_send_after_a_rewind() {
+        use AgentRunEntry::{Regenerate, Send};
+        let pi = |entry, rewound, slash| {
+            realigns_native_history(RegenerateStrategy::PiRpc, entry, rewound, slash)
+        };
+        assert!(pi(Send, true, false));
+        assert!(!pi(Send, false, false));
+        // A slash turn is not a user message; the rewind stays pending for the next send.
+        assert!(!pi(Send, true, true));
+        assert!(pi(Regenerate, false, false));
+        // CLIs without native branching cannot realign and keep their current behavior.
+        assert!(!realigns_native_history(
+            RegenerateStrategy::None,
+            Send,
+            true,
+            false
+        ));
+    }
+
+    #[test]
     fn antigravity_preserves_turn_context_and_restarts_for_launch_changes() {
         let protocol = StreamFormat::AntigravityStreamJson;
         let original =
@@ -3948,49 +4406,6 @@ mod tests {
 
     // ---- CLI 实报用量的合并口径（一轮一次，轮末权威值用的就是它）----
 
-    fn usage_parts(input: u64, output: u64, cache_read: u64, window: Option<u64>) -> ModelUsage {
-        crate::external_agents::stream::usage_from_parts(
-            crate::external_agents::stream::CliUsageParts {
-                input,
-                output,
-                cache_read,
-                context_window: window,
-                ..Default::default()
-            },
-        )
-    }
-
-    /// 零用量的上报不得把已经攒到的分子清零（spec 14h）。`/help` 那种没有 LLM 往返的
-    /// `result` 四个字段全 0 却带窗口 —— 采纳它的窗口，但绝不采纳它的 0。
-    #[test]
-    fn zero_usage_report_does_not_reset_the_numerator() {
-        let real = usage_parts(1_200, 800, 45_000, None);
-        let zero_with_window = usage_parts(0, 0, 0, Some(1_000_000));
-        let merged = merge_cli_usage(Some(&real), zero_with_window);
-        assert_eq!(
-            crate::external_agents::context::cli_reported_context_tokens(&merged),
-            47_000,
-            "分子必须保持 47000（只采纳零值上报带来的窗口）"
-        );
-        assert_eq!(merged.context_window_tokens, Some(1_000_000));
-    }
-
-    #[test]
-    fn cli_usage_merge_keeps_latest_numbers() {
-        let first = ModelUsage {
-            input_tokens: Some(100),
-            ..Default::default()
-        };
-        let merged = merge_cli_usage(
-            Some(&first),
-            ModelUsage {
-                input_tokens: Some(250),
-                ..Default::default()
-            },
-        );
-        assert_eq!(merged.input_tokens, Some(250));
-    }
-
     #[test]
     fn cli_usage_merge_keeps_window_when_later_report_omits_it() {
         // ACP 实际时序：usage_update(带 size) 先到，PromptResponse.usage(无 size) 后到。
@@ -4157,9 +4572,39 @@ mod tests {
         assert!(needs_host("dsh"));
         assert!(needs_host("codex"));
         assert!(needs_host("grok"));
-        assert!(needs_host("cursor-agent"));
+        assert!(get_agent_def("cursor-agent").is_none());
         assert!(get_agent_def("cursor").is_none());
         assert!(!needs_host("claude"));
+    }
+
+    #[test]
+    fn claude_elicitation_url_only_opens_http_links() {
+        let ask = |input: serde_json::Value| crate::external_agents::session::live::ApprovalAsk {
+            request_id: "e".to_string(),
+            tool_call_id: "e".to_string(),
+            tool_name: "elicitation".to_string(),
+            input,
+            requires_user_interaction: true,
+            requires_manual_approval: true,
+            permission_suggestions: None,
+        };
+        let url = serde_json::json!({ "mode": "url", "url": "https://login.test/x" });
+        assert_eq!(
+            claude_elicitation_url("claude", &ask(url.clone())).as_deref(),
+            Some("https://login.test/x")
+        );
+        assert_eq!(claude_elicitation_url("grok", &ask(url)), None);
+        assert_eq!(
+            claude_elicitation_url(
+                "claude",
+                &ask(serde_json::json!({ "mode": "url", "url": "file:///etc/passwd" }))
+            ),
+            None
+        );
+        assert_eq!(
+            claude_elicitation_url("claude", &ask(serde_json::json!({ "mode": "form" }))),
+            None
+        );
     }
 
     /// 「完全」档接上询问通道之后**用户感知不到差别**：普通工具原地放行，只有问用户卡会弹。
@@ -4376,7 +4821,7 @@ mod tests {
         assert_eq!(
             persistent_failure_action(
                 "ACP session exited mid-turn",
-                "cursor-agent",
+                "opencode",
                 false,
                 false,
                 false
@@ -4387,7 +4832,7 @@ mod tests {
         assert_eq!(
             persistent_failure_action(
                 "ACP session exited mid-turn",
-                "cursor-agent",
+                "opencode",
                 true,
                 false,
                 false
@@ -4511,7 +4956,7 @@ mod tests {
         assert_eq!(
             persistent_failure_action(
                 "session/load: Session not found",
-                "cursor-agent",
+                "opencode",
                 false,
                 false,
                 true
@@ -4907,7 +5352,7 @@ mod tests {
         assert!(with(Some("sonnet")).accepts(&with(None)));
     }
 
-    /// Codex sandbox 只在 thread 握手时生效：未选与「工作区写」是同一档，切「完全」必须换进程。
+    /// Codex sandbox 切档需重连以重新解析策略：未选与「工作区写」是同一档。
     /// model / effort 每轮都能带，换它们不该重连。
     #[test]
     fn codex_sandbox_change_forces_a_reconnect() {
@@ -4961,6 +5406,33 @@ mod tests {
         assert_eq!(
             persistent_turn_prompt(StreamFormat::AcpJsonRpc, composed, latest),
             latest
+        );
+    }
+
+    #[test]
+    fn skill_slash_preserves_attachments_on_fresh_and_reused_turns() {
+        assert!(accepts_prompt_attachments(
+            StreamFormat::CodexAppServer,
+            "/wizard task"
+        ));
+        assert!(accepts_prompt_attachments(
+            StreamFormat::PiRpc,
+            "/skill:wizard task"
+        ));
+        assert!(!accepts_prompt_attachments(
+            StreamFormat::CodexAppServer,
+            "/compact"
+        ));
+        assert!(!accepts_prompt_attachments(StreamFormat::PiRpc, "/compact"));
+        assert!(!accepts_prompt_attachments(
+            StreamFormat::PiRpc,
+            "/skill:wizard/file"
+        ));
+        assert!(!accepts_prompt_attachments(StreamFormat::PiRpc, "/skill:"));
+        let composed = "/wizard task\n\n# 附带文件\nPath: /work/example.pdf";
+        assert_eq!(
+            persistent_turn_prompt(StreamFormat::CodexAppServer, composed, "/wizard task"),
+            composed
         );
     }
 

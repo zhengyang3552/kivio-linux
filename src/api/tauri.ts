@@ -18,8 +18,10 @@ import type {
   ChatSegmentPayload as GeneratedChatSegmentPayload,
 } from '../generated/chatProtocol'
 import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRun, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary, NodeOutput, ValidationIssue } from './automationContracts'
+import type { ScheduleRule, ScheduledTask, ScheduledTaskInput, ScheduledTaskRun, ScheduledTasksChangedEvent } from './scheduledTaskContracts'
 import type { GoalState } from './goalContracts'
 import { normalizeGitDiffStat, normalizeGitRepoState, type GitSnapshot } from './dockContracts'
+import type { ThemeDefinition } from '../theme/types'
 
 // ========== 类型定义 ==========
 
@@ -132,6 +134,8 @@ export type ChatContextState = {
   estimatedInputTokens?: number
   context_window_tokens?: number | null
   contextWindowTokens?: number | null
+  auto_compact_threshold_tokens?: number | null
+  autoCompactThresholdTokens?: number | null
   context_window_estimated?: boolean
   contextWindowEstimated?: boolean
   usage_ratio?: number | null
@@ -197,6 +201,8 @@ export type ChatTodoState = {
 export type ChatTodoPayload = {
   conversationId: string
   todoState: ChatTodoState
+  /** Conversation revision of a persisted update; absent for run-scoped replays. */
+  revision?: number
 }
 
 export type ChatPlanMode = 'act' | 'plan'
@@ -464,6 +470,7 @@ export type ChatNativeToolsConfig = {
   runCommand?: boolean
   knowledgeSearch?: boolean
   automation?: boolean
+  scheduledTasks?: boolean
   workingDirectory?: string
   /** Legacy settings compatibility only. */
   workspaceRoots?: string[]
@@ -484,7 +491,7 @@ export type ChatClipboardFilesResult = {
 
 export type ChatClipboardContent =
   | { kind: 'files'; paths: string[] }
-  | { kind: 'image'; dataBase64: string }
+  | { kind: 'image'; dataBase64: string; text?: string; html?: string }
   | { kind: 'text'; text: string }
   | { kind: 'empty' }
 
@@ -903,6 +910,7 @@ export type ModelInfo = {
     streaming?: boolean
     webSearch?: boolean
     imageGeneration?: boolean
+    videoGeneration?: boolean
     embedding?: boolean
   }
   /** 嵌入模型的向量维度（默认/原生）。 */
@@ -1132,7 +1140,10 @@ export type Settings = {
   /** 关闭 AI 客户端（chat 窗口）的全局热键。 */
   closeChatHotkey: string
   theme: 'system' | 'light' | 'dark'
-  themeColor: 'neutral' | 'warm' | 'cool'
+  /** 主题 id：内置主题或 customThemes 中的自定义 id。非法选择由后端收成 neutral。 */
+  themeColor: string
+  /** 自定义主题。旧快照可省略；后端 canonical 响应总是返回完整数组。 */
+  customThemes?: ThemeDefinition[]
   translucentSidebar: boolean
   uiFontScale?: number
   uiFontFamily?: string
@@ -1354,7 +1365,7 @@ export type PluginInstallBrief = {
   userMessage: string
 }
 
-export type UsageRange = 'today' | '1d' | '7d' | '30d'
+export type UsageRange = 'today' | '1d' | '7d' | '30d' | '365d'
 
 export type UsageStatsQuery = {
   range?: UsageRange
@@ -1777,6 +1788,11 @@ export const api = {
   providerOAuthAccount: (provider: ModelProvider) => invoke<ProviderOAuthAccount>('provider_oauth_account', { provider }),
   providerOAuthUsage: (provider: ModelProvider) => invoke<ProviderOAuthUsage>('provider_oauth_usage', { provider }),
   providerOAuthDisconnect: (credentialId: string) => invoke<void>('provider_oauth_disconnect', { credentialId }),
+  desktopPetGetEnabled: () => invoke<boolean>('desktop_pet_get_enabled'),
+  desktopPetSetEnabled: (enabled: boolean) =>
+    invoke<boolean>('desktop_pet_set_enabled', { enabled }),
+  onDesktopPetEnabledChanged: (listener: (enabled: boolean) => void) =>
+    on<boolean>('desktop-pet-enabled-changed', listener),
   // 设置相关
   getSettings: async () => normalizeSettingsSnapshot(await invoke<SettingsSnapshot>('get_settings')),
   onKivioSettingsChanged: (listener: (event: SettingsChangedEvent) => void) =>
@@ -1929,6 +1945,19 @@ export const api = {
   onAutomationChanged: (listener: (payload: AutomationChangedEvent) => void) =>
     on<AutomationChangedEvent>('automation-changed', listener),
 
+  scheduledTasksList: () => invoke<ScheduledTask[]>('scheduled_tasks_list'),
+  scheduledTaskSave: (task: ScheduledTaskInput) =>
+    invoke<ScheduledTask>('scheduled_task_save', { task }),
+  scheduledTaskDelete: (id: string) => invoke<void>('scheduled_task_delete', { id }),
+  scheduledTaskSetEnabled: (id: string, enabled: boolean) =>
+    invoke<ScheduledTask>('scheduled_task_set_enabled', { id, enabled }),
+  scheduledTaskRunNow: (id: string) => invoke<ScheduledTaskRun>('scheduled_task_run_now', { id }),
+  scheduledTaskRuns: (id: string) => invoke<ScheduledTaskRun[]>('scheduled_task_runs', { id }),
+  scheduledTaskRunDelete: (taskId: string, runId: string) => invoke<void>('scheduled_task_run_delete', { taskId, runId }),
+  scheduledTaskPreview: (schedule: ScheduleRule) => invoke<number[]>('scheduled_task_preview', { schedule }),
+  onScheduledTasksChanged: (handler: (payload: ScheduledTasksChangedEvent) => void) =>
+    on<ScheduledTasksChangedEvent>('scheduled-tasks-changed', handler),
+
   // 窗口控制
   /** 给当前（chat）窗口上 Mica，返回材质是否真的生效。Win10 没有 Mica 时为 false —— 这条
    *  路走后端而不是 window.setEffects()，因为 tauri 把 apply_mica 的失败静默吞掉了。 */
@@ -2029,7 +2058,11 @@ export const api = {
     if (!isTauriRuntime()) return Promise.resolve(() => {})
     return onChatProtocol((event) => {
       if (event.type !== 'todo_updated') return
-      listener({ conversationId: event.conversationId, todoState: event.todoState as ChatTodoState })
+      listener({
+        conversationId: event.conversationId,
+        todoState: event.todoState as ChatTodoState,
+        revision: event.scope === 'conversation' ? event.revision : undefined,
+      })
     })
   },
   onChatPlan: (listener: (payload: ChatPlanPayload) => void) => {

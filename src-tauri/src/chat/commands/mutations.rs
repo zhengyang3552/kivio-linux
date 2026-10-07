@@ -14,8 +14,8 @@ use super::super::storage::{
     resolve_conversation_working_directory,
 };
 use super::super::{
-    AdditionalDirectory, AgentPlanState, AgentTodoState, ChatMessage, Conversation,
-    ConversationContextState, ForkOrigin,
+    AdditionalDirectory, AgentPlanState, ChatMessage, Conversation, ConversationContextState,
+    ForkOrigin,
 };
 use super::catalog::{reconcile_conversation_orphan_tool_segments, strip_transcripts_for_frontend};
 use super::context::{
@@ -213,9 +213,7 @@ pub(super) fn apply_reply_with_model_result(
     }
     let new_id = message.id.clone();
     upsert_assistant_message(conversation, message);
-    conversation
-        .group_selections
-        .insert(prep.group_id.clone(), new_id);
+    conversation.select_group_answer(prep.group_id.clone(), new_id);
 }
 
 /// 更新单条消息（仅助手回复）
@@ -325,6 +323,23 @@ pub(super) fn apply_regenerate_truncation(
     Ok(())
 }
 
+/// Truncating history also rewinds the agent todo list to the last snapshot the
+/// retained messages recorded, so it never shows steps from a removed future.
+/// External CLIs keep their list: Codex plan updates and ACP todo notifications
+/// leave no tool record to rebuild it from.
+pub(super) fn restore_todo_state_from_history(conversation: &mut Conversation) {
+    if conversation.agent_runtime.is_external() {
+        return;
+    }
+    let restored = crate::chat::todo::state_from_messages(
+        &conversation.messages,
+        &conversation.group_selections,
+    );
+    if restored.items != conversation.agent_todo_state.items {
+        conversation.agent_todo_state = restored;
+    }
+}
+
 /// 重新生成助手回复（移除该条及之后的消息，再基于此前上下文请求新回复）。
 /// `new_content`：编辑用户提问并重新生成——仅当目标是 user 消息时有效，先替换其内容
 /// 再走截断+重生成（附件保留；一个原子命令，避免"改了历史但不重生成"的不一致状态）。
@@ -369,11 +384,20 @@ pub(crate) async fn chat_regenerate_message(
                 latest
                     .group_selections
                     .retain(|_, selected| existing_ids.contains(selected));
+                restore_todo_state_from_history(latest);
                 Ok(())
             })
             .await
         {
-            Ok(latest) => break latest,
+            Ok(latest) => {
+                crate::chat::todo::emit_chat_todo_state(
+                    &app,
+                    &latest.id,
+                    latest.revision,
+                    &latest.agent_todo_state,
+                );
+                break latest;
+            }
             Err(crate::chat::repository::ConversationRepositoryError::Conflict { .. })
                 if attempt == 0 =>
             {
@@ -630,6 +654,13 @@ pub(crate) async fn chat_rewind_to_message(
         if snapshot.messages[idx].role != "user" {
             return Err("仅支持回到用户提问".to_string());
         }
+        // 外部 CLI 的历史真身在 CLI 自己的原生会话里，只截 Kivio 这份，下一轮 resume 仍会带上
+        // 被删掉的轮次，所以下一轮发送前要先把原生会话拉回可见历史（ADR-0006）。
+        // 校验通过后、截断之前记下「待回退」：记不下就整体失败、不留半截状态。不能提前到校验
+        // 之前——没有原生回退的 CLI 会据此丢弃会话、改为补历史，一次被拒绝的回退不该触发它。
+        if snapshot.agent_runtime.is_external() {
+            crate::external_agents::session::mark_history_rewound(&app, &conversation_id)?;
+        }
         let content = snapshot.messages[idx].content.clone();
         match repository
             .mutate_expected(&app, &conversation_id, Some(snapshot.revision), |latest| {
@@ -647,11 +678,24 @@ pub(crate) async fn chat_rewind_to_message(
                 latest
                     .group_selections
                     .retain(|_, selected| existing_ids.contains(selected));
+                restore_todo_state_from_history(latest);
                 Ok(())
             })
             .await
         {
-            Ok(latest) => break (latest, content),
+            Ok(latest) => {
+                crate::chat::todo::emit_chat_todo_state(
+                    &app,
+                    &latest.id,
+                    latest.revision,
+                    &latest.agent_todo_state,
+                );
+                // Like ZCode, a rewound history starts a fresh compaction circuit breaker.
+                state
+                    .chat_runtime()
+                    .set_auto_compact_failures(&conversation_id, 0);
+                break (latest, content);
+            }
             Err(crate::chat::repository::ConversationRepositoryError::Conflict { .. })
                 if attempt == 0 =>
             {
@@ -783,6 +827,8 @@ pub(crate) async fn chat_fork_conversation(
     let base = truncate_chars(&source.title, 40 - FORK_SUFFIX.chars().count());
     let title = format!("{base}{FORK_SUFFIX}");
 
+    // The branch keeps the todo list as it stood at the fork point.
+    let agent_todo_state = crate::chat::todo::state_from_messages(&messages, &group_selections);
     let conversation = Conversation {
         id: new_id,
         revision: 0,
@@ -802,7 +848,7 @@ pub(crate) async fn chat_fork_conversation(
         project_id: source.project_id.clone(),
         set_id: source.set_id.clone(),
         context_state: ConversationContextState::default(),
-        agent_todo_state: AgentTodoState::default(),
+        agent_todo_state,
         agent_plan_state: AgentPlanState::default(),
         goal_state: None,
         knowledge_base_ids: source.knowledge_base_ids.clone(),
@@ -1336,7 +1382,7 @@ pub(crate) async fn chat_set_group_selection(
             if !valid {
                 return Err("选中的回答不属于该多答组".to_string());
             }
-            conversation.group_selections.insert(group_id, message_id);
+            conversation.select_group_answer(group_id, message_id);
             Ok(())
         })
         .await

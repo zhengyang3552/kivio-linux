@@ -1,10 +1,12 @@
+vi.mock('./ComposerEditor', () => import('./ComposerEditor.testSupport'))
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { describe, expect, it } from 'vitest'
 import { vi } from 'vitest'
 import { InputBar } from './InputBar'
 import { insertTextIntoComposer } from './composerInsert'
-import { draftKey, getComposerDraft, setComposerDraft } from './composerDraft'
+import { draftKey, getComposerDraft, migrateNewChatDraft, setComposerDraft } from './composerDraft'
+import { i18n } from '../components/i18n'
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }))
 vi.mock('@tauri-apps/api/webview', () => ({
@@ -58,6 +60,80 @@ function RewindFirstMessage({ conversationId }: { conversationId: string }) {
 }
 
 describe('InputBar 发送清草稿', () => {
+  it('falls back to loaded prompts when older input history cannot be read', async () => {
+    render(<InputBar onSend={() => {}} conversationId="history-offline" inputHistory={['available']} onLoadInputHistory={async () => null} />)
+    const input = screen.getByRole('textbox')
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input).toHaveValue('available')
+  })
+
+  it('revokes pending input history as soon as the send button starts a submission', async () => {
+    let resolveHistory!: (history: string[]) => void
+    let resolveSend!: (accepted: boolean) => void
+    render(<InputBar conversationId="history-send" onSend={() => new Promise<boolean>(done => { resolveSend = done })}
+      onLoadInputHistory={() => new Promise<string[]>(done => { resolveHistory = done })} />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'sending draft' } })
+    fireEvent.keyDown(input, { key: 'ArrowUp' })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await act(async () => resolveHistory(['wrong old prompt']))
+    expect(input).toHaveValue('sending draft')
+    await act(async () => resolveSend(false))
+  })
+
+  it('loads older prompts on demand and restores the draft after browsing', async () => {
+    const load = vi.fn(async () => ['old outside window', 'recent'])
+    render(<InputBar onSend={() => {}} conversationId="lazy-history" inputHistory={['recent']} onLoadInputHistory={load} />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'draft' } })
+    expect(load).not.toHaveBeenCalled()
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input).toHaveValue('recent')
+    fireEvent.keyDown(input, { key: 'ArrowUp' })
+    expect(input).toHaveValue('old outside window')
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(input).toHaveValue('draft')
+    expect(load).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not replace new typing or another draft with a delayed history read', async () => {
+    let resolve!: (history: string[]) => void
+    const load = () => new Promise<string[]>(done => { resolve = done })
+    const { rerender } = render(<InputBar onSend={() => {}} conversationId="lazy-history-a" onLoadInputHistory={load} />)
+    const input = screen.getByRole('textbox')
+    fireEvent.keyDown(input, { key: 'ArrowUp' })
+    fireEvent.change(input, { target: { value: 'typed while loading' } })
+    await act(async () => resolve(['old']))
+    expect(input).toHaveValue('typed while loading')
+    fireEvent.keyDown(input, { key: 'ArrowUp' })
+    rerender(<InputBar onSend={() => {}} conversationId="lazy-history-b" />)
+    await act(async () => resolve(['wrong conversation']))
+    expect(input).toHaveValue('')
+  })
+
+  it('does not write the outgoing input into the target when editing and switching share a commit', () => {
+    setComposerDraft('batched-draft-a', { input: 'A draft', quotes: [], attachments: [] })
+    setComposerDraft('batched-draft-b', { input: 'B draft', quotes: [], attachments: [] })
+    const { rerender } = render(<InputBar onSend={() => {}} conversationId="batched-draft-a" />)
+    act(() => {
+      fireEvent.change(screen.getByRole('textbox'), { target: { value: 'A edited' } })
+      rerender(<InputBar onSend={() => {}} conversationId="batched-draft-b" />)
+    })
+    expect(screen.getByRole('textbox')).toHaveValue('B draft')
+    expect(getComposerDraft('batched-draft-b')?.input).toBe('B draft')
+  })
+  it('keeps typing between a committed draft migration and the deferred conversation render', () => {
+    setComposerDraft(draftKey(null), { input: '', quotes: [], attachments: [] })
+    const { rerender } = render(<InputBar onSend={() => {}} />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'first' } })
+    migrateNewChatDraft(draftKey(null), 'deferred-creation')
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'first and latest' } })
+    rerender(<InputBar onSend={() => {}} conversationId="deferred-creation" />)
+    expect(screen.getByRole('textbox')).toHaveValue('first and latest')
+    expect(getComposerDraft('deferred-creation')?.input).toBe('first and latest')
+    expect(getComposerDraft(draftKey(null))).toBeUndefined()
+  })
   it('显示自定义编辑菜单，拦截原生菜单且不冒泡到全局', () => {
     const blockContextMenu = vi.fn((event: Event) => event.preventDefault())
     document.addEventListener('contextmenu', blockContextMenu)
@@ -149,14 +225,14 @@ describe('InputBar 发送清草稿', () => {
 
   it('onSend 同一提交内卸载 InputBar 时，草稿 store 也被清空（欢迎页首发竞态）', async () => {
     render(<UnmountOnSend conversationId="c-draft-race" />)
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '我右键无法创建txt文件了' } })
     expect(getComposerDraft(draftKey('c-draft-race'))?.input).toBe('我右键无法创建txt文件了')
 
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     // 卸载丢弃了 setInput('') 与写回 effect —— 只有 handleSend 里的同步清 store 能保证这条。
-    expect(screen.queryByPlaceholderText('Ask me anything...')).not.toBeInTheDocument()
+    expect(screen.queryByPlaceholderText(i18n.zh.chatComposerPlaceholder)).not.toBeInTheDocument()
     await waitFor(() => {
       expect(getComposerDraft(draftKey('c-draft-race'))).toBeUndefined()
     })
@@ -164,7 +240,7 @@ describe('InputBar 发送清草稿', () => {
 
   it('发送未被接受时保留输入草稿', async () => {
     render(<InputBar onSend={() => Promise.resolve(false)} conversationId="c-send-rejected" />)
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '不要丢掉这条消息' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
@@ -183,7 +259,7 @@ describe('InputBar 发送清草稿', () => {
         }}
       />,
     )
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '发送失败也要回来' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
@@ -205,7 +281,7 @@ describe('InputBar 发送清草稿', () => {
         }}
       />,
     )
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '第一句' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     await waitFor(() => expect(textarea).toHaveValue(''))
@@ -238,7 +314,7 @@ describe('InputBar 发送清草稿', () => {
         }}
       />,
     )
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '发出后马上清空' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
@@ -253,10 +329,11 @@ describe('InputBar 发送清草稿', () => {
     let resolveSend!: (accepted: boolean) => void
     const send = new Promise<boolean>((resolve) => { resolveSend = resolve })
     const { rerender } = render(<InputBar onSend={() => send} conversationId={null} />)
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '首条消息' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
+    migrateNewChatDraft(draftKey(undefined), 'c-created-after-send')
     rerender(<InputBar onSend={() => send} conversationId="c-created-after-send" />)
     expect(textarea).toHaveValue('首条消息')
     await act(async () => { resolveSend(true) })
@@ -274,7 +351,7 @@ describe('InputBar 发送清草稿', () => {
       attachments: [],
     })
     const { rerender } = render(<InputBar onSend={() => send} conversationId="c-sending" />)
-    const textarea = screen.getByPlaceholderText('Ask me anything...')
+    const textarea = screen.getByPlaceholderText(i18n.zh.chatComposerPlaceholder)
     fireEvent.change(textarea, { target: { value: '正在发送的消息' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 

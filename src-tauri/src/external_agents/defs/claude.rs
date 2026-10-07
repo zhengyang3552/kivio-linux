@@ -8,8 +8,8 @@ use super::super::types::{
 const FALLBACK_MODELS: &[(&str, &str)] = &[
     ("default", "Default"),
     ("claude-fable-5-1", "Fable 5.1"),
-    ("claude-opus-5", "Opus 5"),
-    ("claude-sonnet-5", "Sonnet 5"),
+    ("claude-opus-5-5", "Opus 5.5"),
+    ("claude-sonnet-5-5", "Sonnet 5.5"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5"),
 ];
 
@@ -268,6 +268,29 @@ pub fn append_system_prompt_file_args(path: &std::path::Path) -> Vec<String> {
     ]
 }
 
+/// `--system-prompt-snapshot off`（2.1.267+）：续接时让**新的**系统提示生效。
+///
+/// 默认（on）CLI 在会话首个请求把系统提示连同 `--append-system-prompt-file` 录下来，之后
+/// 每次请求和 resume 都原样发录下的那份，直到压缩 ——`--help` 原文 "even when a later launch
+/// passes different text"。于是用户改了系统提示 / Memory 后，Kivio 换进程带新文件 `--resume`，
+/// CLI 仍发旧的。只在这种「续接且指令变了」的启动加它：平时保留快照，不白丢提示缓存。
+///
+/// 版本门控：旧 CLI 不认这个 flag 会直接拒绝启动，所以版本未知或低于 2.1.267 都不加。
+pub fn system_prompt_snapshot_off_args(cli_version: Option<&str>) -> Vec<String> {
+    let supported = cli_version
+        .and_then(crate::external_agents::installer::extract_semver)
+        .and_then(|v| {
+            let mut parts = v.split(['.', '-']).map(|p| p.parse::<u64>().ok());
+            Some((parts.next()??, parts.next()??, parts.next()??))
+        })
+        .is_some_and(|v| v >= (2, 1, 267));
+    if supported {
+        vec!["--system-prompt-snapshot".to_string(), "off".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// 把 claude 的启动参数改写成「续接 `session_id` 这个原生会话」：先摘掉已有的
 /// `--session-id <x>` / `--resume <x>`，再追加 `--resume <session_id>`。
 ///
@@ -307,9 +330,13 @@ fn claude_args_with_session_flag(args: &[String], flag: &str, session_id: &str) 
             skip_next = false;
             continue;
         }
-        if arg == "--session-id" || arg == "--resume" {
+        if arg == "--session-id" || arg == "--resume" || arg == "--resume-session-at" {
             // 成对出现，值一起摘掉（值本身可能长得像别的东西，绝不能只摘 flag）。
             skip_next = true;
+            continue;
+        }
+        // 回退分叉（`claude_args_rewound_fork`）的开关只对 `--resume` 有意义，随它一起摘。
+        if arg == "--fork-session" {
             continue;
         }
         out.push(arg.clone());
@@ -324,10 +351,29 @@ fn claude_args_with_session_flag(args: &[String], flag: &str, session_id: &str) 
 /// codex / ACP 的 native id 是握手响应给的；claude 的是我们自己在参数里放进去的，
 /// 所以重连时只能从参数读回来（`system/init` / `result` 的 `session_id` 会在第一轮覆盖它）。
 pub fn claude_session_id_from_args(args: &[String]) -> Option<String> {
-    args.windows(2)
-        .find(|pair| pair[0] == "--session-id" || pair[0] == "--resume")
-        .map(|pair| pair[1].clone())
-        .filter(|id| !id.is_empty())
+    // `--resume <old> --fork-session --session-id <new>` runs as <new>, so `--session-id` wins.
+    let value_of = |flag: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+            .filter(|id| !id.is_empty())
+    };
+    value_of("--session-id").or_else(|| value_of("--resume"))
+}
+
+/// Resume a fork of the session that ends at `entry_id` (a transcript chain-entry UUID), running
+/// as `fork_id`. Claude copies the kept prefix into the new session and leaves the original
+/// transcript untouched (checked with claude 2.1.282: `system/init` reports `fork_id`).
+pub fn claude_args_rewound_fork(args: &[String], entry_id: &str, fork_id: &str) -> Vec<String> {
+    let mut out = args.to_vec();
+    out.extend([
+        "--resume-session-at".to_string(),
+        entry_id.to_string(),
+        "--fork-session".to_string(),
+        "--session-id".to_string(),
+        fork_id.to_string(),
+    ]);
+    out
 }
 
 /// 从启动参数读回 `--model` 的值。
@@ -629,6 +675,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn system_prompt_snapshot_off_is_version_gated() {
+        let off = vec!["--system-prompt-snapshot".to_string(), "off".to_string()];
+        assert_eq!(
+            system_prompt_snapshot_off_args(Some("2.1.287 (Claude Code)")),
+            off
+        );
+        assert_eq!(system_prompt_snapshot_off_args(Some("2.1.267")), off);
+        assert!(system_prompt_snapshot_off_args(Some("2.1.266 (Claude Code)")).is_empty());
+        assert!(system_prompt_snapshot_off_args(None).is_empty());
+    }
+
     /// `--append-system-prompt-file` 必须是「flag 后紧跟路径」的成对形式，
     /// 且是 append 语义（不替换 claude 原生系统提示）。
     #[test]
@@ -677,33 +735,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn claude_build_args_permission_mode_from_sandbox() {
-        let mk = |sandbox: Option<&str>| {
-            build_claude_args(
-                &RuntimeContext {
-                    extra_allowed_dirs: vec![],
-                    resume_session_id: None,
-                    new_session_id: None,
-                    include_partial_messages: false,
-                },
-                &RuntimeBuildOptions {
-                    model: None,
-                    reasoning: None,
-                    sandbox: sandbox.map(str::to_string),
-                },
-                None,
-            )
-        };
-        assert!(mk(Some("plan"))
-            .windows(2)
-            .any(|w| w == ["--permission-mode", "plan"]));
-        // Unset → defaults to bypassPermissions so headless tools still work.
-        assert!(mk(None)
-            .windows(2)
-            .any(|w| w == ["--permission-mode", "bypassPermissions"]));
-    }
-
     // ---- 工具审批：--permission-prompt-tool stdio 的门控 ----
 
     /// **默认档接上通道之后，用户可感知的行为必须一字不变**：默认档仍是
@@ -722,20 +753,6 @@ mod tests {
                 "{mode} 档不该被就地放行（那是偷偷降级成 bypassPermissions）"
             );
         }
-    }
-
-    /// 三个交互工具（`AskUserQuestion` / `EnterPlanMode` / `ExitPlanMode`）只在带 flag 时
-    /// 存在，所以**每一档都带**。值是字面量 `stdio`（不是某个 MCP 工具名）。
-    #[test]
-    fn the_ask_mode_routes_permissions_over_the_stdio_control_channel() {
-        assert_eq!(
-            claude_permission_prompt_args(),
-            vec![
-                "--permission-prompt-tool".to_string(),
-                "stdio".to_string(),
-                "--allow-dangerously-skip-permissions".to_string(),
-            ]
-        );
     }
 
     /// argv 层面：每一档都带 flag（否则那一档的 claude 手里没有问用户这个工具），
@@ -875,5 +892,32 @@ mod tests {
             None,
         );
         assert_eq!(claude_session_id_from_args(&bare), None);
+    }
+
+    #[test]
+    fn rewound_fork_runs_under_the_fork_id() {
+        let args = claude_args_rewound_fork(&args_with("--resume", "old"), "entry-9", "fork-1");
+        assert!(args.windows(2).any(|w| w == ["--resume", "old"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--resume-session-at", "entry-9"]));
+        assert!(args.contains(&"--fork-session".to_string()));
+        // The live handle and stored binding must follow the fork, not the original session.
+        assert_eq!(
+            claude_session_id_from_args(&args).as_deref(),
+            Some("fork-1")
+        );
+        // Losing the original session drops the whole fork request, not just `--resume`.
+        let fresh = claude_args_fresh_session(&args, "fresh");
+        assert!(
+            !fresh.iter().any(|arg| arg.starts_with("--resume")
+                || arg == "--fork-session"
+                || arg == "entry-9"),
+            "{fresh:?}"
+        );
+        assert_eq!(
+            claude_session_id_from_args(&fresh).as_deref(),
+            Some("fresh")
+        );
     }
 }

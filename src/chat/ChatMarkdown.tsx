@@ -1,4 +1,4 @@
-import { createContext, isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Code2, ExternalLink, Eye, Loader2 } from 'lucide-react'
 import type { BlockProps, Components, UrlTransform } from 'streamdown'
@@ -7,6 +7,7 @@ import type { PluggableList } from 'unified'
 import { cjk } from '@streamdown/cjk'
 import { code } from '@streamdown/code'
 import { createMathPlugin } from '@streamdown/math'
+import 'katex/dist/katex.min.css'
 import { mermaid } from '@streamdown/mermaid'
 import remarkBreaks from 'remark-breaks'
 import { normalizeMarkdownForRender, preserveLocalMarkdownLinks } from './markdownUtils'
@@ -17,7 +18,8 @@ import { artifactReferenceId, inlineArtifactReferenceLinks } from './artifactRef
 import { artifactId } from './artifactPresentation'
 import { ArtifactFileChip } from './GeneratedFileArtifacts'
 import { loadArtifactDataUrl } from './attachmentPreview'
-import { remarkCitations, type CitationView } from './citations'
+import { openChatImageViewer } from './imageViewer'
+import { citationMapsEqual, remarkCitations, type CitationView } from './citations'
 import { citationPopoverPosition, type CitationPopoverPosition } from './citationPopover'
 import { isWebCitation } from './webSearchCitations'
 import { ChatInlineImage } from './ChatInlineImage'
@@ -35,6 +37,7 @@ import { copyToClipboard } from '../utils/clipboard'
 import { IconButton } from '../components/Button'
 import { CliCommandReport } from './CliCommandReport'
 import { normalizeLegacyCliReport, parseCliReport } from './cliCommandReportData'
+import { isSvgSource, readSvgPreview } from './svgPreview'
 
 interface ChatMarkdownProps {
   content: string
@@ -48,6 +51,8 @@ interface ChatMarkdownProps {
   /** 已完成助手回答才传入；ChatMarkdown 负责把同一份规范化 Markdown 的标题注册给消息目录。 */
   outlineSource?: ChatMarkdownOutlineSource
 }
+
+const EMPTY_ARTIFACTS: ChatToolArtifact[] = []
 
 export type MarkdownOutlineSourceUpdate = {
   ownerMessageId: string
@@ -69,11 +74,11 @@ function markdownShellClass(variant: ChatMarkdownProps['variant']): string {
     case 'reasoning':
       return 'chat-markdown chat-reasoning-markdown max-w-none break-words text-sm leading-relaxed text-neutral-400 dark:text-neutral-500'
     case 'lens':
-      return 'chat-markdown max-w-none break-words text-[13.5px] leading-7 text-neutral-800 dark:text-neutral-200'
+      return 'chat-markdown max-w-none break-words text-[13.5px] leading-7 text-neutral-800'
     case 'lens-muted':
       return 'chat-markdown max-w-none break-words text-[12.5px] leading-6 text-neutral-500 dark:text-neutral-400'
     default:
-      return 'chat-markdown max-w-none break-words text-[15px] leading-[1.7] text-neutral-900 dark:text-neutral-100'
+      return 'chat-markdown max-w-none break-words text-[15px] leading-[1.7] text-neutral-900'
   }
 }
 
@@ -321,11 +326,10 @@ const highlightCache = new Map<string, ReactNode[]>()
 const HIGHLIGHT_CACHE_MAX = 400
 
 // 导出给 dock 文件查看器复用（逐行调用，块注释跨行会降级——查看器场景可接受）。
-// cache=false（流式中的增长块）只读不写：增长块每个 token 全文都变、键永 miss，
-// 若照写会把每个前缀版本都灌进 LRU —— 一个长代码块流完能把几百条已定稿条目全部
-// 挤光，回翻历史时整批重扫。
+// 流式增长块不走这里：每个 delta 全文都变，扫描和 span 会在主线程上反复重建，
+// 前缀写进 LRU 还会把已定稿条目挤掉。定稿后才扫描并按语言+源码缓存。
 // eslint-disable-next-line react-refresh/only-export-components -- 纯函数 helper，热更新损失可接受
-export function highlightCode(code: string, language: string, options?: { cache?: boolean }) {
+export function highlightCode(code: string, language: string) {
   const key = `${language}\n${code}`
   const cached = highlightCache.get(key)
   if (cached) {
@@ -339,12 +343,10 @@ export function highlightCode(code: string, language: string, options?: { cache?
       ? <span key={index} className={token.className}>{token.text}</span>
       : token.text
   ))
-  if (options?.cache !== false) {
-    highlightCache.set(key, rendered)
-    if (highlightCache.size > HIGHLIGHT_CACHE_MAX) {
-      const oldest = highlightCache.keys().next().value
-      if (oldest !== undefined) highlightCache.delete(oldest)
-    }
+  highlightCache.set(key, rendered)
+  if (highlightCache.size > HIGHLIGHT_CACHE_MAX) {
+    const oldest = highlightCache.keys().next().value
+    if (oldest !== undefined) highlightCache.delete(oldest)
   }
   return rendered
 }
@@ -384,55 +386,104 @@ function ErrorDetails({ detail }: { detail: string }) {
   )
 }
 
-function readDocumentDark(): boolean {
-  return typeof document !== 'undefined' && document.documentElement.classList.contains('dark')
+function readThemeToken(name: string, fallback: string): string {
+  if (typeof document === 'undefined') return fallback
+  const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return value || fallback
 }
 
-function useDocumentDark(): boolean {
-  const [dark, setDark] = useState(readDocumentDark)
+// 图框跟文档根上的语义色板走。主题运行时改的是 html 的 style / class / data-theme-color，
+// 同一明暗模式换色板时 class 不一定变，所以不能只盯 .dark。
+const MERMAID_THEME_TOKENS = [
+  '--theme-surface',
+  '--theme-surface-soft',
+  '--theme-surface-muted',
+  '--theme-surface-border',
+  '--theme-surface-border-strong',
+  '--text',
+  '--text-muted',
+  '--accent',
+  '--accent-soft',
+] as const
+
+function mermaidThemeKey(): string {
+  if (typeof document === 'undefined') return ''
+  const style = getComputedStyle(document.documentElement)
+  return MERMAID_THEME_TOKENS.map((name) => style.getPropertyValue(name).trim()).join('|')
+}
+
+function useMermaidThemeKey(): string {
+  const [key, setKey] = useState(mermaidThemeKey)
 
   useEffect(() => {
     const root = document.documentElement
-    const sync = () => setDark(root.classList.contains('dark'))
+    const sync = () => {
+      const next = mermaidThemeKey()
+      setKey((current) => (current === next ? current : next))
+    }
+    sync()
     const observer = new MutationObserver(sync)
-    observer.observe(root, { attributes: true, attributeFilter: ['class'] })
+    observer.observe(root, { attributes: true, attributeFilter: ['class', 'style', 'data-theme-color'] })
     return () => observer.disconnect()
   }, [])
 
-  return dark
+  return key
 }
 
-function mermaidThemeVariables(dark: boolean) {
-  if (dark) {
-    return {
-      background: 'transparent',
-      primaryColor: '#334155',
-      primaryBorderColor: '#64748b',
-      primaryTextColor: '#f1f5f9',
-      lineColor: '#94a3b8',
-      secondaryColor: '#1e293b',
-      tertiaryColor: '#0f172a',
-      fontFamily: 'ui-sans-serif, system-ui, sans-serif',
-    }
-  }
+function mermaidThemeVariables() {
+  const surface = readThemeToken('--theme-surface', '#fdfcfa')
+  const surfaceSoft = readThemeToken('--theme-surface-soft', '#f9f8f6')
+  const surfaceMuted = readThemeToken('--theme-surface-muted', '#f4f3f1')
+  const border = readThemeToken('--theme-surface-border', '#e2e1df')
+  const borderStrong = readThemeToken('--theme-surface-border-strong', '#d2d1cf')
+  const text = readThemeToken('--text', '#1d1d1f')
+  const muted = readThemeToken('--text-muted', '#6b6b73')
+  const accent = readThemeToken('--accent', '#2f6ff0')
+  const accentSoft = readThemeToken('--accent-soft', '#e6efff')
   return {
+    // 画布透明，卡片底色由外层 bg-[var(--bg-input)] 提供，不另铺一层白底。
     background: 'transparent',
-    primaryColor: '#f8fafc',
-    primaryBorderColor: '#94a3b8',
-    primaryTextColor: '#111827',
-    lineColor: '#64748b',
-    secondaryColor: '#f1f5f9',
-    tertiaryColor: '#ffffff',
+    primaryColor: surfaceMuted,
+    primaryBorderColor: borderStrong,
+    primaryTextColor: text,
+    secondaryColor: surfaceSoft,
+    secondaryBorderColor: border,
+    secondaryTextColor: text,
+    tertiaryColor: surface,
+    tertiaryBorderColor: border,
+    tertiaryTextColor: text,
+    lineColor: muted,
+    textColor: text,
+    mainBkg: surface,
+    secondBkg: surfaceSoft,
+    nodeBkg: surfaceMuted,
+    nodeBorder: borderStrong,
+    clusterBkg: surfaceSoft,
+    clusterBorder: borderStrong,
+    titleColor: text,
+    edgeLabelBackground: surface,
+    actorBkg: surfaceMuted,
+    actorBorder: borderStrong,
+    actorTextColor: text,
+    actorLineColor: muted,
+    signalColor: muted,
+    signalTextColor: text,
+    labelBoxBkgColor: surface,
+    labelTextColor: text,
+    noteBkgColor: accentSoft,
+    noteTextColor: text,
+    noteBorderColor: accent,
     fontFamily: 'ui-sans-serif, system-ui, sans-serif',
   }
 }
 
 function CodeBlock({ code, language, actions }: { code: string; language: string; actions?: ReactNode }) {
   const normalizedCode = useMemo(() => normalizeCodeBlockText(code), [code])
-  // 流式中的增长块只读缓存不写（见 highlightCode 注释），定稿后首次渲染才入缓存。
+  // 上下文为 true 时只放转义后的全文，不调用 highlightCode。Block memo 不订阅这个上下文，
+  // 所以这里自己读：定稿变 false 后仍会重渲，再走缓存高亮。岛一旦 hydrate 不拆这块，<pre>/<code> 仍在。
   const streaming = useContext(MarkdownStreamingContext)
   const highlighted = useMemo(
-    () => highlightCode(normalizedCode, language, { cache: !streaming }),
+    () => (streaming ? null : highlightCode(normalizedCode, language)),
     [normalizedCode, language, streaming],
   )
   const [copied, setCopied] = useState(false)
@@ -453,7 +504,7 @@ function CodeBlock({ code, language, actions }: { code: string; language: string
   // + lucide svg + svg 内的 rect/path + pre + code = 9 个节点，现在 6 个。
   // 每块省 3 个节点，231 块省约 700 个。
   return (
-    <figure className="not-prose relative my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] text-neutral-950 shadow-sm dark:text-neutral-100">
+    <figure className="not-prose relative my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] text-neutral-950 shadow-sm">
       <div
         className="kv-code-toolbar absolute right-1.5 top-1.5 z-10 flex items-center gap-1 rounded-md bg-[var(--bg-input)] pl-2"
         data-code-lang={codeLanguageLabel(language)}
@@ -467,8 +518,8 @@ function CodeBlock({ code, language, actions }: { code: string; language: string
           <span className={copied ? 'kv-copy-glyph is-copied' : 'kv-copy-glyph'} aria-hidden="true" />
         </IconButton>
       </div>
-      <pre className="custom-scrollbar m-0 max-w-full overflow-x-auto bg-transparent px-4 pb-4 pt-10 text-[13px] leading-6 text-neutral-900 dark:text-neutral-100">
-        <code className="font-mono">{highlighted}</code>
+      <pre className="custom-scrollbar m-0 max-w-full overflow-x-auto bg-transparent px-4 pb-4 pt-10 text-[13px] leading-6 text-neutral-900">
+        <code className="font-mono">{highlighted ?? normalizedCode}</code>
       </pre>
     </figure>
   )
@@ -493,8 +544,8 @@ function DeferredCodeBlock({ code, language }: { code: string; language: string 
       delayMs={180}
       eager={conversationOpening || streaming}
       fallback={(
-        <figure className="not-prose relative my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] text-neutral-950 shadow-sm dark:text-neutral-100">
-          <pre className="custom-scrollbar m-0 max-w-full overflow-x-auto bg-transparent px-4 pb-4 pt-10 text-[13px] leading-6 text-neutral-900 dark:text-neutral-100">
+        <figure className="not-prose relative my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] text-neutral-950 shadow-sm">
+          <pre className="custom-scrollbar m-0 max-w-full overflow-x-auto bg-transparent px-4 pb-4 pt-10 text-[13px] leading-6 text-neutral-900">
             <code className="font-mono">{normalizeCodeBlockText(code)}</code>
           </pre>
         </figure>
@@ -508,7 +559,7 @@ function DeferredCodeBlock({ code, language }: { code: string; language: string 
 
 let mermaidRenderCounter = 0
 
-// 已渲染 mermaid SVG 的缓存：键 = 主题 + 源码。虚拟列表会卸载屏外的消息气泡，
+// 已渲染 mermaid SVG 的缓存：键 = 语义色板 + 源码。虚拟列表会卸载屏外的消息气泡，
 // 往回翻时图会重新挂载；若每次都重新 import+parse+render，会出现 spinner(小)→大SVG 的高度
 // 突变，导致 virtualizer 纠正滚动 → 抽搐/闪烁。缓存后命中即同步拿到完整 SVG，挂载时高度即确定，
 // 消除回滚 jank。用外部 Map 而非 useMemo（React 可能在内存压力下丢弃 useMemo 缓存）。
@@ -525,13 +576,15 @@ function cacheMermaidSvg(key: string, svg: string) {
 
 function MermaidBlock({ code }: { code: string }) {
   const normalizedCode = useMemo(() => normalizeCodeBlockText(code), [code])
-  const isDark = useDocumentDark()
-  const cacheKey = `${isDark ? 'd' : 'l'}\n${normalizedCode}`
+  const themeKey = useMermaidThemeKey()
+  const cacheKey = `${themeKey}\n${normalizedCode}`
   const renderBaseId = useRef('')
   const renderSeq = useRef(0)
+  const themeKeyRef = useRef(themeKey)
   const [view, setView] = useState<'diagram' | 'source'>('diagram')
   // 初始即读缓存：命中则首帧就有完整 SVG（高度确定、无 spinner、无闪烁）。
   const [svg, setSvg] = useState(() => mermaidSvgCache.get(cacheKey) ?? '')
+  const [paintedKey, setPaintedKey] = useState(() => (mermaidSvgCache.has(cacheKey) ? themeKey : ''))
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(() => !mermaidSvgCache.has(cacheKey))
   // hooks 必须在 early return 之前：源码/错误分支也会走到下面的 eager 语义。
@@ -543,13 +596,22 @@ function MermaidBlock({ code }: { code: string }) {
   }
 
   useEffect(() => {
+    const themeChanged = themeKeyRef.current !== themeKey
+    themeKeyRef.current = themeKey
     // 命中缓存：同步设回（处理主题/源码切换时的更新；首帧已由 useState 初始值覆盖）。无异步、无闪烁。
     const cached = mermaidSvgCache.get(cacheKey)
     if (cached) {
       setSvg(cached)
+      setPaintedKey(themeKey)
       setError('')
       setLoading(false)
       return
+    }
+    // 色板变了先撤掉上一张 SVG。渲染期也会用 paintedKey 挡住旧图，避免提交前仍画出浅色图框。
+    if (themeChanged) {
+      setSvg('')
+      setPaintedKey('')
+      setLoading(true)
     }
     let cancelled = false
     let errorTimer: ReturnType<typeof setTimeout> | undefined
@@ -567,15 +629,16 @@ function MermaidBlock({ code }: { code: string }) {
           startOnLoad: false,
           securityLevel: 'strict',
           theme: 'base',
-          themeVariables: mermaidThemeVariables(isDark),
+          themeVariables: mermaidThemeVariables(),
         })
         const valid = await mermaid.parse(normalizedCode, { suppressErrors: true })
         if (cancelled) return
         if (valid) {
           const { svg: rendered } = await mermaid.render(renderId, normalizedCode)
-          if (cancelled) return
+          if (cancelled || mermaidThemeKey() !== themeKey) return
           cacheMermaidSvg(cacheKey, rendered)
           setSvg(rendered)
+          setPaintedKey(themeKey)
           setError('')
           setLoading(false)
         } else {
@@ -605,7 +668,7 @@ function MermaidBlock({ code }: { code: string }) {
       cancelled = true
       if (errorTimer) clearTimeout(errorTimer)
     }
-  }, [cacheKey, isDark, normalizedCode])
+  }, [cacheKey, themeKey, normalizedCode])
 
   // 与 CodeBlock 同风格：无独立头栏，"Mermaid" 标签 + 切换按钮悬浮在右上角。
   const toggle = (
@@ -635,6 +698,8 @@ function MermaidBlock({ code }: { code: string }) {
     )
   }
 
+  const diagramReady = !loading && paintedKey === themeKey && svg !== ''
+
   return (
 
     <ChatHeavyIsland
@@ -643,23 +708,23 @@ function MermaidBlock({ code }: { code: string }) {
       fallback={<CodeBlock code={normalizedCode} language="mermaid" actions={toggle} />}
     >
       <figure
-        data-chat-async-pending={loading ? 'true' : undefined}
-        className="not-prose relative my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] text-neutral-950 shadow-sm dark:text-neutral-100"
+        data-chat-async-pending={diagramReady ? undefined : 'true'}
+        className="not-prose relative my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-[var(--bg-input)] text-neutral-950 shadow-sm"
       >
       <div className="absolute right-1.5 top-1.5 z-10 flex items-center gap-1 rounded-md bg-[var(--bg-input)] pl-2">
         <span className="text-[12px] leading-none text-neutral-400 dark:text-neutral-500">Mermaid</span>
         {toggle}
       </div>
-      {loading ? (
+      {diagramReady ? (
+        <div
+          className="custom-scrollbar max-w-full overflow-x-auto overflow-y-hidden [contain:content] bg-[var(--theme-surface)] px-4 pb-4 pt-10 [&>svg]:mx-auto [&>svg]:max-w-none"
+          dangerouslySetInnerHTML={{ __html: svg }}
+        />
+      ) : (
         <div className="flex min-h-28 items-center justify-center gap-2 px-4 py-8 text-[13px] text-neutral-400 dark:text-neutral-500">
           <Loader2 size={15} className="animate-spin" />
           正在渲染图表
         </div>
-      ) : (
-        <div
-          className="custom-scrollbar max-w-full overflow-x-auto overflow-y-hidden [contain:content] bg-white px-4 pb-4 pt-10 dark:bg-neutral-950 [&>svg]:mx-auto [&>svg]:max-w-none"
-          dangerouslySetInnerHTML={{ __html: svg }}
-        />
       )}
       </figure>
     </ChatHeavyIsland>
@@ -736,7 +801,7 @@ function HtmlCodePreview({ html }: { html: string }) {
           fallback={<CodeBlock code={html} language="html" />}
           eager
         >
-          <div className="my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-white dark:bg-neutral-950">
+          <div className="my-3 overflow-hidden rounded-lg border border-[var(--border-input)] bg-neutral-50">
             <iframe
               title="HTML 预览"
               srcDoc={previewHtml}
@@ -744,7 +809,7 @@ function HtmlCodePreview({ html }: { html: string }) {
               // 否则 srcDoc 可直接访问父聊天页及 Tauri 注入的 IPC 全局。
               sandbox="allow-scripts"
               referrerPolicy="no-referrer"
-              className="h-[520px] w-full border-0 bg-white dark:bg-neutral-950"
+              className="h-[520px] w-full border-0 bg-neutral-50"
             />
           </div>
         </ChatHeavyIsland>
@@ -769,6 +834,145 @@ function HtmlCodePreview({ html }: { html: string }) {
   )
 }
 
+/** Decode complete SVG snapshots offscreen; an unfinished delta never clears the last picture. */
+function SvgCodePreview({ source, language }: { source: string; language: string }) {
+  const streaming = useContext(MarkdownStreamingContext)
+  const [view, setView] = useState<'preview' | 'source'>('preview')
+  const [analysis, setAnalysis] = useState(() => ({ source, result: readSvgPreview(source) }))
+  const [frame, setFrame] = useState<{ url: string; svg: string } | null>(null)
+  const [failed, setFailed] = useState(false)
+  const latest = useRef({ source, streaming })
+  const work = useRef({
+    active: false,
+    running: false,
+    timer: undefined as number | undefined,
+    runId: 0,
+    epoch: 0,
+    frame: null as { url: string; svg: string } | null,
+    ratio: analysis.result.snapshot?.aspectRatio ?? null,
+    urls: new Set<string>(),
+  })
+
+  const refresh = useCallback(async function refresh() {
+    const state = work.current
+    state.timer = undefined
+    if (!state.active || state.running) return
+    state.running = true
+    const runId = ++state.runId
+    const epoch = state.epoch
+    const request = latest.current
+    const result = readSvgPreview(request.source)
+    setAnalysis({ source: request.source, result })
+    const snapshot = result.snapshot
+    if (snapshot && state.ratio === null) state.ratio = snapshot.aspectRatio
+    try {
+      if (!snapshot) return
+      if (snapshot.svg === state.frame?.svg) {
+        setFailed(false)
+        return
+      }
+      const url = URL.createObjectURL(new Blob([snapshot.svg], { type: 'image/svg+xml' }))
+      state.urls.add(url)
+      const image = new Image()
+      image.src = url
+      try {
+        await image.decode()
+        if (!state.active || state.runId !== runId || state.epoch !== epoch) {
+          URL.revokeObjectURL(url)
+          state.urls.delete(url)
+          return
+        }
+        state.frame = { url, svg: snapshot.svg }
+        setFrame(state.frame)
+        setFailed(false)
+      } catch {
+        URL.revokeObjectURL(url)
+        state.urls.delete(url)
+        if (state.active && state.runId === runId && state.epoch === epoch) setFailed(true)
+      }
+    } finally {
+      if (state.runId === runId) {
+        state.running = false
+        if (state.active && (latest.current.source !== request.source || latest.current.streaming !== request.streaming)) {
+          // Throttle, not debounce: continuous tokens must still produce pictures.
+          state.timer = window.setTimeout(() => void refresh(), latest.current.streaming ? 120 : 0)
+        }
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    const state = work.current
+    state.active = true
+    return () => {
+      state.active = false
+      state.runId++
+      state.running = false
+      clearTimeout(state.timer)
+      state.timer = undefined
+      for (const url of state.urls) URL.revokeObjectURL(url)
+      state.urls.clear()
+      state.frame = null
+    }
+  }, [])
+  useEffect(() => {
+    if (!frame) return
+    const state = work.current
+    // Revoke the old URL only after React has committed its replacement.
+    return () => {
+      URL.revokeObjectURL(frame.url)
+      state.urls.delete(frame.url)
+    }
+  }, [frame])
+  useEffect(() => {
+    const state = work.current
+    if (!source.trimEnd().startsWith(latest.current.source.trimEnd())) {
+      state.epoch++
+      state.frame = null
+      state.ratio = null
+      setFrame(null)
+      setFailed(false)
+    }
+    latest.current = { source, streaming }
+    if (!streaming) {
+      clearTimeout(state.timer)
+      state.timer = undefined
+    }
+    if (!state.running && state.timer === undefined) {
+      if (streaming) state.timer = window.setTimeout(() => void refresh(), 120)
+      else void refresh()
+    }
+  }, [source, streaming, refresh])
+
+  if (language === 'html' && analysis.source === source && analysis.result.kind === 'html') {
+    return <HtmlCodePreview html={source} />
+  }
+  const snapshot = analysis.source === source ? analysis.result.snapshot : null
+  const status = streaming ? '正在绘制 SVG…'
+    : snapshot?.complete && !failed ? frame?.svg === snapshot.svg ? 'SVG' : '正在加载 SVG…'
+      : 'SVG 未完成或无法预览，请查看源码'
+  return <>
+    {view === 'source' ? <CodeBlock code={source} language={language} /> : (
+      <div className="relative my-3 w-full overflow-hidden rounded-lg border border-[var(--border-input)] bg-neutral-50"
+        style={{ aspectRatio: String(work.current.ratio ?? 16 / 9), maxHeight: 520 }}>
+        {frame ? <img src={frame.url} alt="SVG 预览" className="absolute inset-0 h-full w-full object-contain" />
+          : <div className="absolute inset-0 flex items-center justify-center text-[var(--color-muted-foreground)]"><Loader2 className={streaming ? 'animate-spin' : ''} size={20} aria-hidden="true" /></div>}
+      </div>
+    )}
+    <div className="-mt-1 mb-2 flex items-center justify-between gap-2">
+      <span role="status" className="text-xs text-[var(--color-muted-foreground)]">{status}</span>
+      <div className="flex gap-0.5">
+        <IconButton size="sm" onClick={() => setView((current) => current === 'preview' ? 'source' : 'preview')}
+          label={view === 'preview' ? '查看源码' : '查看预览'}>
+          {view === 'preview' ? <Code2 size={14} strokeWidth={2} /> : <Eye size={14} strokeWidth={2} />}
+        </IconButton>
+        <IconButton size="sm" onClick={() => void api.openHtmlPreview(source).catch((error) => console.error('Failed to open SVG preview:', error))}
+          label="在浏览器打开"><ExternalLink size={14} strokeWidth={2} /></IconButton>
+      </div>
+    </div>
+  </>
+}
+
 function MarkdownPre({ children }: { children?: ReactNode }) {
   // 流式与落库走**同一个** DeferredCodeBlock 外壳：流式下它 eager（`eager={streaming}`，
   // useState 初始化就 hydrated，没有 fallback 112px → 真身的高度跳变），但 island 的
@@ -784,6 +988,9 @@ function MarkdownPre({ children }: { children?: ReactNode }) {
     if (language === 'kivio-cli-report') {
       const report = parseCliReport(code)
       if (report) return <CliCommandReport report={report} />
+    }
+    if (language === 'svg' || (language === 'html' && isSvgSource(code))) {
+      return <SvgCodePreview source={code} language={language} />
     }
     if (language === 'html') {
       return <HtmlCodePreview html={code} />
@@ -820,7 +1027,7 @@ const markdownComponents = {
   th: ({ children, style }) => (
     <th
       style={style}
-      className="rounded-md bg-[var(--bg-hover)] px-3 py-2 text-left font-semibold text-neutral-800 dark:text-neutral-100"
+      className="rounded-md bg-[var(--bg-hover)] px-3 py-2 text-left font-semibold text-neutral-800"
     >
       {children}
     </th>
@@ -828,7 +1035,7 @@ const markdownComponents = {
   td: ({ children, style }) => (
     <td
       style={style}
-      className="rounded-md bg-neutral-500/[0.09] px-3 py-2 align-top text-neutral-700 dark:bg-neutral-400/[0.1] dark:text-neutral-300"
+      className="rounded-md bg-neutral-500/[0.09] px-3 py-2 align-top text-neutral-700 dark:bg-neutral-400/[0.1]"
     >
       {children}
     </td>
@@ -858,6 +1065,8 @@ function LinkAnchor({
       // JS preventDefault 拦不住，会和下面的 openExternal 各开一个网页（双开）。
       href={decodedHref || undefined}
       rel="noopener noreferrer"
+      // Tailwind preflight 会抹掉 <a> 的颜色和下划线，不加样式链接与正文无法区分。
+      className="cursor-pointer text-[var(--accent)] underline decoration-[color-mix(in_srgb,var(--accent)_35%,transparent)] decoration-1 underline-offset-[3px] transition-colors hover:decoration-[var(--accent)]"
       onClick={(event) => {
         // 除了系统 scheme 和页内锚点，**一律**掐掉默认导航。<a> 的默认行为会把 Tauri
         // webview 自己导航走，整个聊天 UI（含未落盘的会话状态）随之消失——实测点一条 CLI
@@ -941,7 +1150,7 @@ function CitationChip({ n, hit }: { n: number; hit?: CitationView }) {
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
-          className="mx-0.5 rounded bg-indigo-500/15 px-1 align-baseline text-[0.82em] font-medium text-indigo-500 transition hover:bg-indigo-500/25"
+          className="mx-0.5 rounded bg-[var(--accent)]/15 px-1 align-baseline text-[0.82em] font-medium text-accent transition hover:bg-[var(--accent)]/25"
           aria-label={`来源 ${n}`}
           aria-expanded={open}
         >
@@ -968,10 +1177,10 @@ function CitationChip({ n, hit }: { n: number; hit?: CitationView }) {
                 onClick={() => {
                   void api.openExternal(web.url).catch((err) => console.error('openExternal failed', err))
                 }}
-                className="mb-1 flex w-full items-center gap-1 font-medium text-neutral-700 hover:underline dark:text-neutral-200"
+                className="mb-1 flex w-full items-center gap-1 font-medium text-neutral-700 hover:underline"
                 title={web.url}
               >
-                <span className="shrink-0 rounded bg-indigo-500/15 px-1 text-indigo-500">[{n}]</span>
+                <span className="shrink-0 rounded bg-[var(--accent)]/15 px-1 text-accent">[{n}]</span>
                 <span className="min-w-0 flex-1 truncate text-left">{web.title}</span>
                 <ExternalLink size={10.5} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
               </button>
@@ -980,21 +1189,21 @@ function CitationChip({ n, hit }: { n: number; hit?: CitationView }) {
                 {web.publishedDate ? ` · ${web.publishedDate}` : ''}
               </span>
               {web.snippet && (
-                <span className="custom-scrollbar block max-h-48 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-neutral-600 dark:text-neutral-300">
+                <span className="custom-scrollbar block max-h-48 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-neutral-600">
                   {web.snippet}
                 </span>
               )}
             </>
           ) : hit && !isWebCitation(hit) ? (
             <>
-              <span className="mb-1 flex items-center gap-1 font-medium text-neutral-700 dark:text-neutral-200">
-                <span className="shrink-0 rounded bg-indigo-500/15 px-1 text-indigo-500">[{n}]</span>
+              <span className="mb-1 flex items-center gap-1 font-medium text-neutral-700">
+                <span className="shrink-0 rounded bg-[var(--accent)]/15 px-1 text-accent">[{n}]</span>
                 <span className="truncate">
                   {hit.docName}
                   {hit.headingPath ? ` · ${hit.headingPath}` : ''}
                 </span>
               </span>
-              <span className="custom-scrollbar block max-h-48 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-neutral-600 dark:text-neutral-300">
+              <span className="custom-scrollbar block max-h-48 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-neutral-600">
                 {hit.text}
               </span>
             </>
@@ -1064,7 +1273,7 @@ function buildArtifactLookup(artifacts: ChatToolArtifact[]): Map<string, ChatToo
   return lookup
 }
 
-/** Markdown 内图片：有 path 时懒加载整图，缩略图仅作占位（重载对话后不再显示 256px 小图）。 */
+/** Markdown 内图片优先显示已有缩略图；查看器按需读取原图。 */
 function MarkdownArtifactImage({
   rawSrc,
   alt,
@@ -1079,41 +1288,46 @@ function MarkdownArtifactImage({
   onImageClick?: (src: string, alt: string, name?: string) => void
 }) {
   const inline = artifact ? artifactDataUrl(artifact) : ''
-  const initial =
-    inline ||
-    (isExternalOrAbsoluteImageSrc(rawSrc) ? rawSrc : '')
-  const [src, setSrc] = useState(initial)
+  const [loadedImage, setLoadedImage] = useState<{
+    path: string
+    conversationId?: string | null
+    src: string
+  } | null>(null)
+  // Cached Markdown keeps this component mounted. A new file/conversation must
+  // never display the previous file while its read is pending or after failure.
+  const src = inline || (artifact?.path
+    ? loadedImage?.path === artifact.path && loadedImage.conversationId === conversationId ? loadedImage.src : ''
+    : isExternalOrAbsoluteImageSrc(rawSrc) ? rawSrc : '')
 
   useEffect(() => {
+    if (inline || !artifact?.path) return
     let cancelled = false
-    if (artifact?.path && conversationId) {
-      if (inline) setSrc(inline)
-      void loadArtifactDataUrl(artifact, conversationId).then((loaded) => {
-        if (!cancelled && loaded) setSrc(loaded)
-      })
-      return () => {
-        cancelled = true
-      }
-    }
-    if (inline) {
-      setSrc(inline)
-      return
-    }
-    if (isExternalOrAbsoluteImageSrc(rawSrc)) setSrc(rawSrc)
+    const path = artifact.path
+    void loadArtifactDataUrl(artifact, conversationId).then((loaded) => {
+      if (!cancelled) setLoadedImage({ path, conversationId, src: loaded ?? '' })
+    })
     return () => {
       cancelled = true
     }
   }, [artifact, conversationId, inline, rawSrc])
 
   if (!src) return null
-  const openViewer = () => onImageClick?.(src, alt, rawSrc)
+  const openViewer = () => {
+    if (artifact?.path) {
+      openChatImageViewer({ src, alt, name: artifact.name ?? rawSrc, path: artifact.path, conversationId })
+    } else {
+      onImageClick?.(src, alt, rawSrc)
+    }
+  }
   return (
     <span data-chat-md-image="" className="inline-block max-w-full align-top">
       <ChatInlineImage
         src={src}
         alt={alt}
         name={artifact?.name ?? rawSrc}
-        path={artifact?.path ?? artifact?.filePath ?? artifact?.localPath ?? rawSrc}
+        path={artifact
+          ? artifact.path ?? artifact.filePath ?? artifact.localPath
+          : /^(?:[a-z]:[\\/]|\/|\\\\)/i.test(rawSrc) ? rawSrc : undefined}
         conversationId={conversationId}
         onOpenViewer={openViewer}
         className="mb-2 mr-2"
@@ -1124,14 +1338,16 @@ function MarkdownArtifactImage({
 
 // Streamdown may memoize a settled Markdown block even when components change.
 // Resolve IDs through context so late artifact events update only these nodes.
-const ArtifactReferenceContext = createContext<{
+const MarkdownReferencesContext = createContext<{
   artifacts: ReadonlyMap<string, ChatToolArtifact>
+  artifactLookup: ReadonlyMap<string, ChatToolArtifact>
+  citations?: ReadonlyMap<number, CitationView>
   conversationId?: string | null
   onImageClick?: ChatMarkdownProps['onImageClick']
-}>({ artifacts: new Map() })
+}>({ artifacts: new Map(), artifactLookup: new Map() })
 
 function MarkdownArtifactReference({ url, label, image }: { url: string; label: string; image: boolean }) {
-  const context = useContext(ArtifactReferenceContext)
+  const context = useContext(MarkdownReferencesContext)
   const id = artifactReferenceId(url)
   const artifact = id ? context.artifacts.get(id) : undefined
   if (!artifact) return <span role="status" className="text-sm text-neutral-500">{label || '文件'}（文件不可用）</span>
@@ -1140,6 +1356,35 @@ function MarkdownArtifactReference({ url, label, image }: { url: string; label: 
       artifact={artifact} conversationId={context.conversationId} onImageClick={context.onImageClick} />
   }
   return <ArtifactFileChip artifact={artifact} conversationId={context.conversationId} variant="inline" />
+}
+
+// Stable component types let cached blocks receive late sources/images through
+// context without reparsing text or remounting their loaded DOM.
+const referencedMarkdownComponents: Components = {
+  ...markdownComponents,
+  a: function MarkdownLink({ href, children }) {
+    const context = useContext(MarkdownReferencesContext)
+    const url = decodeKivioInternalUrl(typeof href === 'string' ? href : '')
+    if (url.startsWith('artifact:')) return <MarkdownArtifactReference url={url} label={codeChildrenToString(children)} image={false} />
+    const cite = /^#kb-cite-(\d{1,3})$/.exec(url)
+    if (cite) {
+      const n = Number(cite[1])
+      const hit = context.citations?.get(n)
+      return hit ? <CitationChip n={n} hit={hit} /> : <>{children}</>
+    }
+    return <LinkAnchor href={url} conversationId={context.conversationId}>{children}</LinkAnchor>
+  },
+  img: function MarkdownImage({ src, alt }) {
+    const context = useContext(MarkdownReferencesContext)
+    const rawSrc = decodeKivioInternalUrl(typeof src === 'string' ? src : '')
+    const altText = alt ?? ''
+    if (rawSrc.startsWith('artifact:')) return <MarkdownArtifactReference url={rawSrc} label={altText} image />
+    const artifact = rawSrc && !isExternalOrAbsoluteImageSrc(rawSrc)
+      ? context.artifactLookup.get(artifactKey(rawSrc)) ?? context.artifactLookup.get(artifactBasename(rawSrc))
+      : undefined
+    return <MarkdownArtifactImage rawSrc={rawSrc} alt={altText} artifact={artifact}
+      conversationId={context.conversationId} onImageClick={context.onImageClick} />
+  },
 }
 
 const streamdownPlugins = {
@@ -1151,6 +1396,9 @@ const streamdownPlugins = {
 const streamdownRemarkPlugins: PluggableList = [
   ...Object.values(defaultRemarkPlugins),
   remarkBreaks,
+  // Parse citation candidates once. Missing sources remain literal text in the
+  // context consumer; a late source can become a chip inside a cached block.
+  remarkCitations(new Set(Array.from({ length: 1000 }, (_, n) => n))),
 ]
 
 // Streamdown 2.5 can leave a block stale after a non-prefix replacement. Scope
@@ -1252,16 +1500,16 @@ const MarkdownDocument = memo(function MarkdownDocument({
     streaming,
   ])
 
-  // Keep one parser mode and document identity through completion. Static mode
-  // parses the whole document differently from streaming's memoized blocks,
-  // changing cross-block syntax and spacing. Only corrected blocks remount.
+  // Static mode replaces the keyed block tree and remounts code at completion.
+  // Keep that tree stable, but repair incomplete syntax only while generating:
+  // settled/history text must not lose unfinished links, images or delimiters.
   return (
     <Streamdown
       mode="streaming"
       BlockComponent={ChatMarkdownBlock}
       // The outer shell owns dir="auto". Streamdown's dir wrappers use
       // display:contents, which breaks the block spacing selectors.
-      parseIncompleteMarkdown
+      parseIncompleteMarkdown={streaming}
       normalizeHtmlIndentation
       plugins={streamdownPlugins}
       remarkPlugins={remarkPlugins}
@@ -1285,7 +1533,7 @@ const MarkdownDocument = memo(function MarkdownDocument({
 
 function ChatMarkdownComponent({
   content,
-  artifacts = [],
+  artifacts = EMPTY_ARTIFACTS,
   conversationId = null,
   onImageClick,
   variant = 'default',
@@ -1294,54 +1542,13 @@ function ChatMarkdownComponent({
 }: ChatMarkdownProps) {
   const streaming = useContext(MarkdownStreamingContext)
   const [documentRoot, setDocumentRoot] = useState<HTMLDivElement | null>(null)
-  const remarkPlugins = useMemo<PluggableList>(() => {
-    const plugins: PluggableList = [...streamdownRemarkPlugins]
-    if (citations && citations.size > 0) {
-      plugins.push(remarkCitations(new Set(citations.keys())))
-    }
-    return plugins
-  }, [citations])
-  const components = useMemo<Components>(() => {
-    const artifactLookup = buildArtifactLookup(artifacts)
-    return {
-      ...markdownComponents,
-      a: ({ href, children }) => {
-        const url = decodeKivioInternalUrl(typeof href === 'string' ? href : '')
-        if (url.startsWith('artifact:')) return <MarkdownArtifactReference url={url} label={codeChildrenToString(children)} image={false} />
-        const cite = /^#kb-cite-(\d{1,3})$/.exec(url)
-        if (cite) {
-          const n = Number(cite[1])
-          return <CitationChip n={n} hit={citations?.get(n)} />
-        }
-        return <LinkAnchor href={url} conversationId={conversationId}>{children}</LinkAnchor>
-      },
-      img: ({ src, alt }) => {
-        const rawSrc = decodeKivioInternalUrl(typeof src === 'string' ? src : '')
-        const altText = alt ?? ''
-        if (rawSrc.startsWith('artifact:')) return <MarkdownArtifactReference url={rawSrc} label={altText} image />
-        const artifact =
-          rawSrc && !isExternalOrAbsoluteImageSrc(rawSrc)
-            ? artifactLookup.get(artifactKey(rawSrc)) ??
-              artifactLookup.get(artifactBasename(rawSrc))
-            : undefined
-        return (
-          <MarkdownArtifactImage
-            rawSrc={rawSrc}
-            alt={altText}
-            artifact={artifact}
-            conversationId={conversationId}
-            onImageClick={onImageClick}
-          />
-        )
-      },
-    }
-  }, [artifacts, conversationId, onImageClick, citations])
-
   const artifactContext = useMemo(() => ({
     artifacts: new Map(artifacts.filter(a => artifactId(a)).map(a => [artifactId(a), a])),
+    artifactLookup: buildArtifactLookup(artifacts),
+    citations,
     conversationId,
     onImageClick,
-  }), [artifacts, conversationId, onImageClick])
+  }), [artifacts, citations, conversationId, onImageClick])
 
   return (
     <div
@@ -1351,20 +1558,35 @@ function ChatMarkdownComponent({
       data-chat-outline-source-id={outlineSource && !streaming ? outlineSource.sourceId : undefined}
     >
       <MarkdownErrorBoundary fallbackText={content}>
-        <ArtifactReferenceContext.Provider value={artifactContext}>
+        <MarkdownReferencesContext.Provider value={artifactContext}>
           <MarkdownDocument
             content={content}
-            components={components}
-            remarkPlugins={remarkPlugins}
+            components={referencedMarkdownComponents}
+            remarkPlugins={streamdownRemarkPlugins}
             streaming={streaming}
             outlineSource={outlineSource}
             documentRoot={documentRoot}
           />
-        </ArtifactReferenceContext.Provider>
+        </MarkdownReferencesContext.Provider>
       </MarkdownErrorBoundary>
     </div>
   )
 }
 
-// memo：仅当 content / artifacts 变化时才重渲染（配合 MessageBubble 的 memo）
-export const ChatMarkdown = memo(ChatMarkdownComponent)
+// A live message derives new arrays/maps as its tools advance. Compare their
+// actual inputs before entering Markdown; unchanged paragraphs keep their
+// parser, components and loaded images. Artifact objects remain immutable, so
+// replacing an artifact (even with the same ID) must invalidate this boundary.
+export const ChatMarkdown = memo(ChatMarkdownComponent, (previous, next) => {
+  if (previous.content !== next.content || previous.conversationId !== next.conversationId
+    || previous.onImageClick !== next.onImageClick || previous.variant !== next.variant) return false
+  const previousArtifacts = previous.artifacts ?? EMPTY_ARTIFACTS
+  const nextArtifacts = next.artifacts ?? EMPTY_ARTIFACTS
+  if (previousArtifacts !== nextArtifacts && (previousArtifacts.length !== nextArtifacts.length
+    || previousArtifacts.some((artifact, index) => artifact !== nextArtifacts[index]))) return false
+  const a = previous.outlineSource
+  const b = next.outlineSource
+  if (a !== b && (!a || !b || a.ownerMessageId !== b.ownerMessageId
+    || a.sourceId !== b.sourceId || a.onChange !== b.onChange)) return false
+  return citationMapsEqual(previous.citations, next.citations)
+})

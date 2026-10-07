@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { BarChart3, Globe } from 'lucide-react'
+import { BarChart3, Globe, PawPrint } from 'lucide-react'
 import { useCloseAnimation } from './useCloseAnimation'
 import { i18n, type Lang } from '../components/i18n'
 import { api } from '../api/tauri'
 import { formatTokensCompact } from '../utils/tokens'
+import { Toggle } from '../settings/public/controls'
 
 interface SidebarAccountMenuProps {
   /** 触发行的视口矩形：菜单开在它上方（bottom 贴 rect.top），不遮住触发行本身。 */
@@ -28,6 +29,60 @@ export function SidebarAccountMenu({
   const { closing, startClose, onAnimationEnd } = useCloseAnimation(onCloseProp)
   const onClose = startClose
   const [todayTokens, setTodayTokens] = useState<number | null>(null)
+  const [petEnabled, setPetEnabled] = useState<boolean | null>(null)
+  const [petBusy, setPetBusy] = useState(false)
+  const [petError, setPetError] = useState<'load' | 'save' | null>(null)
+  const petVersion = useRef(0)
+  const petActive = useRef(false)
+
+  useEffect(() => {
+    let cancelled = false
+    let unlisten: (() => void) | undefined
+    petActive.current = true
+    void (async () => {
+      try {
+        // Subscribe first so tray actions and native right-click hide cannot
+        // disappear between the initial snapshot and listener registration.
+        unlisten = await api.onDesktopPetEnabledChanged(enabled => {
+          if (cancelled) return
+          petVersion.current += 1
+          setPetEnabled(enabled)
+          setPetError(null)
+        })
+        if (cancelled) {
+          unlisten()
+          return
+        }
+        const version = petVersion.current
+        const enabled = await api.desktopPetGetEnabled()
+        if (!cancelled && version === petVersion.current) setPetEnabled(enabled)
+      } catch (error) {
+        console.error('Failed to load desktop pet visibility:', error)
+        if (!cancelled) setPetError('load')
+      }
+    })()
+    return () => {
+      cancelled = true
+      petActive.current = false
+      unlisten?.()
+    }
+  }, [])
+
+  const changePet = async (enabled: boolean) => {
+    if (petEnabled === null || petBusy) return
+    setPetBusy(true)
+    setPetError(null)
+    const version = petVersion.current
+    try {
+      const applied = await api.desktopPetSetEnabled(enabled)
+      if (petActive.current && version === petVersion.current) setPetEnabled(applied)
+    } catch (error) {
+      console.error('Failed to change desktop pet visibility:', error)
+      if (petActive.current) setPetError('save')
+    } finally {
+      if (petActive.current) setPetBusy(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -99,7 +154,7 @@ export function SidebarAccountMenu({
       <div className="kv-menu-item" style={{ cursor: 'default' }}>
         <Globe strokeWidth={1.75} />
         {t.language}
-        <div className="ml-auto flex shrink-0 items-center gap-px rounded-[5px] bg-black/[0.05] p-px dark:bg-white/[0.07]">
+        <div className="ml-auto flex shrink-0 items-center gap-px rounded-[5px] bg-neutral-900/[0.05] p-px">
           {(
             [
               ['zh', '中'],
@@ -114,8 +169,8 @@ export function SidebarAccountMenu({
               onClick={() => onSelectLang(value)}
               className={`rounded-[4px] px-1.5 py-0.5 text-[11px] font-medium leading-none transition-colors ${
                 lang === value
-                  ? 'bg-white text-neutral-900 shadow-sm dark:bg-neutral-600 dark:text-neutral-50'
-                  : 'text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200'
+                  ? 'bg-[var(--theme-surface-active)] text-neutral-900 shadow-sm'
+                  : 'text-neutral-500 hover:text-neutral-800 dark:text-neutral-400'
               }`}
             >
               {label}
@@ -123,6 +178,25 @@ export function SidebarAccountMenu({
           ))}
         </div>
       </div>
+
+      <div className="kv-menu-sep" />
+      <div className="kv-menu-item" style={{ cursor: 'default' }} aria-busy={petBusy || (petEnabled === null && petError === null)}>
+        <PawPrint strokeWidth={1.75} />
+        {t.desktopPet}
+        <div className="ml-auto flex shrink-0 items-center">
+          <Toggle
+            checked={petEnabled === true}
+            disabled={petEnabled === null || petBusy}
+            onChange={enabled => { void changePet(enabled) }}
+            ariaLabel={t.desktopPet}
+          />
+        </div>
+      </div>
+      {petError && (
+        <p role="alert" className="px-3 pb-2 text-xs text-[var(--danger)]">
+          {petError === 'load' ? t.desktopPetLoadFailed : t.desktopPetSaveFailed}
+        </p>
+      )}
     </div>
   )
 

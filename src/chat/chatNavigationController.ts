@@ -12,18 +12,28 @@ import {
   type ConversationLoadHint,
 } from './conversationTransitionStore'
 import { forgetRememberedChatRoute } from './persistence'
+import { draftKey, migrateNewChatDraft } from './composerDraft'
 import type { Conversation } from './types'
+import { isPartialConversation, prependConversationHistoryPage, type ConversationHistoryPage } from './conversationHistoryWindow'
 
+
+type ClearChatDecision = 'busy' | 'cancelled' | 'confirmed'
 interface NavigationPorts {
   currentConversation: () => Conversation | null
   currentConversationId: () => string | null
   listPopouts: () => Promise<ReadonlySet<string>>
   readConversation: (conversationId: string) => Promise<Conversation>
+  readConversationWindow?: (conversationId: string) => Promise<Conversation>
+  readHistoryPage: (conversationId: string, before: number) => Promise<ConversationHistoryPage>
+  showHistoryPage: (conversation: Conversation) => void
   isConversationInFlight: (conversationId: string) => boolean
   prepareNewConversation: () => void
   clearEmptyChat: () => void
-  /** Check busy state before asking for confirmation; no route mutation here. */
-  requestClearChat: (conversationId: string) => 'busy' | 'cancelled' | 'confirmed'
+  /**
+   * Check busy state before asking for confirmation; no route mutation here.
+   * May resolve asynchronously (in-app confirm dialog); re-check busy after the answer.
+   */
+  requestClearChat: (conversationId: string) => ClearChatDecision | Promise<ClearChatDecision>
   deleteConversation: (conversationId: string) => Promise<void>
   cancelDeletedRun: (conversationId: string) => Promise<void>
   /** Synchronously drop local execution state, optionally clear this view, and refresh the list. */
@@ -32,6 +42,8 @@ interface NavigationPorts {
   focusPopout: (conversationId: string) => void
   occupyPopout: (conversationId: string) => void
   prepareSelection: (focusMessageId: string | null, fresh: boolean) => void
+  showHistoryTarget: (conversation: Conversation, messageId: string) => void
+  reportHistoryError: (conversationId: string, message: string | null) => void
   showConversation: (conversation: Conversation, context: {
     renderRequestId: number
     selection: boolean
@@ -44,6 +56,7 @@ interface ReloadOptions {
   force?: boolean
   transitionRequestId?: number
   loadPoppedOut?: boolean
+  initialWindow?: boolean
   /** An execution permit may expire while the read is pending. */
   canCommit?: () => boolean
 }
@@ -56,6 +69,56 @@ function asError(value: unknown, fallback = '对话加载失败，已从列表�
 /** Owns navigation commit rights. Backend runs are deliberately not cancelled
  * when a view changes: only an obsolete UI result loses its lease. */
 export function createChatNavigationController(ports: NavigationPorts) {
+  const historyPages = new Map<string, ReturnType<typeof captureConversationNavigation>>()
+  const loadOlderHistory = async () => {
+    const current = ports.currentConversation()
+    if (!current || !isPartialConversation(current)) return
+    const pending = historyPages.get(current.id)
+    if (pending && isCurrentConversationNavigation(pending)) return
+    const lease = captureConversationNavigation()
+    const canCommit = () => isCurrentConversationNavigation(lease)
+      && ports.currentConversationId() === current.id
+    historyPages.set(current.id, lease)
+    ports.reportHistoryError(current.id, null)
+    try {
+      const page = await ports.readHistoryPage(current.id, current.history_start!)
+      if (!canCommit()) return
+      const latest = ports.currentConversation()
+      if (!latest || latest.id !== current.id || !isPartialConversation(latest)) return
+      const merged = prependConversationHistoryPage(latest, page)
+      const next = merged ?? await ports.readConversation(current.id)
+      if (canCommit()) {
+        ports.showHistoryPage(next)
+        ports.reportHistoryError(current.id, null)
+      }
+    } catch (error) {
+      if (canCommit()) {
+        console.error('Failed to load older conversation history:', error)
+        ports.reportHistoryError(current.id, '加载更早消息失败，请重试。')
+      }
+    } finally {
+      if (historyPages.get(current.id) === lease) historyPages.delete(current.id)
+    }
+  }
+  let historyFocusSequence = 0
+  const focusHistoryMessage = async (conversationId: string, messageId: string, signal: AbortSignal) => {
+    const sequence = ++historyFocusSequence
+    const navigation = captureConversationNavigation()
+    const isCurrent = () => !signal.aborted && sequence === historyFocusSequence
+      && isCurrentConversationNavigation(navigation)
+      && ports.currentConversationId() === conversationId
+    if (!isCurrent()) return
+    ports.reportHistoryError(conversationId, null)
+    try {
+      const complete = await ports.readConversation(conversationId)
+      if (!isCurrent()) return
+      ports.showHistoryTarget(complete, messageId)
+    } catch (error) {
+      if (!isCurrent()) return
+      console.error('Failed to load historical navigation target:', error)
+      ports.reportHistoryError(conversationId, '打开历史消息失败，请重试。')
+    }
+  }
   const beginConversationCreation = () => {
     // A creation is a navigation intent even while its backend request is
     // pending. Revoking the previous generation also orders two creations
@@ -77,6 +140,7 @@ export function createChatNavigationController(ports: NavigationPorts) {
     permit: ReturnType<typeof beginConversationCreation>, conversation: Conversation,
   ): boolean => {
     if (!isConversationCreationCurrent(permit)) return false
+    if (permit.startingConversationId === null) migrateNewChatDraft(draftKey(null), conversation.id)
     ports.showConversation(conversation, { renderRequestId: 0, selection: true })
     syncConversationRoute(conversation.id)
     return true
@@ -110,7 +174,7 @@ export function createChatNavigationController(ports: NavigationPorts) {
       return
     }
     // A rejected clear must not revoke a pending navigation's commit right.
-    const decision = ports.requestClearChat(conversationId)
+    const decision = await ports.requestClearChat(conversationId)
     if (decision === 'busy') {
       ports.reportClearError(conversationId, '请先停止当前回复，再清空对话。')
       return
@@ -173,7 +237,9 @@ export function createChatNavigationController(ports: NavigationPorts) {
     }
     if (ports.isConversationInFlight(conversationId) && !options?.force) return
     try {
-      const conversation = await ports.readConversation(conversationId)
+      const conversation = await (options?.initialWindow && !ports.isConversationInFlight(conversationId)
+        ? (ports.readConversationWindow?.(conversationId) ?? ports.readConversation(conversationId))
+        : ports.readConversation(conversationId))
       const transition = getConversationTransitionSnapshot()
       if (!canCommitResult() || (transition.loading && transition.targetConversationId !== conversationId)) return
       const renderRequestId = transitionRequestId
@@ -197,7 +263,7 @@ export function createChatNavigationController(ports: NavigationPorts) {
 
   const loadRouteConversation = (conversationId: string) => {
     const requestId = beginConversationTransition(conversationId)
-    return reloadConversation(conversationId, { force: true, transitionRequestId: requestId })
+    return reloadConversation(conversationId, { force: true, transitionRequestId: requestId, initialWindow: true })
   }
 
   const openConversation = (conversationId: string, options?: { reload?: boolean | null }) => {
@@ -211,8 +277,10 @@ export function createChatNavigationController(ports: NavigationPorts) {
   }
 
   const selectConversation = async (conversationId: string, hint?: ConversationLoadHint) => {
+    const current = ports.currentConversation()
     const alreadyOpen = ports.currentConversationId() === conversationId
-      && ports.currentConversation()?.id === conversationId
+      && current?.id === conversationId
+      && (!hint?.focusMessageId || current.messages.some(message => message.id === hint.focusMessageId))
     if (alreadyOpen) {
       const inFlight = getConversationTransitionSnapshot()
       if (inFlight.loading && inFlight.targetConversationId !== conversationId) leaveConversation()
@@ -244,7 +312,9 @@ export function createChatNavigationController(ports: NavigationPorts) {
     }
     ports.prepareSelection(hint?.focusMessageId ?? null, true)
     try {
-      const conversation = await ports.readConversation(conversationId)
+      const conversation = await ((hint?.focusMessageId || ports.isConversationInFlight(conversationId))
+        ? ports.readConversation(conversationId)
+        : (ports.readConversationWindow?.(conversationId) ?? ports.readConversation(conversationId)))
       if (!isCurrentConversationTransition(requestId, conversationId)) return
       ports.showConversation(conversation, { renderRequestId: requestId, selection: true })
       if (conversation.messages.length === 0) {
@@ -271,6 +341,8 @@ export function createChatNavigationController(ports: NavigationPorts) {
   }
 
   return {
+    loadOlderHistory,
+    focusHistoryMessage,
     beginConversationCreation,
     isConversationCreationCurrent,
     commitCreatedConversation,

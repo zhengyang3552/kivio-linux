@@ -8,6 +8,7 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleSlash,
+  Clock,
   Copy,
   Download,
   ExternalLink,
@@ -49,7 +50,7 @@ import { AskUserBlock } from './AskUserBlock'
 import { ChatMarkdown } from './ChatMarkdown'
 import { WebSearchIcon } from '../settings/public/icons'
 import { api } from '../api/tauri'
-import { useT } from '../components/i18n'
+import { useT, type I18n } from '../components/i18n'
 import { automationHash, setHash } from './chatRoutes'
 import { loadAttachmentDataUrl } from './attachmentPreview'
 import { openChatImageViewer } from './imageViewer'
@@ -58,6 +59,7 @@ import type { ImageReadItem } from './segments'
 export interface ToolCallBlockProps {
   toolCall: ToolCallRecord
   defaultOpen?: boolean
+  conversationId?: string | null
 }
 
 interface FileMutationFile {
@@ -223,6 +225,11 @@ function toolGlyph(toolCall: ToolCallRecord): LucideIcon | ComponentType<{ size?
     case 'automation_runs':
     case 'automation_delete':
       return Workflow
+    case 'schedule_create':
+    case 'schedule_list':
+    case 'schedule_update':
+    case 'schedule_delete':
+      return Clock
     default:
       break
   }
@@ -247,14 +254,16 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null
 }
 
-function todoStatusLabel(status?: string): string {
+function todoStatusLabel(t: I18n, status?: string): string {
   switch (status) {
     case 'completed':
-      return '已完成'
+      return t.agentTodoStatusDone
     case 'in_progress':
-      return '进行中'
+      return t.agentTodoStatusNow
     case 'pending':
-      return '待处理'
+      return t.agentTodoStatusNext
+    case 'cancelled':
+      return t.agentTodoStatusSkipped
     default:
       return status ? compactText(status, 24) : ''
   }
@@ -271,7 +280,7 @@ function normalizeTodoItem(value: unknown): AgentTodoItem | null {
     // dsh 的 todo_write 没有 id，官方用 content 当身份。
     id: id || content,
     content,
-    status: (status === 'completed' || status === 'in_progress' || status === 'pending'
+    status: (status === 'completed' || status === 'in_progress' || status === 'pending' || status === 'cancelled'
       ? status
       : 'pending') as AgentTodoStatus,
   }
@@ -288,8 +297,18 @@ function todoCounts(items?: AgentTodoItem[]): { completed: number; total: number
   if (!items?.length) return null
   return {
     completed: items.filter((item) => item.status === 'completed').length,
-    total: items.length,
+    // 取消的条目不计入分母，与输入框上方的 Todo 条一致。
+    total: items.filter((item) => item.status !== 'cancelled').length,
   }
+}
+
+// 函数式替换：值里的 `$&` / `$'` / `$$` 等（shell、正则里很常见）原样显示，不当替换模式解析。
+function fill(template: string, key: string, value: string | number): string {
+  return template.replace(`{${key}}`, () => String(value))
+}
+
+function countLabel(n: number, one: string, many: string): string {
+  return n === 1 ? one : fill(many, 'n', n)
 }
 
 function formatTodoCounts(items?: AgentTodoItem[]): string {
@@ -306,6 +325,11 @@ function structuredTodoState(toolCall: ToolCallRecord): AgentTodoState | null {
     updated_at: typeof todoState.updated_at === 'number' ? todoState.updated_at : undefined,
     updatedAt: typeof todoState.updatedAt === 'number' ? todoState.updatedAt : undefined,
   }
+}
+
+/** 内置 todo_write 在全部完成/取消时清空清单，结构化结果里带 `cleared: true`。 */
+function structuredTodoCleared(toolCall: ToolCallRecord): boolean {
+  return objectValue(toolCall.structured_content ?? toolCall.structuredContent)?.cleared === true
 }
 
 function stringArrayValue(value: unknown): string[] {
@@ -429,24 +453,24 @@ function isSubagentLaunchReceipt(text: string | undefined): boolean {
     || trimmed.startsWith('started subagent ')
 }
 
-function subagentDisplayStatus(toolCall: ToolCallRecord, status: ToolCallStatus): ToolCallStatus {
-  if (status === 'completed' && isSubagentLaunchReceipt(getResultPreview(toolCall))) {
+function subagentDisplayStatus(t: I18n, toolCall: ToolCallRecord, status: ToolCallStatus): ToolCallStatus {
+  if (status === 'completed' && isSubagentLaunchReceipt(getResultPreview(t, toolCall))) {
     return 'running'
   }
   return status
 }
 
-function subagentStatusLine(view: SubagentView | null, status: ToolCallStatus): string {
-  if (status === 'completed') return '已完成'
-  if (status === 'error') return view?.error ? compactText(view.error, 160) : '运行失败'
-  if (status === 'cancelled') return '已取消'
+function subagentStatusLine(t: I18n, view: SubagentView | null, status: ToolCallStatus): string {
+  if (status === 'completed') return t.toolCardDone
+  if (status === 'error') return view?.error ? compactText(view.error, 160) : t.toolCardFailed
+  if (status === 'cancelled') return t.toolCardCancelled
   if (status === 'running') {
     const lastStep = view?.steps?.length ? view.steps[view.steps.length - 1] : ''
     if (lastStep) return compactText(lastStep, 160)
     if (view?.preview) return compactText(view.preview, 160)
-    return '运行中…'
+    return t.toolCardRunning
   }
-  return '准备运行…'
+  return t.toolCardStarting
 }
 
 function CardEyebrow({ running = false }: { running?: boolean }) {
@@ -521,7 +545,7 @@ function ConsultCard({
   const hasBody = Boolean(children)
   const running = status === 'running'
   return (
-    <div className="not-prose mb-2 rounded-md border border-neutral-200 bg-neutral-50/70 px-3 py-2 leading-5 text-neutral-500 transition-colors duration-200 hover:bg-neutral-100/70 dark:border-white/10 dark:bg-white/[0.02] dark:text-neutral-400 dark:hover:bg-white/[0.045]">
+    <div className="not-prose mb-2 rounded-md border border-neutral-200 bg-neutral-50/70 px-3 py-2 leading-5 text-neutral-500 transition-colors duration-200 hover:bg-neutral-100/70 dark:text-neutral-400">
       <button
         type="button"
         onClick={() => { if (hasBody) setOpen((v) => !v) }}
@@ -531,7 +555,7 @@ function ConsultCard({
         data-tauri-drag-region="false"
       >
         <CardEyebrow running={running} />
-        <span className="shrink-0 font-mono text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-800 dark:text-neutral-100">
+        <span className="shrink-0 font-mono text-[11px] font-semibold uppercase tracking-[0.14em] text-neutral-800">
           {label}
         </span>
         {identityChips}
@@ -554,7 +578,7 @@ function ConsultCard({
 
       {hasBody && (
         <ChatDisclosureBody open={open}>
-          <div className="mt-2 space-y-2 border-t border-neutral-200 pt-2 text-[12.5px] dark:border-white/10">
+          <div className="mt-2 space-y-2 border-t border-neutral-200 pt-2 text-[12.5px]">
             {children}
           </div>
         </ChatDisclosureBody>
@@ -564,7 +588,8 @@ function ConsultCard({
 }
 
 function SubAgentCard({ toolCall }: ToolCallBlockProps) {
-  const status = subagentDisplayStatus(toolCall, normalizeToolCallStatus(toolCall.status))
+  const t = useT()
+  const status = subagentDisplayStatus(t, toolCall, normalizeToolCallStatus(toolCall.status))
   const view = useMemo(() => structuredSubagent(toolCall), [toolCall])
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
 
@@ -577,12 +602,12 @@ function SubAgentCard({ toolCall }: ToolCallBlockProps) {
   const name = subagentName(view, args)
   const model = view?.model || ''
   const duration = status === 'running' ? '' : formatDuration(getDuration(toolCall))
-  const statusLine = subagentStatusLine(view, status)
+  const statusLine = subagentStatusLine(t, view, status)
   const prompt = subagentPrompt(args)
   // 内置 agent 的最终结果在 structured content 里；外部 CLI（claude Agent/Task）没有
   // structured，最终结果落在 result_preview——终态时兜底取它，否则 Result 区恒空。
   const result =
-    view?.result || (status !== 'running' && status !== 'pending' ? getResultPreview(toolCall) : '')
+    view?.result || (status !== 'running' && status !== 'pending' ? getResultPreview(t, toolCall) : '')
   const error = view?.error || (toolCall.error ? compactToolError(toolCall.error) : '')
   const steps = view?.steps ?? []
   const preview = view?.preview || ''
@@ -620,7 +645,7 @@ function SubAgentCard({ toolCall }: ToolCallBlockProps) {
             </CardSection>
           )}
           {status === 'running' && (steps.length > 0 || preview) && (
-            <div className="border-l border-neutral-300 pl-2.5 dark:border-white/15">
+            <div className="border-l border-neutral-300 pl-2.5">
               {steps.length > 0 && (
                 <div className="space-y-0.5 font-mono text-[10.5px] text-neutral-500 dark:text-neutral-400">
                   {steps.map((step, index) => (
@@ -683,6 +708,7 @@ function isAdvisorRecord(toolCall: ToolCallRecord): boolean {
 /** Dedicated card for an `advisor` consultation: a standalone card whose body
  *  (question + advice) is collapsible, collapsed by default to stay compact. */
 function AdvisorCard({ toolCall }: ToolCallBlockProps) {
+  const t = useT()
   const status = normalizeToolCallStatus(toolCall.status)
   const view = useMemo(() => structuredAdvisor(toolCall), [toolCall])
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
@@ -693,7 +719,7 @@ function AdvisorCard({ toolCall }: ToolCallBlockProps) {
   const error = toolCall.error ? compactToolError(toolCall.error) : ''
   const duration = formatDuration(getDuration(toolCall))
   const statusLine =
-    status === 'running' ? '咨询中…' : status === 'error' ? (error || '咨询失败') : ''
+    status === 'running' ? t.toolCardAdvisorRunning : status === 'error' ? (error || t.toolCardAdvisorFailed) : ''
 
   const hasBody = Boolean(question || advice || error)
 
@@ -843,7 +869,7 @@ function AutomationRunCard({ toolCall }: ToolCallBlockProps) {
         ? t.chatAutomationCancelled
         : ''
   const error = toolCall.error ? compactToolError(toolCall.error) : ''
-  const result = status !== 'running' && status !== 'pending' ? getResultPreview(toolCall) : ''
+  const result = status !== 'running' && status !== 'pending' ? getResultPreview(t, toolCall) : ''
 
   return (
     <ConsultCard
@@ -885,7 +911,7 @@ function AutomationRunCard({ toolCall }: ToolCallBlockProps) {
       {automationId ? (
         <button
           type="button"
-          className="text-[12px] text-neutral-600 underline-offset-2 hover:underline dark:text-neutral-300"
+          className="text-[12px] text-neutral-600 underline-offset-2 hover:underline"
           data-tauri-drag-region="false"
           onClick={() => setHash(automationHash(automationId))}
         >
@@ -946,10 +972,10 @@ function KnowledgeHits({ hits }: { hits: KbHitView[] }) {
       {hits.map((hit, idx) => (
         <div
           key={`${hit.n}-${idx}`}
-          className="rounded-md border border-black/[0.08] bg-black/[0.02] p-2 dark:border-white/[0.1] dark:bg-white/[0.03]"
+          className="rounded-md border border-neutral-900/[0.08] bg-neutral-900/[0.02] p-2"
         >
           <div className="flex items-center gap-1.5 text-[10.5px] font-medium text-neutral-500 dark:text-neutral-400">
-            <span className="shrink-0 rounded bg-indigo-500/15 px-1 text-indigo-500">[{hit.n}]</span>
+            <span className="shrink-0 rounded bg-[var(--accent)]/15 px-1 text-accent">[{hit.n}]</span>
             <span className="min-w-0 truncate">
               {hit.docName}
               {hit.headingPath ? ` · ${hit.headingPath}` : ''}
@@ -975,17 +1001,18 @@ function isKnowledgeSearchRecord(toolCall: ToolCallRecord): boolean {
  *  shell as SUBAGENT/ADVISOR. Body shows the query plus the retrieved [n]
  *  passages (KnowledgeHits) or, when nothing matched, the plain result text. */
 function KnowledgeCard({ toolCall }: ToolCallBlockProps) {
+  const t = useT()
   const status = normalizeToolCallStatus(toolCall.status)
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
   const hits = useMemo(() => knowledgeSearchHits(toolCall), [toolCall])
 
   const query = stringValue(args?.query)
   const duration = formatDuration(getDuration(toolCall))
-  const resultText = getResultPreview(toolCall)
+  const resultText = getResultPreview(t, toolCall)
   const error = toolCall.error ? compactToolError(toolCall.error) : ''
   const count = hits?.length ?? 0
   const statusLine =
-    status === 'running' ? '检索中…' : status === 'error' ? (error || '检索失败') : ''
+    status === 'running' ? t.toolCardKnowledgeRunning : status === 'error' ? (error || t.toolCardKnowledgeFailed) : ''
 
   const hasBody = Boolean(query || hits || (status !== 'running' && resultText) || error)
 
@@ -1043,19 +1070,19 @@ function WebSources({ citations }: { citations: WebCitationView[] }) {
           onClick={() => {
             void api.openExternal(citation.url).catch((err) => console.error('openExternal failed', err))
           }}
-          className="group block w-full min-w-0 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+          className="group block w-full min-w-0 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-neutral-900/[0.03]"
           title={citation.url}
         >
           <div className="flex items-center gap-1.5 min-w-0">
-            <span className="shrink-0 w-4 text-[10.5px] font-medium tabular-nums text-indigo-500">
+            <span className="shrink-0 w-4 text-[10.5px] font-medium tabular-nums text-accent">
               [{citation.n}]
             </span>
-            <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-neutral-700 dark:text-neutral-200">
+            <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-neutral-700 decoration-1 underline-offset-[3px] transition-colors group-hover:text-[var(--accent)] group-hover:underline">
               {citation.title}
             </span>
             <ExternalLink
               size={10.5}
-              className="shrink-0 text-neutral-300 transition-colors group-hover:text-neutral-500 dark:text-neutral-600 dark:group-hover:text-neutral-300"
+              className="shrink-0 text-neutral-400 transition-colors group-hover:text-[var(--accent)] dark:text-neutral-500"
             />
           </div>
           <div className="mt-0.5 truncate pl-5 text-[10.5px] leading-4 text-neutral-400 dark:text-neutral-500">
@@ -1078,6 +1105,7 @@ function WebSources({ citations }: { citations: WebCitationView[] }) {
  *  the numbered, clickable source directory; falls back to the plain result text when
  *  structured citations are absent (old persisted records). */
 function WebSearchCard({ toolCall }: ToolCallBlockProps) {
+  const t = useT()
   const status = normalizeToolCallStatus(toolCall.status)
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
   const view = useMemo(() => webSearchCardView(toolCall), [toolCall])
@@ -1086,10 +1114,10 @@ function WebSearchCard({ toolCall }: ToolCallBlockProps) {
   const citations = view?.citations ?? []
   const provider = view?.provider || ''
   const duration = formatDuration(getDuration(toolCall))
-  const resultText = getResultPreview(toolCall)
+  const resultText = getResultPreview(t, toolCall)
   const error = toolCall.error ? compactToolError(toolCall.error) : ''
   const statusLine =
-    status === 'running' ? '搜索中…' : status === 'error' ? (error || '搜索失败') : ''
+    status === 'running' ? t.toolCardWebRunning : status === 'error' ? (error || t.toolCardWebFailed) : ''
 
   const hasBody = Boolean(
     queries.length ||
@@ -1126,7 +1154,7 @@ function WebSearchCard({ toolCall }: ToolCallBlockProps) {
             status !== 'running' &&
             status !== 'pending' &&
             resultText && (
-              <CardSection label="结果">
+              <CardSection label={t.toolCardResult}>
                 <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
                   {resultText}
                 </div>
@@ -1211,14 +1239,14 @@ function cleanWinPath(path: string): string {
   return path.replace(/^(\\\\\?\\|\/\/\?\/)/, '')
 }
 
-function fileMutationTarget(mutation: FileMutationStructuredContent): string {
+function fileMutationTarget(t: I18n, mutation: FileMutationStructuredContent): string {
   if (mutation.files?.length === 1) return cleanWinPath(mutation.files[0]?.path || '')
-  if (mutation.files?.length) return `${mutation.files.length} 个文件`
+  if (mutation.files?.length) return fill(t.toolCardFileCount, 'n', mutation.files.length)
   return cleanWinPath(mutation.resolvedPath || mutation.resolved_path || '')
 }
 
-function fileMutationPreview(mutation: FileMutationStructuredContent): string {
-  const target = fileMutationTarget(mutation)
+function fileMutationPreview(t: I18n, mutation: FileMutationStructuredContent): string {
+  const target = fileMutationTarget(t, mutation)
   const stats = mutation.files?.length ? fileMutationStats(mutation) : ''
   return [target, stats].filter(Boolean).join(' · ')
 }
@@ -1296,6 +1324,7 @@ function InlineDiffStats({
 }
 
 function FileMutationDetails({ mutation }: { mutation: FileMutationStructuredContent }) {
+  const t = useT()
   const files = mutation.files ?? []
   const warnings = mutation.warnings ?? []
   const diagnostics = mutation.diagnostics ?? []
@@ -1313,7 +1342,7 @@ function FileMutationDetails({ mutation }: { mutation: FileMutationStructuredCon
             {files.map((file, index) => (
               <div key={`${file.path}-${index}`} className="flex min-w-0 items-center gap-1.5">
                 <span className="shrink-0 text-neutral-400 dark:text-neutral-500">
-                  {fileOperationLabel(file.operation)}
+                  {fileOperationLabel(t, file.operation)}
                 </span>
                 <span className="min-w-0 truncate">{cleanWinPath(file.path)}</span>
                 <span className="shrink-0 tabular-nums text-emerald-600 dark:text-emerald-400">
@@ -1356,24 +1385,24 @@ function FileMutationDetails({ mutation }: { mutation: FileMutationStructuredCon
   )
 }
 
-function fileOperationLabel(operation: string): string {
+function fileOperationLabel(t: I18n, operation: string): string {
   switch (operation) {
     case 'create':
-      return '新增'
+      return t.toolCardFileOpCreate
     case 'overwrite':
-      return '覆盖'
+      return t.toolCardFileOpOverwrite
     case 'edit':
-      return '修改'
+      return t.toolCardFileOpEdit
     case 'delete':
-      return '删除'
+      return t.toolCardFileOpDelete
     case 'noop':
-      return '无变更'
+      return t.toolCardFileOpNoop
     default:
-      return operation || '变更'
+      return operation || t.toolCardFileOpOther
   }
 }
 
-function fileToolArgumentPreview(toolCall: ToolCallRecord, args: Record<string, unknown> | null): string {
+function fileToolArgumentPreview(t: I18n, toolCall: ToolCallRecord, args: Record<string, unknown> | null): string {
   const rawName = toolRawName(toolCall)
   const path = toolPathArgument(args)
   const query = typeof args?.query === 'string'
@@ -1383,17 +1412,17 @@ function fileToolArgumentPreview(toolCall: ToolCallRecord, args: Record<string, 
       : ''
   const glob = typeof args?.glob === 'string' ? args.glob.trim() : ''
   if (rawName === 'write' || rawName === 'write_file') {
-    return path ? path : '写入文件'
+    return path ? path : t.toolCardWriteFile
   }
   if (rawName === 'edit' || rawName === 'edit_file') {
     const edits = Array.isArray(args?.edits) ? args.edits : null
     if (edits) {
-      const label = edits.length === 1 ? '1 处编辑' : `${edits.length} 处编辑`
+      const label = countLabel(edits.length, t.toolCardEditOne, t.toolCardEditMany)
       return [path, label].filter(Boolean).join(' · ')
     }
     // Legacy single-edit records (old_string/new_string) from persisted conversations.
     const oldString = typeof args?.old_string === 'string' ? compactText(args.old_string, 80) : ''
-    return [path, oldString ? `替换 ${oldString}` : ''].filter(Boolean).join(' · ')
+    return [path, oldString ? fill(t.toolCardReplace, 'text', oldString) : ''].filter(Boolean).join(' · ')
   }
   if (rawName === 'grep' || rawName === 'search_files') {
     const scope = glob
@@ -1401,7 +1430,7 @@ function fileToolArgumentPreview(toolCall: ToolCallRecord, args: Record<string, 
       : path
     if (!query && !scope) return ''
     const scopeLabel = scope ? compactText(scope, 120) : ''
-    const queryLabel = query ? `搜索 ${compactText(query, 80)}` : ''
+    const queryLabel = query ? fill(t.toolCardSearch, 'query', compactText(query, 80)) : ''
     return [queryLabel, scopeLabel].filter(Boolean).join(' · ')
   }
   return ''
@@ -1426,7 +1455,7 @@ function getDuration(toolCall: ToolCallRecord): number | undefined {
   return delta > 0 && delta < 10_000 ? delta * 1000 : delta
 }
 
-function getToolName(toolCall: ToolCallRecord): string {
+function getToolName(t: I18n, toolCall: ToolCallRecord): string {
   const raw = toolRawName(toolCall) || 'Tool'
   // default 分支要回落的**原始**名（MCP 工具名大小写有意义，归一化后的名字不能拿来显示）。
   const displayName = toolRecordRawName(toolCall) || 'Tool'
@@ -1486,6 +1515,10 @@ function getToolName(toolCall: ToolCallRecord): string {
   if (raw === 'automation_set_enabled') return 'Toggle automation'
   if (raw === 'automation_runs') return 'Automation runs'
   if (raw === 'automation_delete') return 'Delete automation'
+  if (raw === 'schedule_create') return t.chatToolScheduleCreate
+  if (raw === 'schedule_list') return t.chatToolScheduleList
+  if (raw === 'schedule_update') return t.chatToolScheduleUpdate
+  if (raw === 'schedule_delete') return t.chatToolScheduleDelete
   if (raw === 'mixer_vision') return 'Vision'
   if (raw === 'mixer_video_analysis') return 'Video analysis'
   if (raw === 'mixer_generate_image') return 'Generate image'
@@ -1552,7 +1585,7 @@ const READ_PREVIEW_MAX_LINE_CHARS = 160
 
 /** 展开区「结果」：保留换行的前几行（带行号）+ 省略计数 + 末尾续读通知，与模型看到的
  *  尾注一致。不走 compact()：把两千行正文压成一段 220 字的糊，续读提示也跟着糊掉。 */
-function formatReadFilePreview(view: ReadFileView): string {
+function formatReadFilePreview(t: I18n, view: ReadFileView): string {
   const lines = view.content ? view.content.split('\n') : []
   const shown = lines.slice(0, READ_PREVIEW_MAX_LINES)
   const start = Math.max(1, view.startLine)
@@ -1562,14 +1595,14 @@ function formatReadFilePreview(view: ReadFileView): string {
     return `${start + index}  ${body}`
   })
   const hidden = lines.length - shown.length
-  if (hidden > 0) parts.push(`… 还有 ${hidden} 行`)
+  if (hidden > 0) parts.push(fill(t.toolCardMoreLines, 'n', hidden))
   parts.push(...view.notices)
   return parts.join('\n')
 }
 
 /** 折叠行的「目标」：以输入参数为主（文件名 / 命令 / pattern / url），不含动词、不含结果。
  *  Cursor 风格 —— 行内只呈现「动词 + 目标」，其余细节（结果、diff、错误）放展开区。 */
-function getToolTarget(toolCall: ToolCallRecord): string {
+function getToolTarget(t: I18n, toolCall: ToolCallRecord): string {
   const raw = toolRawName(toolCall)
   const args = parsedArguments(toolCall)
   const path = toolPathArgument(args)
@@ -1584,9 +1617,9 @@ function getToolTarget(toolCall: ToolCallRecord): string {
       case 'edit_file': {
         const mutation = structuredFileMutation(toolCall)
         if (mutation && (mutation.files?.length ?? 0) > 1) {
-          return `${mutation.files!.length} files`
+          return fill(t.toolCardFileCount, 'n', mutation.files!.length)
         }
-        const target = (mutation && fileMutationTarget(mutation)) || path
+        const target = (mutation && fileMutationTarget(t, mutation)) || path
         return target.includes('/') || target.includes('\\') ? basename(target) : target
       }
       case 'bash':
@@ -1634,9 +1667,9 @@ function getToolTarget(toolCall: ToolCallRecord): string {
         return compactText(name || firstString(args?.id), 140)
       }
       case 'todo_write': {
-        const counts = formatTodoCounts(
-          structuredTodoState(toolCall)?.items ?? normalizeTodoItems(args?.todos),
-        )
+        // 清单被清空（全部完成）时结构化快照是空表，计数改看本次写入的参数。
+        const snapshot = structuredTodoState(toolCall)?.items
+        const counts = formatTodoCounts(snapshot?.length ? snapshot : normalizeTodoItems(args?.todos))
         return counts || compactText(firstString(args?.objective, args?.content), 140)
       }
       case 'taskcreate': {
@@ -1646,7 +1679,7 @@ function getToolTarget(toolCall: ToolCallRecord): string {
       case 'taskupdate': {
         const counts = formatTodoCounts(structuredTodoState(toolCall)?.items)
         if (counts) return counts
-        const status = typeof args?.status === 'string' ? todoStatusLabel(args.status) : ''
+        const status = typeof args?.status === 'string' ? todoStatusLabel(t, args.status) : ''
         const target = firstString(args?.subject, args?.taskId, args?.id, args?.task_id)
         return [status, compactText(target, 120)].filter(Boolean).join(' · ')
       }
@@ -1656,11 +1689,11 @@ function getToolTarget(toolCall: ToolCallRecord): string {
         return compactText(firstString(args?.content, args?.id), 120)
       case 'mixer_vision': {
         const count = numberValue(args?.images)
-        return count > 0 ? `${count} image${count > 1 ? 's' : ''}` : ''
+        return count > 0 ? countLabel(count, t.toolCardImageOne, t.toolCardImageMany) : ''
       }
       case 'mixer_video_analysis': {
         const count = numberValue(args?.videos)
-        return count > 0 ? `${count} video${count > 1 ? 's' : ''}` : ''
+        return count > 0 ? countLabel(count, t.toolCardVideoOne, t.toolCardVideoMany) : ''
       }
       case 'mixer_generate_image':
         return compactText(firstString(args?.prompt), 140)
@@ -1669,38 +1702,40 @@ function getToolTarget(toolCall: ToolCallRecord): string {
     }
   })()
   if (primary) return primary
-  return getArgumentPreview(toolCall)
+  return getArgumentPreview(t, toolCall)
 }
 
-function getArgumentPreview(toolCall: ToolCallRecord): string {
+function getArgumentPreview(t: I18n, toolCall: ToolCallRecord): string {
   if (isKivioToolDraft(toolCall)) return ''
   const rawName = toolRawName(toolCall)
   const args = parsedArguments(toolCall)
   if (rawName === 'todo_write') {
     const todos = normalizeTodoItems(args?.todos)
     const counts = formatTodoCounts(todos)
-    return counts ? `清单 ${counts}` : todos.length ? `清单 ${todos.length} 项` : '替换 Todo 清单'
+    return counts
+      ? fill(t.toolCardTodoList, 'counts', counts)
+      : todos.length ? fill(t.toolCardTodoItems, 'n', todos.length) : t.toolCardTodoReplace
   }
   if (rawName === 'todo_update') {
     const content = typeof args?.content === 'string' ? compactText(args.content, 120) : ''
-    const status = typeof args?.status === 'string' ? todoStatusLabel(args.status) : ''
+    const status = typeof args?.status === 'string' ? todoStatusLabel(t, args.status) : ''
     const id = typeof args?.id === 'string' ? compactText(args.id, 80) : ''
     const target = content || id
-    return ['更新条目', status, target].filter(Boolean).join(' · ')
+    return [t.toolCardTodoUpdate, status, target].filter(Boolean).join(' · ')
   }
   const fileMutation = structuredFileMutation(toolCall)
   if (fileMutation) {
-    return fileMutationPreview(fileMutation)
+    return fileMutationPreview(t, fileMutation)
   }
-  const fileArgsPreview = fileToolArgumentPreview(toolCall, args)
+  const fileArgsPreview = fileToolArgumentPreview(t, toolCall, args)
   if (fileArgsPreview) return fileArgsPreview
   if (rawName === 'mixer_vision') {
     const imageCount = typeof args?.images === 'number' ? args.images : null
     const provider = typeof args?.provider === 'string' ? args.provider : ''
     const model = typeof args?.model === 'string' ? args.model : ''
     const imageLabel = imageCount == null
-      ? '图片'
-      : `图片 ${imageCount} 张`
+      ? t.toolCardImages
+      : countLabel(imageCount, t.toolCardImageOne, t.toolCardImageMany)
     const modelLabel = [provider, model].filter(Boolean).join(' / ')
     return modelLabel ? `${imageLabel} · ${modelLabel}` : imageLabel
   }
@@ -1708,7 +1743,7 @@ function getArgumentPreview(toolCall: ToolCallRecord): string {
     const prompt = typeof args?.prompt === 'string' ? compactText(args.prompt, 140) : ''
     const size = typeof args?.size === 'string' && args.size ? args.size : ''
     const quality = typeof args?.quality === 'string' && args.quality ? args.quality : ''
-    const count = typeof args?.n === 'number' && Number.isFinite(args.n) ? `${args.n} 张` : ''
+    const count = typeof args?.n === 'number' && Number.isFinite(args.n) ? countLabel(args.n, t.toolCardImageOne, t.toolCardImageMany) : ''
     return [prompt, size, quality, count].filter(Boolean).join(' · ')
   }
   return (
@@ -1719,24 +1754,25 @@ function getArgumentPreview(toolCall: ToolCallRecord): string {
   )
 }
 
-function getResultPreview(toolCall: ToolCallRecord): string {
+function getResultPreview(t: I18n, toolCall: ToolCallRecord): string {
   if (isKivioToolDraft(toolCall)) return ''
   const rawName = toolRawName(toolCall)
   const todoItems = structuredTodoState(toolCall)?.items
   if (rawName === 'todo_write' || rawName === 'todo_update' || todoItems) {
     if (normalizeToolCallStatus(toolCall.status) !== 'completed') return ''
+    if (structuredTodoCleared(toolCall)) return t.toolCardTodoAllDone
     const counts = formatTodoCounts(todoItems)
-    return counts ? `已同步 ${counts}` : '已同步'
+    return counts ? fill(t.toolCardTodoSyncedCounts, 'counts', counts) : t.toolCardTodoSynced
   }
   const fileMutation = structuredFileMutation(toolCall)
   if (fileMutation) {
     if (fileMutation.ok === false) {
-      return `未完成 ${fileMutationPreview(fileMutation)}`
+      return fill(t.toolCardFileNotApplied, 'target', fileMutationPreview(t, fileMutation))
     }
-    return `已应用 ${fileMutationPreview(fileMutation)}`
+    return fill(t.toolCardFileApplied, 'target', fileMutationPreview(t, fileMutation))
   }
   const readFile = structuredReadFile(toolCall)
-  if (readFile) return formatReadFilePreview(readFile)
+  if (readFile) return formatReadFilePreview(t, readFile)
   const raw =
     toolCall.result_preview ||
     toolCall.resultPreview ||
@@ -1771,7 +1807,7 @@ function StatusIcon({ status }: { status: ToolCallStatus }) {
   if (isDone) {
     return (
       <CheckCircle2
-        className={`shrink-0 text-[#2f6ff0] dark:text-[#5c8df7]${justCompleted ? ' chat-motion-pop' : ''}`}
+        className={`shrink-0 text-accent${justCompleted ? ' chat-motion-pop' : ''}`}
         size={14}
         strokeWidth={1.9}
       />
@@ -1845,11 +1881,12 @@ function DefaultToolCallBlock({
   toolCall,
   defaultOpen = false,
 }: ToolCallBlockProps) {
+  const t = useT()
   const status = normalizeToolCallStatus(toolCall.status)
   const [open, setOpen] = useState(defaultOpen)
 
-  const toolName = getToolName(toolCall)
-  const target = useMemo(() => getToolTarget(toolCall), [toolCall])
+  const toolName = getToolName(t, toolCall)
+  const target = useMemo(() => getToolTarget(t, toolCall), [t, toolCall])
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
   const fileMutation = useMemo(() => structuredFileMutation(toolCall), [toolCall])
   const inlineStats = useMemo(
@@ -1862,8 +1899,8 @@ function DefaultToolCallBlock({
     [toolCall, fileMutation, args],
   )
   const knowledgeHits = useMemo(() => knowledgeSearchHits(toolCall), [toolCall])
-  const argumentPreview = useMemo(() => getArgumentPreview(toolCall), [toolCall])
-  const resultPreview = useMemo(() => getResultPreview(toolCall), [toolCall])
+  const argumentPreview = useMemo(() => getArgumentPreview(t, toolCall), [t, toolCall])
+  const resultPreview = useMemo(() => getResultPreview(t, toolCall), [t, toolCall])
   // 文件类工具（Read/Write/Edit）的目标路径：折叠行文件名可点，跳到右侧 dock 查看器预览。
   const previewPath = useMemo(() => {
     const raw = toolRawName(toolCall)
@@ -1899,23 +1936,23 @@ function DefaultToolCallBlock({
         data-chat-disclosure={hasDetails || undefined}
         className={`max-w-full min-w-0 inline-flex items-center gap-1.5 rounded-md py-0 text-[11.5px] transition-colors ${
           hasDetails
-            ? 'hover:text-neutral-700 dark:hover:text-neutral-200'
+            ? 'hover:text-neutral-700'
             : 'cursor-default'
         }`}
       >
         <ToolTypeIcon toolCall={toolCall} status={status} />
         <span
-          className={`shrink-0 font-medium text-neutral-700 dark:text-neutral-200${
+          className={`shrink-0 font-medium text-neutral-700${
             status === 'running' ? ' chat-motion-tool-shimmer' : ''
           }`}
         >
-          {toolName || '工具'}
+          {toolName || t.toolCardFallbackName}
         </span>
         {target && (
           <span
             className={`min-w-0 truncate ${
               previewPath || diffPatch
-                ? 'cursor-pointer text-neutral-400 underline-offset-2 hover:text-neutral-700 hover:underline dark:text-neutral-500 dark:hover:text-neutral-200'
+                ? 'cursor-pointer text-neutral-400 underline-offset-2 hover:text-neutral-700 hover:underline dark:text-neutral-500'
                 : 'text-neutral-400 dark:text-neutral-500'
             }`}
             onClick={
@@ -1951,11 +1988,11 @@ function DefaultToolCallBlock({
 
       {hasDetails && (
         <ChatDisclosureBody open={open}>
-          <div className="mt-1.5 ml-1.5 space-y-1.5 border-l border-black/[0.08] pl-2.5 dark:border-white/[0.1]">
+          <div className="mt-1.5 ml-1.5 space-y-1.5 border-l border-neutral-900/[0.08] pl-2.5">
             {argumentPreview && (
               <div>
                 <div className="text-[10.5px] font-medium text-neutral-400 dark:text-neutral-500">
-                  {'参数'}
+                  {t.toolCardArgs}
                 </div>
                 <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
                   {argumentPreview}
@@ -1965,7 +2002,7 @@ function DefaultToolCallBlock({
             {resultPreview && !knowledgeHits && (
               <div>
                 <div className="text-[10.5px] font-medium text-neutral-400 dark:text-neutral-500">
-                  {'结果'}
+                  {t.toolCardResult}
                 </div>
                 <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
                   {resultPreview}
@@ -1977,7 +2014,7 @@ function DefaultToolCallBlock({
               <FileMutationDetails mutation={fileMutation} />
             )}
             {argDiff && (
-              <div className="custom-scrollbar max-h-72 overflow-auto rounded-md border border-neutral-200/80 dark:border-neutral-700/60">
+              <div className="custom-scrollbar max-h-72 overflow-auto rounded-md border border-neutral-200/80">
                 <pre className="font-mono text-[11px] leading-[1.5]">
                   {argDiff.split('\n').map((line, index) => (
                     <div
@@ -2013,7 +2050,7 @@ function collectImageReadItems(toolCalls: ToolCallRecord[]): ImageReadItem[] {
   const items: ImageReadItem[] = []
   for (const toolCall of toolCalls) {
     for (const item of imageReadItems(toolCall)) {
-      const key = item.path || item.name
+      const key = item.path || item.id || item.dataUrl || item.name
       if (!key || seen.has(key)) continue
       seen.add(key)
       items.push(item)
@@ -2022,7 +2059,7 @@ function collectImageReadItems(toolCalls: ToolCallRecord[]): ImageReadItem[] {
   return items
 }
 
-function ImageReadThumb({ item }: { item: ImageReadItem }) {
+function ImageReadThumb({ item, conversationId }: { item: ImageReadItem; conversationId?: string | null }) {
   const t = useT()
   const [src, setSrc] = useState<string | null>(item.dataUrl || null)
   const [failed, setFailed] = useState(false)
@@ -2040,7 +2077,7 @@ function ImageReadThumb({ item }: { item: ImageReadItem }) {
     let cancelled = false
     setSrc(null)
     setFailed(false)
-    void loadAttachmentDataUrl({ type: 'image', path: item.path, name: item.name }, null).then((dataUrl) => {
+    void loadAttachmentDataUrl({ type: 'image', path: item.path, name: item.name }, conversationId).then((dataUrl) => {
       if (cancelled) return
       if (dataUrl) setSrc(dataUrl)
       else setFailed(true)
@@ -2048,12 +2085,12 @@ function ImageReadThumb({ item }: { item: ImageReadItem }) {
     return () => {
       cancelled = true
     }
-  }, [item.dataUrl, item.path, item.name])
+  }, [item.dataUrl, item.path, item.name, conversationId])
 
   if (failed) {
     return (
       <div
-        className="flex h-16 w-16 items-center justify-center rounded-lg bg-neutral-100 text-neutral-400 dark:bg-neutral-800"
+        className="flex h-16 w-16 items-center justify-center rounded-lg bg-neutral-100 text-neutral-400"
         title={item.name}
       >
         <ImageOff size={16} strokeWidth={1.8} />
@@ -2069,7 +2106,7 @@ function ImageReadThumb({ item }: { item: ImageReadItem }) {
   return (
     <button
       type="button"
-      className="h-16 w-16 shrink-0 overflow-hidden rounded-lg bg-neutral-100 p-0 dark:bg-neutral-800"
+      className="h-16 w-16 shrink-0 overflow-hidden rounded-lg bg-neutral-100 p-0"
       title={item.name}
       aria-label={t.chatPreviewImage}
       onClick={() => openChatImageViewer({
@@ -2077,7 +2114,7 @@ function ImageReadThumb({ item }: { item: ImageReadItem }) {
         alt: item.name,
         name: item.name,
         path: item.path || null,
-        conversationId: null,
+        conversationId,
       })}
     >
       <img src={src} alt="" className="h-full w-full object-cover" loading="lazy" />
@@ -2085,15 +2122,18 @@ function ImageReadThumb({ item }: { item: ImageReadItem }) {
   )
 }
 
-export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] }) {
+export function ImageReadCluster({ toolCalls, conversationId }: { toolCalls: ToolCallRecord[]; conversationId?: string | null }) {
   const t = useT()
   const [open, setOpen] = useState(false)
   const items = useMemo(() => collectImageReadItems(toolCalls), [toolCalls])
-  const count = Math.max(
-    items.length,
-    toolCalls.reduce((total, toolCall) => total + imageReadCount(toolCall), 0),
-  )
-  const running = toolCalls.some((toolCall) => normalizeToolCallStatus(toolCall.status) === 'running')
+  // Count the same deduplicated images as the thumbnails, not read operations.
+  // Historical records without identities can only contribute their reported count.
+  const count = items.length + toolCalls.reduce((total, toolCall) =>
+    total + (imageReadItems(toolCall).length === 0 ? imageReadCount(toolCall) : 0), 0)
+  const running = toolCalls.some((toolCall) => {
+    const status = normalizeToolCallStatus(toolCall.status)
+    return status === 'running' || status === 'pending'
+  })
   const label = (running ? t.chatViewingImages : t.chatViewedImages).replace('{n}', String(Math.max(1, count)))
 
   return (
@@ -2103,7 +2143,7 @@ export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] })
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         data-chat-disclosure
-        className="max-w-full min-w-0 inline-flex items-center gap-1.5 rounded-md py-0 text-[11.5px] text-neutral-500 transition-colors hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+        className="max-w-full min-w-0 inline-flex items-center gap-1.5 rounded-md py-0 text-[11.5px] text-neutral-500 transition-colors hover:text-neutral-700 dark:text-neutral-400"
       >
         <Eye
           className="shrink-0 text-neutral-400 dark:text-neutral-500"
@@ -2111,7 +2151,7 @@ export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] })
           strokeWidth={1.9}
         />
         <span
-          className={`shrink-0 font-medium text-neutral-700 dark:text-neutral-200${
+          className={`shrink-0 font-medium text-neutral-700${
             running ? ' chat-motion-tool-shimmer' : ''
           }`}
         >
@@ -2127,7 +2167,7 @@ export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] })
         <ChatDisclosureBody open={open}>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {items.map((item, index) => (
-              <ImageReadThumb key={item.path || `${item.name}-${index}`} item={item} />
+              <ImageReadThumb key={item.path || item.id || `${item.name}-${index}`} item={item} conversationId={conversationId} />
             ))}
           </div>
         </ChatDisclosureBody>
@@ -2144,7 +2184,7 @@ function ToolCallBlockComponent(props: ToolCallBlockProps) {
     return <AskUserBlock toolCall={props.toolCall} />
   }
   if (isImageReadToolCall(props.toolCall)) {
-    return <ImageReadCluster toolCalls={[props.toolCall]} />
+    return <ImageReadCluster toolCalls={[props.toolCall]} conversationId={props.conversationId} />
   }
   if (isSubAgentRecord(props.toolCall)) {
     return <SubAgentCard {...props} />

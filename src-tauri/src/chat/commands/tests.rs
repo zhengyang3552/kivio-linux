@@ -18,13 +18,13 @@ use super::catalog::{assistant_from_builder_args, strip_transcripts_for_frontend
 use super::context::{
     apply_context_clear, build_chat_api_messages, count_tokens_in_value,
     estimate_image_tokens_for_dimensions, group_answer_excluded_from_context,
-    mark_summary_stale_if_needed, resolve_usage_anchor, should_auto_compress_context,
+    mark_summary_stale_if_needed, resolve_usage_anchor,
 };
 use super::interaction::{format_tool_approval_summary, stream_delta_event_kinds};
 use super::messages::{
     assistant_model_messages_for_storage, build_assistant_message, build_error_arm_message,
-    content_from_segments, normalize_assistant_segments, reasoning_from_segments,
-    reconcile_orphan_tool_segments, replace_final_text_segments_for_edit,
+    content_from_segments, history_unchanged, normalize_assistant_segments,
+    reasoning_from_segments, reconcile_orphan_tool_segments, replace_final_text_segments_for_edit,
 };
 use super::mutations::{
     apply_regenerate_truncation, apply_reply_with_model_result, build_fork_messages,
@@ -38,6 +38,78 @@ use super::tooling::{
     try_apply_skill_slash_trigger,
 };
 use super::*;
+
+#[test]
+fn history_window_and_pages_resolve_only_missing_artifact_dependencies() {
+    let artifact = serde_json::json!({"id":"art_early", "name":"early.png",
+        "mime_type":"image/png", "data_url":"data:image/png;base64,AAAA", "path":"early.png"});
+    let mut messages: Vec<ChatMessage> = (0..130)
+        .map(|index| test_chat_message(&format!("m{index}"), "assistant", "reply", index))
+        .collect();
+    messages[0].artifacts = serde_json::from_value(serde_json::json!([
+        artifact, {"id":"art_unused", "name":"unused.png", "mime_type":"image/png", "data_url":"large-unused"}
+    ])).unwrap();
+    messages[129].content = "![earlier](artifact:art_early) `artifact:art_unused`".into();
+    messages[69].content = "[earlier again](artifact://art_early)".into();
+    for end in [130, 70] {
+        let start = super::catalog::history_window_start(&messages, end);
+        assert_eq!(end - start, 60);
+        let dependencies =
+            crate::chat::artifacts::history_reference_artifacts(&messages, start..end);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id.as_deref(), Some("art_early"));
+        assert_eq!(dependencies[0].path.as_deref(), Some("early.png"));
+    }
+    assert!(
+        messages[129].artifacts.is_empty(),
+        "display dependencies must not change message ownership"
+    );
+    assert!(crate::chat::artifacts::history_reference_artifacts(&messages, 0..130).is_empty());
+}
+
+#[test]
+fn history_window_resolves_segment_and_presentation_dependencies_from_tools() {
+    let artifact = serde_json::json!({"id":"art_tool", "name":"tool.png", "mime_type":"image/png", "data_url":""});
+    let mut origin = test_chat_message("origin", "assistant", "", 1);
+    origin.tool_calls = serde_json::from_value(serde_json::json!([{
+        "id":"read", "name":"read", "source":"native", "arguments":"{}", "status":"success", "artifacts":[artifact]
+    }])).unwrap();
+    let mut target = test_chat_message("target", "assistant", "", 2);
+    target.segments = serde_json::from_value(serde_json::json!([{
+        "id":"text", "kind":"text", "phase":"plain", "order":0, "text":"![tool](artifact:art_tool)"
+    }]))
+    .unwrap();
+    let mut messages = vec![origin, target];
+    assert_eq!(
+        crate::chat::artifacts::history_reference_artifacts(&messages, 1..2).len(),
+        1
+    );
+    messages[1].segments.clear();
+    for mode in ["preview", "prepare"] {
+        messages[1].tool_calls = serde_json::from_value(serde_json::json!([{
+            "id":"present", "name":"present_artifacts", "source":"native", "arguments":"{}", "status":"success",
+            "structured_content":{"type":"artifact_presentation", "artifactIds":["art_tool", "art_tool", "art_missing"], "mode":mode}
+        }])).unwrap();
+        let dependencies = crate::chat::artifacts::history_reference_artifacts(&messages, 1..2);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id.as_deref(), Some("art_tool"));
+    }
+}
+
+#[test]
+fn history_window_bounds_payload_and_keeps_oversized_message_reachable() {
+    let messages: Vec<ChatMessage> = (0..60)
+        .map(|index| {
+            serde_json::from_value(serde_json::json!({
+        "id": format!("m{index}"), "role": "user", "content": "x".repeat(180_000), "timestamp": 1
+    })).unwrap()
+        })
+        .collect();
+    assert!(super::catalog::history_window_start(&messages, 60) > 55);
+    let mut oversized = messages[0].clone();
+    oversized.content = "x".repeat(900_000);
+    assert_eq!(super::catalog::history_window_start(&[oversized], 1), 0);
+}
 
 #[test]
 fn resolve_thinking_maps_levels_and_defaults_to_high() {
@@ -249,7 +321,6 @@ fn slash_trigger_keeps_user_task_and_loads_instructions_once() {
                 None,
                 None,
                 None,
-                None,
                 &[],
             );
             assert_eq!(prompt.matches("Create distinctive interfaces.").count(), 1);
@@ -304,6 +375,55 @@ fn slash_trigger_ignores_non_slash_and_unknown() {
     assert!(
         try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/unknown x", false).is_none()
     );
+}
+
+#[test]
+fn slash_trigger_activates_inline_skills_without_losing_the_task() {
+    let registry = slash_skill_registry(slash_skill_record("commit", "Commit", vec!["/commit"]));
+    let config = crate::settings::ChatToolsConfig::default();
+    for content in [
+        "请用/commit fix login",
+        "please /commit fix login",
+        "please\n/commit fix login",
+    ] {
+        let (id, body) =
+            try_apply_skill_slash_trigger(&registry, &config, None, content, false).unwrap();
+        assert_eq!(id, "commit");
+        assert!(body.contains("Write a commit for: fix login"));
+    }
+    for content in [
+        "https://host/commit",
+        "`/commit`",
+        "/commit/file",
+        "> /commit",
+    ] {
+        assert!(try_apply_skill_slash_trigger(&registry, &config, None, content, false).is_none());
+    }
+}
+
+#[test]
+fn slash_trigger_loads_multiple_inline_skills_once() {
+    let registry = skills::SkillRegistry {
+        records: vec![
+            slash_skill_record("review", "Review", vec![]),
+            slash_skill_record("commit", "Commit", vec![]),
+        ],
+        warnings: vec![],
+    };
+    let mut config = crate::settings::ChatToolsConfig::default();
+    let (id, detail) = resolve_request_skill(
+        &registry,
+        &mut config,
+        None,
+        "please /review changes then /commit fix login /review again",
+        None,
+        false,
+    );
+    assert_eq!(id.as_deref(), Some("review"));
+    let body = detail.unwrap().body;
+    assert_eq!(body.matches("<skill_content name=\"Review\">").count(), 1);
+    assert_eq!(body.matches("<skill_content name=\"Commit\">").count(), 1);
+    assert!(body.contains("Write a commit for: fix login"));
 }
 
 #[test]
@@ -1732,6 +1852,7 @@ fn test_conversation_with_summary(stale: bool) -> Conversation {
                 model: "model".to_string(),
                 stale,
                 file_ledger: None,
+                replay: None,
             }),
             ..ConversationContextState::default()
         },
@@ -1802,43 +1923,6 @@ fn strip_transcripts_for_frontend_keeps_interrupted_draft_drops_completed() {
 }
 
 #[test]
-fn effective_side_models_auto_use_session_main_model() {
-    let mut settings = Settings::default();
-    settings.providers.push(test_provider(
-        "global",
-        "Global",
-        vec!["gemini-3.1-flash-lite"],
-    ));
-    settings
-        .providers
-        .push(test_provider("session", "Session", vec!["gpt-4.1"]));
-    settings.default_models.chat.provider_id = "global".to_string();
-    settings.default_models.chat.model = "gemini-3.1-flash-lite".to_string();
-
-    let session = SessionModel {
-        provider_id: "session",
-        model: "gpt-4.1",
-    };
-
-    assert_eq!(
-        settings.effective_compression_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-    assert_eq!(
-        settings.effective_title_summary_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-    assert_eq!(
-        settings.effective_prompt_optimize_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-    assert_eq!(
-        settings.effective_vision_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-}
-
-#[test]
 fn effective_side_models_honor_explicit_mixer_selection() {
     let mut settings = Settings::default();
     settings.providers.push(test_provider(
@@ -1866,89 +1950,6 @@ fn effective_side_models_honor_explicit_mixer_selection() {
 }
 
 #[test]
-fn should_auto_compress_allows_recompression_when_summary_exists() {
-    let mut conversation = test_conversation_with_summary(false);
-    for i in 0..12 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        let content = format!("extra content {i} ").repeat(1_000);
-        conversation.messages.push(test_chat_message(
-            &format!("msg_extra_{i}"),
-            role,
-            &content,
-            10 + i,
-        ));
-    }
-    let context_state = ConversationContextState {
-        usage_ratio: Some(0.9),
-        ..ConversationContextState::default()
-    };
-    assert!(should_auto_compress_context(&context_state, &conversation));
-}
-
-#[test]
-fn should_auto_compress_false_when_no_new_compressible_range() {
-    let mut conversation = test_conversation_with_summary(false);
-    conversation
-        .context_state
-        .summary
-        .as_mut()
-        .expect("summary")
-        .source_until_message_id = "msg_assistant_2".to_string();
-    let context_state = ConversationContextState {
-        usage_ratio: Some(0.9),
-        ..ConversationContextState::default()
-    };
-    assert!(!should_auto_compress_context(&context_state, &conversation));
-}
-
-#[test]
-fn token_split_starts_after_existing_summary() {
-    let mut conversation = test_conversation_with_summary(false);
-    // summary source_until = msg_assistant_1（index 1）→ summary_start = 2。
-    // 推 3 条大消息（每条 ~20000 tokens，ASCII 4 chars/token），recent 尾窗 20000 只够最后 1 条，
-    // 其余进 old_segment；boundary 落在倒数第 2 条（index = len-2）。
-    for i in 0..3 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        conversation.messages.push(test_chat_message(
-            &format!("msg_extra_{i}"),
-            role,
-            &"a".repeat(80_000),
-            10 + i as i64,
-        ));
-    }
-    let summary_start = 2;
-    let boundary = crate::chat::agent::compaction::token_split_chat_messages(
-        &conversation.messages,
-        summary_start,
-        crate::chat::agent::compaction::RECENT_KEEP_TOKENS,
-    )
-    .expect("boundary");
-    assert_eq!(boundary, conversation.messages.len() - 2);
-    assert!(boundary > summary_start);
-}
-
-#[test]
-fn token_split_returns_none_when_recent_window_covers_all() {
-    // 全是小消息，远不到 20k 尾窗 → 没有可摘要旧段。
-    let mut conversation = test_conversation_with_summary(false);
-    for i in 0..5 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        conversation.messages.push(test_chat_message(
-            &format!("msg_small_{i}"),
-            role,
-            "x",
-            10 + i as i64,
-        ));
-    }
-    let split = crate::chat::agent::compaction::token_split_chat_messages(
-        &conversation.messages,
-        2,
-        crate::chat::agent::compaction::RECENT_KEEP_TOKENS,
-    );
-    assert!(split.is_none());
-}
-
-#[test]
 fn build_chat_api_messages_replays_saved_child_report_as_external_input() {
     let mut conversation = test_conversation_with_summary(false);
     conversation.context_state = Default::default();
@@ -1967,6 +1968,179 @@ fn build_chat_api_messages_replays_saved_child_report_as_external_input() {
     assert_eq!(
         conversation.messages[0].role, "assistant",
         "UI provenance remains unchanged"
+    );
+}
+
+#[test]
+fn compaction_replay_round_trip_uses_exact_tail_once() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay = Some(
+        crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":"kept", "type":"function", "function":{"name":"read","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool","tool_call_id":"kept","content":"exact preserved result"}),
+                serde_json::json!({"role":"assistant","content":"preserved final answer"}),
+            ],
+        },
+    );
+    let disk = serde_json::to_vec(&conversation).unwrap();
+    let mut restored: Conversation = serde_json::from_slice(&disk).unwrap();
+    restored
+        .messages
+        .push(test_chat_message("next", "user", "continue", 10));
+    let messages =
+        build_chat_api_messages(None, "fresh system", &restored, None, None, &[]).unwrap();
+    let text = serde_json::to_string(&messages).unwrap();
+    assert_eq!(messages[0]["content"], "fresh system");
+    assert_eq!(text.matches("exact preserved result").count(), 1);
+    assert!(!text.contains("recent assistant content"));
+    assert_eq!(messages.last().unwrap()["content"], "continue");
+    mark_summary_stale_if_needed(&mut restored, 3);
+    assert!(restored.context_state.summary.as_ref().unwrap().stale);
+    let messages = build_chat_api_messages(None, "system", &restored, None, None, &[]).unwrap();
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("exact preserved result"));
+}
+
+/// A manual compaction commit survives revision bumps that leave the summarized
+/// history intact (statistics refresh, rename, new messages), but not edits,
+/// answer re-selection or a context clear.
+#[test]
+fn compaction_commit_accepts_only_unchanged_history() {
+    let source = test_conversation_with_summary(false);
+    let mut latest = source.clone();
+    latest.revision += 3;
+    latest.title = "renamed".into();
+    latest.context_state.estimated_input_tokens = 42;
+    latest
+        .messages
+        .push(test_chat_message("later", "user", "later", 9));
+    assert!(history_unchanged(&latest, &source, None));
+
+    let mut edited = source.clone();
+    edited.messages[1].content = "edited".into();
+    assert!(!history_unchanged(&edited, &source, None));
+
+    let mut reselected = source.clone();
+    reselected
+        .group_selections
+        .insert("group".into(), "msg_assistant_1".into());
+    assert!(!history_unchanged(&reselected, &source, None));
+
+    let mut cleared = source.clone();
+    apply_context_clear(&mut cleared).unwrap();
+    assert!(!history_unchanged(&cleared, &source, None));
+}
+
+/// Auto compaction keeps a tail that starts with an assistant tool call. The
+/// persisted summary must stay a user turn: as a system message it would be
+/// hoisted into the system prompt, leaving the tool call as the first provider
+/// message, which Gemini rejects. Run-scoped system notices saved in older
+/// snapshots must not be hoisted into later system prompts either.
+#[test]
+fn compaction_replay_starts_with_user_summary_and_drops_run_notices() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay = Some(
+        crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"kept","type":"function","function":{"name":"read","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool","tool_call_id":"kept","content":"kept result"}),
+                crate::chat::agent::stop::step_limit_system_message(),
+                serde_json::json!({"role":"assistant","content":"kept final answer"}),
+            ],
+        },
+    );
+    conversation
+        .messages
+        .push(test_chat_message("next", "user", "continue", 10));
+
+    let messages =
+        build_chat_api_messages(None, "fresh system", &conversation, None, None, &[]).unwrap();
+    assert_eq!(messages[1]["role"], "user");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("Previous conversation summary:"));
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("工具调用轮次上限"));
+
+    let request = crate::chat::model::generate_request_from_openai_messages(
+        "test-model",
+        messages,
+        None,
+        Default::default(),
+        "test",
+        Default::default(),
+    );
+    assert_eq!(request.system, "fresh system");
+    assert!(matches!(request.messages[0].role, ModelRole::User));
+    let contents = crate::chat::model::gemini::gemini_contents_from_generate_request(&request);
+    assert_eq!(contents[0]["role"], "user");
+    assert!(contents[0]
+        .to_string()
+        .contains("summary of older messages"));
+}
+
+/// A child report delivered during a compacted run lives both in the snapshot
+/// (where the run saw it) and as a persisted `subagent-result-*` message that
+/// may sort after the reply. It must reach the model exactly once.
+#[test]
+fn compaction_replay_does_not_duplicate_snapshot_child_reports() {
+    let mut conversation = test_conversation_with_summary(false);
+    let mut report = crate::chat::sub_agent::control::report_input("CHILD_A findings");
+    report[crate::chat::sub_agent::control::REPORT_MESSAGE_ID_KEY] =
+        serde_json::json!("subagent-result-a");
+    conversation.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                report,
+                serde_json::json!({"role":"assistant","content":"kept final answer"}),
+            ],
+        });
+    conversation.messages.push(test_chat_message(
+        "subagent-result-a",
+        "assistant",
+        "CHILD_A findings",
+        10,
+    ));
+    conversation.messages.push(test_chat_message(
+        "subagent-result-b",
+        "assistant",
+        "CHILD_B findings",
+        11,
+    ));
+
+    let text = serde_json::to_string(
+        &build_chat_api_messages(None, "system", &conversation, None, None, &[]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(text.matches("CHILD_A findings").count(), 1);
+    assert_eq!(
+        text.matches("CHILD_B findings").count(),
+        1,
+        "reports outside the snapshot still replay"
+    );
+}
+
+#[test]
+fn clear_context_discards_compacted_tail_too() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![serde_json::json!({"role":"user","content":"old retained details"})],
+        });
+    apply_context_clear(&mut conversation).unwrap();
+    assert_eq!(
+        build_chat_api_messages(None, "system", &conversation, None, None, &[])
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -2174,6 +2348,52 @@ fn regenerate_truncation_edits_user_content_and_truncates_after() {
         covered.context_state.summary.as_ref().map(|s| s.stale),
         Some(true)
     );
+}
+
+#[test]
+fn truncating_history_rewinds_the_todo_list_to_the_retained_snapshot() {
+    use crate::chat::types::{AgentTodoItem, AgentTodoStatus, ToolCallRecord};
+    fn snapshot(content: &str) -> AgentTodoState {
+        AgentTodoState {
+            items: vec![AgentTodoItem {
+                id: "1".to_string(),
+                content: content.to_string(),
+                status: AgentTodoStatus::InProgress,
+                ..Default::default()
+            }],
+            updated_at: 1,
+        }
+    }
+    fn todo_call(state: &AgentTodoState) -> ToolCallRecord {
+        let mut record: ToolCallRecord = serde_json::from_value(serde_json::json!({
+            "id": "call", "name": "todo_write", "status": "success"
+        }))
+        .unwrap();
+        record.structured_content = Some(serde_json::json!({ "todoState": state }));
+        record
+    }
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.messages[1].tool_calls = vec![todo_call(&snapshot("early step"))];
+    conversation.messages[3].tool_calls = vec![todo_call(&snapshot("later step"))];
+    conversation.agent_todo_state = snapshot("later step");
+
+    // Regenerating the last answer drops its todo_write; the list follows the history.
+    apply_regenerate_truncation(&mut conversation, 3, None).unwrap();
+    super::mutations::restore_todo_state_from_history(&mut conversation);
+    assert_eq!(conversation.agent_todo_state.items[0].content, "early step");
+
+    // Going back before any todo_write empties it.
+    conversation.messages.truncate(1);
+    super::mutations::restore_todo_state_from_history(&mut conversation);
+    assert!(conversation.agent_todo_state.items.is_empty());
+
+    // External CLIs keep their own list: not every CLI leaves a record to rebuild it from.
+    let mut external = test_conversation_with_summary(false);
+    external.agent_runtime.kind = crate::chat::types::AgentRuntimeKind::External;
+    external.agent_runtime.external_agent_id = Some("codex".to_string());
+    external.agent_todo_state = snapshot("codex plan");
+    super::mutations::restore_todo_state_from_history(&mut external);
+    assert_eq!(external.agent_todo_state.items[0].content, "codex plan");
 }
 
 #[test]
@@ -2745,6 +2965,27 @@ fn boundary_at(created_at: i64) -> CompactionBoundaryRecord {
 }
 
 #[test]
+fn history_directory_keeps_compaction_after_display_anchor_deletion() {
+    let mut conversation = test_conversation_with_messages(vec![
+        test_chat_message("u1", "user", "old question", 1),
+        test_chat_message("a2", "assistant", "replacement", 3),
+    ]);
+    let mut boundary = boundary_at(2);
+    boundary.display_after_message_id = Some("deleted-assistant".to_string());
+    conversation
+        .context_state
+        .compaction_boundaries
+        .push(boundary);
+    let directory = super::catalog::conversation_history_directory(&conversation);
+    let entry = directory
+        .iter()
+        .find(|entry| entry["kind"] == "compaction")
+        .expect("the fallback compaction marker must stay navigable");
+    assert_eq!(entry["message_id"], "u1");
+    assert_eq!(entry["message_index"], 0);
+}
+
+#[test]
 fn resolve_usage_anchor_reports_prompt_and_trailing() {
     let conv = test_conversation_with_messages(vec![
         test_chat_message("u1", "user", "hi", 1),
@@ -3256,17 +3497,17 @@ fn file_ledger_flows_into_replayed_summary_message() {
     let messages =
         build_chat_api_messages(None, "system prompt", &conversation, Some(2), None, &[]).unwrap();
 
-    // The injected summary system message (index 1) must carry the ledger block.
+    // The injected summary message (a user turn at index 1) must carry the ledger block.
     let summary_sys = messages
         .iter()
         .find(|m| {
-            m.get("role").and_then(|r| r.as_str()) == Some("system")
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content")
                     .and_then(|c| c.as_str())
                     .map(|c| c.contains("### Files touched"))
                     .unwrap_or(false)
         })
-        .expect("a system message carries the Files touched block");
+        .expect("the summary message carries the Files touched block");
     let content = summary_sys["content"].as_str().unwrap();
     assert!(
         content.contains(r#"Modified: "src/main.rs""#),
@@ -3301,4 +3542,132 @@ fn empty_delta_with_segment_still_emits_a_placeholder_event() {
         stream_delta_event_kinds("", Some(""), false),
         (false, false)
     );
+}
+
+#[test]
+fn late_compaction_preserves_concurrent_edits_but_allows_title_changes() {
+    let mut source = test_conversation_with_summary(false);
+    source.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "completed-reply".into(),
+            messages: vec![],
+        });
+    let mut latest = source.clone();
+    latest.context_state.summary = None;
+    latest.title = "user renamed".into();
+    super::messages::adopt_compacted_context(&mut latest, &source, "completed-reply");
+    assert!(latest.context_state.summary.is_some());
+    assert_eq!(latest.title, "user renamed");
+
+    latest.context_state.summary = None;
+    latest.messages[0].content = "concurrent correction".into();
+    super::messages::adopt_compacted_context(&mut latest, &source, "completed-reply");
+    assert!(latest.context_state.summary.is_none());
+    assert_eq!(latest.messages[0].content, "concurrent correction");
+
+    let mut cleared = source.clone();
+    apply_context_clear(&mut cleared).unwrap();
+    super::messages::adopt_compacted_context(&mut cleared, &source, "completed-reply");
+    assert!(cleared.context_state.summary.is_none());
+    assert_eq!(cleared.context_state.clear_boundaries.len(), 1);
+}
+
+#[test]
+fn compaction_fix_new_selected_answer_invalidates_saved_tail() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                serde_json::json!({"role":"assistant","content":"STALE_SNAPSHOT_ANSWER"}),
+            ],
+        });
+    let prep = prepare_reply_with_model(
+        &conversation,
+        "msg_assistant_2",
+        "other",
+        "other",
+        Some("g"),
+    )
+    .unwrap();
+    let mut answer = test_chat_message("answer_b", "assistant", "SELECTED_ANSWER_B", 6);
+    answer.group_id = Some("g".into());
+    apply_reply_with_model_result(&mut conversation, &prep, answer);
+    let restored: Conversation =
+        serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+    let wire = serde_json::to_string(
+        &build_chat_api_messages(None, "system", &restored, None, None, &[]).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !wire.contains("STALE_SNAPSHOT_ANSWER"),
+        "obsolete replay survived selection change: {wire}"
+    );
+    assert!(wire.contains("SELECTED_ANSWER_B"));
+    assert!(!wire.contains("recent assistant content"));
+}
+
+#[test]
+fn compaction_fix_late_summary_does_not_override_answer_selection() {
+    let mut source = test_conversation_with_summary(false);
+    source.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "reply".into(),
+            messages: vec![],
+        });
+    source.messages[3].group_id = Some("g".into());
+    let mut other = test_chat_message("answer_b", "assistant", "B", 6);
+    other.group_id = Some("g".into());
+    source.messages.push(other);
+    let mut latest = source.clone();
+    latest
+        .group_selections
+        .insert("g".into(), "answer_b".into());
+    latest.context_state.summary = None;
+    super::messages::adopt_compacted_context(&mut latest, &source, "reply");
+    assert!(
+        latest.context_state.summary.is_none(),
+        "late compaction ignored the changed selection"
+    );
+}
+
+#[test]
+fn compaction_fix_selection_respects_snapshot_boundary_and_no_op() {
+    for replay in [false, true] {
+        let mut conversation = test_conversation_with_summary(false);
+        conversation.messages[1].group_id = Some("old-group".into());
+        conversation.messages[3].group_id = Some("new-group".into());
+        conversation
+            .group_selections
+            .insert("old-group".into(), "msg_assistant_1".into());
+        if replay {
+            conversation.context_state.summary.as_mut().unwrap().replay =
+                Some(crate::chat::types::CompactionReplay {
+                    through_message_id: "msg_assistant_2".into(),
+                    messages: vec![serde_json::json!({"role":"assistant","content":"snapshot"})],
+                });
+        }
+        // Selecting the explicit current answer again must leave the snapshot usable.
+        conversation.select_group_answer("old-group".into(), "msg_assistant_1".into());
+        assert!(!conversation.context_state.summary.as_ref().unwrap().stale);
+        conversation.select_group_answer("new-group".into(), "msg_assistant_2".into());
+        // The older format ends before this group; the replay format includes it.
+        assert_eq!(
+            conversation.context_state.summary.as_ref().unwrap().stale,
+            replay
+        );
+
+        let mut alternative = test_chat_message("alternative", "assistant", "CHOSEN", 7);
+        alternative.group_id = Some("old-group".into());
+        conversation.messages.insert(2, alternative);
+        conversation.select_group_answer("old-group".into(), "alternative".into());
+        assert!(conversation.context_state.summary.as_ref().unwrap().stale);
+        let wire = serde_json::to_string(
+            &build_chat_api_messages(None, "system", &conversation, None, None, &[]).unwrap(),
+        )
+        .unwrap();
+        assert!(wire.contains("CHOSEN"));
+        assert!(!wire.contains("old assistant content"));
+        assert!(!wire.contains("Previous conversation summary"));
+    }
 }

@@ -1,8 +1,24 @@
 {
   "_meta": {
-    "version": "2026-09-24",
+    "version": "2026-10-04",
     "description": "AI model database for Kivio. Keyed by model ID patterns. Used for auto-filling model info when adding models.",
     "sources": [
+      "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+      "https://platform.claude.com/docs/en/models/sonnet-5-5/overview",
+      "https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5",
+      "https://platform.minimax.io/docs/api-reference/text-chat-openai.md",
+      "https://platform.minimax.io/docs/guides/models-intro",
+      "https://openrouter.ai/api/v1/models/openai/gpt-6.1-sol-pro/endpoints",
+      "https://openrouter.ai/api/v1/models/inclusionai/ling-3.1-flash/endpoints",
+      "https://openrouter.ai/api/v1/models/apodex/apodex-1.1-mini:free/endpoints",
+      "https://openrouter.ai/api/v1/models/unbiased/pareto-26.10-preview/endpoints",
+      "https://openrouter.ai/api/v1/models/perceptron/perceptron-mk1.5/endpoints",
+      "https://openrouter.ai/api/v1/models/fireworks/ember-1/endpoints",
+      "https://docs.cohere.com/v2/docs/models",
+      "https://cohere.com/blog/embed-5",
+      "https://help.aliyun.com/zh/model-studio/qwen-image-2-1-pro",
+      "https://help.aliyun.com/zh/model-studio/step-5-preview",
+      "https://help.aliyun.com/zh/model-studio/stepfun",
       "https://developers.openai.com/api/docs/models/gpt-6-sol",
       "https://developers.openai.com/api/docs/models/gpt-6-luna",
       "https://platform.claude.com/docs/en/models/opus-5-5/overview",
@@ -97,8 +113,118 @@
       "https://openrouter.ai/bytedance-seed",
       "https://openrouter.ai/bytedance-seed/seed-2.0-code",
       "https://ai.volcengine.com/model",
-      "https://research.doubao.com/zh/seed2_1"
+      "https://research.doubao.com/zh/seed2_1",
+      "https://platform.minimax.cn/docs/guides/video-generation.md",
+      "https://platform.minimax.cn/docs/api-reference/video-generation-v2-create.md",
+      "https://docs.volcengine.com/docs/ark/create-video-generation-task-api",
+      "https://help.aliyun.com/zh/model-studio/text-to-video-api-reference",
+      "https://help.aliyun.com/zh/model-studio/image-to-video-api-reference",
+      "https://help.aliyun.com/zh/model-studio/image-to-video-general-api-reference"
     ]
+  },
+
+  "gpt-6.1-sol": {
+    "displayName": "GPT-6.1 Sol",
+    "contextWindow": 256000,
+    "maxOutput": 128000,
+    "capabilities": { "vision": true, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": true },
+    "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+    "pricing": { "input": 2, "output": 10, "cachedInput": 0.1 }
+  },
+  "openai/gpt-6.1-sol-pro": {
+    "displayName": "GPT-6.1 Sol Pro (OpenRouter)",
+    "contextWindow": 256000,
+    "maxOutput": 128000,
+    "capabilities": { "vision": true, "functionCalling": true, "reasoning": true, "streaming": true },
+    "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+    "pricing": { "input": 2, "output": 10, "cachedInput": 0.1 }
+  },
+  "claude-sonnet-5.5": {
+    "displayName": "Claude Sonnet 5.5",
+    "contextWindow": 1000000,
+    "maxOutput": 128000,
+    "capabilities": { "vision": true, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": true },
+    "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"],
+    "pricing": { "input": 2, "output": 10, "cachedInput": 0.2 }
+  },
+  "minimax-m3.1-flash-preview": {
+    "displayName": "MiniMax M3.1 Flash Preview",
+    "contextWindow": 1000000,
+    "maxOutput": 524288,
+    "capabilities": { "vision": true, "videoInput": true, "functionCalling": true, "reasoning": true, "streaming": true },
+    "reasoningEfforts": ["low", "medium", "high", "xhigh", "max"]
+  },
+  "inclusionai/ling-3.1-flash": {
+    "displayName": "Ling 3.1 Flash",
+    "contextWindow": 262144,
+    "maxOutput": 32768,
+    "capabilities": { "vision": false, "functionCalling": true, "reasoning": true, "streaming": true },
+    "reasoningEfforts": [],
+    "pricing": { "input": 0, "output": 0 }
+  },
+  "apodex/apodex-1.1-mini:free": {
+    "displayName": "Apodex 1.1 Mini (Free)",
+    "contextWindow": 262144,
+    "maxOutput": 235929,
+    "capabilities": { "vision": false, "functionCalling": true, "reasoning": true, "streaming": true },
+    "reasoningEfforts": [],
+    "pricing": { "input": 0, "output": 0 }
+  },
+  "unbiased/pareto-26.10-preview": {
+    "displayName": "Pareto 26.10 Preview",
+    "contextWindow": 1048576,
+    "maxOutput": 131072,
+    "capabilities": { "vision": true, "functionCalling": true, "streaming": true },
+    "reasoningEfforts": [],
+    "pricing": { "input": 0.8, "output": 3.2, "cachedInput": 0.03 }
+  },
+  "perceptron/perceptron-mk1.5": {
+    "displayName": "Perceptron Mk1.5",
+    "contextWindow": 36864,
+    "maxOutput": 8192,
+    "capabilities": { "vision": true, "videoInput": true, "functionCalling": true, "reasoning": true, "streaming": true },
+    "reasoningEfforts": ["low", "medium", "high"],
+    "pricing": { "input": 0.15, "output": 1.5 }
+  },
+  "fireworks/ember-1": {
+    "displayName": "Fireworks Ember-1",
+    "contextWindow": 1048576,
+    "maxOutput": 943718,
+    "capabilities": { "vision": true, "functionCalling": true, "reasoning": true, "streaming": true },
+    "reasoningEfforts": ["low", "high", "max"],
+    "pricing": { "input": 3, "output": 15, "cachedInput": 0.3 }
+  },
+  "stepfun/step-5-preview": {
+    "displayName": "Step 5 Preview",
+    "contextWindow": 1048576,
+    "maxOutput": 1048576,
+    "capabilities": { "vision": true, "videoInput": true, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": false },
+    "reasoningEfforts": ["low", "medium", "high"]
+  },
+  "qwen-image-2.1-pro": {
+    "displayName": "Qwen Image 2.1 Pro",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "imageGeneration": true },
+    "reasoningEfforts": []
+  },
+  "embed-v5.0-pro": {
+    "displayName": "Cohere Embed 5 Pro",
+    "contextWindow": 128000,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "embedding": true },
+    "dimensions": 2048,
+    "multilingual": true,
+    "pricing": { "input": 0.12, "output": 0 }
+  },
+  "embed-v5.0-fast": {
+    "displayName": "Cohere Embed 5 Fast",
+    "contextWindow": 128000,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "embedding": true },
+    "dimensions": 2048,
+    "multilingual": true,
+    "pricing": { "input": 0.08, "output": 0 }
   },
 
   "gpt-6-sol": {
@@ -875,6 +1001,132 @@
     "contextWindow": 0,
     "maxOutput": 0,
     "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "imageGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "grok-imagine-video": {
+    "displayName": "Grok Imagine Video",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "minimax-h3": {
+    "displayName": "MiniMax H3",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "minimax-h3-max": {
+    "displayName": "MiniMax H3 Max",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "doubao-seedance-2-5": {
+    "displayName": "Doubao Seedance 2.5",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "doubao-seedance-2-0": {
+    "displayName": "Doubao Seedance 2.0",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "doubao-seedance-1-5-pro": {
+    "displayName": "Doubao Seedance 1.5 Pro",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "doubao-seedance-1-0-pro": {
+    "displayName": "Doubao Seedance 1.0 Pro",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "doubao-seedance-1-0-pro-fast": {
+    "displayName": "Doubao Seedance 1.0 Pro Fast",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.7-t2v": {
+    "displayName": "Wan 2.7 T2V",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": false, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.7-i2v": {
+    "displayName": "Wan 2.7 I2V",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.6-t2v": {
+    "displayName": "Wan 2.6 T2V",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": false, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.6-i2v": {
+    "displayName": "Wan 2.6 I2V",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.6-i2v-flash": {
+    "displayName": "Wan 2.6 I2V Flash",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.5-t2v-preview": {
+    "displayName": "Wan 2.5 T2V Preview",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": false, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.5-i2v-preview": {
+    "displayName": "Wan 2.5 I2V Preview",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.2-t2v-plus": {
+    "displayName": "Wan 2.2 T2V Plus",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": false, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.2-i2v-plus": {
+    "displayName": "Wan 2.2 I2V Plus",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
+    "pricing": { "input": 0.00, "output": 0.00 }
+  },
+  "wan2.2-i2v-flash": {
+    "displayName": "Wan 2.2 I2V Flash",
+    "contextWindow": 0,
+    "maxOutput": 0,
+    "capabilities": { "vision": true, "functionCalling": false, "reasoning": false, "streaming": false, "webSearch": false, "videoGeneration": true },
     "pricing": { "input": 0.00, "output": 0.00 }
   },
   "gpt-image-2": {
@@ -1705,16 +1957,16 @@
 
   "minimax-m3": {
     "displayName": "MiniMax M3",
-    "contextWindow": 1048576,
-    "maxOutput": 512000,
-    "capabilities": { "vision": true, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": false },
+    "contextWindow": 1000000,
+    "maxOutput": 524288,
+    "capabilities": { "vision": true, "videoInput": true, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": false },
     "reasoningEfforts": [],
     "pricing": { "input": 0.30, "output": 1.20, "cachedInput": 0.06 }
   },
   "minimax-m2.7-highspeed": {
     "displayName": "MiniMax M2.7 Highspeed",
     "contextWindow": 204800,
-    "maxOutput": 131072,
+    "maxOutput": 204800,
     "capabilities": { "vision": false, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": false },
     "reasoningEfforts": [],
     "pricing": { "input": 0.60, "output": 2.40, "cachedInput": 0.06 }
@@ -1722,7 +1974,7 @@
   "minimax-m2.7": {
     "displayName": "MiniMax M2.7",
     "contextWindow": 204800,
-    "maxOutput": 131072,
+    "maxOutput": 204800,
     "capabilities": { "vision": false, "functionCalling": true, "reasoning": true, "streaming": true, "webSearch": false },
     "reasoningEfforts": [],
     "pricing": { "input": 0.30, "output": 1.20, "cachedInput": 0.06 }

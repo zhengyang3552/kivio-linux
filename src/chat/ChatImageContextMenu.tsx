@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom'
 import { save } from '@tauri-apps/plugin-dialog'
 import { Check, Clipboard, Download, FolderOpen, Maximize2 } from 'lucide-react'
 import { api } from '../api/tauri'
+import { useT } from '../components/i18n'
+import { alertDialog } from '../components/dialogQueue'
 import { useCloseAnimation } from './useCloseAnimation'
 import { useClampedMenuPosition } from './useClampedMenuPosition'
 import { base64FromDataUrl, imageExtension } from './imageData'
@@ -16,6 +18,8 @@ interface ChatImageContextMenuProps {
   anchor: ChatImageMenuAnchor
   /** 图片的 data URL（复制/另存都从它取字节）。 */
   src: string
+  /** 列表显示缩略图时，复制/另存前按需取原图。 */
+  loadFullSrc?: () => Promise<string | null>
   name?: string
   onOpenViewer?: () => void
   onRevealLocation?: () => Promise<void>
@@ -25,18 +29,28 @@ interface ChatImageContextMenuProps {
 export function ChatImageContextMenu({
   anchor,
   src,
+  loadFullSrc,
   name,
   onOpenViewer,
   onRevealLocation,
   onClose: onCloseProp,
 }: ChatImageContextMenuProps) {
+  const t = useT()
   const menuRef = useRef<HTMLDivElement>(null)
   const pos = useClampedMenuPosition(menuRef, anchor)
   const { closing, startClose, onAnimationEnd } = useCloseAnimation(onCloseProp)
   const onClose = startClose
   const [copied, setCopied] = useState(false)
+  const [fullImageError, setFullImageError] = useState(false)
   const [locationError, setLocationError] = useState(false)
   const base64 = base64FromDataUrl(src)
+
+  const actionImage = async (): Promise<string | null> => {
+    if (!loadFullSrc) return src
+    const full = await loadFullSrc()
+    setFullImageError(!full)
+    return full
+  }
 
   useEffect(() => {
     const onPointerDown = (e: MouseEvent) => {
@@ -55,11 +69,14 @@ export function ChatImageContextMenu({
   }, [onClose])
 
   const handleCopy = async () => {
-    if (!base64) return
+    const image = await actionImage()
+    if (!image) return
+    const payload = base64FromDataUrl(image)
+    if (!payload) return
     // 复用 Lens 标注早就有的剪贴板写图命令（解码 → arboard set_image），不另造一条。
-    const result = await api.lensCopyImageToClipboard(base64)
+    const result = await api.lensCopyImageToClipboard(payload)
     if (!result.success) {
-      window.alert(`复制失败：${result.error ?? '未知错误'}`)
+      void alertDialog(t.chatImageCopyFailed.replace('{error}', () => result.error ?? t.chatUnknownError))
       return
     }
     setCopied(true)
@@ -67,15 +84,18 @@ export function ChatImageContextMenu({
   }
 
   const handleSave = async () => {
-    if (!base64) return
-    const ext = imageExtension(src, name)
+    const image = await actionImage()
+    if (!image) return
+    const payload = base64FromDataUrl(image)
+    if (!payload) return
+    const ext = imageExtension(image, name)
     const path = await save({
       defaultPath: name || `image.${ext}`,
       filters: [{ name: 'Image', extensions: [ext] }],
     })
     if (!path) return
-    const result = await api.lensSaveAnnotatedPng(base64, path)
-    if (!result.success) window.alert(`保存失败：${result.error ?? '未知错误'}`)
+    const result = await api.lensSaveAnnotatedPng(payload, path)
+    if (!result.success) void alertDialog(t.chatImageSaveFailed.replace('{error}', () => result.error ?? t.chatUnknownError))
     onClose()
   }
 
@@ -103,7 +123,7 @@ export function ChatImageContextMenu({
         ) : (
           <Clipboard size={16} strokeWidth={1.75} className={iconClass} />
         )}
-        {copied ? '已复制图片' : '复制图片'}
+        {copied ? t.chatImageCopied : t.chatImageCopy}
       </button>
       <button
         type="button"
@@ -113,7 +133,7 @@ export function ChatImageContextMenu({
         onClick={() => void handleSave()}
       >
         <Download size={16} strokeWidth={1.75} className={iconClass} />
-        图片另存为…
+        {t.chatImageSaveAs}
       </button>
       {onOpenViewer ? (
         <button
@@ -126,7 +146,7 @@ export function ChatImageContextMenu({
           }}
         >
           <Maximize2 size={16} strokeWidth={1.75} className={iconClass} />
-          查看大图
+          {t.chatImageViewLarge}
         </button>
       ) : null}
       {onRevealLocation && <button type="button" role="menuitem" className={itemClass} onClick={() => {
@@ -134,9 +154,10 @@ export function ChatImageContextMenu({
         void onRevealLocation().then(onClose).catch(() => setLocationError(true))
       }}>
         <FolderOpen size={16} strokeWidth={1.75} />
-        打开所在位置
+        {t.chatImageRevealLocation}
       </button>}
-      {locationError && <span role="status" className="block max-w-64 px-3 py-1 text-xs text-neutral-500">无法打开所在位置，请检查文件是否仍存在。</span>}
+      {locationError && <span role="status" className="block max-w-64 px-3 py-1 text-xs text-neutral-500">{t.chatImageRevealFailed}</span>}
+      {fullImageError && <span role="status" className="block max-w-64 px-3 py-1 text-xs text-neutral-500">{t.chatImageLoadOriginalFailed}</span>}
     </div>
   )
 

@@ -230,6 +230,8 @@ fn last_user_text(messages: &[Value]) -> Option<String> {
         .iter()
         .rev()
         .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        // Runtime todo reminders are user-role messages but never the question.
+        .filter(|m| !crate::chat::todo::is_reminder_message(m))
         .find_map(|message| {
             // Tool-generated image turns carry no question. Keep looking for
             // the user's text, including multimodal messages and steering.
@@ -359,7 +361,7 @@ fn silent_overflow_aware_kind(
 async fn recover_overflow_compact_and_retry(env: &LoopEnv<'_>, state: &mut RunState) -> String {
     let config = env.config;
     // 压缩一次(L1 snip → L2 摘要);返回压缩后的发送视图,并已写回 state.runtime_messages。
-    let compacted = super::compaction::maybe_compact_send_view(env, state).await;
+    let compacted = super::compaction::compact_send_view(env, state, true).await;
     // 恢复重试内部有 send_with_retry 多次退避——必须接取消，否则用户点停止后卡到重试耗尽。
     let result = tokio::select! {
         result = config.provider_runtime.message(super::provider_runtime::MessageRequest {
@@ -500,4 +502,18 @@ fn log_empty_synthesis_output(
         stream.reasoning.as_deref().map(|value| value.chars().count()).unwrap_or(0),
         stream.tool_calls.len(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_user_text_skips_todo_reminders() {
+        let messages = vec![
+            json!({ "role": "user", "content": "修一下登录页" }),
+            json!({ "role": "user", "content": "<todo-reminder>\n1. [pending] x\n</todo-reminder>" }),
+        ];
+        assert_eq!(last_user_text(&messages).as_deref(), Some("修一下登录页"));
+    }
 }

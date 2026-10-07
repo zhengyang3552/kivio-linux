@@ -117,10 +117,11 @@ fn runtime_workspace_roots(cwd: &str, extra: &[String]) -> Vec<String> {
 /// when the model asks for workspace permission — echoing the grant is not enough
 /// if this list is empty.
 ///
-/// `thread/resume` sends **only** `threadId`. Extra cwd / sandbox / experimental roots
-/// made Codex reject a perfectly good rollout (Windows vs WSL path, or a capsule that
-/// did not exist when the thread was created). Model / sandbox for this turn go on
-/// `turn/start`.
+/// `thread/resume` sends **only** `threadId` + `excludeTurns`. Extra cwd / sandbox /
+/// experimental roots made Codex reject a perfectly good rollout (Windows vs WSL path, or a
+/// capsule that did not exist when the thread was created). Model / sandbox for this turn go
+/// on `turn/start`. `excludeTurns` (0.148+) skips full-history hydration — deprecated for
+/// paginated threads since 0.155 — and we only read `thread.id` back anyway.
 fn build_codex_thread_params(
     cwd: &str,
     sandbox_mode: &str,
@@ -129,7 +130,10 @@ fn build_codex_thread_params(
     resume_thread: Option<&str>,
 ) -> (&'static str, Value) {
     if let Some(tid) = resume_thread.filter(|tid| !tid.is_empty()) {
-        return ("thread/resume", json!({ "threadId": tid }));
+        return (
+            "thread/resume",
+            json!({ "threadId": tid, "excludeTurns": true }),
+        );
     }
     let cwd_abs = absolute_workspace_path(cwd);
     let mut params = json!({});
@@ -178,6 +182,23 @@ pub(crate) fn normalize_codex_sandbox(sandbox: Option<&str>) -> &'static str {
     match sandbox.map(str::trim) {
         Some("danger-full-access") => "danger-full-access",
         Some("read-only") => "read-only",
+        Some(CODEX_PLAN_MODE) => CODEX_PLAN_MODE,
+        _ => "workspace-write",
+    }
+}
+
+/// 底栏「计划」档。Codex 自己的 collaboration mode（`collaborationMode/list` 0.158 本机实测
+/// 有 `plan` / `default` 两档），不是沙盒档：线程以只读沙盒起，每轮 `turn/start` 带
+/// `collaborationMode {mode:"plan"}`；`developer_instructions: null` = 用 Codex 内置的计划模式
+/// 提示词（schema 原文），不必像 t3code 那样自带一份长 prompt。
+pub(crate) const CODEX_PLAN_MODE: &str = "plan";
+
+/// 线程握手用的真实沙盒档：计划档只读。
+fn codex_thread_sandbox(tier: &str) -> &'static str {
+    match tier {
+        CODEX_PLAN_MODE => "read-only",
+        "danger-full-access" => "danger-full-access",
+        "read-only" => "read-only",
         _ => "workspace-write",
     }
 }
@@ -233,7 +254,7 @@ fn approval_response(method: &str, params: &Value) -> Option<Value> {
     }
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            Some(json!({ "decision": "acceptForSession" }))
+            Some(json!({ "decision": approve_decision(params) }))
         }
         // Legacy exec/apply-patch approval requests use ReviewDecision.
         "execCommandApproval" | "applyPatchApproval" => {
@@ -244,6 +265,19 @@ fn approval_response(method: &str, params: &Value) -> Option<Value> {
             "scope": "session"
         })),
         _ => None,
+    }
+}
+
+/// `acceptForSession` unless the server's ordered `availableDecisions` leaves it out —
+/// 0.158 terminal-input approvals (`kind: writeStdin`) only offer `accept` / `cancel`.
+fn approve_decision(params: &Value) -> &'static str {
+    let offered = params
+        .get("availableDecisions")
+        .and_then(|v| v.as_array())
+        .filter(|list| !list.is_empty());
+    match offered {
+        Some(list) if !list.iter().any(|d| d.as_str() == Some("acceptForSession")) => "accept",
+        _ => "acceptForSession",
     }
 }
 
@@ -285,8 +319,15 @@ fn approval_ask_from_params(method: &str, id: &Value, params: &Value) -> Approva
             let command = json_str(params, "command").unwrap_or("");
             let reason = json_str(params, "reason").unwrap_or("");
             let display = if command.is_empty() { reason } else { command };
+            // Input for an already-running terminal is its own tool: a prior 「总是允许」
+            // Bash must not cover it, and the card has to say what is being typed where.
+            let tool = if json_str(params, "kind") == Some("writeStdin") {
+                "write_stdin"
+            } else {
+                "Bash"
+            };
             (
-                "Bash",
+                tool,
                 json!({
                     "command": display,
                     "cwd": params.get("cwd").cloned().unwrap_or(Value::Null),
@@ -320,6 +361,8 @@ fn approval_ask_from_params(method: &str, id: &Value, params: &Value) -> Approva
         tool_name: tool_name.to_string(),
         input,
         requires_user_interaction: false,
+        requires_manual_approval: false,
+        permission_suggestions: None,
     }
 }
 
@@ -444,6 +487,24 @@ fn map_codex_notification(
                         usage: usage_from_parts(parts),
                     });
                 }
+            }
+        }
+        // 0.155+：Codex 对弃用行为（如 paginated 线程整段加载历史）和 config.toml 问题的提示。
+        // TUI 会显示；不接的话用户的配置错了也毫无察觉。走状态行。
+        "deprecationNotice" | "configWarning" => {
+            if let Some(summary) = json_str(params, "summary") {
+                let text = match json_str(params, "path") {
+                    Some(path) => format!("{summary} · {path}"),
+                    None => summary.to_string(),
+                };
+                sink(UnifiedAgentEvent::StatusNote {
+                    text: text.chars().take(200).collect(),
+                });
+            }
+        }
+        "account/rateLimits/updated" => {
+            if let Some(text) = codex_rate_limit_reached_note(params) {
+                sink(UnifiedAgentEvent::StatusNote { text });
             }
         }
         "turn/completed" => {
@@ -653,6 +714,41 @@ fn is_codex_reconnect_progress(raw: &str) -> bool {
     parse_reconnect_progress(raw).is_some()
         || raw.to_ascii_lowercase().contains("reconnecting")
         || raw.contains("正在重新连接")
+}
+
+/// `account/rateLimits/updated` (sparse snapshot): only speaks up once a limit is actually
+/// reached (`rateLimitReachedType` set), naming the window that is full and when it resets —
+/// the turn error alone says "usage limit" without telling the user how long to wait.
+fn codex_rate_limit_reached_note(params: &Value) -> Option<String> {
+    let limits = params.get("rateLimits")?;
+    let reached = limits.get("rateLimitReachedType")?.as_str()?;
+    if reached.contains("credits_depleted") {
+        return Some("credits depleted".to_string());
+    }
+    let full = ["primary", "secondary"]
+        .iter()
+        .filter_map(|key| limits.get(*key))
+        .filter(|w| w.get("usedPercent").and_then(Value::as_i64).unwrap_or(0) >= 100)
+        .max_by_key(|w| w.get("resetsAt").and_then(Value::as_i64).unwrap_or(0));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let reset = full
+        .and_then(|w| w.get("resetsAt").and_then(Value::as_i64))
+        .filter(|at| *at > now)
+        .map(|at| {
+            let mins = (at - now + 59) / 60;
+            match (mins / 1440, (mins % 1440) / 60, mins % 60) {
+                (0, 0, m) => format!("{m}m"),
+                (0, h, m) => format!("{h}h {m}m"),
+                (d, h, _) => format!("{d}d {h}h"),
+            }
+        });
+    Some(match reset {
+        Some(wait) => format!("usage limit reached · resets in {wait}"),
+        None => "usage limit reached".to_string(),
+    })
 }
 
 /// Fold `codexErrorInfo` (string variant or tagged object) into the message so retry
@@ -877,6 +973,48 @@ fn emit_thread_item(
                     duration_ms: None,
                 });
             }
+        }
+        // `/review` 进出审查模式（0.160 `enteredReviewMode` / `exitedReviewMode {review}`）。
+        // 退出那一项带的是审查结论本身，丢掉的话 `/review` 跑完界面上什么都没有。
+        Some("exitedReviewMode") if include_result => {
+            let review = map_str(item, "review").unwrap_or("").trim();
+            let Some(id) = item_id(item) else {
+                return;
+            };
+            if review.is_empty() || !emitted_tools.insert(format!("codex-review-{id}")) {
+                return;
+            }
+            sink(UnifiedAgentEvent::TextDelta {
+                delta: format!("\n\n{review}\n"),
+            });
+        }
+        Some("enteredReviewMode") if include_result => {
+            if let Some(review) = map_str(item, "review").filter(|r| !r.trim().is_empty()) {
+                sink(UnifiedAgentEvent::StatusNote {
+                    text: format!(
+                        "review · {}",
+                        review.trim().chars().take(120).collect::<String>()
+                    ),
+                });
+            }
+        }
+        // `hookPrompt`（用户自己配的 hook 往对话里注入的文本）与 `functionCallOutput`
+        // （动态工具的原始输出，已由 dynamicToolCall 卡承载）有意不接：前者与 claude 的
+        // hook_* 同理是用户侧配置的回声，后者重复。
+        // 计划模式产出的 `<proposed_plan>`（0.160 `PlanThreadItem {id, text}`）。Codex 把它从
+        // agentMessage 正文里切出来单独成项，不接的话计划本体整个消失。完成项为准、不拼
+        // `item/plan/delta`；作为回答正文（Markdown）输出——它就是这一轮要交付的东西。
+        Some("plan") if include_result => {
+            let text = map_str(item, "text").unwrap_or("").trim();
+            let Some(id) = item_id(item) else {
+                return;
+            };
+            if text.is_empty() || !emitted_tools.insert(format!("codex-plan-{id}")) {
+                return;
+            }
+            sink(UnifiedAgentEvent::TextDelta {
+                delta: format!("\n\n{text}\n"),
+            });
         }
         Some("imageView") => {
             let path = map_str(item, "path").unwrap_or("");
@@ -1208,11 +1346,10 @@ pub fn normalize_codex_effort(raw: Option<&str>) -> Option<String> {
 /// applies both every turn, so a mid-session switch takes effect on the next turn). Pure so the
 /// per-turn application is unit-testable.
 ///
-/// Extra writable roots become `runtimeWorkspaceRoots` (cwd + extras). Do **not** replace
-/// the thread sandbox with a `sandboxPolicy` object — that object defaults
-/// `networkAccess: false` and drops the environment-scoped workspace roots, which is
-/// exactly the "工作区权限没放开" failure mode. Empty extra list = omit the field so
-/// the thread's existing roots stay in force.
+/// Carry the server-resolved policy every turn: `sandboxPolicy` is sticky, including after
+/// a resumed plan turn. Keep its configured network access and writable roots rather than
+/// constructing a workspace-write policy with protocol defaults. Runtime workspace roots
+/// remain independent; an empty extra list must not clear the thread's existing roots.
 ///
 /// `approval_policy` is sent every turn so a live thread that started under `never` still
 /// picks up `on-request` after this adapter change (and the 「完全」档 can switch back).
@@ -1224,12 +1361,14 @@ fn build_codex_turn_params(
     effort: Option<&str>,
     extra_writable_roots: &[String],
     approval_policy: &str,
+    sandbox_policy: &Value,
 ) -> Value {
     let mut turn_params = json!({
         "threadId": thread_id,
         "input": input,
         "cwd": cwd,
         "approvalPolicy": approval_policy,
+        "sandboxPolicy": sandbox_policy,
     });
     if let Some(effort) = normalize_codex_effort(effort) {
         turn_params["effort"] = json!(effort);
@@ -1245,6 +1384,24 @@ fn build_codex_turn_params(
             json!(runtime_workspace_roots(cwd, extra_writable_roots));
     }
     turn_params
+}
+
+/// 每轮显式带上 collaboration mode（t3code 同款）：模式记在线程上，续接 / 换档后不显式发
+/// `default` 的话，上一次的计划模式会一直粘着。拿不到模型（必填）时不发，退回线程现状。
+fn codex_collaboration_mode(
+    plan_mode: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Option<Value> {
+    let model = model.map(str::trim).filter(|m| !m.is_empty())?;
+    Some(json!({
+        "mode": if plan_mode { CODEX_PLAN_MODE } else { "default" },
+        "settings": {
+            "model": model,
+            "reasoning_effort": effort,
+            "developer_instructions": null,
+        },
+    }))
 }
 
 fn local_image_items(
@@ -1278,6 +1435,12 @@ pub struct CodexAppServerSession {
     stderr_tail: tokio::task::JoinHandle<String>,
     /// `on-request` (workspace-write / read-only) asks the host; `never` (完全) auto-allows.
     approval_policy: &'static str,
+    /// Server-resolved policy for the selected capsule, including configured network/roots.
+    sandbox_policy: Value,
+    /// 底栏选的是「计划」档：每轮带 `collaborationMode {mode:"plan"}`。
+    plan_mode: bool,
+    /// thread/start / resume 回报的模型，`collaborationMode.settings.model` 的兜底。
+    thread_model: Option<String>,
 }
 
 /// Handshake timeouts (缺陷 4 / R3): 30s each, up from 15/20s.
@@ -1286,6 +1449,38 @@ const CODEX_THREAD_START_TIMEOUT: Duration = Duration::from_secs(30);
 /// Resume replays the on-disk rollout. A long project thread can exceed the start
 /// timeout; treating that as "thread missing" opens a blank session.
 const CODEX_THREAD_RESUME_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Upper bound on `thread/turns/list` pages read while aligning a rewind (100 turns each).
+const CODEX_REWIND_MAX_PAGES: usize = 50;
+
+/// `(turn id, user prompt text)` for each turn of a `thread/turns/list` page that starts with a
+/// user message. Turns without one (e.g. compaction) are not user prompts.
+fn codex_prompt_turns(page: &Value) -> Vec<(String, String)> {
+    page.get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| {
+            let id = turn.get("id").and_then(Value::as_str)?;
+            let text = turn
+                .get("items")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
+                .flat_map(|item| {
+                    item.get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter(|input| input.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|input| input.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then(|| (id.to_string(), text))
+        })
+        .collect()
+}
 
 impl CodexAppServerSession {
     /// Spawn `codex app-server`, `initialize`, then create or resume a thread. The process and
@@ -1298,8 +1493,14 @@ impl CodexAppServerSession {
         sandbox: Option<&str>,
         resume_thread: Option<&str>,
     ) -> Result<Self, String> {
+        let tier = normalize_codex_sandbox(sandbox);
+        let sandbox_mode = codex_thread_sandbox(tier);
+        let approval_policy = codex_approval_policy(Some(sandbox_mode));
         let mut child = codex_cli_command(resolved_bin)
             .args(args)
+            // Resume must stay narrow, but its config must use the selected capsule rather
+            // than the previous rollout's sandbox. Let Codex resolve network/roots itself.
+            .args(["-c", &format!("sandbox_mode=\"{sandbox_mode}\"")])
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1330,8 +1531,6 @@ impl CodexAppServerSession {
             .to_string_lossy()
             .into_owned();
         let chosen_model = model.filter(|m| !m.is_empty() && *m != "default");
-        let sandbox_mode = normalize_codex_sandbox(sandbox);
-        let approval_policy = codex_approval_policy(Some(sandbox_mode));
 
         let handshake = async {
             let mut next_id = 1u64;
@@ -1367,7 +1566,7 @@ impl CodexAppServerSession {
             } else {
                 CODEX_THREAD_START_TIMEOUT
             };
-            let result =
+            let mut result =
                 read_until_response(&mut reader, &mut stdin, thread_rpc_id, thread_timeout)
                     .await
                     .map_err(|e| format!("thread-start: {e}"))?;
@@ -1378,12 +1577,27 @@ impl CodexAppServerSession {
                 .or_else(|| result.get("threadId").and_then(|v| v.as_str()))
                 .map(str::to_string)
                 .ok_or_else(|| format!("thread-start: invalid {method} response"))?;
-            Ok::<_, String>((thread_id, next_id))
+            // `collaborationMode.settings.model` 必填：没选模型的轮次用线程实际用的那个。
+            let thread_model = result
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let sandbox_policy = if sandbox_mode == "read-only" {
+                // A native writable rollout must not weaken a plan/read-only turn.
+                json!({"type": "readOnly"})
+            } else {
+                result
+                    .get_mut("sandbox")
+                    .map(Value::take)
+                    .filter(Value::is_object)
+                    .ok_or_else(|| format!("thread-start: missing {method} sandbox policy"))?
+            };
+            Ok::<_, String>((thread_id, next_id, thread_model, sandbox_policy))
         }
         .await;
 
         match handshake {
-            Ok((thread_id, next_id)) => Ok(Self {
+            Ok((thread_id, next_id, thread_model, sandbox_policy)) => Ok(Self {
                 child,
                 stdin,
                 reader,
@@ -1395,6 +1609,9 @@ impl CodexAppServerSession {
                 active_turn_id: None,
                 stderr_tail,
                 approval_policy,
+                sandbox_policy,
+                plan_mode: tier == CODEX_PLAN_MODE,
+                thread_model,
             }),
             Err(msg) => {
                 let tail = join_stderr_tail(&mut child, stderr_tail).await;
@@ -1405,6 +1622,71 @@ impl CodexAppServerSession {
 
     pub fn thread_id(&self) -> &str {
         &self.thread_id
+    }
+
+    /// After a Kivio rewind, drop the turns of the resumed thread that the visible history no
+    /// longer has (`thread/revert` rewrites only the stored history, not files). Fails when the
+    /// prompts cannot be matched or this Codex lacks `thread/turns/list` / `thread/revert`; the
+    /// caller then starts a fresh thread carrying the visible history instead.
+    pub async fn revert_to_visible(&mut self, visible_users: &[String]) -> Result<(), String> {
+        use crate::external_agents::session::NativeRewindPoint;
+
+        let mut turns = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..CODEX_REWIND_MAX_PAGES {
+            let mut params = json!({
+                "threadId": self.thread_id,
+                "sortDirection": "asc",
+                "itemsView": "summary",
+                "limit": 100,
+            });
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let page = self.request("thread/turns/list", params).await?;
+            turns.extend(codex_prompt_turns(&page));
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        if cursor.is_some() {
+            return Err("thread history is too long to align".to_string());
+        }
+        let native: Vec<String> = turns.iter().map(|(_, text)| text.clone()).collect();
+        match codex_rewind_point(&native, visible_users) {
+            NativeRewindPoint::Aligned => Ok(()),
+            NativeRewindPoint::DropFrom(index) => self
+                .request(
+                    "thread/revert",
+                    json!({ "threadId": self.thread_id, "beforeTurnId": turns[index].0 }),
+                )
+                .await
+                .map(|_| ()),
+            NativeRewindPoint::Unmatched => {
+                Err("thread history does not match the visible conversation".to_string())
+            }
+        }
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        write_rpc(&mut self.stdin, id, method, params)
+            .await
+            .map_err(|e| format!("{method}: {e}"))?;
+        read_until_response(
+            &mut self.reader,
+            &mut self.stdin,
+            id,
+            CODEX_THREAD_RESUME_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("{method}: {e}"))
     }
 
     /// 常驻子进程的 pid。只作为注册表元数据（诊断 / 「两轮是不是同一个进程」），
@@ -1428,6 +1710,31 @@ impl CodexAppServerSession {
     ) -> Result<(), String> {
         let chosen_model = model.filter(|m| !m.is_empty() && *m != "default");
         let chosen_effort = normalize_codex_effort(reasoning);
+        let mut input = if codex_skill_command(prompt).is_some() {
+            // Resolve against this live session's working directory. The picker cache
+            // is presentation data; only the runtime can authorize the skill path.
+            let params = json!({"cwds":[self.cwd], "forceReload":true});
+            let request =
+                tokio::time::timeout(Duration::from_secs(10), self.request("skills/list", params));
+            tokio::pin!(request);
+            let catalog = loop {
+                tokio::select! {
+                    result = &mut request => {
+                        break result.map_err(|_| "加载 Codex Skill 超时，请重试。".to_string())??;
+                    }
+                    command = control.recv() => match command {
+                        Some(SessionCommand::Cancel) => return Err("cancelled".into()),
+                        Some(SessionCommand::Close) | None => return Err("closed".into()),
+                        Some(SessionCommand::Steer { accepted, .. }) => { let _ = accepted.send(false); }
+                        Some(SessionCommand::RunTurn { done, .. }) => { let _ = done.send(Err("session busy".into())); }
+                        Some(SessionCommand::StopTask { .. }) => {}
+                    }
+                }
+            };
+            codex_skill_input(prompt, &catalog)?
+        } else {
+            vec![json!({"type":"text", "text":prompt})]
+        };
         let turn_id = self.next_id;
         self.next_id += 1;
 
@@ -1444,9 +1751,8 @@ impl CodexAppServerSession {
         } else {
             // Codex reads images as `localImage` items pointing at on-disk files; copy each into a
             // private temp dir (its sandbox can't reach the conversation attachments dir).
-            let mut input = vec![json!({ "type": "text", "text": prompt })];
             input.extend(local_image_items(&self.cli_bin, images));
-            let turn_params = build_codex_turn_params(
+            let mut turn_params = build_codex_turn_params(
                 &self.thread_id,
                 &self.cwd,
                 input,
@@ -1454,7 +1760,15 @@ impl CodexAppServerSession {
                 chosen_effort.as_deref(),
                 extra_writable_roots,
                 self.approval_policy,
+                &self.sandbox_policy,
             );
+            if let Some(mode) = codex_collaboration_mode(
+                self.plan_mode,
+                chosen_model.or(self.thread_model.as_deref()),
+                chosen_effort.as_deref(),
+            ) {
+                turn_params["collaborationMode"] = mode;
+            }
             write_rpc(&mut self.stdin, turn_id, "turn/start", turn_params).await?;
         }
 
@@ -1473,7 +1787,7 @@ impl CodexAppServerSession {
                         &mut self.stdin,
                         iid,
                         "turn/interrupt",
-                        json!({ "threadId": self.thread_id }),
+                        turn_interrupt_params(&self.thread_id, self.active_turn_id.as_deref()),
                     )
                     .await;
                     return Err("cancelled".to_string());
@@ -1568,8 +1882,17 @@ impl CodexAppServerSession {
             if let Some(method) = value.get("method").and_then(|v| v.as_str()) {
                 let params = value.get("params").cloned().unwrap_or(Value::Null);
                 // 服务端给的活跃 turn id：每条 turn 相关通知的 params 都带 turnId。
-                // `turn/steer` 的 `expectedTurnId` 只能取自这里。
-                if let Some(turn) = params.get("turnId").and_then(|v| v.as_str()) {
+                // `turn/steer` 的 `expectedTurnId` 只能取自这里。子代理线程的通知也带 turnId，
+                // 只认本线程的，否则中断 / 引导会打到子线程的轮次上。
+                let own_thread = params
+                    .get("threadId")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|t| t == self.thread_id);
+                if let Some(turn) = params
+                    .get("turnId")
+                    .and_then(|v| v.as_str())
+                    .filter(|_| own_thread)
+                {
                     self.active_turn_id = Some(turn.to_string());
                 }
                 let mut buf: Vec<UnifiedAgentEvent> = Vec::new();
@@ -1692,6 +2015,16 @@ async fn answer_codex_server_request(
     write_rpc_result(stdin, id, unknown_server_request_result()).await
 }
 
+/// `turn/interrupt` 的 `turnId` 是必填项（0.148–0.160 schema 均如此）；缺了服务端回
+/// `-32600 missing field turnId`，中断从未生效，只能靠拆进程收场。服务端反向请求的
+/// params 都带 `turnId`，在飞轮次则取通知里记下的 `active_turn_id`。
+fn turn_interrupt_params(thread_id: &str, turn_id: Option<&str>) -> Value {
+    match turn_id {
+        Some(turn_id) => json!({ "threadId": thread_id, "turnId": turn_id }),
+        None => json!({ "threadId": thread_id }),
+    }
+}
+
 /// 未知的带 `id` 请求：回 decline 结果而不是 `-32601`，避免这一轮挂死。
 fn unknown_server_request_result() -> Value {
     json!({ "decision": "decline" })
@@ -1737,7 +2070,7 @@ async fn answer_codex_tool_approval(
                     stdin,
                     iid,
                     "turn/interrupt",
-                    json!({ "threadId": thread_id }),
+                    turn_interrupt_params(thread_id, params.get("turnId").and_then(|v| v.as_str())),
                 )
                 .await;
                 return Err("cancelled".to_string());
@@ -1816,6 +2149,8 @@ async fn answer_codex_user_interaction(
         },
         input: params.clone(),
         requires_user_interaction: true,
+        requires_manual_approval: false,
+        permission_suggestions: None,
     };
     if bridge.requests.send(ask).await.is_err() {
         if elicitation {
@@ -1840,7 +2175,7 @@ async fn answer_codex_user_interaction(
                     stdin,
                     iid,
                     "turn/interrupt",
-                    json!({ "threadId": thread_id }),
+                    turn_interrupt_params(thread_id, params.get("turnId").and_then(|v| v.as_str())),
                 )
                 .await;
                 return Err("cancelled".to_string());
@@ -2078,6 +2413,105 @@ const CODEX_BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("undo", "撤销上一步"),
 ];
 
+pub(crate) fn codex_skill_command(prompt: &str) -> Option<&str> {
+    let prompt = prompt.trim_start();
+    let range = crate::chat::slash_commands::command_ranges(prompt)
+        .into_iter()
+        .next()?;
+    if range.start != 0 {
+        return None;
+    }
+    let name = &prompt[1..range.end];
+    (!CODEX_BUILTIN_COMMANDS
+        .iter()
+        .any(|(builtin, _)| name.eq_ignore_ascii_case(builtin)))
+    .then_some(name)
+}
+
+fn available_codex_skills(catalog: &Value) -> impl Iterator<Item = (&str, &str, &Value)> {
+    catalog
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("skills").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|skill| {
+            if skill.get("enabled").and_then(Value::as_bool) == Some(false) {
+                return None;
+            }
+            let name = skill.get("name")?.as_str()?.trim();
+            let path = skill.get("path")?.as_str()?.trim();
+            (!name.is_empty() && !path.is_empty()).then_some((name, path, skill))
+        })
+}
+
+fn codex_skill_input(prompt: &str, catalog: &Value) -> Result<Vec<Value>, String> {
+    let Some(command) = codex_skill_command(prompt) else {
+        return Ok(vec![json!({ "type": "text", "text": prompt })]);
+    };
+    let candidates: HashSet<_> = available_codex_skills(catalog)
+        .filter(|(name, _, _)| name.eq_ignore_ascii_case(command))
+        .map(|(name, path, _)| (name, path))
+        .collect();
+    if candidates.len() != 1 {
+        return Err(format!("无法明确加载 Codex Skill /{command}：技能不存在、已禁用或存在同名项。请刷新命令列表后重试。"));
+    }
+    let (name, path) = candidates.into_iter().next().unwrap();
+    let arguments = prompt.trim_start()[command.len() + 1..].trim();
+    let text = if arguments.is_empty() {
+        format!("${name}")
+    } else {
+        format!("${name} {arguments}")
+    };
+    Ok(vec![
+        json!({ "type": "text", "text": text }),
+        json!({"type":"skill", "name":name, "path":path}),
+    ])
+}
+
+fn codex_rewind_point(
+    native: &[String],
+    visible: &[String],
+) -> crate::external_agents::session::NativeRewindPoint {
+    // Reproduce only the exact wire transformation evidenced by the corresponding
+    // native $name prompt. Never match by command name alone or read changed skills.
+    let visible: Vec<_> = visible
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let Some(name) = native
+                .get(index)
+                .and_then(|text| text.strip_prefix('$'))
+                .and_then(|text| text.split_whitespace().next())
+            else {
+                return text.clone();
+            };
+            let command = ExternalCliSlashCommand {
+                name: name.into(),
+                slash: format!("/{name}"),
+                description: None,
+                argument_hint: None,
+            };
+            let Ok(adapted) =
+                crate::external_agents::slash::inline_command_prompt(text, &[command])
+            else {
+                return text.clone();
+            };
+            let adapted = adapted.as_deref().unwrap_or(text).trim_start();
+            match codex_skill_command(adapted) {
+                Some(actual) if actual.eq_ignore_ascii_case(name) => {
+                    format!("${name} {}", adapted[actual.len() + 1..].trim())
+                        .trim_end()
+                        .to_owned()
+                }
+                _ => text.clone(),
+            }
+        })
+        .collect();
+    crate::external_agents::session::native_rewind_point(native, &visible)
+}
+
 /// Result of a one-shot Codex model catalog probe (app-server `model/list`).
 ///
 /// Aligns with desktop-cc-gui: runtime list is authoritative; each model carries its own
@@ -2091,14 +2525,11 @@ pub struct CodexModelsProbe {
     pub reasoning_options: Vec<crate::external_agents::types::RuntimeModelOption>,
 }
 
-/// **Selectable** Codex catalog — word-for-word the 4 entries in desktop-cc-gui
-/// `generatedModelCatalog.json` → `engines.codex`.
-///
-/// This is what users actually see in cc-gui when `model/list` is empty/degraded
-/// (workspace not connected): sol / terra / luna / gpt-5.5. Live `model/list` on
-/// current CLI returns a *different* short set (5.5/5.4/5.4-mini/5.3-codex/5.2) and
-/// **omits** gpt-5.6-* — so we do **not** dump that list into the picker. Runtime is
-/// only used to enrich efforts/labels for ids that already sit in this curated table.
+/// Offline fallback catalog — used only when neither `model/list` nor `codex debug models`
+/// answers, plus effort ladders for listed ids that come back without
+/// `supportedReasoningEfforts`. Live `model/list` is authoritative since 0.157: it filters
+/// legacy models server-side (`hidden`) and is the only place new families such as GPT-6
+/// (`gpt-6-astra` default in 0.158) appear.
 const CODEX_CURATED_CATALOG: &[(&str, &str, &[&str])] = &[
     (
         "gpt-5.6-sol",
@@ -2129,59 +2560,65 @@ fn effort_options(ids: &[&str]) -> Vec<crate::external_agents::types::RuntimeMod
         .collect()
 }
 
-/// Build the picker list the way desktop-cc-gui does in practice for most users:
+/// Build the picker list:
 ///
-/// 1. **Curated 4** (generated catalog) as the selectable set / order  
-/// 2. If runtime `model/list` has the **same id**, overwrite label / efforts / window  
-/// 3. If `config.toml` model is still missing, inject it after Auto  
-///
-/// Deliberately does **not** append every runtime-only id (gpt-5.4 / 5.2 / …) — that
-/// is what made Kivio show a junk list while cc-gui showed the clean 4.
+/// 1. Live `model/list` (already `hidden`-filtered, server default first) is the selectable
+///    set — same as t3code. A static table would hide every model released after it.
+/// 2. Only when the probe returned nothing, the curated fallback table.
+/// 3. If `config.toml` model is still missing, inject it after Auto.
 pub fn merge_codex_model_catalog(
     runtime: CodexModelsProbe,
     config_model: Option<&str>,
 ) -> CodexModelsProbe {
     use crate::external_agents::types::{default_model_option, RuntimeModelOption};
 
-    let runtime_by_id: std::collections::HashMap<&str, &RuntimeModelOption> = runtime
+    let curated_efforts = |id: &str| {
+        CODEX_CURATED_CATALOG
+            .iter()
+            .find(|(cid, _, _)| *cid == id)
+            .map(|(_, _, efforts)| effort_options(efforts))
+    };
+    let mut models = vec![runtime
         .models
         .iter()
-        .filter(|m| m.id != "default")
-        .map(|m| (m.id.as_str(), m))
-        .collect();
-
-    let mut models = vec![default_model_option()];
+        .find(|m| m.id == "default")
+        .cloned()
+        .unwrap_or_else(default_model_option)];
     let mut reasoning_by_model = std::collections::HashMap::new();
     let mut seen = HashSet::new();
     seen.insert("default".to_string());
 
-    for (id, label, efforts) in CODEX_CURATED_CATALOG {
-        seen.insert((*id).to_string());
-        // Runtime enrichment when the same catalog id appears in model/list.
-        if let Some(rt) = runtime_by_id.get(*id) {
-            models.push(RuntimeModelOption {
-                id: (*id).to_string(),
-                label: if rt.label.trim().is_empty() {
-                    (*label).to_string()
-                } else {
-                    rt.label.clone()
-                },
-                context_window_tokens: rt.context_window_tokens,
-            });
-            if let Some(opts) = runtime.reasoning_by_model.get(*id) {
-                if !opts.is_empty() {
-                    reasoning_by_model.insert((*id).to_string(), opts.clone());
-                    continue;
-                }
-            }
-        } else {
+    let live: Vec<&RuntimeModelOption> = runtime
+        .models
+        .iter()
+        .filter(|m| m.id != "default")
+        .collect();
+    if live.is_empty() {
+        for (id, label, efforts) in CODEX_CURATED_CATALOG {
+            seen.insert((*id).to_string());
             models.push(RuntimeModelOption {
                 id: (*id).to_string(),
                 label: (*label).to_string(),
                 context_window_tokens: None,
             });
+            reasoning_by_model.insert((*id).to_string(), effort_options(efforts));
         }
-        reasoning_by_model.insert((*id).to_string(), effort_options(efforts));
+    } else {
+        for m in live {
+            if !seen.insert(m.id.clone()) {
+                continue;
+            }
+            let efforts = runtime
+                .reasoning_by_model
+                .get(&m.id)
+                .filter(|o| !o.is_empty())
+                .cloned()
+                .or_else(|| curated_efforts(&m.id));
+            if let Some(efforts) = efforts {
+                reasoning_by_model.insert(m.id.clone(), efforts);
+            }
+            models.push(m.clone());
+        }
     }
 
     // config.toml model missing from curated set → inject (cc-gui same behavior).
@@ -2210,7 +2647,6 @@ pub fn merge_codex_model_catalog(
         .filter(|s| !s.is_empty())
         .and_then(|cfg| reasoning_by_model.get(cfg).cloned())
         .filter(|o| !o.is_empty())
-        .or_else(|| reasoning_by_model.get("gpt-5.6-sol").cloned())
         .or_else(|| {
             models
                 .iter()
@@ -2226,7 +2662,7 @@ pub fn merge_codex_model_catalog(
     }
 }
 
-/// When model/list / debug models both fail — still serve the curated 4.
+/// When model/list / debug models both fail — still serve the curated fallback.
 pub fn codex_static_fallback_probe() -> CodexModelsProbe {
     merge_codex_model_catalog(
         CodexModelsProbe {
@@ -2495,40 +2931,29 @@ pub async fn detect_codex_commands(
                 && write_rpc_notification(&mut stdin, "initialized", json!({}))
                     .await
                     .is_ok()
-                && write_rpc(&mut stdin, 2, "skills/list", json!({}))
-                    .await
-                    .is_ok();
+                && write_rpc(
+                    &mut stdin,
+                    2,
+                    "skills/list",
+                    json!({"cwds":[crate::external_agents::wsl::path_for_cli(resolved_bin, cwd)]}),
+                )
+                .await
+                .is_ok();
             if ok {
                 if let Ok(result) = read_until_response(&mut reader, &mut stdin, 2, overall).await {
                     let mut seen: HashSet<String> = out.iter().map(|c| c.name.clone()).collect();
-                    if let Some(groups) = result.get("data").and_then(|v| v.as_array()) {
-                        for group in groups {
-                            let Some(skills) = group.get("skills").and_then(|v| v.as_array())
-                            else {
-                                continue;
-                            };
-                            for skill in skills {
-                                let Some(name) = skill
-                                    .get("name")
+                    for (name, _, skill) in available_codex_skills(&result) {
+                        if seen.insert(name.to_string()) {
+                            out.push(ExternalCliSlashCommand {
+                                slash: format!("/{name}"),
+                                name: name.to_string(),
+                                description: skill
+                                    .get("description")
                                     .and_then(|v| v.as_str())
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                else {
-                                    continue;
-                                };
-                                if seen.insert(name.to_string()) {
-                                    out.push(ExternalCliSlashCommand {
-                                        slash: format!("/{name}"),
-                                        name: name.to_string(),
-                                        description: skill
-                                            .get("description")
-                                            .and_then(|v| v.as_str())
-                                            .map(|d| d.trim().to_string())
-                                            .filter(|d| !d.is_empty()),
-                                        argument_hint: None,
-                                    });
-                                }
-                            }
+                                    .map(|d| d.trim().to_string())
+                                    .filter(|d| !d.is_empty()),
+                                argument_hint: None,
+                            });
                         }
                     }
                 }
@@ -2575,7 +3000,12 @@ pub fn spawn_codex_session_actor(
                             approvals.as_mut(),
                         )
                         .await;
+                    let closed = result.as_ref().err().is_some_and(|error| error == "closed");
                     let _ = done.send(result);
+                    if closed {
+                        session.close().await;
+                        return;
+                    }
                 }
                 // 轮次之间没有可注入的对象：回 false 让前端把这条留在队列里、
                 // 轮末按普通消息发出去（绝不静默吞掉）。
@@ -2599,6 +3029,164 @@ pub fn spawn_codex_session_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_slash_rewind_matches_the_exact_transformed_task() {
+        use crate::external_agents::session::NativeRewindPoint;
+        let native = vec!["$wizard 配置环境\n请用".into(), "later task".into()];
+        assert_eq!(
+            codex_rewind_point(&native, &["请用/wizard 配置环境".into(), "new task".into()]),
+            NativeRewindPoint::DropFrom(1)
+        );
+        assert_eq!(
+            codex_rewind_point(&native, &["请用/wizard 配置别的".into(), "new task".into()]),
+            NativeRewindPoint::Unmatched
+        );
+        assert_eq!(
+            codex_rewind_point(&native, &["请用/other 配置环境".into(), "new task".into()]),
+            NativeRewindPoint::Unmatched
+        );
+        assert_eq!(
+            codex_rewind_point(
+                &["$wizard 配置环境".into()],
+                &["/wizard配置环境".into(), "new task".into()]
+            ),
+            NativeRewindPoint::Aligned
+        );
+    }
+
+    // A real pipe peer exercises serialization and the production run_turn path
+    // without invoking a paid model or requiring an installed Codex binary.
+    #[test]
+    fn skill_slash_protocol_peer() {
+        let Ok(mode) = std::env::var("KIVIO_SKILL_PROTOCOL_PEER") else {
+            return;
+        };
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        let mut lines = stdin.lock().lines();
+        let list: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(list["method"], "skills/list");
+        assert_eq!(list["params"]["cwds"], json!(["/work"]));
+        println!(
+            "{}",
+            json!({"id":list["id"], "result":{"data":[{"skills":[{
+                "name":"wizard", "path":"/work/.agents/skills/wizard/SKILL.md", "enabled":mode == "enabled"
+            }]}]}})
+        );
+        std::io::stdout().flush().unwrap();
+        if mode == "enabled" {
+            let turn: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+            assert_eq!(turn["method"], "turn/start");
+            assert_eq!(
+                turn["params"]["input"],
+                json!([
+                    {"type":"text", "text":"$wizard 配置环境"},
+                    {"type":"skill", "name":"wizard", "path":"/work/.agents/skills/wizard/SKILL.md"}
+                ])
+            );
+            println!(
+                "{}",
+                json!({"method":"turn/completed", "params":{"turn":{"id":"turn-1", "status":"completed"}}})
+            );
+            std::io::stdout().flush().unwrap();
+        }
+        let finish: Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
+        assert_eq!(
+            finish["method"], "test/finish",
+            "unexpected turn sent after skill resolution"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_slash_runtime_resolves_before_dispatch_and_blocks_disabled_skills() {
+        for mode in ["enabled", "disabled"] {
+            let exe = std::env::current_exe().unwrap();
+            let mut child = tokio::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "external_agents::session::codex_app_server::tests::skill_slash_protocol_peer",
+                    "--nocapture",
+                ])
+                .env("KIVIO_SKILL_PROTOCOL_PEER", mode)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .no_console_window()
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut session = CodexAppServerSession {
+                stdin: child.stdin.take().unwrap(),
+                reader: BufReader::new(child.stdout.take().unwrap()).lines(),
+                stderr_tail: crate::external_agents::spawn::spawn_stderr_tail(child.stderr.take()),
+                child,
+                thread_id: "thread-1".into(),
+                cwd: "/work".into(),
+                cli_bin: exe,
+                next_id: 1,
+                emitted_tools: HashSet::new(),
+                active_turn_id: None,
+                approval_policy: "never",
+                sandbox_policy: json!({"type": "dangerFullAccess"}),
+                plan_mode: false,
+                thread_model: None,
+            };
+            let (events, _event_rx) = mpsc::channel(32);
+            let (_control_tx, mut control) = mpsc::channel(8);
+            let result = timeout(
+                Duration::from_secs(5),
+                session.run_turn(
+                    "/wizard配置环境",
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    &events,
+                    &mut control,
+                    None,
+                ),
+            )
+            .await
+            .expect("protocol exchange timed out");
+            if mode == "enabled" {
+                assert!(result.is_ok(), "{result:?}");
+            } else {
+                assert!(result.unwrap_err().contains("无法明确加载"));
+            }
+            write_rpc_notification(&mut session.stdin, "test/finish", json!({}))
+                .await
+                .unwrap();
+            let status = timeout(Duration::from_secs(5), session.child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(status.success(), "{}", session.stderr_tail.await.unwrap());
+        }
+    }
+
+    #[test]
+    fn codex_prompt_turns_keep_user_text_and_turn_ids() {
+        let page = json!({"data": [
+            {"id": "t1", "items": [
+                {"type": "userMessage", "id": "i1", "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "image", "url": "x"}
+                ]},
+                {"type": "agentMessage", "id": "i2", "text": "ok"}
+            ]},
+            {"id": "compact", "items": [{"type": "contextCompaction", "id": "i3"}]},
+            {"id": "t2", "items": [{"type": "userMessage", "id": "i4", "content": [{"type": "text", "text": "second"}]}]}
+        ], "nextCursor": null});
+        assert_eq!(
+            codex_prompt_turns(&page),
+            vec![
+                ("t1".to_string(), "first".to_string()),
+                ("t2".to_string(), "second".to_string())
+            ]
+        );
+        assert!(codex_prompt_turns(&json!({})).is_empty());
+    }
 
     #[test]
     fn production_codex_paths_do_not_use_the_binary_compatibility_launcher() {
@@ -2756,30 +3344,48 @@ mod tests {
     }
 
     #[test]
-    fn merge_uses_curated_four_like_cc_gui_not_raw_model_list() {
-        // Live model/list on this machine — 5 ids, no gpt-5.6-*. Must NOT dump these.
+    fn merge_uses_live_model_list_and_falls_back_to_curated() {
+        // Live 0.158 shape: GPT-6 family first, server default flagged.
         let runtime = parse_codex_model_list_result(&json!({
             "data": [
+                {"id": "gpt-6-sol", "displayName": "GPT-6-Sol"},
                 {
-                    "id": "gpt-5.5",
-                    "displayName": "GPT-5.5",
+                    "id": "gpt-6-astra",
+                    "displayName": "GPT-6-Astra",
                     "isDefault": true,
                     "supportedReasoningEfforts": [
                         {"reasoningEffort": "low", "description": "Fast"},
-                        {"reasoningEffort": "high", "description": "Deep"}
+                        {"reasoningEffort": "ultra", "description": "Deep"}
                     ]
                 },
-                {"id": "gpt-5.4", "displayName": "gpt-5.4"},
-                {"id": "gpt-5.4-mini", "displayName": "GPT-5.4-Mini"},
-                {"id": "gpt-5.3-codex", "displayName": "gpt-5.3-codex"},
-                {"id": "gpt-5.2", "displayName": "gpt-5.2"}
+                {"id": "gpt-5.6-sol", "displayName": "GPT-5.6-Sol"},
+                {"id": "gpt-5.4", "displayName": "gpt-5.4", "hidden": true}
             ]
         }))
         .unwrap();
 
-        let merged = merge_codex_model_catalog(runtime, Some("gpt-5.6-sol"));
-        // curated four (+ Auto)
+        let merged = merge_codex_model_catalog(runtime, Some("gpt-6-astra"));
         let ids: Vec<&str> = merged.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["default", "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol"]
+        );
+        assert_eq!(
+            merged.reasoning_by_model.get("gpt-6-astra").unwrap().len(),
+            2
+        );
+        assert_eq!(merged.reasoning_options.len(), 2);
+        // Listed without efforts: curated ladder fills in when the id is known.
+        assert!(merged
+            .reasoning_by_model
+            .get("gpt-5.6-sol")
+            .unwrap()
+            .iter()
+            .any(|e| e.id == "ultra"));
+        assert!(!merged.reasoning_by_model.contains_key("gpt-6-sol"));
+
+        let fallback = codex_static_fallback_probe();
+        let ids: Vec<&str> = fallback.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
@@ -2787,30 +3393,9 @@ mod tests {
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
-                "gpt-5.5",
+                "gpt-5.5"
             ]
         );
-        // runtime-only junk must not appear
-        assert!(!merged.models.iter().any(|m| m.id == "gpt-5.4"));
-        assert!(!merged.models.iter().any(|m| m.id == "gpt-5.2"));
-        // runtime enriches gpt-5.5 label + efforts
-        assert_eq!(
-            merged
-                .models
-                .iter()
-                .find(|m| m.id == "gpt-5.5")
-                .unwrap()
-                .label,
-            "GPT-5.5"
-        );
-        assert_eq!(merged.reasoning_by_model.get("gpt-5.5").unwrap().len(), 2);
-        // sol keeps curated ultra ladder
-        assert!(merged
-            .reasoning_by_model
-            .get("gpt-5.6-sol")
-            .unwrap()
-            .iter()
-            .any(|e| e.id == "ultra"));
     }
 
     #[test]
@@ -2846,9 +3431,124 @@ mod tests {
         assert_eq!(merged.models[0].id, "default");
         assert_eq!(merged.models[1].id, "my-custom-proxy-model");
         assert!(merged.models[1].label.contains("config"));
-        // still the curated four after the config inject
-        assert!(merged.models.iter().any(|m| m.id == "gpt-5.6-sol"));
         assert!(merged.models.iter().any(|m| m.id == "gpt-5.5"));
+    }
+
+    /// Real app-server policy transitions, with no model turns or user native sessions.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires an installed Codex app-server; offline, no model requests"]
+    async fn resumed_plan_enforces_read_only_then_restores_writable_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = which_codex().expect("codex on PATH");
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("codex-home");
+        let work = fixture.path().join("work");
+        let extra = fixture.path().join("extra");
+        for path in [&home, &work, &extra] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "sandbox_mode = \"workspace-write\"\n[sandbox_workspace_write]\nnetwork_access = true\nwritable_roots = [{}]\n",
+                serde_json::to_string(&extra.to_string_lossy()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let wrapper = fixture.path().join("codex");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport CODEX_HOME={}\nexec {} \"$@\"\n",
+                quote(&home),
+                quote(&bin),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let args = vec!["app-server".to_string()];
+        let mut writable = CodexAppServerSession::connect(
+            &wrapper, &args, &work, None, Some("workspace-write"), None,
+        )
+        .await
+        .unwrap();
+        let native_id = writable.thread_id().to_string();
+        let original_policy = writable.sandbox_policy.clone();
+        eprintln!("initial writable sandbox: {original_policy}");
+        assert_eq!(original_policy["type"], "workspaceWrite");
+        assert_eq!(original_policy["networkAccess"], true);
+        assert!(original_policy["writableRoots"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(extra)));
+        let native = writable.request("thread/read", json!({
+            "threadId": native_id, "includeTurns": false
+        })).await.unwrap();
+        let rollout = native["thread"]["path"].as_str().map(PathBuf::from).unwrap_or_else(|| {
+            home.join("sessions/2026/10/04").join(format!(
+                "rollout-2026-10-04T00-00-00-{native_id}.jsonl"
+            ))
+        });
+        writable.request("thread/unsubscribe", json!({"threadId": native_id})).await.unwrap();
+        writable.close().await;
+        // Empty threads need not flush a rollout until their first model turn. Seed only
+        // this isolated test home's metadata instead of paying for generation to persist it.
+        if !rollout.exists() {
+            std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+            std::fs::write(&rollout, format!("{}\n", json!({
+                "timestamp": "2026-10-04T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": native_id, "timestamp": "2026-10-04T00:00:00.000Z",
+                    "cwd": work, "originator": "kivio-offline-regression",
+                    "cli_version": "0.158.0", "source": "cli", "model_provider": "openai"
+                }
+            }))).unwrap();
+        }
+
+        let mut plan = CodexAppServerSession::connect(
+            &wrapper, &args, &work, None, Some(CODEX_PLAN_MODE), Some(&native_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.thread_id(), native_id);
+        // Ask the loaded server, not just the adapter's cached policy.
+        let active = plan.request("thread/resume", json!({"threadId": native_id, "excludeTurns": true})).await.unwrap();
+        eprintln!("resumed plan sandbox: {}", active["sandbox"]);
+        assert_eq!(active["sandbox"]["type"], "readOnly");
+        let turn = build_codex_turn_params(
+            &native_id, &plan.cwd, vec![], None, None, &[], plan.approval_policy,
+            &plan.sandbox_policy,
+        );
+        // Apply precisely the turn's policy through the offline settings API. Both APIs
+        // update the same sticky thread policy, without starting an inference request.
+        plan.request("thread/settings/update", json!({
+            "threadId": native_id, "sandboxPolicy": turn["sandboxPolicy"]
+        })).await.unwrap();
+        plan.request("thread/unsubscribe", json!({"threadId": native_id})).await.unwrap();
+        plan.close().await;
+
+        for tier in ["workspace-write", "danger-full-access"] {
+            let mut resumed = CodexAppServerSession::connect(
+                &wrapper, &args, &work, None, Some(tier), Some(&native_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.thread_id(), native_id);
+            let active = resumed.request("thread/resume", json!({"threadId": native_id, "excludeTurns": true})).await.unwrap();
+            eprintln!("resumed {tier} sandbox: {}", active["sandbox"]);
+            if tier == "workspace-write" {
+                assert_eq!(active["sandbox"], original_policy);
+                assert_eq!(resumed.sandbox_policy, original_policy);
+            } else {
+                assert_eq!(active["sandbox"]["type"], "dangerFullAccess");
+            }
+            resumed.request("thread/unsubscribe", json!({"threadId": native_id})).await.unwrap();
+            resumed.close().await;
+        }
     }
 
     /// Live cross-turn continuity: connect once, run two turns on the SAME process, and confirm
@@ -3603,6 +4303,7 @@ mod tests {
             Some("high"),
             &[],
             "on-request",
+            &json!({"type": "workspaceWrite", "networkAccess": true}),
         );
         assert_eq!(params["threadId"], json!("thread-1"));
         assert_eq!(params["model"], json!("gpt-5.3-codex"));
@@ -3611,40 +4312,61 @@ mod tests {
     }
 
     #[test]
-    fn build_codex_turn_params_omits_defaults() {
+    fn codex_skill_slash_sends_explicit_input_with_the_discovered_path() {
+        let catalog = json!({"data": [{"skills": [
+            {"name": "wizard", "path": "/work/.agents/skills/wizard/SKILL.md", "enabled": true}
+        ]}]});
+        let input = codex_skill_input("/wizard 帮我配置环境", &catalog).unwrap();
         let params = build_codex_turn_params(
             "thread-1",
             "/work",
-            vec![json!({ "type": "text", "text": "hi" })],
+            input,
             None,
             None,
             &[],
             "on-request",
+            &json!({"type": "workspaceWrite", "networkAccess": true}),
         );
-        assert!(params.get("model").is_none());
-        assert!(params.get("effort").is_none());
-        assert!(params.get("sandboxPolicy").is_none());
-        assert!(params.get("sandbox").is_none());
-        assert!(params.get("runtimeWorkspaceRoots").is_none());
+        assert_eq!(
+            params["input"],
+            json!([
+                {"type": "text", "text": "$wizard 帮我配置环境"},
+                {"type": "skill", "name": "wizard", "path": "/work/.agents/skills/wizard/SKILL.md"}
+            ])
+        );
     }
 
     #[test]
-    fn build_codex_turn_params_adds_writable_roots_without_sandbox_string() {
-        let params = build_codex_turn_params(
-            "thread-1",
-            "/work",
-            vec![json!({ "type": "text", "text": "hi" })],
-            None,
-            None,
-            &["/tmp/attach".to_string()],
-            "on-request",
-        );
-        assert_eq!(
-            params["runtimeWorkspaceRoots"],
-            json!(["/work", "/tmp/attach"]),
-        );
-        assert!(params.get("sandboxPolicy").is_none());
-        assert!(params.get("sandbox").is_none());
+    fn codex_skill_slash_fails_closed_for_missing_disabled_or_ambiguous_skills() {
+        for skills in [
+            json!([]),
+            json!([{"name":"wizard", "path":"/skill/SKILL.md", "enabled":false}]),
+            json!([{"name":"wizard", "enabled":true}]),
+            json!([
+                {"name":"wizard", "path":"/a/SKILL.md", "enabled":true},
+                {"name":"wizard", "path":"/b/SKILL.md", "enabled":true}
+            ]),
+        ] {
+            assert!(
+                codex_skill_input("/wizard task", &json!({"data":[{"skills":skills}]})).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_skill_slash_keeps_ordinary_prompts_and_builtins_as_text() {
+        for prompt in [
+            "normal task",
+            "/compact",
+            "`/wizard`",
+            "/wizard/file",
+            "https://host/wizard",
+        ] {
+            assert_eq!(
+                codex_skill_input(prompt, &json!({})).unwrap(),
+                vec![json!({"type":"text", "text":prompt})]
+            );
+        }
     }
 
     #[test]
@@ -3675,7 +4397,7 @@ mod tests {
             Some("thr_1"),
         );
         assert_eq!(method, "thread/resume");
-        assert_eq!(params, json!({ "threadId": "thr_1" }));
+        assert_eq!(params, json!({ "threadId": "thr_1", "excludeTurns": true }));
     }
 
     #[test]
@@ -3745,6 +4467,142 @@ mod tests {
         assert_eq!(
             unknown_server_request_result(),
             json!({ "decision": "decline" })
+        );
+    }
+
+    #[test]
+    fn write_stdin_approval_is_its_own_tool_and_honors_available_decisions() {
+        let params = json!({
+            "kind": "writeStdin",
+            "command": "write_stdin --session-id 3 y",
+            "availableDecisions": ["accept", "cancel"]
+        });
+        let ask =
+            approval_ask_from_params("item/commandExecution/requestApproval", &json!(7), &params);
+        assert_eq!(ask.tool_name, "write_stdin");
+        assert_eq!(
+            approval_response("item/commandExecution/requestApproval", &params),
+            Some(json!({ "decision": "accept" }))
+        );
+        // Older servers / ordinary commands keep the session-wide grant.
+        let command = json!({ "command": "ls", "availableDecisions": ["accept", "acceptForSession", "cancel"] });
+        assert_eq!(
+            approval_ask_from_params("item/commandExecution/requestApproval", &json!(8), &command)
+                .tool_name,
+            "Bash"
+        );
+        assert_eq!(
+            approval_response("item/commandExecution/requestApproval", &command),
+            Some(json!({ "decision": "acceptForSession" }))
+        );
+        assert_eq!(
+            approval_response("item/commandExecution/requestApproval", &json!({})),
+            Some(json!({ "decision": "acceptForSession" }))
+        );
+    }
+
+    #[test]
+    fn reached_rate_limit_names_the_reset_time() {
+        let later = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3 * 3600
+            + 600;
+        let mut events = Vec::new();
+        map_codex_notification(
+            "account/rateLimits/updated",
+            &json!({"rateLimits": {
+                "rateLimitReachedType": "rate_limit_reached",
+                "primary": {"usedPercent": 40, "resetsAt": 1},
+                "secondary": {"usedPercent": 100, "resetsAt": later}
+            }}),
+            &mut HashSet::new(),
+            &mut |e| events.push(e),
+        );
+        match events.as_slice() {
+            [UnifiedAgentEvent::StatusNote { text }] => {
+                assert!(
+                    text.starts_with("usage limit reached · resets in 3h"),
+                    "{text}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            codex_rate_limit_reached_note(&json!({"rateLimits": {"primary": {"usedPercent": 99}}})),
+            None
+        );
+    }
+
+    #[test]
+    fn collaboration_mode_explicitly_leaves_plan() {
+        assert_eq!(
+            codex_collaboration_mode(true, Some("gpt-6-astra"), Some("high")),
+            Some(json!({"mode": "plan", "settings": {
+                "model": "gpt-6-astra", "reasoning_effort": "high", "developer_instructions": null
+            }}))
+        );
+        // 不在计划档也显式发 default，免得线程上的计划模式粘着不退。
+        assert_eq!(
+            codex_collaboration_mode(false, Some("gpt-6-astra"), None).unwrap()["mode"],
+            "default"
+        );
+        assert_eq!(codex_collaboration_mode(true, None, None), None);
+    }
+
+    #[test]
+    fn review_result_and_config_warnings_are_surfaced() {
+        let mut events = Vec::new();
+        let mut seen = HashSet::new();
+        map_codex_notification(
+            "item/completed",
+            &json!({"item": {"type": "exitedReviewMode", "id": "r1", "review": "No issues found."}}),
+            &mut seen,
+            &mut |e| events.push(e),
+        );
+        map_codex_notification(
+            "configWarning",
+            &json!({"summary": "Unknown key `foo`", "path": "/h/.codex/config.toml"}),
+            &mut seen,
+            &mut |e| events.push(e),
+        );
+        match events.as_slice() {
+            [UnifiedAgentEvent::TextDelta { delta }, UnifiedAgentEvent::StatusNote { text }] => {
+                assert!(delta.contains("No issues found."));
+                assert_eq!(text, "Unknown key `foo` · /h/.codex/config.toml");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn proposed_plan_item_is_rendered_as_answer_text() {
+        let mut events = Vec::new();
+        let mut seen = HashSet::new();
+        for _ in 0..2 {
+            map_codex_notification(
+                "item/completed",
+                &json!({"item": {"type": "plan", "id": "p1", "text": "# Plan\n1. Do it"}}),
+                &mut seen,
+                &mut |e| events.push(e),
+            );
+        }
+        match events.as_slice() {
+            [UnifiedAgentEvent::TextDelta { delta }] => assert!(delta.contains("# Plan")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_interrupt_carries_required_turn_id() {
+        assert_eq!(
+            turn_interrupt_params("th_1", Some("turn_7")),
+            json!({ "threadId": "th_1", "turnId": "turn_7" })
+        );
+        assert_eq!(
+            turn_interrupt_params("th_1", None),
+            json!({ "threadId": "th_1" })
         );
     }
 

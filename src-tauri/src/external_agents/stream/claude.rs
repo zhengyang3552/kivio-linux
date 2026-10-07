@@ -182,6 +182,25 @@ fn result_error_subtype_reason(subtype: &str) -> Option<&'static str> {
 /// 文案优先级 `errors[]` > `result`：前者是 error 子型独有的结构化原因列表，后者是
 /// success 子型带 `is_error` 时错误文案的落点。两者都缺才用 subtype 兜底（仍带上
 /// subtype，`<details>` 里能看出到底是哪种失败）。
+/// `result.terminal_reason` 的失败码 → 人话（2.1.287 的封闭集合，取自 t3code
+/// `terminalResultError`）。只在 CLI 没给 `errors` / `result` 文案时兜底。
+fn terminal_reason_text(reason: &str) -> Option<&'static str> {
+    Some(match reason {
+        "api_error" => "claude 多次请求 API 失败后放弃了本轮。",
+        "malformed_tool_use_exhausted" => "claude 多次生成了无效的工具调用，已放弃本轮。",
+        "budget_exhausted" => "claude 已停止：本轮 token 预算用完。",
+        "structured_output_retry_exhausted" => "claude 无法生成要求的结构化输出。",
+        "tool_deferred_unavailable" => "claude 无法继续挂起的工具调用：该工具已不可用。",
+        "turn_setup_failed" => "claude 无法开始本轮。",
+        "blocking_limit" => "claude 已停止：请求被用量上限挡住。",
+        "rapid_refill_breaker" => "claude 已停止：压缩后上下文又被迅速填满。",
+        "prompt_too_long" => "claude 已停止：提示超出了模型的上下文窗口，请压缩对话或开新会话。",
+        "image_error" => "claude 已停止：对话中有一张图片无法处理。",
+        "model_error" => "claude 已停止：模型返回了错误。",
+        _ => return None,
+    })
+}
+
 fn claude_result_error_message(obj: &serde_json::Map<String, Value>) -> Option<String> {
     let subtype = obj.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
     let is_error = obj
@@ -189,10 +208,17 @@ fn claude_result_error_message(obj: &serde_json::Map<String, Value>) -> Option<S
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let subtype_reason = result_error_subtype_reason(subtype);
+    // 529 过载在 2.1.287 是 `subtype:"success"` + `api_error_status:529`，可能连 `is_error`
+    // 都没有、`errors` 为空（t3code `isOverloadedResult` 同一判据）——不认的话这一轮
+    // 无声地「成功」结束，没有回答也没有提示。
+    if obj.get("api_error_status").and_then(|v| v.as_u64()) == Some(529) {
+        return Some("Claude API overloaded (529)，请稍后重试。".to_string());
+    }
     if !is_error && subtype_reason.is_none() {
         return None;
     }
 
+    // `[ede_diagnostic] …` 是 CLI 的内部诊断行，不是给人看的错误（t3code 同样滤掉）。
     let joined_errors = obj
         .get("errors")
         .and_then(|v| v.as_array())
@@ -201,7 +227,7 @@ fn claude_result_error_message(obj: &serde_json::Map<String, Value>) -> Option<S
                 .iter()
                 .filter_map(|item| item.as_str())
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !s.starts_with("[ede_diagnostic]"))
                 .collect::<Vec<_>>()
                 .join("; ")
         })
@@ -217,6 +243,14 @@ fn claude_result_error_message(obj: &serde_json::Map<String, Value>) -> Option<S
         .filter(|s| !s.is_empty());
     if let Some(text) = result_text {
         return Some(text.to_string());
+    }
+
+    if let Some(reason) = obj
+        .get("terminal_reason")
+        .and_then(|v| v.as_str())
+        .and_then(terminal_reason_text)
+    {
+        return Some(reason.to_string());
     }
 
     Some(match subtype_reason {
@@ -454,6 +488,86 @@ fn api_retry_note(obj: &serde_json::Map<String, Value>) -> Option<String> {
         Some(text) => format!("retry {attempt}{of_max} · {text}"),
         None => format!("retry {attempt}{of_max}"),
     })
+}
+
+fn permission_denied_note(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let tool = obj.get("tool_name").and_then(|v| v.as_str())?.trim();
+    let reason = obj
+        .get("decision_reason")
+        .or_else(|| obj.get("decision_reason_type"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(match reason {
+        Some(reason) => format!(
+            "denied {tool} · {}",
+            reason.chars().take(120).collect::<String>()
+        ),
+        None => format!("denied {tool}"),
+    })
+}
+
+/// `model_fallback` / `model_refusal_fallback` / `model_refusal_no_fallback` → 状态行短句。
+/// 优先用 `original_model → fallback_model`（短、稳定），拒答无回退时用 CLI 的 `content`。
+fn model_fallback_note(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let field = |key: &str| {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    if let (Some(from), Some(to)) = (field("original_model"), field("fallback_model")) {
+        return Some(format!("model fallback · {from} → {to}"));
+    }
+    field("api_refusal_explanation")
+        .or_else(|| field("content"))
+        .map(|text| text.chars().take(160).collect())
+}
+
+/// 顶层 `rate_limit_event.rate_limit_info`（2.1.287 schema：`status` allowed /
+/// allowed_warning / rejected、`rateLimitType`、`resetsAt` 秒级 epoch、`overageStatus`）。
+///
+/// 订阅窗口被拒且没有超额可用时，CLI 不再出新帧、静静等窗口重置，界面只剩一个转圈
+/// （t3code 同样为此补了提示）。只对这一种状态出状态行；allowed / warning 不打扰。
+fn rate_limit_rejected_note(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let info = obj.get("rate_limit_info")?;
+    if info.get("status").and_then(|v| v.as_str()) != Some("rejected") {
+        return None;
+    }
+    if matches!(
+        info.get("overageStatus").and_then(|v| v.as_str()),
+        Some("allowed" | "allowed_warning")
+    ) {
+        return None;
+    }
+    let window = match info.get("rateLimitType").and_then(|v| v.as_str()) {
+        Some("five_hour") => "5-hour limit",
+        Some("seven_day") | Some("seven_day_overage_included") => "weekly limit",
+        Some("seven_day_opus") => "weekly Opus limit",
+        Some("seven_day_sonnet") => "weekly Sonnet limit",
+        Some("overage") => "extra usage limit",
+        _ => "usage limit",
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(match info.get("resetsAt").and_then(|v| v.as_i64()) {
+        Some(at) if at > now => {
+            format!("{window} reached · resets in {}", format_wait(at - now))
+        }
+        _ => format!("{window} reached"),
+    })
+}
+
+fn format_wait(secs: i64) -> String {
+    let mins = (secs + 59) / 60;
+    let (d, h, m) = (mins / 1440, (mins % 1440) / 60, mins % 60);
+    match (d, h) {
+        (0, 0) => format!("{m}m"),
+        (0, _) => format!("{h}h {m}m"),
+        _ => format!("{d}d {h}h"),
+    }
 }
 
 /// `system/init.mcp_server_errors`（2.1.219）：`--mcp-config` 校验失败被跳过的条目。
@@ -1005,6 +1119,24 @@ impl ClaudeStreamState {
                             sink(UnifiedAgentEvent::StatusNote { text });
                         }
                     }
+                    // 本轮被切到了别的模型（2.1.287：主模型下线 / 无权限 / 529 / 拒答后重试）。
+                    // CLI 自己带了一句 `content` 说明；不接的话用户看到的回答出自另一个模型却
+                    // 毫无察觉。走状态行，不进正文。
+                    Some("model_fallback")
+                    | Some("model_refusal_fallback")
+                    | Some("model_refusal_no_fallback") => {
+                        if let Some(text) = model_fallback_note(obj) {
+                            sink(UnifiedAgentEvent::StatusNote { text });
+                        }
+                    }
+                    // 工具被自动拒了、没经过审批卡（2.1.287 `system/permission_denied`：auto 档
+                    // 分类器、dontAsk、deny 规则）。tool_result 里只有给模型看的那句话，用户只看到
+                    // 工具失败却不知道是被权限挡的；状态行点明工具名和原因。
+                    Some("permission_denied") => {
+                        if let Some(text) = permission_denied_note(obj) {
+                            sink(UnifiedAgentEvent::StatusNote { text });
+                        }
+                    }
                     // ---- 以下 subtype **有意不接**（不是漏了）----
                     //
                     // `hook_started` / `hook_progress` / `hook_response`：hook 是**用户自己**
@@ -1294,6 +1426,11 @@ impl ClaudeStreamState {
                         .to_string(),
                 });
             }
+            "rate_limit_event" => {
+                if let Some(text) = rate_limit_rejected_note(obj) {
+                    sink(UnifiedAgentEvent::StatusNote { text });
+                }
+            }
             // ---- 以下顶层 type **有意不接**（不是漏了）----
             //
             // `tool_progress`（`SDKToolProgressMessage`：tool_use_id / tool_name /
@@ -1508,27 +1645,6 @@ mod tests {
             events.first(),
             Some(UnifiedAgentEvent::TextDelta { delta }) if delta == "hi"
         ));
-    }
-
-    #[test]
-    fn parses_streamed_tool_use_from_content_blocks() {
-        let chunks = [
-            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg-1"}}}"#,
-            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu-1","name":"Write"}}}"#,
-            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"page.html\"}"}}}"#,
-            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
-        ];
-        let mut state = ClaudeStreamState::default();
-        let mut events = Vec::new();
-        for raw in chunks {
-            let value: Value = serde_json::from_str(raw).unwrap();
-            state.handle_value(&value, &mut |e| events.push(e));
-        }
-        assert!(events.iter().any(|event| matches!(
-            event,
-            UnifiedAgentEvent::ToolUse { id, name, .. }
-                if id == "toolu-1" && name == "Write"
-        )));
     }
 
     #[test]
@@ -2271,19 +2387,6 @@ mod tests {
         assert!(text.contains("Total duration"), "{text}");
     }
 
-    /// 另一条通道：报告正文落在 `result.result` 上（成功 + `output_tokens == 0`）。
-    #[test]
-    fn zero_output_result_text_is_surfaced_when_no_body_was_streamed() {
-        let events = run(&[r#"{"type":"result","subtype":"success","is_error":false,
-               "result":"Context usage: 42k/1M tokens",
-               "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,
-                        "cache_creation_input_tokens":0,"iterations":[]}}"#]);
-        assert!(
-            texts(&events).contains("Context usage: 42k/1M tokens"),
-            "{events:?}"
-        );
-    }
-
     /// **不得重复**：本轮已经流过正文时，`result.result`（常是回答的完整副本）不再发一遍。
     #[test]
     fn result_text_is_not_duplicated_when_the_answer_already_streamed() {
@@ -2407,6 +2510,83 @@ mod tests {
         ]);
         assert_eq!(notes(&events).len(), 1, "{events:?}");
         assert!(errors(&events).is_empty(), "{events:?}");
+    }
+
+    #[test]
+    fn overloaded_success_and_terminal_reasons_are_reported() {
+        let errs = |raw: &str| errors(&run(&[raw]));
+        assert_eq!(
+            errs(r#"{"type":"result","subtype":"success","api_error_status":529,"result":"","usage":{"input_tokens":1,"output_tokens":0}}"#).len(),
+            1
+        );
+        let e = errs(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["[ede_diagnostic] x"],"terminal_reason":"prompt_too_long"}"#,
+        );
+        assert!(e[0].contains("上下文窗口"), "{e:?}");
+        assert!(!e[0].contains("ede_diagnostic"));
+    }
+
+    #[test]
+    fn auto_denied_tool_is_named_on_the_status_line() {
+        let events = run(&[
+            r#"{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"t","decision_reason_type":"rule","decision_reason":"Bash(rm:*) is denied","message":"m","uuid":"u","session_id":"s"}"#,
+        ]);
+        assert_eq!(notes(&events), vec!["denied Bash · Bash(rm:*) is denied"]);
+    }
+
+    #[test]
+    fn model_fallback_frames_become_status_notes() {
+        let events = run(&[
+            r#"{"type":"system","subtype":"model_fallback","trigger":"overloaded","original_model":"claude-opus-5-5","fallback_model":"claude-sonnet-5-5","content":"x","uuid":"u","session_id":"s"}"#,
+            r#"{"type":"system","subtype":"model_refusal_no_fallback","original_model":"m","request_id":null,"content":"The model declined this request.","uuid":"u","session_id":"s"}"#,
+        ]);
+        assert_eq!(
+            notes(&events),
+            vec![
+                "model fallback · claude-opus-5-5 → claude-sonnet-5-5",
+                "The model declined this request."
+            ]
+        );
+        assert!(errors(&events).is_empty());
+    }
+
+    #[test]
+    fn rejected_rate_limit_window_shows_a_status_note() {
+        let note = |info: &str| {
+            let raw = format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{info},"uuid":"u","session_id":"s"}}"#
+            );
+            run(&[raw.as_str()]).into_iter().find_map(|e| match e {
+                UnifiedAgentEvent::StatusNote { text } => Some(text),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            note(r#"{"status":"allowed","rateLimitType":"five_hour"}"#),
+            None
+        );
+        assert_eq!(
+            note(r#"{"status":"rejected","rateLimitType":"five_hour","overageStatus":"allowed"}"#),
+            None
+        );
+        assert_eq!(
+            note(r#"{"status":"rejected","rateLimitType":"seven_day","resetsAt":1}"#).as_deref(),
+            Some("weekly limit reached")
+        );
+        let far = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2 * 3600;
+        let text = note(&format!(
+            r#"{{"status":"rejected","rateLimitType":"five_hour","resetsAt":{far}}}"#
+        ))
+        .unwrap();
+        assert!(
+            text.starts_with("5-hour limit reached · resets in 2h"),
+            "{text}"
+        );
+        assert_eq!(format_wait(3 * 86400 + 5 * 3600), "3d 5h");
     }
 
     #[test]

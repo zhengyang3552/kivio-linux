@@ -291,6 +291,7 @@ impl ToolExecutor for WorkflowToolExecutor {
                 tool_call_id: Some(ctx.tool_call_id.to_string()),
                 run_id: ctx.run_id.to_string(),
                 generation: ctx.generation,
+                round: ctx.round,
                 depth: ctx.depth,
             };
             crate::mcp::registry::call_tool(
@@ -489,7 +490,6 @@ async fn run_builtin_agent_node(
         None,
         None,
         None,
-        None,
         workdir_str.as_deref(),
         None,
         obsidian_vault_path,
@@ -549,6 +549,7 @@ async fn run_builtin_agent_node(
         initial_anchor_total_tokens: None,
         initial_anchor_trailing_estimate: 0,
         skill_project_cwd: workdir,
+        todo_state: Default::default(),
     };
 
     let outcome = run_agent_loop(config, &host, &executor).await;

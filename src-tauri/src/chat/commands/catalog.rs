@@ -171,6 +171,189 @@ pub(crate) async fn chat_get_conversation(
     }))
 }
 
+/// Return a bounded first-paint window and a compact turn directory. The
+/// repository remains authoritative; edits and sends still use full snapshots.
+#[tauri::command]
+pub(crate) async fn chat_get_conversation_window(
+    app: AppHandle,
+    conversation_id: String,
+) -> Result<serde_json::Value, String> {
+    let started = std::time::Instant::now();
+    let repository = crate::chat::repository::repository(&app);
+    let mut conversation = match repository
+        .externalize_stored_images(&app, &conversation_id)
+        .await
+    {
+        Ok(conversation) => conversation,
+        Err(_) => repository
+            .get(&app, &conversation_id)
+            .await
+            .map_err(crate::chat::repository::repository_error)?,
+    };
+    let read_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    reconcile_conversation_orphan_tool_segments(&mut conversation);
+    strip_transcripts_for_frontend(&mut conversation);
+    let total = conversation.messages.len();
+    let start = history_window_start(&conversation.messages, total);
+    let directory = conversation_history_directory(&conversation);
+    let history_artifacts =
+        crate::chat::artifacts::history_reference_artifacts(&conversation.messages, start..total);
+    conversation.messages = conversation.messages.split_off(start);
+    Ok(serde_json::json!({
+        "success": true,
+        "conversation": conversation,
+        "history_start": start,
+        "history_total": total,
+        "history_directory": directory,
+        "history_artifacts": history_artifacts,
+        "read_ms": read_ms,
+        "prepare_ms": started.elapsed().as_secs_f64() * 1_000.0 - read_ms,
+    }))
+}
+
+pub(super) fn conversation_history_directory(conversation: &Conversation) -> Vec<Value> {
+    let mut directory = Vec::new();
+    let message_indices: std::collections::HashMap<&str, usize> = conversation
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id.as_str(), index))
+        .collect();
+    for (index, message) in conversation.messages.iter().enumerate() {
+        if message.role != "user" {
+            continue;
+        }
+        directory.push(serde_json::json!({
+            "kind": "turn",
+            "id": format!("turn-{}", message.id),
+            "message_id": message.id,
+            "message_index": index,
+            "title": message.content.chars().take(120).collect::<String>(),
+        }));
+    }
+    for record in &conversation.context_state.compaction_boundaries {
+        let anchor = record
+            .display_after_message_id
+            .as_deref()
+            .filter(|anchor| message_indices.contains_key(*anchor))
+            .unwrap_or(&record.source_until_message_id);
+        let Some(&index) = message_indices.get(anchor) else {
+            continue;
+        };
+        directory.push(serde_json::json!({
+            "kind": "compaction",
+            "id": format!("compaction-{}", record.id),
+            "message_id": anchor,
+            "message_index": index,
+            "title": "已压缩此前上下文",
+            "answer_preview": record.summary_content.chars().take(120).collect::<String>(),
+        }));
+    }
+    if conversation.context_state.compaction_boundaries.is_empty() {
+        if let Some(summary) = conversation
+            .context_state
+            .summary
+            .as_ref()
+            .filter(|summary| !summary.stale)
+        {
+            if let Some(&index) = message_indices.get(summary.source_until_message_id.as_str()) {
+                directory.push(serde_json::json!({
+                    "kind": "compaction",
+                    "id": format!("compaction-{}", summary.id),
+                    "message_id": summary.source_until_message_id,
+                    "message_index": index,
+                    "title": "已压缩此前上下文",
+                    "answer_preview": summary.content.chars().take(120).collect::<String>(),
+                }));
+            }
+        }
+    }
+    for record in &conversation.context_state.clear_boundaries {
+        let Some(&index) = message_indices.get(record.source_until_message_id.as_str()) else {
+            continue;
+        };
+        directory.push(serde_json::json!({
+            "kind": "clear",
+            "id": format!("clear-{}", record.id),
+            "message_id": record.source_until_message_id,
+            "message_index": index,
+            "title": "清空上下文",
+        }));
+    }
+    directory.sort_by_key(|entry| entry["message_index"].as_u64().unwrap_or(u64::MAX));
+    directory
+}
+
+/// Older pages are admitted only by the renderer when revision still matches.
+#[tauri::command]
+pub(crate) async fn chat_get_conversation_page(
+    app: AppHandle,
+    conversation_id: String,
+    before: usize,
+) -> Result<serde_json::Value, String> {
+    let mut conversation = crate::chat::repository::repository(&app)
+        .get(&app, &conversation_id)
+        .await
+        .map_err(crate::chat::repository::repository_error)?;
+    reconcile_conversation_orphan_tool_segments(&mut conversation);
+    strip_transcripts_for_frontend(&mut conversation);
+    let total = conversation.messages.len();
+    let end = before.min(total);
+    let start = history_window_start(&conversation.messages, end);
+    Ok(serde_json::json!({
+        "success": true,
+        "revision": conversation.revision,
+        "start": start,
+        "end": end,
+        "total": total,
+        "messages": &conversation.messages[start..end],
+        "history_artifacts": crate::chat::artifacts::history_reference_artifacts(&conversation.messages, start..end),
+    }))
+}
+
+pub(super) fn history_window_start(messages: &[crate::chat::ChatMessage], end: usize) -> usize {
+    let mut start = end;
+    let mut bytes: usize = 0;
+    while start > end.saturating_sub(60) {
+        let size = serde_json::to_vec(&messages[start - 1]).map_or(usize::MAX, |data| data.len());
+        // Always include one message. A single large message remains intact;
+        // its process details are progressively disclosed by the renderer.
+        if start < end && bytes.saturating_add(size) > 512 * 1024 {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        start -= 1;
+    }
+    if start == 0 || start >= end {
+        return start;
+    }
+    // Keep the first visible multi-answer arm with its siblings and user
+    // message. The extra allowance stays bounded even for corrupt old groups.
+    if messages[start].role == "assistant" {
+        if let Some(group) = messages[start].group_id.as_deref() {
+            let group_floor = start.saturating_sub(4);
+            while start > group_floor && messages[start - 1].group_id.as_deref() == Some(group) {
+                start -= 1;
+            }
+        }
+        if start > 0 && messages[start].role == "assistant" && messages[start - 1].role == "user" {
+            start -= 1;
+        }
+    }
+    start
+}
+
+#[tauri::command]
+pub(crate) async fn chat_get_conversation_revision(
+    app: AppHandle,
+    conversation_id: String,
+) -> Result<Option<u64>, String> {
+    crate::chat::repository::repository(&app)
+        .revision(&app, &conversation_id)
+        .await
+        .map_err(crate::chat::repository::repository_error)
+}
+
 /// 读取时对账(只读、不写盘):对每条 assistant 消息补齐孤立工具分段为中断态记录,
 /// 使**存量**坏会话(改动前落库、含「有分段无记录」的消息)打开即正常显示,而不必等
 /// 该消息被重新落库自愈。必须在 [`strip_transcripts_for_frontend`] **之前**跑——它会清空
@@ -201,6 +384,9 @@ pub(super) fn reconcile_conversation_orphan_tool_segments(conversation: &mut Con
 /// 所必需的（见 commit 9d247b0），**绝不剥**。仅剥已完成的 assistant 消息（至多保留最后
 /// 一条中断草稿的转录，体积有界）。
 pub(crate) fn strip_transcripts_for_frontend(conversation: &mut Conversation) {
+    if let Some(summary) = &mut conversation.context_state.summary {
+        summary.replay = None;
+    }
     for message in conversation.messages.iter_mut() {
         if message.role != "assistant" {
             continue;
@@ -293,6 +479,7 @@ pub(crate) async fn chat_create_conversation(
         project_id,
         set_id,
         assistant_id,
+        true,
     )
     .await?;
 
@@ -302,6 +489,10 @@ pub(crate) async fn chat_create_conversation(
     }))
 }
 
+/// `reuse_blank`: hand back a matching untouched blank conversation instead of
+/// creating another one (UI "new chat"). Background creators that must own a
+/// fresh conversation pass false.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_chat_conversation_internal(
     app: &AppHandle,
     state: &AppState,
@@ -311,6 +502,7 @@ pub(crate) async fn create_chat_conversation_internal(
     project_id: Option<String>,
     set_id: Option<String>,
     assistant_id: Option<String>,
+    reuse_blank: bool,
 ) -> Result<Conversation, String> {
     let settings = state.settings_read().clone();
     let set_id = set_id.and_then(non_empty_string);
@@ -391,19 +583,23 @@ pub(crate) async fn create_chat_conversation_internal(
 
     let conversation = {
         let _create_guard = state.chat_runtime().lock_conversation_creation().await;
-        if let Some(conversation) = crate::chat::repository::repository(app)
-            .find_reusable_blank(
-                app,
-                &provider_id,
-                &model,
-                folder.as_deref(),
-                project_id.as_deref(),
-                set_id.as_deref(),
-                assistant_id_for_reuse.as_deref(),
-            )
-            .await
-            .map_err(crate::chat::repository::repository_error)?
-        {
+        let reusable = if reuse_blank {
+            crate::chat::repository::repository(app)
+                .find_reusable_blank(
+                    app,
+                    &provider_id,
+                    &model,
+                    folder.as_deref(),
+                    project_id.as_deref(),
+                    set_id.as_deref(),
+                    assistant_id_for_reuse.as_deref(),
+                )
+                .await
+                .map_err(crate::chat::repository::repository_error)?
+        } else {
+            None
+        };
+        if let Some(conversation) = reusable {
             conversation
         } else {
             let now = chrono::Local::now().timestamp();
@@ -484,6 +680,7 @@ pub(crate) async fn chat_import_external_conversation(
         project_id,
         None,
         None,
+        true,
     )
     .await?;
     // create 可能复用了一个空白会话；这里清空以确保从干净状态写入历史。

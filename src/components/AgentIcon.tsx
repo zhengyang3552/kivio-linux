@@ -4,7 +4,6 @@ import Antigravity from '@lobehub/icons/es/Antigravity/components/Color'
 const ICON_EXT: Record<string, 'svg'> = {
   claude: 'svg',
   codex: 'svg',
-  'cursor-agent': 'svg',
   opencode: 'svg',
   gemini: 'svg',
   kimi: 'svg',
@@ -14,7 +13,7 @@ const ICON_EXT: Record<string, 'svg'> = {
   dsh: 'svg',
 }
 
-const MONO_ICONS = new Set(['codex', 'cursor-agent', 'opencode', 'hermes', 'grok'])
+const MONO_ICONS = new Set(['codex', 'opencode', 'hermes', 'grok'])
 
 interface AgentIconProps {
   id: string
@@ -58,7 +57,7 @@ export function AgentIcon({ id, size = 20, className }: AgentIconProps) {
   }
   return (
     <span
-      className={`${cls} inline-flex items-center justify-center rounded-md bg-neutral-200 text-[10px] font-semibold uppercase text-neutral-600 dark:bg-neutral-700 dark:text-neutral-300`}
+      className={`${cls} inline-flex items-center justify-center rounded-md bg-neutral-200 text-[10px] font-semibold uppercase text-neutral-600`}
       style={{ width: size, height: size }}
       aria-hidden="true"
     >

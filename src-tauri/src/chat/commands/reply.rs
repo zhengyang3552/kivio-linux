@@ -572,16 +572,21 @@ pub(super) async fn complete_assistant_reply_inner(
         user_tools_available,
     );
     let ask_user_tools_available = append_agent_ask_user_tools(&mut tools);
-    let todo_tools_available = if chat_mode || plan_mode {
-        false
-    } else {
-        append_agent_todo_tools(&mut tools)
-    };
+    if !chat_mode && !plan_mode {
+        append_agent_todo_tools(&mut tools);
+    }
     let goal_tools_available = if !chat_mode && !plan_mode && !orchestrate_mode && arm.is_none() {
         append_goal_tools(&mut tools, conversation.goal_state.as_ref())
     } else {
         false
     };
+    if settings.chat_tools.native_tools.scheduled_tasks
+        && !plan_mode
+        && !builder_mode
+        && arm.is_none()
+    {
+        crate::scheduled_tasks::tools::append_tools(app, &conversation.id, &mut tools);
+    }
     // Resolved here (rather than further down with the other prompt context) so
     // the sub-agent role registry below can reuse the project root instead of
     // resolving the conversation's project a second time.
@@ -602,14 +607,6 @@ pub(super) async fn complete_assistant_reply_inner(
     }
     let runtime_tools_available = !tools.is_empty();
     let available_builtin_tools = agent_prepare::available_builtin_tool_names(&tools);
-    let agent_todo_prompt = if chat_mode || plan_mode {
-        None
-    } else {
-        Some(crate::chat::todo::format_prompt(
-            &conversation.agent_todo_state,
-            todo_tools_available,
-        ))
-    };
     let agent_ask_user_prompt = crate::chat::ask_user::format_prompt(ask_user_tools_available);
     let runtime_prompts = agent_prepare::resolve_runtime_prompt_sources(
         chat_mode,
@@ -652,7 +649,6 @@ pub(super) async fn complete_assistant_reply_inner(
         memory_prompt.as_deref(),
         runtime_prompts.agent_plan_prompt.as_deref(),
         Some(&agent_ask_user_prompt),
-        agent_todo_prompt.as_deref(),
         project_prompt_context.as_ref(),
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
@@ -721,15 +717,6 @@ pub(super) async fn complete_assistant_reply_inner(
         memory_prompt.as_deref(),
         runtime_prompts.agent_plan_prompt.as_deref(),
         Some(&crate::chat::ask_user::format_prompt(false)),
-        if chat_mode || plan_mode {
-            None
-        } else {
-            Some(crate::chat::todo::format_prompt(
-                &conversation.agent_todo_state,
-                false,
-            ))
-        }
-        .as_deref(),
         project_prompt_context.as_ref(),
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
@@ -844,6 +831,7 @@ pub(super) async fn complete_assistant_reply_inner(
             initial_anchor_total_tokens,
             initial_anchor_trailing_estimate,
             skill_project_cwd: skill_cwd.clone(),
+            todo_state: conversation.agent_todo_state.clone(),
         },
         host,
         &executor,

@@ -1,4 +1,4 @@
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
 
 use crate::chat::attachments::{
@@ -13,8 +13,7 @@ use crate::state::AppState;
 use super::catalog::strip_transcripts_for_frontend;
 use super::complete_assistant_reply;
 use super::context::{
-    compress_conversation_context, compute_context_state, context_likely_over_limit,
-    emit_chat_context_state, rollback_user_message_after_failed_send, should_auto_compress_context,
+    compute_context_state, emit_chat_context_state, persist_context_state_best_effort,
 };
 use super::fan_out::run_reply_fan_out;
 use super::reply_runtime::{resolve_reply_arms, ChatSendReservation, CHAT_REPLY_BUSY_ERROR};
@@ -76,9 +75,8 @@ pub(crate) async fn chat_send_message(
     text_attachments: Option<Vec<TextAttachmentInput>>,
     active_skill_id: Option<String>,
     plan_message_id: Option<String>,
+    user_message_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    // 内存文本附件（粘贴长文本虚拟 txt）：前端总传；缺省为空数组以兼容旧调用。
-    let mut text_attachments = text_attachments.unwrap_or_default();
     // Busy 拒绝：该会话仍有任意一条 run 在跑（含多模型并发组）时不允许再发新消息。
     // 用原子的哨兵预留替代「先 check 后 register」，关闭并发发送同时通过 busy 检查的 TOCTOU 窗口。
     // 哨兵在本命令返回前一直存活；实际的 per-run 槽位 / generation 在 `complete_assistant_reply`
@@ -90,8 +88,94 @@ pub(crate) async fn chat_send_message(
             "error": CHAT_REPLY_BUSY_ERROR,
         }));
     };
+    send_reserved(
+        app,
+        state,
+        conversation_id,
+        content,
+        attachments,
+        text_attachments,
+        active_skill_id,
+        plan_message_id,
+        user_message_id,
+        None,
+    )
+    .await
+}
+
+/// Backend-initiated user send (scheduled tasks). Unlike the command it does
+/// not reject a busy conversation: it waits until every reply has finished,
+/// then runs the normal send transaction. `on_user_message_saved` runs once the
+/// user message is committed, before the reply starts.
+pub(crate) async fn send_user_message_when_idle(
+    app: &AppHandle,
+    conversation_id: &str,
+    content: String,
+    on_user_message_saved: &(dyn Fn() + Send + Sync),
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _send_reservation =
+        ChatSendReservation::acquire_when_idle(state.inner(), conversation_id).await;
+    let outcome = send_reserved(
+        app.clone(),
+        app.state::<AppState>(),
+        conversation_id.to_string(),
+        content,
+        Vec::new(),
+        None,
+        None,
+        None,
+        None,
+        Some(on_user_message_saved),
+    )
+    .await?;
+    if outcome.get("success").and_then(|value| value.as_bool()) == Some(true) {
+        Ok(())
+    } else {
+        Err(outcome
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("发送失败")
+            .to_string())
+    }
+}
+
+/// The send transaction; the caller already holds the conversation's send reservation.
+#[allow(clippy::too_many_arguments)]
+async fn send_reserved(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conversation_id: String,
+    content: String,
+    attachments: Vec<String>,
+    text_attachments: Option<Vec<TextAttachmentInput>>,
+    active_skill_id: Option<String>,
+    plan_message_id: Option<String>,
+    user_message_id: Option<String>,
+    on_user_message_saved: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<serde_json::Value, String> {
+    let user_message_id = match user_message_id {
+        Some(id)
+            if id
+                .strip_prefix("msg_")
+                .is_some_and(|value| Uuid::parse_str(value).is_ok()) =>
+        {
+            id
+        }
+        Some(_) => return Err("Invalid user message id".into()),
+        None => format!("msg_{}", Uuid::new_v4()),
+    };
+    // 内存文本附件（粘贴长文本虚拟 txt）：前端总传；缺省为空数组以兼容旧调用。
+    let mut text_attachments = text_attachments.unwrap_or_default();
 
     let mut conversation = load_conversation(&app, &conversation_id)?;
+    if conversation
+        .messages
+        .iter()
+        .any(|message| message.id == user_message_id)
+    {
+        return Err("User message already exists".into());
+    }
 
     let plan_message_id = plan_message_id.or_else(|| {
         (conversation.agent_plan_state.document.is_some()
@@ -120,13 +204,7 @@ pub(crate) async fn chat_send_message(
         }));
     }
 
-    let goal_started = content.trim().strip_prefix("/goal").and_then(|rest| {
-        if !rest.chars().next().is_some_and(char::is_whitespace) {
-            return None;
-        }
-        let objective = rest.trim();
-        (!objective.is_empty()).then_some(objective.to_string())
-    });
+    let goal_started = crate::chat::slash_commands::goal_objective(&content);
     if goal_started.is_some()
         && conversation.goal_state.as_ref().is_some_and(|goal| {
             !matches!(
@@ -203,7 +281,7 @@ pub(crate) async fn chat_send_message(
 
     // 创建用户消息
     let user_message = ChatMessage {
-        id: format!("msg_{}", Uuid::new_v4()),
+        id: user_message_id,
         role: "user".to_string(),
         content: content.clone(),
         attachments: message_attachments,
@@ -295,6 +373,9 @@ pub(crate) async fn chat_send_message(
     if goal_started.is_some() || resumed_waiting_goal {
         crate::chat::goal::emit_goal_state(&app, &conversation);
     }
+    if let Some(on_user_message_saved) = on_user_message_saved {
+        on_user_message_saved();
+    }
 
     match compute_context_state(
         &app,
@@ -306,89 +387,21 @@ pub(crate) async fn chat_send_message(
     .await
     {
         Ok(context_state) => {
-            conversation.context_state = context_state;
-            if should_auto_compress_context(&conversation.context_state, &conversation) {
-                match compress_conversation_context(&state, &mut conversation, "auto").await {
-                    Ok(()) => {
-                        let refreshed = compute_context_state(
-                            &app,
-                            &state,
-                            &conversation,
-                            Some(api_content.as_str()),
-                            &last_user_image_paths,
-                        )
-                        .await?;
-                        conversation.context_state = refreshed.clone();
-                        conversation.updated_at = chrono::Local::now().timestamp();
-                        conversation = crate::chat::repository::repository(&app)
-                            .mutate(&app, &conversation_id, |latest| {
-                                latest.context_state = refreshed.clone();
-                                Ok(())
-                            })
-                            .await
-                            .map_err(crate::chat::repository::repository_error)?;
-                        emit_chat_context_state(
-                            &app,
-                            &conversation.id,
-                            conversation.revision,
-                            &refreshed,
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!("Auto context compression failed: {err}");
-                        if context_likely_over_limit(&conversation.context_state) {
-                            rollback_user_message_after_failed_send(
-                                &app,
-                                &state,
-                                &mut conversation,
-                                &user_message.id,
-                                provisional_title.as_deref(),
-                            )
-                            .await?;
-                            strip_transcripts_for_frontend(&mut conversation);
-                            return Ok(serde_json::json!({
-                                "success": false,
-                                "conversation": conversation,
-                                "error": format!(
-                                    "Context is likely over the model limit and automatic compression failed: {err}. Please compress manually or switch to a larger-context model."
-                                ),
-                            }));
-                        }
-                        conversation.context_state.warning = Some(format!(
-                            "Automatic compression failed: {err}. The uncompressed request was sent because the estimate is still within the model window."
-                        ));
-                        let next_context_state = conversation.context_state.clone();
-                        conversation = crate::chat::repository::repository(&app)
-                            .mutate(&app, &conversation_id, |latest| {
-                                latest.context_state = next_context_state;
-                                Ok(())
-                            })
-                            .await
-                            .map_err(crate::chat::repository::repository_error)?;
-                        emit_chat_context_state(
-                            &app,
-                            &conversation.id,
-                            conversation.revision,
-                            &conversation.context_state,
-                        );
-                    }
-                }
-            } else {
-                let context_state = conversation.context_state.clone();
-                conversation = crate::chat::repository::repository(&app)
-                    .mutate(&app, &conversation_id, |latest| {
-                        latest.context_state = context_state.clone();
-                        Ok(())
-                    })
-                    .await
-                    .map_err(crate::chat::repository::repository_error)?;
-                emit_chat_context_state(
-                    &app,
-                    &conversation.id,
-                    conversation.revision,
-                    &context_state,
-                );
-            }
+            // Usage is a cache. A concurrent refresh/rename must not abort an
+            // already persisted user message or overwrite a newer summary.
+            conversation = persist_context_state_best_effort(
+                &app,
+                &conversation_id,
+                conversation,
+                context_state,
+            )
+            .await?;
+            emit_chat_context_state(
+                &app,
+                &conversation.id,
+                conversation.revision,
+                &conversation.context_state,
+            );
         }
         Err(err) => {
             eprintln!("Context usage estimate failed before send: {err}");

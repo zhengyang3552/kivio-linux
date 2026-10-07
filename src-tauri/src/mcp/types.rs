@@ -288,13 +288,13 @@ pub fn native_read_file_tool() -> ChatToolDefinition {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "File path or directory to read. Relative paths use the current working directory (project root or conversation workbench). Explicit absolute and ~/ paths can point outside it; normal OS permissions and tool approvals apply. Use the user's disk path directly; no artifact ID or registration is required." },
-                "artifact_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 12, "description": "Exact art_ IDs already returned by tools in this conversation. Use for known generated artifacts; use path for a user-provided disk path. Supply artifact_ids or path/paths, not both. No filesystem search or registration is needed when the ID is already known." },
+                "path": { "type": "string", "description": "File path or directory to read. Relative paths use the current working directory (project root or conversation workbench). Explicit absolute and ~/ paths can point outside it; normal OS permissions and tool approvals apply. Use the user's disk path directly with artifact_ids: [] and paths: []; no registration is required. When selecting artifact_ids or paths, omit path or use an empty string." },
+                "artifact_ids": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 0, "maxItems": 12, "description": "Exact art_ IDs already returned by tools in this conversation. For a disk path, omit artifact_ids or use []; never invent placeholder IDs. Nonempty artifact_ids take precedence over path/paths: those fields are ignored. For ID reads use path: empty string and paths: []. No filesystem search or registration is needed when the ID is known." },
                 "paths": {
                     "type": "array",
-                    "description": "Several image files to inspect in one call (png/jpg/webp/gif, max 12). Default is one image each. Do not use this for text files.",
+                    "description": "Several image files to inspect in one call (png/jpg/webp/gif, max 12). Default is one image each. Omit or use [] when reading by path or artifact_ids; never add dummy or placeholder paths. Do not use this for text files.",
                     "items": { "type": "string", "minLength": 1 },
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 12
                 },
                 "overview": {
@@ -562,16 +562,16 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
             "properties": {
                 "artifact_ids": {
                     "type": "array",
-                    "description": "Copy `art_…` ids from tool results verbatim. Short strings only — not file names, paths, bytes, base64, or data URLs. Generated files have these ids and no usable path.",
+                    "description": "Copy `art_…` ids from tool results verbatim. For local files passed in paths, omit artifact_ids or use []; never supply dummy or placeholder IDs. Short strings only — not file names, paths, bytes, base64, or data URLs. Generated files have these ids and no usable path.",
                     "items": { "type": "string", "minLength": 1 },
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 16
                 },
                 "paths": {
                     "type": "array",
-                    "description": "Existing disk paths for files you already read or wrote. Do not use for generated artifacts (those use artifact_ids). Never file contents.",
+                    "description": "Existing disk paths for files you already read or wrote. Omit or use [] when selecting only artifact_ids. For a local file, use paths with artifact_ids: []. Do not use for generated artifacts (those use artifact_ids). Never file contents.",
                     "items": { "type": "string", "minLength": 1 },
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 16
                 },
                 "mode": {
@@ -754,16 +754,16 @@ pub fn mixer_generate_image_tool_for(model: Option<&str>) -> ChatToolDefinition 
                 },
                 "paths": {
                     "type": "array",
-                    "description": "Local image files to edit",
+                    "description": "Local image files to edit. Omit or use [] when no disk file is needed; never invent placeholder paths.",
                     "items": { "type": "string", "minLength": 1 },
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 4
                 },
                 "artifact_ids": {
                     "type": "array",
-                    "description": "art_ IDs from earlier generate/edit results",
+                    "description": "Exact art_ IDs from earlier generate/edit results. Omit or use [] when no prior artifact is needed; never invent placeholder IDs.",
                     "items": { "type": "string", "minLength": 1 },
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 4
                 }
             },
@@ -869,7 +869,7 @@ pub fn native_automation_get_tool() -> ChatToolDefinition {
 pub fn native_automation_upsert_tool() -> ChatToolDefinition {
     native_automation_tool(
         "automation_upsert",
-        "Create or replace a Kivio automation graph in ONE call. Omit id to create. Omit node positions to auto-layout. Activate the `automation` skill first for node types and examples. Do not glob the repo and do not dry_run-probe types. Validation errors return allowedNodeTypes and schemaHint.",
+        "Create or replace a Kivio automation graph in ONE call. Only when the user explicitly asks for an automation/workflow; for 定时任务 or reminders use schedule_create instead. Omit id to create. Omit node positions to auto-layout. Activate the `automation` skill first for node types and examples. Do not glob the repo and do not dry_run-probe types. Validation errors return allowedNodeTypes and schemaHint.",
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -1232,6 +1232,26 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("plain-text"),);
+    }
+
+    #[test]
+    fn image_tool_unused_sources_allow_empty_arrays() {
+        for tool in [
+            native_read_file_tool(),
+            native_present_artifacts_tool(),
+            mixer_generate_image_tool(),
+        ] {
+            for field in ["artifact_ids", "paths"] {
+                let minimum = tool.input_schema["properties"][field]["minItems"]
+                    .as_u64()
+                    .unwrap_or(0);
+                assert_eq!(
+                    minimum, 0,
+                    "{}.{field} must not force placeholder entries",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]

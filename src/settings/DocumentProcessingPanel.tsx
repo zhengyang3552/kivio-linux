@@ -1,19 +1,18 @@
 // 文档处理设置区（知识库页）：Kivio 内置本地解析 + 图片 OCR，
 // 以及可选第三方解析服务（MinerU / LlamaParse，扫描版/复杂版面）。
 import { Download, RefreshCw } from 'lucide-react'
-import { useEffect, useState } from 'react'
 import {
   api,
   type DocProcessorProvider,
   type DocumentProcessingConfig,
   type OcrEngine,
   type PdfStrategy,
-  type RapidOcrStatus,
   type RapidOcrTier,
 } from '../api/tauri'
 import { type Lang } from '../components/i18n'
 import { SettingsGroup, Select, SettingRow, Toggle, Input } from './components'
 import { Button, IconButton } from '../components/Button'
+import { useSettingsOcrDownloads } from './useSettingsOcrDownloads'
 
 const EMPTY: DocumentProcessingConfig = {
   ocrEngine: 'off',
@@ -198,7 +197,7 @@ export function DocumentProcessingPanel({
   )
 }
 
-/** RapidOCR 离线引擎的状态/下载组件，本地自管状态。 */
+/** Knowledge-base RapidOCR reads the same download flight as settings screenshot OCR. */
 function RapidOcrWidget({
   t,
   tier,
@@ -208,45 +207,21 @@ function RapidOcrWidget({
   tier: RapidOcrTier
   onChangeTier: (tier: RapidOcrTier) => void
 }) {
-  const [status, setStatus] = useState<RapidOcrStatus | null>(null)
-  const [downloadState, setDownloadState] = useState<'idle' | 'downloading' | 'failed'>('idle')
-  const [downloadError, setDownloadError] = useState('')
-
-  const refresh = () => {
-    api
-      .rapidOcrStatus()
-      .then(setStatus)
-      .catch(() => setStatus({ standardAvailable: false, highAvailable: false }))
-  }
-
-  useEffect(() => {
-    refresh()
-  }, [])
-
-  const download = async () => {
-    setDownloadState('downloading')
-    setDownloadError('')
-    try {
-      const res = await api.rapidOcrInstall(tier)
-      if (res.success) {
-        setDownloadState('idle')
-        refresh()
-      } else {
-        setDownloadState('failed')
-        setDownloadError(res.message)
-      }
-    } catch (e) {
-      setDownloadState('failed')
-      setDownloadError(String(e))
-    }
-  }
-
+  const {
+    rapidStatus: status,
+    rapidDownloadState: downloadState,
+    rapidDownloadError: downloadError,
+    refreshRapid,
+    downloadRapid,
+  } = useSettingsOcrDownloads(true, tier, api, { observeReplacePack: false })
+  const refresh = () => { void refreshRapid() }
+  const download = () => { void downloadRapid(tier) }
   const available = tier === 'high' ? status?.highAvailable : status?.standardAvailable
 
   return (
-    <div className="mx-1 mb-2 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900/40">
+    <div className="mx-1 mb-2 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-2.5">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+        <span className="text-sm font-medium text-zinc-700">
           {t('模型档位', 'Model tier')}
         </span>
         <Select
@@ -269,7 +244,7 @@ function RapidOcrWidget({
         <div className="flex items-start gap-2">
           <span className="mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+            <div className="text-sm font-medium text-zinc-700">
               {t('RapidOCR 已就绪', 'RapidOCR ready')}
             </div>
             {status?.modelDir && (
@@ -284,7 +259,7 @@ function RapidOcrWidget({
         <div className="space-y-2">
           <div className="flex items-start gap-2">
             <span className="mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
-            <div className="flex-1 text-sm font-medium text-zinc-700 dark:text-zinc-200">
+            <div className="flex-1 text-sm font-medium text-zinc-700">
               {t('RapidOCR 模型未下载', 'RapidOCR models not downloaded')}
             </div>
             <IconButton

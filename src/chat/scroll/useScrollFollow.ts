@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 
 import {
@@ -10,6 +10,11 @@ import {
   reduceFollowEvent,
 } from './scrollFollowCore'
 
+// Share the viewport authority with nested timelines, including multi-answer columns.
+export const ScrollFollowingContext = createContext({
+  following: true,
+  isFollowing: (): boolean => true,
+})
 
 // 低于此高度元素无法有效滚动；其上的 wheel/touch 不应改变跟随状态。
 const SCROLLABLE_OVERFLOW_MIN_PX = 4
@@ -52,6 +57,8 @@ export type ScrollFollowHandle = {
   jumpToBottom: () => void
   // 主动脱离跟随（导航跳转到上方消息时用）。
   releaseFollow: () => void
+  // Restore a previous reading location before the viewport effect binds.
+  restoreReadingPosition: (offset: number) => void
   // 程序化定位（消息导航）唯一的 scrollTop 写入口，不改变 follow 意图。
   scrollToOffset: (offset: number, options?: { adjustments?: number; behavior?: ScrollBehavior }) => void
   isFollowing: () => boolean
@@ -116,6 +123,7 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
   const lastScrollHeightRef = useRef<number | null>(null)
   const lastScrollTopRef = useRef<number | null>(null)
   const geometrySampledRef = useRef(false)
+  const pendingRestoreRef = useRef<number | null>(null)
 
   // 唯一的 scrollTop 写入口：写完立刻读回并登记，别处一律不许直接赋值。
   const applyScrollTop = useCallback((el: HTMLElement, value: number) => {
@@ -190,6 +198,13 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
     dispatch({ type: 'release' })
   }, [dispatch])
 
+  const restoreReadingPosition = useCallback((offset: number) => {
+    pendingRestoreRef.current = Math.max(0, offset)
+    dispatch({ type: 'release' })
+    const el = boundViewportRef.current ?? viewport
+    if (el) applyScrollTop(el, pendingRestoreRef.current)
+  }, [applyScrollTop, dispatch, viewport])
+
   const scrollToOffset = useCallback((offset: number, options?: { adjustments?: number; behavior?: ScrollBehavior }) => {
     const viewport = boundViewportRef.current
     if (!viewport) return
@@ -214,10 +229,15 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
 
     // 新绑定总是跟随：新挂载、视口重建、重新启用都从钉底开始，元素到位前 dispatch 的 forceFollow 也由此兑现。
     boundViewportRef.current = viewport
-    stateRef.current = createFollowState()
-    setFollowing(true)
-    setShowJumpButton(false)
-    pinToBottom()
+    const restoredOffset = pendingRestoreRef.current
+    pendingRestoreRef.current = null
+    stateRef.current = restoredOffset === null
+      ? createFollowState()
+      : { ...createFollowState(), following: false, userDetached: true }
+    setFollowing(restoredOffset === null)
+    setShowJumpButton(restoredOffset !== null && restoredOffset < viewport.scrollHeight - viewport.clientHeight - jumpButtonThreshold())
+    if (restoredOffset === null) pinToBottom()
+    else applyScrollTop(viewport, restoredOffset)
     lastScrollHeightRef.current = viewport.scrollHeight
     lastScrollTopRef.current = viewport.scrollTop
     geometrySampledRef.current = false
@@ -269,6 +289,14 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
         && previousScrollTop !== null
         && scrollTop > previousScrollTop + 1
       const selfInduced = scrollTop === token || contentGrewBeforeScroll || (layoutCompensation && !userReturnedDuringLayout)
+      // Native scrollbar movement may have no wheel/pointer event. A backwards
+      // move with unchanged geometry and no compensation token takes ownership.
+      if (!selfInduced && previousScrollTop !== null &&
+        scrollTop < previousScrollTop - 1 &&
+        previousScrollHeight === viewport.scrollHeight &&
+        gap > configRef.current.attachThresholdPx) {
+        dispatch({ type: 'release' })
+      }
       dispatch({
         type: 'scroll',
         gap,
@@ -399,7 +427,7 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
       lastScrollTopRef.current = null
       geometrySampledRef.current = false
     }
-  }, [content, dispatch, enabled, listenerRoot, markLayoutCompensation, pinToBottom, trackKeys, viewport])
+  }, [applyScrollTop, content, dispatch, enabled, jumpButtonThreshold, listenerRoot, markLayoutCompensation, pinToBottom, trackKeys, viewport])
 
   // RO 主路径之外的补钉：仅当跟随中且 scrollHeight 真的变了。
   useLayoutEffect(() => {
@@ -421,12 +449,13 @@ export function useScrollFollow(args: UseScrollFollowArgs): {
       stickToBottom,
       jumpToBottom,
       releaseFollow,
+      restoreReadingPosition,
       scrollToOffset,
       isFollowing: () => stateRef.current.following,
       markLayoutCompensation,
       pinIfFollowing,
     }),
-    [jumpToBottom, markLayoutCompensation, pinIfFollowing, releaseFollow, scrollToOffset, stickToBottom],
+    [jumpToBottom, markLayoutCompensation, pinIfFollowing, releaseFollow, restoreReadingPosition, scrollToOffset, stickToBottom],
   )
 
   return { handle, following, showJumpButton }

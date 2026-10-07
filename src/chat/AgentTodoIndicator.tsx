@@ -1,5 +1,6 @@
 import { CheckCircle2, ListTodo, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
+import { useT, type I18n } from '../components/i18n'
 import type { AgentTodoItem, AgentTodoState } from './types'
 
 interface AgentTodoIndicatorProps {
@@ -10,16 +11,16 @@ interface AgentTodoIndicatorProps {
 
 const EMPTY_TODO_ITEMS: AgentTodoItem[] = []
 
-function statusLabel(status: AgentTodoItem['status']): string {
+function statusLabel(status: AgentTodoItem['status'], t: I18n): string {
   switch (status) {
     case 'completed':
-      return 'Done'
+      return t.agentTodoStatusDone
     case 'in_progress':
-      return 'Now'
+      return t.agentTodoStatusNow
     case 'cancelled':
-      return 'Skip'
+      return t.agentTodoStatusSkipped
     default:
-      return 'Next'
+      return t.agentTodoStatusNext
   }
 }
 
@@ -30,7 +31,7 @@ function dotClass(status: AgentTodoItem['status']): string {
     case 'in_progress':
       return 'bg-amber-500 shadow-[0_0_0_3px_rgba(245,158,11,0.16)]'
     case 'cancelled':
-      return 'bg-neutral-300 ring-1 ring-inset ring-neutral-400 dark:bg-neutral-700'
+      return 'bg-neutral-300 ring-1 ring-inset ring-neutral-400'
     default:
       return 'bg-neutral-300 dark:bg-neutral-600'
   }
@@ -41,11 +42,11 @@ function textClass(status: AgentTodoItem['status']): string {
     case 'completed':
       return 'text-neutral-400 line-through decoration-neutral-300 dark:text-neutral-500 dark:decoration-neutral-600'
     case 'in_progress':
-      return 'font-medium text-neutral-900 dark:text-neutral-100'
+      return 'font-medium text-neutral-900'
     case 'cancelled':
       return 'text-neutral-400 line-through decoration-neutral-300 dark:text-neutral-500 dark:decoration-neutral-600'
     default:
-      return 'text-neutral-600 dark:text-neutral-300'
+      return 'text-neutral-600'
   }
 }
 
@@ -59,10 +60,14 @@ function formatUpdatedAt(todoState?: AgentTodoState | null): string {
 }
 
 export function AgentTodoIndicator({ todoState, placement = 'titlebar' }: AgentTodoIndicatorProps) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const inStatusBar = placement === 'status'
   const items = todoState?.items ?? EMPTY_TODO_ITEMS
   const completedCount = items.filter((item) => item.status === 'completed').length
+  // 取消的条目不计入分母：全部处理完时显示 3/3，而不是 3/5。
+  const countedTotal = items.filter((item) => item.status !== 'cancelled').length
+  const contentById = useMemo(() => new Map(items.map((item) => [item.id, item.content])), [items])
   const currentItem = useMemo(
     () =>
       items.find((item) => item.status === 'in_progress') ??
@@ -82,14 +87,14 @@ export function AgentTodoIndicator({ todoState, placement = 'titlebar' }: AgentT
         type="button"
         className={
           inStatusBar
-            ? 'flex h-[22px] shrink-0 items-center gap-1.5 rounded-[5px] px-1.5 text-[12px] font-medium text-neutral-700 transition-colors duration-[var(--kv-dur-instant)] hover:bg-black/[0.05] dark:text-neutral-200 dark:hover:bg-white/[0.07]'
+            ? 'flex h-[22px] shrink-0 items-center gap-1.5 rounded-[5px] px-1.5 text-[12px] font-medium text-neutral-700 transition-colors duration-[var(--kv-dur-instant)] hover:bg-neutral-900/[0.05]'
             : `flex h-8 min-w-0 max-w-[18rem] shrink items-center gap-1.5 rounded-lg px-2 text-[12px] font-medium transition duration-[var(--kv-dur-instant)] active:scale-[0.97] ${
                 allDone
-                  ? 'text-neutral-500 hover:bg-black/[0.05] hover:text-neutral-800 dark:text-neutral-400 dark:hover:bg-white/[0.07] dark:hover:text-neutral-100'
-                  : 'text-neutral-700 hover:bg-black/[0.05] hover:text-neutral-950 dark:text-neutral-200 dark:hover:bg-white/[0.07] dark:hover:text-neutral-50'
+                  ? 'text-neutral-500 hover:bg-neutral-900/[0.05] hover:text-neutral-800 dark:text-neutral-400'
+                  : 'text-neutral-700 hover:bg-neutral-900/[0.05] hover:text-neutral-950'
               }`
         }
-        aria-label="Agent todo"
+        aria-label={t.agentTodoTitle}
         title={inStatusBar && !allDone && currentItem ? currentItem.content : undefined}
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
@@ -100,7 +105,7 @@ export function AgentTodoIndicator({ todoState, placement = 'titlebar' }: AgentT
           <ListTodo size={14} strokeWidth={2} className="shrink-0 text-neutral-500 dark:text-neutral-400" />
         )}
         <span className="shrink-0 tabular-nums">
-          {allDone ? 'Done' : 'Todo'} {completedCount}/{items.length}
+          {allDone ? t.agentTodoChipDone : t.agentTodoChip} {completedCount}/{countedTotal}
         </span>
         {/* ponytail: 状态条只放计数，当前任务文本点开弹层看 —— 铺满整行读起来是噪音。 */}
         {!inStatusBar && !allDone && currentItem && (
@@ -114,30 +119,30 @@ export function AgentTodoIndicator({ todoState, placement = 'titlebar' }: AgentT
 
       {open && (
         <div
-          className={`chat-motion-popover absolute z-40 w-[21rem] max-w-[calc(100vw-2rem)] rounded-xl border border-neutral-200/90 bg-white p-3 shadow-xl dark:border-neutral-700 dark:bg-neutral-900 ${
+          className={`chat-motion-popover absolute z-40 w-[21rem] max-w-[calc(100vw-2rem)] rounded-xl border border-neutral-200/90 bg-neutral-50 p-3 shadow-xl ${
             inStatusBar ? 'bottom-8 left-0' : 'right-0 top-9'
           }`}
         >
           <div className="mb-3 flex items-start justify-between gap-3">
             <div className="min-w-0">
               <div className="flex min-w-0 items-center gap-2">
-                <span className="text-[13px] font-semibold leading-none text-neutral-900 dark:text-neutral-50">
-                  Agent todo
+                <span className="text-[13px] font-semibold leading-none text-neutral-900">
+                  {t.agentTodoTitle}
                 </span>
-                <span className="shrink-0 rounded-full bg-neutral-100 px-1.5 py-[2px] text-[10px] font-medium leading-none text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
-                  {completedCount}/{items.length}
+                <span className="shrink-0 rounded-full bg-neutral-100 px-1.5 py-[2px] text-[10px] font-medium leading-none text-neutral-500 dark:text-neutral-400">
+                  {completedCount}/{countedTotal}
                 </span>
               </div>
               {updatedAt && (
                 <div className="mt-1 text-[10.5px] leading-none text-neutral-400 dark:text-neutral-500">
-                  Updated {updatedAt}
+                  {t.agentTodoUpdatedAt.replace('{time}', updatedAt)}
                 </div>
               )}
             </div>
             <button
               type="button"
-              className="-mr-1 -mt-1 rounded-md p-1 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
-              aria-label="Close todo panel"
+              className="-mr-1 -mt-1 rounded-md p-1 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700"
+              aria-label={t.agentTodoClose}
               onClick={() => setOpen(false)}
             >
               <X size={14} />
@@ -150,7 +155,7 @@ export function AgentTodoIndicator({ todoState, placement = 'titlebar' }: AgentT
                 <span className={`mt-[7px] size-2.5 rounded-full transition-colors duration-[var(--kv-dur-normal)] ${dotClass(item.status)}`} />
                 <div className="min-w-0">
                   <div className="mb-0.5 text-[10px] font-medium uppercase leading-none tracking-normal text-neutral-400 dark:text-neutral-500">
-                    {statusLabel(item.status)}
+                    {statusLabel(item.status, t)}
                   </div>
                   <div className={textClass(item.status)}>
                     {item.content}
@@ -161,8 +166,11 @@ export function AgentTodoIndicator({ todoState, placement = 'titlebar' }: AgentT
                     </div>
                   )}
                   {item.blocked_by && item.blocked_by.length > 0 && (
-                    <div className="mt-0.5 text-[10.5px] leading-none text-neutral-400 dark:text-neutral-500">
-                      blocked by: {item.blocked_by.join(', ')}
+                    <div className="mt-0.5 text-[10.5px] leading-snug text-neutral-400 dark:text-neutral-500">
+                      {t.agentTodoBlockedBy.replace(
+                        '{items}',
+                        item.blocked_by.map((id) => contentById.get(id) ?? id).join(', '),
+                      )}
                     </div>
                   )}
                 </div>

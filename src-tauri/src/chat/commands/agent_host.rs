@@ -24,6 +24,27 @@ pub(super) struct ChatAgentHost<'a> {
 }
 
 impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
+    fn wait_for_child_results<'b>(
+        &'b self,
+        conversation_id: &'b str,
+        run_id: &'b str,
+        generation: u64,
+    ) -> crate::chat::agent::AgentHostFuture<'b, Result<bool, String>> {
+        Box::pin(async move {
+            let runtime = crate::chat::sub_agent::control::runtime(&self.app)?;
+            crate::chat::sub_agent::control::wait_for_parent_results(
+                &runtime,
+                conversation_id,
+                run_id,
+                || {
+                    !self.is_generation_active(conversation_id, generation)
+                        || self.state.chat_runtime().has_pending_input(conversation_id)
+                },
+            )
+            .await
+        })
+    }
+
     fn run_ended(&self, _conversation_id: &str) {
         if let Ok(runtime) = crate::chat::sub_agent::control::runtime(&self.app) {
             runtime.release_parent(&self.run_id);
@@ -65,6 +86,18 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
         record: &ToolCallRecord,
     ) {
         emit_chat_tool_record(&self.app, run_id, record);
+    }
+
+    fn auto_compact_failures(&self, conversation_id: &str) -> u32 {
+        self.state
+            .chat_runtime()
+            .auto_compact_failures(conversation_id)
+    }
+
+    fn set_auto_compact_failures(&self, conversation_id: &str, failures: u32) {
+        self.state
+            .chat_runtime()
+            .set_auto_compact_failures(conversation_id, failures);
     }
 
     fn emit_compaction_status(
@@ -230,6 +263,24 @@ pub(super) struct ProbeAgentHost<'a> {
 
 #[cfg(debug_assertions)]
 impl crate::chat::agent::AgentHost for ProbeAgentHost<'_> {
+    fn wait_for_child_results<'b>(
+        &'b self,
+        conversation_id: &'b str,
+        run_id: &'b str,
+        generation: u64,
+    ) -> crate::chat::agent::AgentHostFuture<'b, Result<bool, String>> {
+        Box::pin(async move {
+            let runtime = crate::chat::sub_agent::control::runtime(&self.app)?;
+            crate::chat::sub_agent::control::wait_for_parent_results(
+                &runtime,
+                conversation_id,
+                run_id,
+                || !self.is_generation_active(conversation_id, generation),
+            )
+            .await
+        })
+    }
+
     fn run_ended(&self, _conversation_id: &str) {
         if let Ok(runtime) = crate::chat::sub_agent::control::runtime(&self.app) {
             runtime.release_parent(&self.run_id);
@@ -398,6 +449,7 @@ impl crate::chat::agent::ToolExecutor for RegistryToolExecutor<'_> {
                 tool_call_id: Some(ctx.tool_call_id.to_string()),
                 run_id: ctx.run_id.to_string(),
                 generation: ctx.generation,
+                round: ctx.round,
                 depth: ctx.depth,
             };
             let result = mcp::registry::call_tool(

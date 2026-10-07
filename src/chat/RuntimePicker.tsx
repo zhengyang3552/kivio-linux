@@ -6,6 +6,7 @@ import { chatApi, type DetectedExternalAgent } from './api'
 import { chatTitlebarPillButtonClass } from './platform'
 import { IconButton } from '../components/Button'
 import { usePopoverMaxHeight } from './usePopoverMaxHeight'
+import { usePopoverMenu } from './usePopoverMenu'
 import type { AgentRuntimeConfig } from './types'
 import { rememberedExternalRuntime } from './lastAgentRuntime'
 import { modelIncludesEffort } from './externalModelEffort'
@@ -106,6 +107,7 @@ function RuntimePickerBase({ agentRuntime, onRuntimeChange, conversationId, lock
   const [agents, setAgents] = useState<DetectedExternalAgent[]>([])
   const [refreshing, setRefreshing] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  usePopoverMenu(open, () => setOpen(false), menuRef)
   const menuMaxH = usePopoverMaxHeight(open, menuRef, 'down', 460)
   // 请求代际：conversationId 切换 / 手动刷新会并发发起检测，只让最新一次的结果落地
   // （也兜住卸载后 setState）。
@@ -304,6 +306,9 @@ function ExternalModelSelectorBase({
   const [open, setOpen] = useState(false)
   const [reasoningOpen, setReasoningOpen] = useState(false)
   const modelMenuRef = useRef<HTMLDivElement>(null)
+  const reasoningMenuRef = useRef<HTMLDivElement>(null)
+  usePopoverMenu(open, () => setOpen(false), modelMenuRef)
+  usePopoverMenu(reasoningOpen, () => setReasoningOpen(false), reasoningMenuRef)
   const modelMenuMaxH = usePopoverMaxHeight(open, modelMenuRef, 'down', 320)
   // 懒查：只探选中 agent 的模型（cwd-scoped），不再拉全量列表。保留上次结果，不清空闪。
   const [models, setModels] = useState<DetectedExternalAgent['models']>([])
@@ -495,12 +500,14 @@ function ExternalModelSelectorBase({
         <button
           type="button"
           onClick={() => setOpen(!open)}
+          aria-haspopup="menu"
+          aria-expanded={open}
           className={`${chatTitlebarPillButtonClass} max-w-full min-w-0`}
           title={displayName}
         >
           {/* ponytail: 探测中复用已有的 shimmer 文字动画，不再转圈；chevron 常驻避免宽度跳动 */}
           <span
-            className={`${agentRuntime.externalAgentId === 'antigravity' ? 'max-w-[240px]' : 'max-w-[140px]'} truncate font-medium ${loading ? 'reasoning-shimmer-text' : 'text-neutral-800 dark:text-neutral-200'}`}
+            className={`${agentRuntime.externalAgentId === 'antigravity' ? 'max-w-[240px]' : 'max-w-[140px]'} truncate font-medium ${loading ? 'reasoning-shimmer-text' : 'text-neutral-800'}`}
           >
             {displayName}
           </span>
@@ -565,7 +572,7 @@ function ExternalModelSelectorBase({
                       onModelChange(model.id, nextReasoning)
                       setOpen(false)
                     }}
-                    className={`kv-menu-row text-neutral-700 hover:bg-black/[0.05] dark:text-neutral-200 dark:hover:bg-white/[0.07] ${
+                    className={`kv-menu-row text-neutral-700 hover:bg-neutral-900/[0.05] ${
                       agentRuntime.externalModel === model.id ? 'font-semibold' : ''
                     }`}
                   >
@@ -584,12 +591,14 @@ function ExternalModelSelectorBase({
           <button
             type="button"
             onClick={() => setReasoningOpen(!reasoningOpen)}
+            aria-haspopup="menu"
+            aria-expanded={reasoningOpen}
             className={`${chatTitlebarPillButtonClass} max-w-full min-w-0`}
             title={t.chatThinkingLevel.replace('{level}', currentReasoningLabel)}
             aria-label={t.chatThinkingLevel.replace('{level}', currentReasoningLabel)}
           >
             <Brain size={15} className="shrink-0 text-neutral-500 dark:text-neutral-400" />
-            <span className="chat-thinking-level-label max-w-[64px] truncate font-medium text-neutral-800 dark:text-neutral-200">
+            <span className="chat-thinking-level-label max-w-[64px] truncate font-medium text-neutral-800">
               {currentReasoningLabel}
             </span>
             <ChevronDown
@@ -604,12 +613,14 @@ function ExternalModelSelectorBase({
                 onClick={() => setReasoningOpen(false)}
                 aria-hidden
               />
-              <div className="chat-model-selector-menu chat-motion-popover absolute left-0 top-full z-20 mt-2 min-w-[160px] overflow-y-auto kv-menu">
+              <div role="menu" ref={reasoningMenuRef} className="chat-model-selector-menu chat-motion-popover absolute left-0 top-full z-20 mt-2 min-w-[160px] overflow-y-auto kv-menu">
                 {activeReasoningOptions.map((option) => {
                   const active = option.id === reasoningPillValue
                   return (
                     <button
                       key={option.id}
+                      role="menuitemradio"
+                      aria-checked={active}
                       type="button"
                       onClick={() => {
                         onModelChange(agentRuntime.externalModel ?? 'default', option.id)
@@ -617,8 +628,8 @@ function ExternalModelSelectorBase({
                       }}
                       className={`kv-menu-row justify-between transition-colors ${
                         active
-                          ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100'
-                          : 'text-neutral-700 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-neutral-800/80'
+                          ? 'bg-neutral-100 font-medium text-neutral-900'
+                          : 'text-neutral-700 hover:bg-neutral-50'
                       }`}
                     >
                       <span className="min-w-0 truncate">

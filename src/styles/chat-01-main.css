@@ -12,7 +12,7 @@
   flex-direction: column;
   overflow: hidden;
   border-radius: 14px;
-  border: 1px solid rgba(0, 0, 0, 0.06);
+  border: 1px solid var(--theme-surface-border);
   background: var(--theme-surface);
   box-shadow:
     inset 0 0 0 0.5px rgba(255, 255, 255, 0.55),
@@ -21,8 +21,6 @@
 }
 
 .dark .chat-window-shell {
-  border-color: rgba(255, 255, 255, 0.08);
-  background: #212121;
   box-shadow:
     inset 0 0 0 0.5px rgba(255, 255, 255, 0.04),
     0 0 0 0.5px rgba(255, 255, 255, 0.05),
@@ -91,7 +89,7 @@
 .chat-dock-shell {
   border-radius: var(--chat-card-radius);
   background: var(--theme-surface-soft);
-  border: 1px solid rgba(24, 24, 27, 0.07);
+  border: 1px solid var(--theme-surface-border);
   box-shadow:
     0 1px 2px rgba(24, 24, 27, 0.04),
     0 5px 14px -8px rgba(24, 24, 27, 0.10);
@@ -174,10 +172,6 @@
   background: var(--theme-surface-hover);
 }
 
-/* 暗色里「浮起」= 更亮（压深读作凹陷），与三张卡片同一套判断。 */
-.dark .chat-user-bubble {
-  background: #313134;
-}
 
 /* Markdown 纯图片段落拆掉 <p> 盒，磁贴在正文流里并排换行。 */
 .chat-markdown p:has(> [data-chat-md-image]):not(:has(> :not([data-chat-md-image]):not(br))) {
@@ -237,13 +231,9 @@
 
 .chat-sidebar-resize:hover::after,
 .chat-window-shell.is-sidebar-resizing .chat-sidebar-resize::after {
-  background: rgba(24, 24, 27, 0.22);
+  background: color-mix(in srgb, var(--text) 22%, transparent);
 }
 
-.dark .chat-sidebar-resize:hover::after,
-.dark .chat-window-shell.is-sidebar-resizing .chat-sidebar-resize::after {
-  background: rgba(255, 255, 255, 0.28);
-}
 
 .chat-window-shell.is-sidebar-resizing,
 .chat-window-shell.is-sidebar-resizing * {
@@ -305,25 +295,20 @@
   background: var(--theme-surface);
 }
 
-/* 有 field-sizing 时高度跟内容走，避开 JS 把 height 塌成 auto 的回流。 */
-.chat-composer-shell textarea {
-  field-sizing: content;
-}
-
 /* 问题优化：两拍，必须看得出「字被换过」。
    等待 = 草稿失焦呼吸；落地 = 旧稿先化开淡出，换字后再清晰落入。
    不用扫光 / background-clip:text（WebView 会退化成色块）。 */
-.chat-composer-shell textarea.is-optimizing {
+.chat-composer-shell .chat-composer-editor.is-optimizing {
   caret-color: transparent;
   animation: chat-composer-optimize-wait 1.7s ease-in-out infinite;
 }
 
-.chat-composer-shell textarea.is-optimize-out {
+.chat-composer-shell .chat-composer-editor.is-optimize-out {
   caret-color: transparent;
   animation: chat-composer-optimize-out var(--kv-dur-slow) var(--kv-ease-out) forwards;
 }
 
-.chat-composer-shell textarea.is-optimize-reveal {
+.chat-composer-shell .chat-composer-editor.is-optimize-reveal {
   animation: chat-composer-optimize-in calc(var(--kv-dur-slow) + var(--kv-dur-fast)) var(--kv-ease-standard) both;
 }
 
@@ -377,9 +362,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-composer-shell textarea.is-optimizing,
-  .chat-composer-shell textarea.is-optimize-out,
-  .chat-composer-shell textarea.is-optimize-reveal {
+  .chat-composer-shell .chat-composer-editor.is-optimizing,
+  .chat-composer-shell .chat-composer-editor.is-optimize-out,
+  .chat-composer-shell .chat-composer-editor.is-optimize-reveal {
     animation: none;
     opacity: 1;
     filter: none;
@@ -392,29 +377,52 @@
   }
 }
 
-/* 斜杠命令高亮：透明字 + 同几何叠层，textarea 只负责光标和选区。 */
-.chat-composer-highlight {
+/* The editor owns caret/selection geometry, including atomic command chips. */
+.chat-composer-editor {
+  width: 100%;
+  min-height: 28px;
+  max-height: 160px;
+  overflow-y: auto;
+  padding: 6px 4px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  caret-color: var(--text);
+}
+.chat-composer-editor[data-empty="true"]::before {
+  content: attr(data-placeholder);
+  color: var(--text-faint);
   pointer-events: none;
   position: absolute;
-  inset: 0;
-  overflow: hidden;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: break-word;
 }
-
-.chat-composer-slash {
+.chat-composer-command {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 0 5px;
+  margin: 0 1px;
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
   color: var(--accent);
+  line-height: 1.4;
+  vertical-align: baseline;
+  white-space: nowrap;
 }
-
-.chat-composer-shell textarea.is-slash-highlight {
-  color: transparent;
-  caret-color: var(--text, #171717);
+.chat-composer-command > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.chat-composer-command-icon { display: inline-flex; flex: none; align-self: center; }
+.chat-composer-command.ProseMirror-selectednode {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
-
-.dark .chat-composer-shell textarea.is-slash-highlight {
-  caret-color: var(--text, #f5f5f5);
-}
+.chat-composer-editor .ProseMirror-separator { display: none; }
 
 /* ===== 输入区三层结构 =====
    原来是「一个 28px 大圆角盒子，图标全塞在里面」→ 盒子被撑到 ~100px 高。
@@ -442,9 +450,6 @@
   display: none;
 }
 
-.dark .chat-composer-status {
-  background: rgba(255, 255, 255, 0.035);
-}
 
 /* 无项目且无改动时状态条内容为空（diff 徽标自隐藏），空条直接不显示。 */
 .chat-composer-status:empty {
@@ -462,9 +467,6 @@
   color: var(--text-faint);
 }
 
-.dark .chat-composer-queue {
-  background: rgba(255, 255, 255, 0.035);
-}
 
 /* 输入框功能栏右侧的用量小字（缓存命中/↑输入/↓输出）：主区容器过窄时直接隐藏，
    避免和模式胶囊、上下文指示器挤在一行。容器查询挂在 .chat-main-pane 的
@@ -478,12 +480,9 @@
 /* 一条排队消息。动作键平时透明（不占注意力也不跳版：仍然挂载、只是不可见），
    指针悬停或键盘聚焦到行内任意控件时才现出来。 */
 .chat-composer-queue-row:hover {
-  background: rgba(0, 0, 0, 0.04);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
-.dark .chat-composer-queue-row:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
 
 .chat-composer-queue-actions {
   opacity: 0;
@@ -516,12 +515,9 @@
 }
 
 button.chat-composer-status-item:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
-.dark button.chat-composer-status-item:hover {
-  background: rgba(255, 255, 255, 0.07);
-}
 
 .chat-composer-status-item > svg {
   width: 13px;
@@ -546,21 +542,17 @@ button.chat-composer-status-item:hover {
 /* 裸露工具栏上的图标钮：原来是极浅的细线图标，飘在点阵背景上立不住。
    加深到 --text-faint 之上一档，并让 hover 有明确的底，读作「可按」。 */
 .chat-composer-tools .kv-icon-btn {
-  color: #71717a;
+  color: var(--text-muted);
 }
 
-.dark .chat-composer-tools .kv-icon-btn {
-  color: #a1a1aa;
-}
 
 .chat-composer-tools .kv-icon-btn:hover:not(:disabled) {
   color: var(--text);
-  background: rgba(0, 0, 0, 0.06);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
 }
 
 .dark .chat-composer-tools .kv-icon-btn:hover:not(:disabled) {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.09);
 }
 
 /* 图标统一 16px：各调用点传的是 18（原来在高盒子里合适），裸栏里偏大。
@@ -578,24 +570,17 @@ button.chat-composer-status-item:hover {
 }
 
 .chat-composer-send.is-ready {
-  color: #2f6ff0;
+  color: var(--accent);
 }
 
 .chat-composer-send.is-ready:hover {
-  color: #2960d8;
+  color: var(--accent-hover);
 }
 
 .chat-composer-send.is-ready:active {
   transform: scale(0.9);
 }
 
-.dark .chat-composer-send.is-ready {
-  color: #5c8df7;
-}
-
-.dark .chat-composer-send.is-ready:hover {
-  color: #6f9bf8;
-}
 
 .chat-message-navigator {
   position: absolute;
@@ -608,139 +593,141 @@ button.chat-composer-status-item:hover {
 }
 
 /* 回答标题目录：和右侧轮次导航共用主区的绝对层，不参与消息列宽度计算。
-   收起时只保留短刻度；展开层向正文内侧覆盖，第一条标题直接顶在面板顶部。 */
+   刻度和标题是同一行：收起时只露出刻度，悬停时原地展开标题，行位置不动，也不做过渡动画。
+   行高按可用高度和标题数自适应（14–22px），放不下时列表滚动。
+   层级靠刻度长短和标题字重区分：主级刻度最长、标题最重，子级依次缩短、变淡并缩进。 */
 .chat-heading-navigator {
+  --outline-tick: var(--text-faint);
+  --outline-strong: var(--text);
+  --outline-text: var(--text);
+  --outline-sub: var(--text-muted);
+  --outline-hover: color-mix(in srgb, var(--text) 8%, transparent);
+  --outline-panel: var(--theme-surface-soft);
+  --outline-edge: var(--theme-surface-border);
   position: absolute;
   z-index: 13;
   top: 16px;
   bottom: 16px;
-  left: 12px;
-  width: 26px;
-}
-
-.chat-heading-navigator-rail {
+  left: 6px;
   display: flex;
-  height: 100%;
-  width: 26px;
+  width: min(320px, calc(100vw - 48px));
   flex-direction: column;
   align-items: flex-start;
   justify-content: center;
-  overflow-y: auto;
-  scrollbar-width: none;
-  transition: opacity var(--kv-dur-fast) var(--kv-ease-standard);
+  container-type: size;
+  pointer-events: none;
 }
 
-.chat-heading-navigator-rail::-webkit-scrollbar {
-  display: none;
-}
 
-.chat-heading-navigator-tick {
-  display: flex;
-  width: 26px;
-  min-height: 13px;
-  flex: 0 0 13px;
-  align-items: center;
-  border: 0;
-  padding: 0;
-  background: transparent;
-  color: rgb(163 163 163);
-  cursor: pointer;
-}
-
-.chat-heading-navigator-tick > span {
-  display: block;
-  width: calc(8px + min(var(--heading-depth), 2) * 2px);
-  height: 1.5px;
-  border-radius: 999px;
-  background: currentColor;
-  transition: width var(--kv-dur-fast) var(--kv-ease-standard), color var(--kv-dur-fast) var(--kv-ease-standard);
-}
-
-.chat-heading-navigator-tick:hover,
-.chat-heading-navigator-tick:focus-visible,
-.chat-heading-navigator-tick.is-active {
-  color: rgb(23 23 23);
-  outline: none;
-}
-
-.chat-heading-navigator-tick:focus-visible > span {
-  width: 16px;
-}
-
-.chat-heading-navigator-panel {
-  position: absolute;
-  top: 50%;
-  left: 0;
+.chat-heading-navigator-list {
+  position: relative;
   display: flex;
   box-sizing: border-box;
-  width: 26px;
-  height: max-content;
+  width: 32px;
   max-height: 100%;
   flex-direction: column;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
-  border: 1px solid rgb(229 229 229 / 0.95);
   border-radius: 14px;
-  background: var(--theme-surface-soft);
   padding: 6px;
-  box-shadow: 0 14px 38px rgb(0 0 0 / 0.12);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-50%);
-  transform-origin: left center;
-  visibility: hidden;
-  transition:
-    width 220ms var(--kv-ease-standard),
-    opacity 140ms var(--kv-ease-standard),
-    visibility 0s linear 220ms;
-}
-
-.chat-heading-navigator.is-expanded .chat-heading-navigator-rail {
-  opacity: 0;
-}
-
-.chat-heading-navigator.is-expanded .chat-heading-navigator-panel {
-  width: min(300px, calc(100vw - 48px));
-  opacity: 1;
   pointer-events: auto;
-  visibility: visible;
-  transition-delay: 0s;
+}
+
+.chat-heading-navigator:not(.is-expanded) .chat-heading-navigator-list {
+  scrollbar-width: none;
+}
+
+.chat-heading-navigator:not(.is-expanded) .chat-heading-navigator-list::-webkit-scrollbar {
+  display: none;
+}
+
+/* 展开时面板贴合标题宽度，短目录不拉出大片空白；过长标题在最大宽度处省略。 */
+.chat-heading-navigator.is-expanded .chat-heading-navigator-list {
+  width: max-content;
+  min-width: 180px;
+  max-width: 100%;
+  background: var(--outline-panel);
+  box-shadow: 0 0 0 1px var(--outline-edge), 0 14px 38px rgb(0 0 0 / 0.12);
 }
 
 .chat-heading-navigator-item {
   display: flex;
   width: 100%;
-  min-height: 30px;
+  height: clamp(14px, calc((100cqh - 12px) / var(--heading-count)), 22px);
   flex: 0 0 auto;
   align-items: center;
   border: 0;
   border-radius: 7px;
-  padding: 5px 8px 5px calc(8px + var(--heading-indent));
+  padding: 0 10px 0 0;
   background: transparent;
-  color: rgb(82 82 82);
+  color: var(--outline-text);
   font-size: 12px;
   line-height: 1.4;
   text-align: left;
   cursor: pointer;
 }
 
-.chat-heading-navigator-item.has-level-toggle {
-  padding-right: 29px;
+.chat-heading-navigator-item:focus-visible {
+  outline: none;
 }
 
-.chat-heading-navigator-item > span {
+.chat-heading-navigator-tick {
+  display: flex;
+  width: 20px;
+  flex: 0 0 20px;
+  align-items: center;
+}
+
+.chat-heading-navigator-tick::before {
+  content: '';
+  display: block;
+  width: calc(10px - min(var(--heading-depth), 2) * 2.5px);
+  height: 1.5px;
+  border-radius: 999px;
+  background: var(--outline-tick);
+}
+
+.chat-heading-navigator-item:hover .chat-heading-navigator-tick::before,
+.chat-heading-navigator-item:focus-visible .chat-heading-navigator-tick::before,
+.chat-heading-navigator-item.is-active .chat-heading-navigator-tick::before {
+  height: 2px;
+  background: var(--outline-strong);
+}
+
+.chat-heading-navigator-title {
+  display: none;
+  min-width: 0;
+  padding-left: calc(min(var(--heading-depth), 2) * 12px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-weight: 500;
 }
 
-.chat-heading-navigator-item:hover,
-.chat-heading-navigator-item:focus-visible,
-.chat-heading-navigator-item.is-active {
-  background: rgb(23 23 23 / 0.07);
-  color: rgb(23 23 23);
-  outline: none;
+.chat-heading-navigator-item.is-sub .chat-heading-navigator-title {
+  color: var(--outline-sub);
+  font-weight: 400;
+}
+
+.chat-heading-navigator.is-expanded .chat-heading-navigator-title {
+  display: block;
+}
+
+.chat-heading-navigator.is-expanded .chat-heading-navigator-item:hover,
+.chat-heading-navigator.is-expanded .chat-heading-navigator-item:focus-visible {
+  background: var(--outline-hover);
+}
+
+.chat-heading-navigator-item:hover .chat-heading-navigator-title,
+.chat-heading-navigator-item:focus-visible .chat-heading-navigator-title,
+.chat-heading-navigator-item.is-active .chat-heading-navigator-title {
+  color: var(--outline-strong);
+}
+
+/* 为层级按钮留出独立的一列，标题文字和点击区域均不延伸到按钮下方。 */
+.chat-heading-navigator.is-expanded .chat-heading-navigator-list.has-level-toggle {
+  padding-right: 34px;
 }
 
 .chat-heading-navigator-level-toggle {
@@ -748,37 +735,6 @@ button.chat-composer-status-item:hover {
   z-index: 1;
   top: 7px;
   right: 7px;
-  background: var(--theme-surface-soft);
-}
-
-.dark .chat-heading-navigator-tick {
-  color: rgb(115 115 115);
-}
-
-.dark .chat-heading-navigator-tick:hover,
-.dark .chat-heading-navigator-tick:focus-visible,
-.dark .chat-heading-navigator-tick.is-active {
-  color: rgb(245 245 245);
-}
-
-.dark .chat-heading-navigator-panel {
-  border-color: rgb(64 64 64 / 0.95);
-  background: #262629;
-}
-
-.dark .chat-heading-navigator-item {
-  color: rgb(190 190 190);
-}
-
-.dark .chat-heading-navigator-item:hover,
-.dark .chat-heading-navigator-item:focus-visible,
-.dark .chat-heading-navigator-item.is-active {
-  background: rgb(245 245 245 / 0.1);
-  color: rgb(245 245 245);
-}
-
-.dark .chat-heading-navigator-level-toggle {
-  background: #262629;
 }
 
 .chat-message-navigator-viewport {
@@ -812,7 +768,7 @@ button.chat-composer-status-item:hover {
   border: 0;
   padding: 0;
   background: transparent;
-  color: rgb(163 163 163);
+  color: var(--text-faint);
   cursor: pointer;
 }
 
@@ -829,7 +785,7 @@ button.chat-composer-status-item:hover {
 
 .chat-message-navigator-node:hover,
 .chat-message-navigator-node:focus-visible {
-  color: rgb(82 82 82);
+  color: var(--text-muted);
   outline: none;
 }
 
@@ -839,7 +795,7 @@ button.chat-composer-status-item:hover {
 
 .chat-message-navigator-node.is-visible,
 .chat-message-navigator-node.is-active {
-  color: rgb(23 23 23);
+  color: var(--text);
 }
 
 .chat-message-navigator-node.is-active .chat-message-navigator-tick {
@@ -875,11 +831,11 @@ button.chat-composer-status-item:hover {
   z-index: 1000;
   width: min(320px, calc(100vw - 32px));
   transform: translateY(-50%);
-  border: 1px solid rgb(229 229 229 / 0.95);
+  border: 1px solid var(--theme-surface-border-strong);
   border-radius: 16px;
-  background: rgb(255 255 255 / 0.96);
+  background: color-mix(in srgb, var(--theme-surface) 96%, transparent);
   padding: 14px 16px;
-  color: rgb(38 38 38);
+  color: var(--text);
   box-shadow: 0 14px 38px rgb(0 0 0 / 0.12);
   backdrop-filter: blur(18px);
   pointer-events: none;
@@ -905,7 +861,7 @@ button.chat-composer-status-item:hover {
   display: -webkit-box;
   overflow: hidden;
   margin: 9px 0 0;
-  color: rgb(115 115 115);
+  color: var(--text-muted);
   font-size: 13px;
   line-height: 1.55;
   -webkit-box-orient: vertical;
@@ -914,39 +870,25 @@ button.chat-composer-status-item:hover {
 
 .chat-message-navigator-preview-model {
   margin-top: 11px;
-  color: rgb(163 163 163);
+  color: var(--text-faint);
   font-size: 12px;
 }
 
-.dark .chat-message-navigator-node {
-  color: rgb(115 115 115);
-}
-
-.dark .chat-message-navigator-node:hover,
-.dark .chat-message-navigator-node:focus-visible {
-  color: rgb(190 190 190);
-}
-
-.dark .chat-message-navigator-node.is-visible,
-.dark .chat-message-navigator-node.is-active {
-  color: rgb(245 245 245);
-}
 
 .dark .chat-message-navigator-preview {
-  border-color: rgb(64 64 64 / 0.95);
-  background: rgb(38 38 38 / 0.96);
-  color: rgb(245 245 245);
   box-shadow: 0 16px 42px rgb(0 0 0 / 0.4);
 }
 
-.dark .chat-message-navigator-preview-answer {
-  color: rgb(180 180 180);
-}
 
 @container chat-main (max-width: 719px) {
   .chat-message-navigator {
     display: none;
   }
+}
+
+/* 标题目录随滚动在不同回答间出现 / 消失，不能靠给正文加内边距让位，否则正文会反复重排。
+   消息列（max-w-4xl）左侧留白不够放下目录时直接隐藏。 */
+@container chat-main (max-width: 959px) {
   .chat-heading-navigator {
     display: none;
   }
@@ -958,17 +900,15 @@ button.chat-composer-status-item:hover {
   .has-message-navigator .chat-message-list-inner {
     padding-right: 3.25rem;
   }
-  .has-heading-navigator .chat-message-list-inner {
-    padding-left: 3.25rem;
-  }
 }
 
-/* 并排区域在宽屏也会延伸到边缘，为两侧导航器保留空间。 */
+/* 并排区域在宽屏也会延伸到边缘，为两侧导航器保留空间。左侧标题目录随滚动出现 / 消失，
+   固定预留，不跟着 has-heading-navigator 切换，免得正文重排。 */
 @container chat-main (min-width: 1000px) {
   .has-message-navigator .chat-message-list-inner--wide {
     padding-right: 3.25rem;
   }
-  .has-heading-navigator .chat-message-list-inner--wide {
+  .chat-message-list-inner--wide {
     padding-left: 3.25rem;
   }
 }
@@ -977,31 +917,13 @@ button.chat-composer-status-item:hover {
   .chat-message-navigator-tick {
     transition: none;
   }
-  .chat-heading-navigator-tick > span {
-    transition: none;
-  }
-  .chat-heading-navigator-rail,
-  .chat-heading-navigator-panel {
-    transition: none;
-  }
 }
 
-/* 暗色同理：外壳 #212121，三张卡片只比它亮一点点（不是压深 —— 暗色里「浮起」= 更亮，
-   压深读作凹陷）。 */
-.dark .chat-sidebar-shell,
-.dark .chat-main-pane,
-.dark .chat-center-page,
-.dark .chat-dock-shell,
-.dark .chat-themed-surface,
-.dark .chat-conversation-loading {
-  background: #262629;
-}
 
 .dark .chat-sidebar-shell,
 .dark .chat-main-pane,
 .dark .chat-center-page,
 .dark .chat-dock-shell {
-  border-color: rgba(255, 255, 255, 0.07);
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.35),
     0 5px 16px -8px rgba(0, 0, 0, 0.45);
@@ -1025,7 +947,7 @@ button.chat-composer-status-item:hover {
 /* 暗色 scrim 更薄：深底 Mica 本身偏暗，66% 实色会把壁纸取色吃没，读成「没开半透明」。 */
 .dark .chat-window-host--native-effect .chat-sidebar-shell,
 .dark .chat-window-host--native-effect .chat-dock-shell {
-  background: color-mix(in srgb, #262629 48%, transparent);
+  background: color-mix(in srgb, var(--theme-surface-soft) 48%, transparent);
 }
 
 /* 原生控件的暗色方案只挂在不透明阅读面上，绝不挂 html：
@@ -1046,9 +968,6 @@ button.chat-composer-status-item:hover {
   color-scheme: dark;
 }
 
-.dark .chat-composer-shell {
-  background: rgb(23, 23, 23);
-}
 
 /* —— 主内容区：宽度 —— */
 @container chat-main (max-width: 560px) {
@@ -1216,9 +1135,6 @@ button.chat-composer-status-item:hover {
     border-bottom: 1px solid rgba(0, 0, 0, 0.08);
   }
 
-  .dark .assistant-center-sidebar {
-    border-bottom-color: rgba(255, 255, 255, 0.08);
-  }
 }
 
 /* 空对话页 */
@@ -1228,9 +1144,6 @@ button.chat-composer-status-item:hover {
   background-color: var(--theme-surface-soft);
 }
 
-.dark .chat-empty-hero {
-  background-color: #262629;
-}
 
 .chat-empty-hero-dot-canvas {
   position: absolute;
@@ -1262,24 +1175,18 @@ button.chat-composer-status-item:hover {
   font-weight: 500;
   letter-spacing: -0.02em;
   line-height: 1.2;
-  color: #171717;
+  color: var(--text);
 }
 
-.dark .chat-empty-hero-title {
-  color: #fafafa;
-}
 
 .chat-typewriter-cursor {
   display: inline-block;
   margin-left: 0.02em;
   font-weight: 400;
-  color: var(--tw-prose-body, #a3a3a3);
+  color: var(--tw-prose-body, var(--text-faint));
   animation: chat-typewriter-blink 1s step-end infinite;
 }
 
-.dark .chat-typewriter-cursor {
-  color: #737373;
-}
 
 @keyframes chat-typewriter-blink {
   0%, 100% { opacity: 1; }
@@ -1300,13 +1207,11 @@ button.chat-composer-status-item:hover {
   width: 2px;
   height: 100%;
   border-radius: 1px;
-  background: #71717a;
+  background: var(--theme-surface-active);
   transform-origin: center;
   animation: chat-gen-wave 1.4s cubic-bezier(0.45, 0.05, 0.55, 0.95) infinite;
 }
-.dark .chat-gen-wave > span {
-  background: #a1a1aa;
-}
+
 .chat-gen-wave > span:nth-child(1) { animation-delay: 0s; }
 .chat-gen-wave > span:nth-child(2) { animation-delay: 0.2s; }
 .chat-gen-wave > span:nth-child(3) { animation-delay: 0.4s; }
@@ -1379,16 +1284,17 @@ button.chat-composer-status-item:hover {
 }
 
 
-
 .chat-motion-fade-up {
   animation: chat-motion-fade-up var(--chat-motion-duration, var(--kv-dur-normal)) var(--kv-ease-standard) both;
   animation-delay: var(--chat-motion-delay, 0ms);
 }
 
 /* 气泡入场：在 fade-up 基础上加轻微缩放，对齐 LiveAgent chatBubbleIn。
-   单列出来（不改 chat-motion-fade-up）避免影响附件 chip/提示行等复用点。 */
+   单列出来（不改 chat-motion-fade-up）避免影响附件 chip/提示行等复用点。
+   结束后释放 transform：长任务气泡可高达数十万像素；保留缩放层会让屏外
+   运行指示器的每次动画触发整个气泡的 Paint/Layerize，阻塞侧栏和滚动。 */
 .chat-motion-bubble-in {
-  animation: chat-motion-bubble-in var(--kv-dur-normal) var(--kv-ease-standard) both;
+  animation: chat-motion-bubble-in var(--kv-dur-normal) var(--kv-ease-standard) backwards;
 }
 
 /* 视图/页面切换入场：三段式递进（对齐 LiveAgent hubPageIn/hubPanelIn）——
@@ -1505,8 +1411,6 @@ button.chat-composer-status-item:hover {
 }
 
 .dark .kv-menu {
-  border-color: rgba(255, 255, 255, 0.09);
-  background: #2a2a2c;
   box-shadow:
     0 0 0 0.5px rgba(255, 255, 255, 0.05),
     0 4px 14px -4px rgba(0, 0, 0, 0.5),
@@ -1528,12 +1432,9 @@ button.chat-composer-status-item:hover {
 }
 
 .kv-menu-item:hover:not(:disabled) {
-  background: rgba(0, 0, 0, 0.05);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
 }
 
-.dark .kv-menu-item:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.07);
-}
 
 .kv-menu-item:disabled {
   opacity: 0.4;
@@ -1588,9 +1489,6 @@ button.chat-composer-status-item:hover {
   background: var(--theme-surface-border);
 }
 
-.dark .kv-menu-sep {
-  background: rgba(255, 255, 255, 0.08);
-}
 
 /* 分组小标题 */
 .kv-menu-label {
@@ -1660,7 +1558,7 @@ button.chat-composer-status-item:hover {
   aspect-ratio: 4 / 3;
   overflow: hidden;
   border-radius: 12px;
-  background: #f3f4f5;
+  background: var(--theme-surface-soft);
   box-shadow:
     inset 0 0 0 1px rgba(0, 0, 0, 0.075),
     inset 0 1px 0 rgba(255, 255, 255, 0.78),
@@ -1668,7 +1566,6 @@ button.chat-composer-status-item:hover {
 }
 
 .dark .image-generation-pending-frame {
-  background: #252527;
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.075),
     inset 0 1px 0 rgba(255, 255, 255, 0.045),
@@ -1685,23 +1582,17 @@ button.chat-composer-status-item:hover {
     linear-gradient(180deg, rgba(243, 244, 245, 0.24), transparent 42%, rgba(243, 244, 245, 0.34));
 }
 
-.dark .image-generation-pending-frame::after {
-  background:
-    radial-gradient(circle at 50% 46%, transparent 0 46%, rgba(37, 37, 39, 0.48) 76%),
-    linear-gradient(180deg, rgba(37, 37, 39, 0.28), transparent 42%, rgba(37, 37, 39, 0.38));
-}
 
 .image-generation-pending-indicator {
   width: 6px;
   height: 6px;
   border-radius: 999px;
-  background: #a3a3a3;
+  background: var(--theme-surface-active);
   box-shadow: 0 0 0 0 rgba(163, 163, 163, 0.3);
   animation: image-generation-indicator-pulse 1.8s ease-in-out infinite;
 }
 
 .dark .image-generation-pending-indicator {
-  background: #8a8a8a;
   box-shadow: 0 0 0 0 rgba(138, 138, 138, 0.24);
 }
 
@@ -1839,7 +1730,7 @@ button.chat-composer-status-item:hover {
 }
 
 .kv-skeleton {
-  background-color: rgba(0, 0, 0, 0.04);
+  background-color: color-mix(in srgb, var(--text) 4%, transparent);
   background-image: linear-gradient(
     100deg,
     rgba(0, 0, 0, 0) 30%,
@@ -1852,7 +1743,6 @@ button.chat-composer-status-item:hover {
 }
 
 .dark .kv-skeleton {
-  background-color: rgba(255, 255, 255, 0.05);
   background-image: linear-gradient(
     100deg,
     rgba(255, 255, 255, 0) 30%,
@@ -2095,23 +1985,19 @@ button.chat-composer-status-item:hover {
   color: rgb(196, 181, 253);
 }
 
-/* 普通工具「运行中」状态：accent blue 工具名亮度呼吸，整行不缩放/发光。
-   颜色与已完成 ✓ 的 #2f6ff0 / dark #5c8df7 同源。 */
+/* 普通工具「运行中」状态：主题强调色亮度呼吸，整行不缩放/发光。 */
 .chat-motion-tool-shimmer {
-  color: #2f6ff0;
+  color: var(--accent);
   animation: chat-motion-text-pulse 2s ease-in-out infinite;
 }
 
-.dark .chat-motion-tool-shimmer {
-  color: #5c8df7;
-}
 
 .chat-compaction-divider {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 12px 0 4px;
-  color: var(--color-neutral-500, #737373);
+  color: var(--color-neutral-500, var(--text-muted));
   font-size: 11px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   user-select: none;
@@ -2138,7 +2024,7 @@ button.chat-composer-status-item:hover {
 .chat-compaction-divider-line {
   flex: 1;
   height: 1px;
-  background: rgba(120, 120, 120, 0.28);
+  background: color-mix(in srgb, var(--text) 28%, transparent);
   transform-origin: center;
 }
 
@@ -2162,15 +2048,15 @@ button.chat-composer-status-item:hover {
 }
 
 .chat-compaction-divider-arrow {
-  color: rgba(120, 120, 120, 0.72);
+  color: var(--text-muted);
 }
 
 .chat-context-clear-badge {
-  border: 1px solid rgba(120, 120, 120, 0.28);
+  border: 1px solid var(--theme-surface-border-strong);
   border-radius: 999px;
   padding: 2px 10px;
   line-height: 1.4;
-  color: var(--color-neutral-500, #737373);
+  color: var(--color-neutral-500, var(--text-muted));
   background: var(--bg-primary, transparent);
 }
 
@@ -2199,16 +2085,16 @@ button.chat-composer-status-item:hover {
   background: transparent;
   padding: 2px 0 6px;
   font-size: 11px;
-  color: var(--color-neutral-500, #737373);
+  color: var(--color-neutral-500, var(--text-muted));
   cursor: pointer;
 }
 
 .chat-compaction-summary-toggle:hover {
-  color: var(--color-neutral-700, #404040);
+  color: var(--color-neutral-700, var(--text));
 }
 
 .dark .chat-compaction-summary-toggle:hover {
-  color: var(--color-neutral-300, #d4d4d4);
+  color: var(--color-neutral-300);
 }
 
 .chat-compaction-summary-body {
@@ -2216,11 +2102,11 @@ button.chat-composer-status-item:hover {
   margin-left: 0;
   padding-bottom: 8px;
   font-size: 12px;
-  color: var(--color-neutral-600, #525252);
+  color: var(--color-neutral-600, var(--text-muted));
 }
 
 .dark .chat-compaction-summary-body {
-  color: var(--color-neutral-300, #d4d4d4);
+  color: var(--color-neutral-300);
 }
 
 @keyframes chat-compaction-line-in {
@@ -2421,17 +2307,4 @@ button.chat-composer-status-item:hover {
   }
 }
 
-.chat-window-shell button:focus {
-  outline: none;
-}
-
-.chat-window-shell button:focus-visible {
-  outline: none;
-  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.14);
-  /* 键盘聚焦时焦点环缓入；失焦时瞬退（不拖尾），是更利落的行为。 */
-  transition: box-shadow var(--kv-dur-fast) var(--kv-ease-out);
-}
-
-.dark .chat-window-shell button:focus-visible {
-  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.18);
-}
+/* 按钮焦点环见 shared-surfaces.css（与模态框共用，并只在键盘操作时出现）。 */

@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Archive, Pin } from 'lucide-react'
+import { Archive, Clock, Pin } from 'lucide-react'
 import type { ChatProject, ChatSet, ConversationListItem } from './types'
 import { i18n, type I18n, type Lang } from '../components/i18n'
 import { chatApi, normalizeAgentRuntime } from './api'
@@ -56,6 +56,7 @@ interface ConversationListProps {
   currentConversationId?: string
   generatingConversationIds?: ReadonlySet<string>
   titleGeneratingConversationIds?: ReadonlySet<string>
+  scheduledTaskNamesByConversation?: ReadonlyMap<string, string[]>
   projects: ChatProject[]
   sets: ChatSet[]
   lang: Lang
@@ -92,6 +93,7 @@ export const ConversationList = memo(function ConversationList({
   currentConversationId,
   generatingConversationIds = new Set(),
   titleGeneratingConversationIds = new Set(),
+  scheduledTaskNamesByConversation,
   projects,
   sets,
   lang,
@@ -278,6 +280,10 @@ export const ConversationList = memo(function ConversationList({
           const isRenaming = renamingId === conv.id
           const isExiting = exitingIds.has(conv.id)
           const folderLabel = showFolderLabel ? conversationFolderLabel(conv, projects, sets, t) : ''
+          const scheduledTaskNames = scheduledTaskNamesByConversation?.get(conv.id)
+          const scheduledTasksTitle = scheduledTaskNames
+            ? t.chatConversationScheduledTasks + scheduledTaskNames.join(lang === 'zh' ? '、' : ', ')
+            : ''
           // 分支对话：把「（分支）」后缀从可截断的标题里拆出，做成不缩的固定标签，
           // 避免侧栏窄宽时被省略号吃掉（forked_from 字段判定，不依赖标题文字）。
           const isFork = Boolean(conv.forked_from ?? conv.forkedFrom)
@@ -305,8 +311,8 @@ export const ConversationList = memo(function ConversationList({
                     isDragging ? 'is-dragging ' : ''
                   }${
                     active
-                      ? 'bg-black/[0.07] dark:bg-white/[0.11]'
-                      : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+                      ? 'bg-neutral-900/[0.07]'
+                      : 'hover:bg-neutral-900/[0.04]'
                   }`}
                 >
                   <input
@@ -330,8 +336,8 @@ export const ConversationList = memo(function ConversationList({
                         : 'px-3 py-2 text-[13px]'
                     } font-medium ${
                       active
-                        ? 'text-neutral-900 dark:text-neutral-100'
-                        : 'text-neutral-700 dark:text-neutral-300'
+                        ? 'text-neutral-900'
+                        : 'text-neutral-700'
                     }`}
                     placeholder={t.chatLibUntitled}
                   />
@@ -366,8 +372,8 @@ export const ConversationList = memo(function ConversationList({
                   isDragging ? 'is-dragging ' : ''
                 }${
                   active
-                    ? 'bg-black/[0.07] dark:bg-white/[0.11]'
-                    : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+                    ? 'bg-neutral-900/[0.07]'
+                    : 'hover:bg-neutral-900/[0.04]'
                 }`}
               >
               <button
@@ -384,8 +390,8 @@ export const ConversationList = memo(function ConversationList({
                     : 'px-3 py-2 text-[13px]'
                 } ${
                   active
-                    ? 'text-neutral-900 dark:text-neutral-100'
-                    : 'text-neutral-700 dark:text-neutral-300'
+                    ? 'text-neutral-900'
+                    : 'text-neutral-700'
                 }`}
                 title={
                   isGenerating || isTitleGenerating
@@ -427,6 +433,15 @@ export const ConversationList = memo(function ConversationList({
                   </span>
                 )}
               </button>
+              {scheduledTasksTitle && (
+                <span
+                  className="mr-1 flex shrink-0 items-center text-neutral-400 dark:text-neutral-500"
+                  title={scheduledTasksTitle}
+                  aria-label={scheduledTasksTitle}
+                >
+                  <Clock size={13} strokeWidth={1.75} aria-hidden="true" />
+                </span>
+              )}
               {/* 行尾：平时短龄；悬停让给 PIN + 归档；生成中优先慢波。
                   短龄叠在槽右侧（置顶时针占左、龄占右）。慢波保持原始 chat-gen-wave。 */}
 
@@ -466,12 +481,12 @@ export const ConversationList = memo(function ConversationList({
                       e.stopPropagation()
                       void onTogglePinConversation(conv.id, !conv.pinned)
                     }}
-                    className={`shrink-0 rounded-md p-0.5 transition-opacity hover:bg-black/[0.06] dark:hover:bg-white/[0.1] ${
+                    className={`shrink-0 rounded-md p-0.5 transition-opacity hover:bg-neutral-900/[0.06] ${
                       conv.pinned
-                        ? 'text-neutral-700 opacity-100 dark:text-neutral-200'
+                        ? 'text-neutral-700 opacity-100'
                         : isGenerating
-                          ? 'text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200'
-                          : 'text-neutral-400 opacity-0 group-hover:opacity-100 hover:text-neutral-600 dark:hover:text-neutral-200'
+                          ? 'text-neutral-400 hover:text-neutral-600'
+                          : 'text-neutral-400 opacity-0 group-hover:opacity-100 hover:text-neutral-600'
                     }`}
                     aria-label={conv.pinned ? t.chatUnpin : t.chatPin}
                     title={conv.pinned ? t.chatUnpin : t.chatPin}
@@ -485,7 +500,7 @@ export const ConversationList = memo(function ConversationList({
                       e.stopPropagation()
                       beginArchive(conv, index)
                     }}
-                    className={`shrink-0 rounded-md p-0.5 text-neutral-400 transition-opacity hover:bg-black/[0.06] hover:text-neutral-600 dark:hover:bg-white/[0.1] dark:hover:text-neutral-200 ${
+                    className={`shrink-0 rounded-md p-0.5 text-neutral-400 transition-opacity hover:bg-neutral-900/[0.06] hover:text-neutral-600 ${
                       isGenerating && !conv.pinned
                         ? ''
                         : 'opacity-0 group-hover:opacity-100'

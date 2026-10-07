@@ -217,7 +217,13 @@ struct PendingApproval {
 fn reject_pending_lines(pending: &[PendingApproval], reason: &str) -> Vec<String> {
     pending
         .iter()
-        .map(|entry| approval_response_line(&entry.request_id, false, reason, None))
+        .map(|entry| {
+            if entry.tool_name == CLAUDE_ELICITATION {
+                elicitation_response_line(&entry.request_id, &json!({ "action": "cancel" }))
+            } else {
+                approval_response_line(&entry.request_id, false, reason, None)
+            }
+        })
         .collect()
 }
 
@@ -240,12 +246,26 @@ fn approval_response_line(
     deny_message: &str,
     updated_input: Option<&Value>,
 ) -> String {
+    approval_response_line_with_permissions(request_id, approved, deny_message, updated_input, None)
+}
+
+fn approval_response_line_with_permissions(
+    request_id: &str,
+    approved: bool,
+    deny_message: &str,
+    updated_input: Option<&Value>,
+    updated_permissions: Option<&Value>,
+) -> String {
     let payload = if approved {
-        match updated_input {
+        let mut payload = match updated_input {
             // `AskUserQuestion` 的答复就走这里：`updatedInput` 带回 `{questions, answers}`。
             Some(input) => json!({ "behavior": "allow", "updatedInput": input }),
             None => json!({ "behavior": "allow" }),
+        };
+        if let Some(permissions) = updated_permissions {
+            payload["updatedPermissions"] = permissions.clone();
         }
+        payload
     } else {
         json!({ "behavior": "deny", "message": deny_message, "interrupt": false })
     };
@@ -342,6 +362,7 @@ fn approval_verdict(ask: &ApprovalAsk) -> Result<(), &'static str> {
         && !is_ask_user_question(&ask.tool_name)
         && !is_exit_plan_mode(&ask.tool_name)
         && !is_enter_plan_mode(&ask.tool_name)
+        && ask.tool_name != CLAUDE_ELICITATION
     {
         return Err(APPROVAL_INTERACTIVE_UNSUPPORTED);
     }
@@ -398,7 +419,87 @@ fn approval_ask_from_request(request_id: &str, request: &Value) -> ApprovalAsk {
             .get("requires_user_interaction")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        requires_manual_approval: requires_manual_approval(request),
+        permission_suggestions: request
+            .get("permission_suggestions")
+            .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            .cloned(),
     }
+}
+
+/// 「总是允许」→ 回给 CLI 的 `updatedPermissions`（t3code `toSessionPermissionUpdates` 同款）：
+/// CLI 的建议原样复用但改成 `destination: "session"`——它的建议通常写 `localSettings`，照抄会
+/// 把一次会话内的选择落成 `.claude/settings.local.json` 里的永久规则。没有建议（MCP 工具常见）
+/// 时退回整个工具的 session allow 规则，免得「总是允许」静默退化成一次性放行。
+pub fn session_permission_updates(tool_name: &str, suggestions: Option<&Value>) -> Value {
+    let scoped: Vec<Value> = suggestions
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let mut s = s.as_object()?.clone();
+            s.insert("destination".to_string(), json!("session"));
+            Some(Value::Object(s))
+        })
+        .collect();
+    if !scoped.is_empty() {
+        return Value::Array(scoped);
+    }
+    json!([{
+        "type": "addRules",
+        "rules": [{ "toolName": tool_name }],
+        "behavior": "allow",
+        "destination": "session",
+    }])
+}
+
+/// MCP 服务器经 claude 向宿主要输入（2.1.281+ `control_request{subtype:"elicitation"}`：
+/// `mcp_server_name` / `message` / `mode` form|url / `requested_schema` / `url`）。
+///
+/// 当作一个名为 `elicitation` 的交互工具挂起：表单走 Kivio 已有的问用户卡片
+/// （与 codex / grok 同一个 `ask_user::parse_mcp_elicitation`），答复走专用的
+/// `{action, content}` 回执而不是 `can_use_tool` 的 `{behavior}`。
+pub const CLAUDE_ELICITATION: &str = "elicitation";
+
+fn elicitation_ask_from_request(request_id: &str, request: &Value) -> ApprovalAsk {
+    ApprovalAsk {
+        request_id: request_id.to_string(),
+        tool_call_id: format!("claude-elicitation-{request_id}"),
+        tool_name: CLAUDE_ELICITATION.to_string(),
+        input: request.clone(),
+        requires_user_interaction: true,
+        requires_manual_approval: true,
+        permission_suggestions: None,
+    }
+}
+
+/// elicitation 的回执（含换行）。`content` 只在 accept 时带；拒绝统一 `decline`
+/// （用户点了拒绝或我们答不了这种形状），中止走 `cancel`。
+fn elicitation_response_line(request_id: &str, result: &Value) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": result,
+            },
+        })
+    )
+}
+
+/// 安全检查要求人工确认（claude 2.1.281+，二进制 schema 原文）：
+/// - `classifier_approvable: false` = "at least one safety check requires manual approval
+///   (e.g. Windows path bypass, dangerous rm)"；复合 bash 的 `decision_reason_type` 是
+///   `subcommandResults`，嵌套的 safetyCheck 只能靠这个字段看出来；
+/// - `default_to_no: true` = "the ask must not be approvable by a single stray keystroke"。
+fn requires_manual_approval(request: &Value) -> bool {
+    request
+        .get("classifier_approvable")
+        .and_then(|v| v.as_bool())
+        == Some(false)
+        || request.get("default_to_no").and_then(|v| v.as_bool()) == Some(true)
 }
 
 /// 分流一帧 stdout JSON。
@@ -433,6 +534,9 @@ fn classify_inbound_frame(value: &Value, can_ask: bool) -> InboundFrame {
                 if can_ask && subtype == "can_use_tool" {
                     let request = request.cloned().unwrap_or(Value::Null);
                     InboundFrame::Ask(approval_ask_from_request(&request_id, &request))
+                } else if can_ask && subtype == CLAUDE_ELICITATION {
+                    let request = request.cloned().unwrap_or(Value::Null);
+                    InboundFrame::Ask(elicitation_ask_from_request(&request_id, &request))
                 } else {
                     InboundFrame::Reply(control_error_response_line(&request_id, &subtype))
                 }
@@ -904,7 +1008,17 @@ impl ClaudeStreamJsonSession {
                         // 已经被 `control_cancel_request` 撤回、或已在别处答过：不能重复回复。
                         continue;
                     };
-                    pending.remove(index);
+                    let entry = pending.remove(index);
+                    if entry.tool_name == CLAUDE_ELICITATION {
+                        let result = match (decision.approved, decision.updated_input) {
+                            (true, Some(result)) => result,
+                            _ => json!({ "action": "decline" }),
+                        };
+                        let line = elicitation_response_line(&decision.request_id, &result);
+                        let _ = self.stdin.write_all(line.as_bytes()).await;
+                        let _ = self.stdin.flush().await;
+                        continue;
+                    }
                     // 先切档位、再放行（顺序不能反）：`ExitPlanMode` 的批准要让 CLI 真的
                     // 离开计划档，否则它下一句 `Edit` 又被挡回来。同一条 stdin 上的两帧按
                     // 写入顺序处理，所以这里只要保证「切档在前」即可。
@@ -918,11 +1032,12 @@ impl ClaudeStreamJsonSession {
                         // 失败了要让用户看见，而不是留他对着一个「批准了却还在计划档」的会话。
                         pending_mode_switch = Some((request_id, mode.to_string()));
                     }
-                    let line = approval_response_line(
+                    let line = approval_response_line_with_permissions(
                         &decision.request_id,
                         decision.approved,
                         APPROVAL_DENIED_MESSAGE,
                         decision.updated_input.as_ref(),
+                        decision.updated_permissions.as_ref(),
                     );
                     let _ = self.stdin.write_all(line.as_bytes()).await;
                     let _ = self.stdin.flush().await;
@@ -1014,6 +1129,14 @@ impl ClaudeStreamJsonSession {
                         },
                     };
                     match immediate_deny {
+                        Some(_) if tool_name == CLAUDE_ELICITATION => {
+                            let line = elicitation_response_line(
+                                &request_id,
+                                &json!({ "action": "cancel" }),
+                            );
+                            let _ = self.stdin.write_all(line.as_bytes()).await;
+                            let _ = self.stdin.flush().await;
+                        }
                         Some(reason) => {
                             let line = approval_response_line(&request_id, false, reason, None);
                             let _ = self.stdin.write_all(line.as_bytes()).await;
@@ -1633,6 +1756,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn always_allow_scopes_cli_suggestions_to_the_session() {
+        let ask = ask_for(
+            r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool",
+                "tool_name":"Bash","input":{"command":"npm test"},"tool_use_id":"t",
+                "permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"npm test:*"}],"behavior":"allow","destination":"localSettings"}]}}"#,
+        )
+        .unwrap();
+        let updates =
+            session_permission_updates(&ask.tool_name, ask.permission_suggestions.as_ref());
+        assert_eq!(updates[0]["destination"], "session");
+        assert_eq!(updates[0]["rules"][0]["ruleContent"], "npm test:*");
+        // 没有建议：整工具 session 规则。
+        assert_eq!(
+            session_permission_updates("mcp__x__y", None),
+            json!([{"type":"addRules","rules":[{"toolName":"mcp__x__y"}],"behavior":"allow","destination":"session"}])
+        );
+        let line = approval_response_line_with_permissions("r", true, "no", None, Some(&updates));
+        let value = frame(line.trim());
+        assert_eq!(value["response"]["response"]["behavior"], "allow");
+        assert_eq!(value["response"]["response"]["updatedPermissions"], updates);
+    }
+
+    /// MCP elicitation（2.1.281+）有宿主时挂起成交互询问，回执是 `{action}` 形状，
+    /// 取消时也必须按这个形状回（`behavior:deny` 对它无效，那一轮会挂死）。
+    #[test]
+    fn mcp_elicitation_is_asked_and_answered_with_an_action() {
+        let ask = ask_for(
+            r#"{"type":"control_request","request_id":"e1","request":{"subtype":"elicitation",
+                "mcp_server_name":"linear","message":"Sign in","mode":"url","url":"https://x.test/a"}}"#,
+        )
+        .expect("ask");
+        assert_eq!(ask.tool_name, CLAUDE_ELICITATION);
+        assert!(ask.requires_user_interaction && ask.requires_manual_approval);
+        assert!(approval_verdict(&ask).is_ok());
+        assert_eq!(ask.input["url"], "https://x.test/a");
+
+        let lines = reject_pending_lines(
+            &[PendingApproval {
+                request_id: "e1".to_string(),
+                tool_name: CLAUDE_ELICITATION.to_string(),
+            }],
+            "x",
+        );
+        let value = frame(lines[0].trim());
+        assert_eq!(value["response"]["request_id"], "e1");
+        assert_eq!(value["response"]["response"], json!({ "action": "cancel" }));
+    }
+
+    /// 2.1.281+ 的安全检查必须等人确认：`classifier_approvable:false` 或 `default_to_no:true`
+    /// 任一出现即标记，「完全」档据此不再自动放行。
+    #[test]
+    fn safety_checks_require_manual_approval() {
+        let ask = |extra: &str| {
+            ask_for(&format!(
+                r#"{{"type":"control_request","request_id":"r","request":{{"subtype":"can_use_tool",
+                    "tool_name":"Bash","input":{{"command":"rm -rf ~"}},"tool_use_id":"t"{extra}}}}}"#
+            ))
+            .expect("ask")
+            .requires_manual_approval
+        };
+        assert!(!ask(""));
+        assert!(!ask(
+            r#","decision_reason_type":"safetyCheck","classifier_approvable":true"#
+        ));
+        assert!(ask(
+            r#","decision_reason_type":"subcommandResults","classifier_approvable":false"#
+        ));
+        assert!(ask(r#","default_to_no":true"#));
+    }
+
     /// **本项修复的核心断言**：喂一个我们不认识的 `control_request`，必须产生一条**带同一个
     /// `request_id`** 的 error 响应。
     ///
@@ -1675,6 +1869,7 @@ mod tests {
     fn a_never_seen_control_request_subtype_still_gets_answered() {
         for raw in [
             r#"{"type":"control_request","request_id":"r1","request":{"subtype":"request_user_dialog","dialog_kind":"x"}}"#,
+            // 没有宿主时 elicitation 同样 fail-closed（有宿主时走问用户卡，见下一条测试）。
             r#"{"type":"control_request","request_id":"r2","request":{"subtype":"elicitation","mcp_server_name":"s","message":"m"}}"#,
             r#"{"type":"control_request","request_id":"r3","request":{"subtype":"totally_new_in_a_future_cli"}}"#,
             // `request` 缺失（CLI 自己会把这种判成 `Missing request on control_request`）：
@@ -2361,6 +2556,7 @@ mod live_tests {
                         approved: true,
                         updated_input,
                         set_permission_mode: None,
+                        updated_permissions: None,
                     })
                     .await;
                 if sent.is_err() {
@@ -2459,6 +2655,7 @@ text={}",
                         approved: true,
                         updated_input: None,
                         set_permission_mode,
+                        updated_permissions: None,
                     })
                     .await;
                 if sent.is_err() {
@@ -2592,6 +2789,7 @@ text={}",
                         approved: true,
                         updated_input,
                         set_permission_mode: None,
+                        updated_permissions: None,
                     })
                     .await;
                 if sent.is_err() {
@@ -3045,6 +3243,7 @@ text={}",
                         approved: approve,
                         updated_input: None,
                         set_permission_mode: None,
+                        updated_permissions: None,
                     })
                     .await;
                 if sent.is_err() {

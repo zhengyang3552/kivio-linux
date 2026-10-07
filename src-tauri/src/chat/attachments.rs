@@ -250,13 +250,13 @@ pub(crate) fn read_attachment_as_data_url(path: &Path) -> Result<String, String>
     Ok(format!("data:{mime};base64,{encoded}"))
 }
 
-// 超过该大小的内联图片 artifact 才外置到磁盘（小图保持内联，避免无谓的读盘往返）。
+// 图片可保留缩略预览；非图片无论大小都只保留文件引用。
 const ARTIFACT_INLINE_THRESHOLD_BYTES: usize = 32 * 1024;
 // 缩略图最长边像素：列表里只需要小预览，原图点开时再按 path 懒加载。
 const ARTIFACT_THUMBNAIL_MAX_DIM: u32 = 256;
 
-/// 把一条消息里内联的大图 artifact（含 `tool_calls` 内的）外置到对话附件目录：
-/// 整图写盘并置 `path`，`data_url` 替换为内联缩略图（生成失败则留空，前端按 path 懒加载原图）。
+/// 把一条消息里内联的大 artifact（含 `tool_calls` 内的）外置到对话附件目录：
+/// 原文件写盘并置 `path`；图片的 `data_url` 替换为缩略图，其他类型留空。
 /// 返回是否发生了修改。已带 `path` 且文件在盘上的 artifact 只缩 `data_url` 不再写盘，
 /// 因此可重复安全调用（极噪的图缩略后可能仍超阈值、被再缩一次，幂等无害）。
 pub(crate) fn externalize_message_artifacts(
@@ -266,11 +266,11 @@ pub(crate) fn externalize_message_artifacts(
 ) -> bool {
     let mut changed = false;
     for artifact in message.artifacts.iter_mut() {
-        changed |= externalize_image_artifact(app, conversation_id, artifact);
+        changed |= externalize_artifact(app, conversation_id, artifact);
     }
     for tool_call in message.tool_calls.iter_mut() {
         for artifact in tool_call.artifacts.iter_mut() {
-            changed |= externalize_image_artifact(app, conversation_id, artifact);
+            changed |= externalize_artifact(app, conversation_id, artifact);
         }
     }
     changed |= externalize_model_message_images(app, conversation_id, message);
@@ -660,16 +660,16 @@ fn normalize_stored_image_mime(mime_type: &str) -> String {
         lowered
     }
 }
-/// 快速判断:消息里是否存在"需要外置"的内联大图(图片 + data_url 超阈值)。
+/// 图片按预览阈值检查；其他附件只要内联了内容就需外置，不按大小豁免。
 /// 用于会话持久化的廉价预扫描——没有这类 artifact 就完全不必克隆对话。
 /// 注意**不能**把"已带 path"当豁免条件：present_artifacts 这类已落盘的成果卡
 /// 会同时带 path 和整图 data_url（曾让 10 条消息的会话膨胀到 54MB），
 /// 有 path 只影响外置方式（免写盘、只缩 data_url），不影响是否需要外置。
-pub(crate) fn message_has_inline_image_to_externalize(message: &ChatMessage) -> bool {
+pub(crate) fn message_has_inline_artifact_to_externalize(message: &ChatMessage) -> bool {
     let needs = |artifact: &ChatToolArtifact| match parse_data_url(artifact.data_url.trim()) {
         Some((mime, payload)) => {
-            mime.starts_with("image/")
-                && decoded_base64_len(payload) > ARTIFACT_INLINE_THRESHOLD_BYTES
+            !mime.starts_with("image/")
+                || decoded_base64_len(payload) > ARTIFACT_INLINE_THRESHOLD_BYTES
         }
         None => false,
     };
@@ -680,7 +680,7 @@ pub(crate) fn message_has_inline_image_to_externalize(message: &ChatMessage) -> 
             .any(|tool_call| tool_call.artifacts.iter().any(needs))
 }
 
-fn externalize_image_artifact(
+fn externalize_artifact(
     app: &AppHandle,
     conversation_id: &str,
     artifact: &mut ChatToolArtifact,
@@ -689,21 +689,19 @@ fn externalize_image_artifact(
         Ok(dir) => dir,
         Err(_) => return false,
     };
-    externalize_image_artifact_in_dir(&dir, artifact)
+    externalize_artifact_in_dir(&dir, artifact)
 }
 
-/// [`externalize_image_artifact`] 的纯目录版（可单测，不需要 `AppHandle`）。
-fn externalize_image_artifact_in_dir(dir: &Path, artifact: &mut ChatToolArtifact) -> bool {
+/// [`externalize_artifact`] 的纯目录版（可单测，不需要 `AppHandle`）。
+fn externalize_artifact_in_dir(dir: &Path, artifact: &mut ChatToolArtifact) -> bool {
     let Some((mime, payload)) = parse_data_url(artifact.data_url.trim()) else {
         return false;
     };
-    if !mime.starts_with("image/") {
-        return false;
-    }
+    let is_image = mime.starts_with("image/");
     let Ok(bytes) = general_purpose::STANDARD.decode(payload) else {
         return false;
     };
-    if bytes.len() <= ARTIFACT_INLINE_THRESHOLD_BYTES {
+    if is_image && bytes.len() <= ARTIFACT_INLINE_THRESHOLD_BYTES {
         return false;
     }
 
@@ -722,8 +720,19 @@ fn externalize_image_artifact_in_dir(dir: &Path, artifact: &mut ChatToolArtifact
             dir.join(existing).is_file()
         };
         if on_disk {
+            let preview = if is_image {
+                make_thumbnail_data_url(&bytes).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if artifact.data_url == preview {
+                return false;
+            }
+            if !is_image && !Path::new(existing).is_absolute() {
+                artifact.path = Some(dir.join(existing).to_string_lossy().into_owned());
+            }
             artifact.size_bytes = artifact.size_bytes.or(Some(bytes.len() as u64));
-            artifact.data_url = make_thumbnail_data_url(&bytes).unwrap_or_default();
+            artifact.data_url = preview;
             return true;
         }
     }
@@ -731,15 +740,43 @@ fn externalize_image_artifact_in_dir(dir: &Path, artifact: &mut ChatToolArtifact
     let file_name = format!(
         "artifact-{}.{}",
         sha256_hex(&bytes),
-        extension_for_image_mime(&mime)
+        if is_image {
+            extension_for_image_mime(&mime)
+        } else {
+            Path::new(&artifact.name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .filter(|ext| {
+                    !ext.is_empty()
+                        && ext.len() <= 10
+                        && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+                })
+                .unwrap_or("bin")
+        }
     );
-    if !dir.join(&file_name).is_file() && fs::write(dir.join(&file_name), &bytes).is_err() {
-        return false;
+    if !dir.join(&file_name).is_file() {
+        let temporary = dir.join(format!("{file_name}.{}.tmp", Uuid::new_v4()));
+        if fs::write(&temporary, &bytes)
+            .and_then(|()| fs::rename(&temporary, dir.join(&file_name)))
+            .is_err()
+        {
+            let _ = fs::remove_file(&temporary);
+            return false;
+        }
     }
 
     artifact.size_bytes = Some(bytes.len() as u64);
-    artifact.data_url = make_thumbnail_data_url(&bytes).unwrap_or_default();
-    artifact.path = Some(file_name);
+    artifact.data_url = if is_image {
+        make_thumbnail_data_url(&bytes).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    artifact.path = Some(if is_image {
+        file_name
+    } else {
+        // Generated file chips open through the OS and require an absolute path.
+        dir.join(file_name).to_string_lossy().into_owned()
+    });
     true
 }
 
@@ -1490,7 +1527,7 @@ mod tests {
 
         // 大内联图、无 path → 需要外置
         let msg = make_message(&format!("data:image/png;base64,{big_payload}"), None);
-        assert!(message_has_inline_image_to_externalize(&msg));
+        assert!(message_has_inline_artifact_to_externalize(&msg));
 
         // 已有 path 但 data_url 仍是整图 → 一样要外置（present_artifacts 的成果卡
         // 曾同时带绝对 path 和整图 base64，把 path 当豁免就漏成 54MB 会话文件）。
@@ -1498,13 +1535,13 @@ mod tests {
             &format!("data:image/png;base64,{big_payload}"),
             Some("artifact-x.png"),
         );
-        assert!(message_has_inline_image_to_externalize(&msg));
+        assert!(message_has_inline_artifact_to_externalize(&msg));
 
         // 小图 → 跳过（带不带 path 都一样）
         let msg = make_message("data:image/png;base64,aGVsbG8=", None);
-        assert!(!message_has_inline_image_to_externalize(&msg));
+        assert!(!message_has_inline_artifact_to_externalize(&msg));
         let msg = make_message("data:image/png;base64,aGVsbG8=", Some("artifact-x.png"));
-        assert!(!message_has_inline_image_to_externalize(&msg));
+        assert!(!message_has_inline_artifact_to_externalize(&msg));
     }
 
     /// 造一张 >32KB 阈值、可被 image crate 解码的噪声 PNG。
@@ -1556,16 +1593,69 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(externalize_image_artifact_in_dir(dir.path(), &mut artifact));
+        assert!(externalize_artifact_in_dir(dir.path(), &mut artifact));
         let path = dir.path().join(artifact.path.as_ref().unwrap());
         assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("svg"));
         assert_eq!(read_attachment_as_data_url(&path).unwrap(), data_url);
         assert!(artifact.data_url.is_empty());
-        assert!(!externalize_image_artifact_in_dir(
-            dir.path(),
+        assert!(!externalize_artifact_in_dir(dir.path(), &mut artifact));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn binary_artifacts_are_externalized_without_losing_bytes() {
+        for mime in [
+            "video/mp4",
+            "application/octet-stream",
+            "text/plain",
+            "application/pdf",
+        ] {
+            for size in [0, 11, 100_000] {
+                for existing in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let bytes = vec![42u8; size];
+                    let original = dir.path().join("movie.mp4");
+                    if existing {
+                        fs::write(&original, &bytes).unwrap();
+                    }
+                    let mut artifact: ChatToolArtifact = serde_json::from_value(serde_json::json!({
+                    "name": "movie.mp4", "mime_type": mime,
+                    "data_url": format!("data:{mime};base64,{}", general_purpose::STANDARD.encode(&bytes)),
+                    "path": original.to_string_lossy(),
+                })).unwrap();
+                    let message: ChatMessage = serde_json::from_value(serde_json::json!({
+                    "id": "m", "role": "assistant", "content": "", "timestamp": 0,
+                    "tool_calls": [{"id": "t", "name": "video", "arguments": "{}", "status": "success", "artifacts": [artifact.clone()]}],
+                })).unwrap();
+                    assert!(message_has_inline_artifact_to_externalize(&message));
+                    assert!(externalize_artifact_in_dir(dir.path(), &mut artifact));
+                    assert!(artifact.data_url.is_empty());
+                    // File chips open the path directly through the OS, without a conversation id.
+                    assert!(Path::new(artifact.path.as_ref().unwrap()).is_absolute());
+                    let stored = dir.path().join(artifact.path.as_ref().unwrap());
+                    assert_eq!(fs::read(&stored).unwrap(), bytes);
+                    assert_eq!(stored.extension().unwrap(), "mp4");
+                    assert!(!externalize_artifact_in_dir(dir.path(), &mut artifact));
+                    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+                }
+            }
+        }
+        // A failed write must retain the only copy of the artifact.
+        let dir = tempfile::tempdir().unwrap();
+        let mut artifact = artifact_with(
+            format!(
+                "data:video/mp4;base64,{}",
+                general_purpose::STANDARD.encode(vec![0u8; 100_000])
+            ),
+            None,
+        );
+        let before = artifact.data_url.clone();
+        assert!(!externalize_artifact_in_dir(
+            &dir.path().join("missing"),
             &mut artifact
         ));
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(artifact.data_url, before);
+        assert!(artifact.path.is_none());
     }
 
     #[test]
@@ -1581,7 +1671,7 @@ mod tests {
         let mut paths = std::collections::HashSet::new();
         for _ in 0..10 {
             let mut snapshot = original.clone();
-            assert!(externalize_image_artifact_in_dir(dir.path(), &mut snapshot));
+            assert!(externalize_artifact_in_dir(dir.path(), &mut snapshot));
             paths.insert(snapshot.path.unwrap());
         }
         assert_eq!(
@@ -1608,10 +1698,7 @@ mod tests {
         );
         let original_str = original.to_string_lossy().into_owned();
         let mut artifact = artifact_with(data_url, Some(original_str.clone()));
-        assert!(externalize_image_artifact_in_dir(
-            &attachments_dir,
-            &mut artifact
-        ));
+        assert!(externalize_artifact_in_dir(&attachments_dir, &mut artifact));
 
         // path 原样保留（前端按它懒加载原图），附件目录没有多写一份字节
         assert_eq!(artifact.path.as_deref(), Some(original_str.as_str()));
@@ -1639,10 +1726,7 @@ mod tests {
         );
         let missing = root.join("gone.png").to_string_lossy().into_owned();
         let mut artifact = artifact_with(data_url, Some(missing));
-        assert!(externalize_image_artifact_in_dir(
-            &attachments_dir,
-            &mut artifact
-        ));
+        assert!(externalize_artifact_in_dir(&attachments_dir, &mut artifact));
 
         let new_path = artifact.path.expect("path");
         assert!(
@@ -1856,6 +1940,130 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn migrated_pdf_survives_message_deletion_gc_from_each_artifact_source() {
+        for source in ["message", "tool_call", "model_tool_result"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut retained: ChatToolArtifact = serde_json::from_value(serde_json::json!({
+                "name": "report.pdf", "mime_type": "application/pdf",
+                "data_url": format!("data:application/pdf;base64,{}", general_purpose::STANDARD.encode(b"%PDF-retained")),
+            })).unwrap();
+            let mut deleted = retained.clone();
+            deleted.data_url = format!(
+                "data:application/pdf;base64,{}",
+                general_purpose::STANDARD.encode(b"%PDF-deleted"),
+            );
+            assert!(externalize_artifact_in_dir(dir.path(), &mut retained));
+            assert!(externalize_artifact_in_dir(dir.path(), &mut deleted));
+            let retained_path = Path::new(retained.path.as_deref().unwrap()).to_path_buf();
+            assert!(retained_path.is_absolute());
+            let retained_name = retained_path.file_name().unwrap().to_str().unwrap().to_string();
+            let orphan_name = Path::new(deleted.path.as_deref().unwrap())
+                .file_name().unwrap().to_str().unwrap().to_string();
+            let upload_name = "att_original-user.pdf".to_string();
+            fs::write(dir.path().join(&upload_name), b"user upload").unwrap();
+
+            let mut message = serde_json::json!({
+                "id": "remaining", "role": "assistant", "content": "report", "timestamp": 1,
+            });
+            match source {
+                "message" => message["artifacts"] = serde_json::json!([retained]),
+                "tool_call" => message["tool_calls"] = serde_json::json!([{
+                    "id": "call", "name": "report", "status": "success", "artifacts": [retained],
+                }]),
+                "model_tool_result" => message["model_messages"] = serde_json::json!([{
+                    "role": "tool", "content": [{
+                        "type": "tool_result", "tool_call_id": "call", "content": "report",
+                        "is_error": false, "artifacts": [retained],
+                    }],
+                }]),
+                _ => unreachable!(),
+            }
+            let mut conversation: crate::chat::Conversation =
+                serde_json::from_value(serde_json::json!({
+                    "id": "conv_gc_pdf", "title": "test", "provider_id": "p", "model": "m",
+                    "created_at": 1, "updated_at": 2, "messages": [message, {
+                        "id": "deleted", "role": "assistant", "content": "old report",
+                        "timestamp": 2, "artifacts": [deleted],
+                    }],
+                })).unwrap();
+            conversation.messages.pop();
+            let disk = dir.path().join("conversation.json");
+            fs::write(&disk, serde_json::to_vec(&conversation).unwrap()).unwrap();
+            let restored = serde_json::from_slice(&fs::read(disk).unwrap()).unwrap();
+            let references = crate::chat::gc::referenced_attachment_names(&restored);
+            let orphans = crate::chat::gc::unreferenced_attachment_names(
+                dir.path(),
+                &[retained_name, orphan_name.clone(), upload_name.clone()],
+                &references,
+            );
+            assert_eq!(orphans, vec![orphan_name.clone()], "{source}");
+            for name in orphans {
+                fs::remove_file(dir.path().join(name)).unwrap();
+            }
+            assert_eq!(fs::read(retained_path).unwrap(), b"%PDF-retained", "{source}");
+            assert!(!dir.path().join(orphan_name).exists(), "{source}");
+            assert_eq!(fs::read(dir.path().join(upload_name)).unwrap(), b"user upload");
+        }
+    }
+
+    #[test]
+    fn compaction_fix_replay_image_survives_gc_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = general_purpose::STANDARD.encode(b"retained-image");
+        let original = format!("data:image/png;base64,{payload}");
+        let mut replay = vec![api_image_message(&original)];
+        externalize_api_message_images_in_dir(dir.path(), &mut replay);
+        let file_name = api_image_url(&replay[0])
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let conversation: crate::chat::Conversation = serde_json::from_value(serde_json::json!({
+            "id":"gc-replay", "title":"test", "provider_id":"p", "model":"m", "created_at":1, "updated_at":1,
+            "messages":[{"id":"u", "role":"user", "content":"image", "timestamp":1,
+                "attachments":[{"id":"a", "type":"image", "name":"photo.png", "path":"att_original.png"}]},
+                {"id":"a", "role":"assistant", "content":"answer", "timestamp":2}],
+            "context_state":{"summary":{"id":"s", "content":"summary", "source_message_ids":["u"],
+                "source_until_message_id":"u", "token_estimate_before":10, "token_estimate_after":5,
+                "created_at":2, "provider_id":"p", "model":"m", "stale":false,
+                "replay":{"through_message_id":"a", "messages":replay}}}
+        })).unwrap();
+        let disk = dir.path().join("conversation.json");
+        fs::write(&disk, serde_json::to_vec(&conversation).unwrap()).unwrap();
+        let mut restored: crate::chat::Conversation =
+            serde_json::from_slice(&fs::read(disk).unwrap()).unwrap();
+        let referenced = crate::chat::gc::referenced_attachment_names(&restored);
+        let orphan = "msgimg-unreferenced.png".to_string();
+        fs::write(dir.path().join(&orphan), b"unused").unwrap();
+        for name in crate::chat::gc::unreferenced_attachment_names(
+            dir.path(),
+            &[file_name.clone(), orphan.clone()],
+            &referenced,
+        ) {
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        assert!(
+            dir.path().join(&file_name).exists(),
+            "live replay image was deleted"
+        );
+        assert!(
+            !dir.path().join(orphan).exists(),
+            "unused files must still be collected"
+        );
+        let tail = &mut restored
+            .context_state
+            .summary
+            .as_mut()
+            .unwrap()
+            .replay
+            .as_mut()
+            .unwrap()
+            .messages;
+        rehydrate_api_message_images_in_dir(dir.path(), tail);
+        assert_eq!(api_image_url(&tail[0]), original);
+    }
+
     /// 回放前必须还原成 data URL，且 mime 逐字保留（不能靠扩展名猜）。
     #[test]
     fn rehydrate_api_message_images_round_trips() {
@@ -1947,5 +2155,16 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Reuse the existing attachment store for the compacted provider tail.
+pub(crate) fn externalize_compaction_images(
+    app: &AppHandle,
+    conversation_id: &str,
+    messages: &mut [serde_json::Value],
+) {
+    if let Ok(dir) = conversation_attachments_dir(app, conversation_id) {
+        externalize_api_message_images_in_dir(&dir, messages);
     }
 }

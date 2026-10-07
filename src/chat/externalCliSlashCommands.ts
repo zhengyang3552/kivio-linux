@@ -23,8 +23,6 @@ function agentDisplayName(agentId: string): string {
       return 'OpenCode'
     case 'codex':
       return 'Codex'
-    case 'cursor':
-      return 'Cursor Agent'
     case 'gemini':
       return 'Gemini CLI'
     case 'kimi':
@@ -68,6 +66,7 @@ export function mapExternalCliSlashCommands(
       category,
       keywords: [commandName, commandName.split(':').pop() ?? commandName],
       kind: 'cli',
+      agentId: id,
       argumentHint: command.argumentHint?.trim() || undefined,
     }
   })

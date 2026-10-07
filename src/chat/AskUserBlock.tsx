@@ -1,5 +1,6 @@
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { AsyncQuestionsContext } from './asyncQuestionsContext'
+import { codexAsyncReplyEnvelope } from './asyncQuestionReply'
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
 import {
   ArrowRight,
@@ -331,7 +332,10 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
     const el = optionsScrollRef.current
     if (el) el.scrollTop = 0
     setActiveIndex(0)
-  }, [toolCall.id, visibleIndex])
+    // 换题会重建整个选项区：在自定义框里按 Enter 翻页时，输入框随之卸载、焦点掉到 body，
+    // 后面的 ↑↓ / Enter / 数字键就全失效。
+    if (docked && parsedRef.current?.phase === 'awaiting') listRef.current?.focus({ preventScroll: true })
+  }, [toolCall.id, visibleIndex, docked])
 
   // 卡片一出现就把焦点收到选项列表上：这一刻整轮生成都停在这里等答复，键盘直接能用
   // （↑↓ / Enter / 数字键）。与审批卡同一套取舍 —— 那边也是让主按钮 autoFocus，
@@ -393,7 +397,14 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
         ? existing.selectedOptionIds.filter((item) => item !== optionId)
         : [...existing.selectedOptionIds, optionId]
       : [optionId]
-    return { ...current, [question.id]: { ...existing, selectedOptionIds } }
+    // 单选题的选项与自定义文字互斥：否则「先打了字、又点了选项」会把两个答案一起交上去。
+    const exclusive = !allowMultiple(question) && !(question.value_schema ?? question.valueSchema)
+    return {
+      ...current,
+      [question.id]: exclusive
+        ? { selectedOptionIds, customText: '', customTextEdited: false }
+        : { ...existing, selectedOptionIds },
+    }
   }
 
   /** 点一行选项。单题单选时**直接落答案**（把新草稿同步传下去），不用再点提交。 */
@@ -439,10 +450,16 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
   }
 
   const setCustomText = (questionId: string, customText: string) => {
+    const question = parsed.questions.find((item) => item.id === questionId)
+    const exclusive = Boolean(question)
+      && !allowMultiple(question!)
+      && !(question!.value_schema ?? question!.valueSchema)
     const next = {
       ...draftRef.current,
       [questionId]: {
-        selectedOptionIds: draftRef.current[questionId]?.selectedOptionIds ?? [],
+        selectedOptionIds: exclusive && customText.trim()
+          ? []
+          : draftRef.current[questionId]?.selectedOptionIds ?? [],
         customText,
         customTextEdited: true,
       },
@@ -483,13 +500,16 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
         }))
       if (parsed.async) {
         if (!asyncQuestions) throw new Error('当前视图无法发送答复')
-        const text = parsed.questions.map((question) => {
+        const replies = parsed.questions.flatMap((question) => {
           const answer = answers[question.id]
-          if (!answer) return ''
+          if (!answer) return []
           const labels = answer.selected_option_ids.map((id) => optionLabel(question, id))
           if (answer.custom_text) labels.push(answer.custom_text)
-          return `${question.prompt}\n${labels.join('；')}`
-        }).filter(Boolean).join('\n\n')
+          return [{ index: Number(question.id), question: question.prompt, answer: labels.join('；') }]
+        })
+        // Codex 认得出这个信封：别的客户端会收起同一张卡、历史里也记成「答复」。
+        const text = codexAsyncReplyEnvelope(toolCall.id, replies)
+          ?? replies.map((reply) => `${reply.question}\n${reply.answer}`).join('\n\n')
         await asyncQuestions.reply(toolCall.id, skipped ? null : text)
       } else {
         await api.chatSubmitUserChoice(toolCallId, answers, skipped)
@@ -508,7 +528,7 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
   submitRef.current = (skipped, draftOverride) => { void submit(skipped, draftOverride) }
 
   return (
-    <div className={`not-prose w-full overflow-hidden rounded-2xl border border-neutral-200/70 bg-white/95 text-[12px] leading-5 text-neutral-700 dark:border-neutral-700/70 dark:bg-neutral-900/85 dark:text-neutral-200 ${
+    <div className={`not-prose w-full overflow-hidden rounded-2xl border border-neutral-200/70 bg-[var(--theme-surface)]/95 text-[12px] leading-5 text-neutral-700 ${
       // 只有吊在输入框上方那张才有投影（它是浮在对话之上的层）。消息流里的那块是**内容**，
       // 带投影会在浅灰底上糊出一条脏影子 —— 与旁边其它工具卡（无投影）也不是一套。
       docked
@@ -518,7 +538,7 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
       {/* 标题行：问题本身当标题（原来是「需要确认」当标题、问题降到正文，主次颠倒）。
           右侧是翻页 + 跳过，同参考图的 `‹ 1 of 4 ›  ×`。 */}
       <div className="flex items-start gap-3 px-3.5 pt-3 pb-2">
-        <div className="min-w-0 flex-1 text-[14px] font-semibold leading-6 text-neutral-950 dark:text-neutral-50">
+        <div className="min-w-0 flex-1 text-[14px] font-semibold leading-6 text-neutral-950">
           {awaiting && currentQuestion ? currentQuestion.prompt : compactText(parsed.title, 96)}
           {awaiting && currentQuestion?.required === false && (
             <span className="ml-1.5 text-[11px] font-normal text-neutral-400 dark:text-neutral-500">可选</span>
@@ -604,21 +624,21 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
                       // 冗余的边界。也别改回「非当前行才加 border-t」—— 那会让行高随 hover 在
                       // 1px 之间变，整张面板（吊在输入框上方）跟着上下跳。尺寸绝不能随 hover 变。
                       active
-                        ? 'bg-neutral-100 dark:bg-neutral-800'
-                        : 'hover:bg-neutral-50 dark:hover:bg-neutral-800/50'
+                        ? 'bg-neutral-100'
+                        : 'hover:bg-neutral-50'
                     }`}
                   >
                     <span
                       className={`grid size-6 shrink-0 place-items-center rounded-md text-[11.5px] font-medium tabular-nums transition-colors ${
                         selected
-                          ? 'bg-neutral-900 text-white dark:bg-neutral-100 dark:text-neutral-900'
-                          : 'bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400'
+                          ? 'bg-neutral-900 text-neutral-50'
+                          : 'bg-neutral-100 text-neutral-500 dark:text-neutral-400'
                       }`}
                     >
                       {selected && multiSelect ? <Check size={13} strokeWidth={2.4} /> : index + 1}
                     </span>
                     <span className="min-w-0 flex-1">
-                      <span className="block break-words text-[13px] font-medium leading-5 text-neutral-900 dark:text-neutral-100">
+                      <span className="block break-words text-[13px] font-medium leading-5 text-neutral-900">
                         {option.label}
                       </span>
                       {option.description && (
@@ -644,10 +664,10 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
                 <div
                   className={`flex items-center gap-3 rounded-xl px-1.5 py-1.5 ${
                     // 同上：不画分隔线。
-                    activeIndex === optionCount ? 'bg-neutral-100 dark:bg-neutral-800' : ''
+                    activeIndex === optionCount ? 'bg-neutral-100' : ''
                   }`}
                 >
-                  <span className="grid size-6 shrink-0 place-items-center rounded-md bg-neutral-100 text-neutral-400 dark:bg-neutral-800 dark:text-neutral-500">
+                  <span className="grid size-6 shrink-0 place-items-center rounded-md bg-neutral-100 text-neutral-400 dark:text-neutral-500">
                     <Pencil size={12} strokeWidth={2} />
                   </span>
                   <input
@@ -660,9 +680,23 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
                     onFocus={() => setActiveIndex(optionCount)}
                     onChange={(event) => setCustomText(currentQuestion.id, event.target.value)}
                     onKeyDown={(event) => {
+                      // 输入框嵌在列表里：不拦住的话 ↑↓ / 数字键会被列表当成选项导航，
+                      // 输入「1」就变成直选第 1 项并提交。
+                      event.stopPropagation()
+                      // 输入法选词的 Enter 不是提交（中文拼音候选会被当成答案发出去）。
+                      if (event.nativeEvent.isComposing || event.keyCode === 229) return
+                      if (event.key === 'ArrowUp' && optionCount > 0) {
+                        event.preventDefault()
+                        setActiveIndex(optionCount - 1)
+                        listRef.current?.focus({ preventScroll: true })
+                        return
+                      }
                       if (event.key !== 'Enter' || !draftHasAnswer(currentQuestion, draftRef.current[currentQuestion.id])) return
                       event.preventDefault()
+                      // 与点选项同一套流转：单题单选直接提交；多题则翻到下一题，最后一题凑齐了再提交。
                       if (answerOnPick) void submit(false)
+                      else if (!isLastQuestion) goNext()
+                      else if (allAnswered) void submit(false)
                     }}
                     placeholder="自己写一个…"
                     className="min-w-0 flex-1 bg-transparent text-[13px] leading-5 outline-none placeholder:text-neutral-400 dark:placeholder:text-neutral-500"
@@ -676,7 +710,9 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
             <span className="min-w-0 flex-1 truncate text-[11px] text-neutral-400 dark:text-neutral-500">
               ↑↓ 切换 · Enter 选择{optionCount > 1 ? ` · 数字键 1–${Math.min(optionCount, 9)} 直选` : ''}
             </span>
-            {(!answerOnPick || currentQuestion.required === false) && (
+            {(!answerOnPick
+              || currentQuestion.required === false
+              || (allowCustom(currentQuestion) && currentAnswer.customText.trim() !== '')) && (
               <Button
                 variant="primary"
                 size="sm"
@@ -698,7 +734,7 @@ export function AskUserBlock({ toolCall, variant = 'inline', onResolved }: AskUs
           <div className="space-y-2">
             {parsed.questions.map((question) => (
               <div key={question.id}>
-                <div className="break-words text-[12.5px] font-medium leading-5 text-neutral-800 dark:text-neutral-100">
+                <div className="break-words text-[12.5px] font-medium leading-5 text-neutral-800">
                   {question.prompt}
                 </div>
                 <div className="mt-0.5 break-words text-[12px] leading-5 text-neutral-500 dark:text-neutral-400">

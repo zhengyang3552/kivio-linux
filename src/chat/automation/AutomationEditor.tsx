@@ -27,6 +27,7 @@ import { isTauriRuntime } from '../../api/tauri'
 import { Button } from '../../components/Button'
 import { Toggle } from '../../settings/public/controls'
 import { useT, useLang } from '../../components/i18n'
+import { useDocumentDark } from '../../theme/useDocumentDark'
 import { WorkflowWorkbench } from './WorkflowWorkbench'
 import { localizeValidationIssue, workflowIssues } from './workflowData'
 import { ValidationContext } from './nodes/chrome'
@@ -34,6 +35,7 @@ import type { ValidationIssue, NodeOutput } from '../../api/automationContracts'
 import { AddNodePicker } from './AddNodePicker'
 import { automationApi } from './api'
 import { NodeInspector } from './NodeInspector'
+import { RunDetails } from './RunDetails'
 import { RunStatusCapsule } from './RunStatusCapsule'
 import { useAutomationRunState } from './useAutomationRunState'
 import {
@@ -74,6 +76,7 @@ import type {
   AutomationNodeType,
   FlowNode as FlowNodeModel,
 } from '../../api/automationContracts'
+import { alertDialog } from '../../components/dialogQueue'
 
 const nodeTypes = {
   'trigger.manual': FlowNode,
@@ -179,11 +182,13 @@ function EditorInner({
   onFlushSave: () => Promise<void>
 }) {
   const t = useT()
+  const dark = useDocumentDark()
   const [nodes, setNodes] = useNodesState<AutomationRfNode>(toRfNodes(automation.nodes))
   const [edges, setEdges, onEdgesChange] = useEdgesState(toRfEdges(automation))
   const [selectedId, setSelectedId] = useState<string | null>(
     automation.nodes[0]?.id ?? null,
   )
+  const [historyRunId, setHistoryRunId] = useState<string | null>(null)
   const [picker, setPicker] = useState<'trigger' | 'action' | null>(null)
   const { running, setRunning, runError, setRunError, nodeStatus, nodeOutput, runs, liveStartedAt, runData } = useAutomationRunState(automation.id)
   const english = useLang() === 'en'
@@ -224,7 +229,7 @@ function EditorInner({
   const edgesRef = useRef(edges)
   nodesRef.current = nodes
   edgesRef.current = edges
-  const { screenToFlowPosition } = useReactFlow()
+  const { screenToFlowPosition, fitView } = useReactFlow()
 
   const selected = useMemo((): FlowNodeModel | null => {
     const rf = nodes.find((node) => node.id === selectedId)
@@ -441,11 +446,13 @@ function EditorInner({
     commit(nodesRef.current, nextEdges)
   }, [commit, setEdges])
 
+  const startingRef = useRef(false)
   const runGraph = useCallback(async (untilNodeId?: string) => {
-    if (!isTauriRuntime()) return
+    if (!isTauriRuntime() || startingRef.current || running) return
+    startingRef.current = true
     setRunError('')
     try {
-      const problems = [...workflowIssues(automation, english), ...await automationApi.validate(automation)]
+      const problems = [...workflowIssues(automation, english), ...(await automationApi.validate(automation)).map((issue) => localizeValidationIssue(issue, english))]
         .filter((issue) => issue.severity === 'error' && !automation.nodes.find((node) => node.id === issue.nodeId)?.data.disabled)
       if (problems.length) {
         if (problems[0].nodeId) setSelectedId(problems[0].nodeId)
@@ -457,8 +464,8 @@ function EditorInner({
     } catch (err) {
       setRunning(false)
       setRunError(err instanceof Error ? err.message : String(err))
-    }
-  }, [automation, english, onFlushSave, setRunError, setRunning])
+    } finally { startingRef.current = false }
+  }, [automation, english, onFlushSave, running, setRunError, setRunning])
 
   const testSelected = async (input: NodeOutput) => {
     if (!isTauriRuntime()) throw new Error(english ? 'Node tests require the desktop app' : '单节点测试需要在桌面应用中执行')
@@ -470,6 +477,19 @@ function EditorInner({
     setRunning(true)
     try { await automationApi.testNode(automation.id, selected.id, input) }
     catch (err) { setRunning(false); throw err }
+  }
+
+  const changeEnabled = (enabled: boolean) => {
+    setRunError('')
+    const problem = enabled ? issues.find((issue) => issue.severity === 'error') : undefined
+    if (problem) {
+      if (problem.nodeId) setSelectedId(problem.nodeId)
+      setHistoryRunId(null)
+      setPicker(null)
+      setRunError(problem.message)
+      return
+    }
+    onChange(persist({ ...automation, enabled }, nodesRef.current, edgesRef.current, viewportRef.current))
   }
 
   const cancelRun = useCallback(async () => {
@@ -577,7 +597,7 @@ function EditorInner({
       await automationApi.exportToFile(automation.id, path)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      window.alert(`${t.chatAutomationExportFailed}${message}`)
+      void alertDialog(`${t.chatAutomationExportFailed}${message}`)
     }
   }, [automation.id, automation.name, onFlushSave, t])
 
@@ -587,6 +607,7 @@ function EditorInner({
   )
 
   const openPicker = (kind: 'trigger' | 'action') => {
+    setHistoryRunId(null)
     pendingAddRef.current = null
     setPicker((current) => (current === kind ? null : kind))
   }
@@ -634,6 +655,7 @@ function EditorInner({
               onConnectEnd={onConnectEnd}
               isValidConnection={isValidConnection}
               onNodeClick={(_, node) => {
+                setHistoryRunId(null)
                 setSelectedId(node.id)
                 setPicker(null)
                 pendingAddRef.current = null
@@ -686,7 +708,7 @@ function EditorInner({
               edgesReconnectable={false}
               reconnectRadius={0}
               proOptions={{ hideAttribution: true }}
-              colorMode={document.documentElement.classList.contains('dark') ? 'dark' : 'light'}
+              colorMode={dark ? 'dark' : 'light'}
             >
               <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} />
               <Controls showInteractive={false} />
@@ -699,14 +721,7 @@ function EditorInner({
               <div className="kv-automation-enable">
                 <Toggle
                   checked={automation.enabled}
-                  onChange={(enabled) =>
-                    onChange(persist(
-                      { ...automation, enabled },
-                      nodesRef.current,
-                      edgesRef.current,
-                      viewportRef.current,
-                    ))
-                  }
+                  onChange={(enabled) => void changeEnabled(enabled)}
                   ariaLabel={t.chatAutomationEnabled}
                 />
                 <span>{automation.enabled ? t.chatAutomationEnabled : t.chatAutomationDisabled}</span>
@@ -742,12 +757,14 @@ function EditorInner({
               <p>{t.chatAutomationEmptyCanvas}</p>
             </div>
           ) : null}
+          {runError && <p role="alert" className="absolute left-4 top-4 z-10 max-w-[70%] rounded-lg bg-[var(--theme-surface)] p-3 text-[13px]">{runError}</p>}
           <RunStatusCapsule
             running={running}
             runs={runs}
             error={runError}
             liveStartedAt={liveStartedAt}
             resetKey={automation.id}
+            onOpenRun={setHistoryRunId}
           />
         </div>
         <div className="kv-automation-side">
@@ -757,7 +774,12 @@ function EditorInner({
               {automation.nodes.find((node) => node.id === issue.nodeId)?.data.label}: {issue.message}
             </button>)}
           </details>}
-          {picker || !selected ? (
+          {historyRunId ? <RunDetails key={historyRunId} automation={automation} runId={historyRunId}
+            onClose={() => setHistoryRunId(null)} onLocate={(nodeId) => {
+              setSelectedId(nodeId)
+              setNodes((current) => current.map((node) => ({ ...node, selected: node.id === nodeId })))
+              void fitView({ nodes: [{ id: nodeId }], duration: 250, maxZoom: 1 })
+            }} /> : picker || !selected ? (
             <AddNodePicker
               kind={picker ?? (hasTrigger ? 'action' : 'trigger')}
               presentTypes={nodes.map((node) => node.type ?? '')}

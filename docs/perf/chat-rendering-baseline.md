@@ -12,6 +12,7 @@ network data and use a fixed timestamp so the same run produces the same row key
 | F2 | 20 assistant answers with 200 code blocks | code-heavy row estimates and syntax-heavy layout |
 | F3 | tables, KaTeX, Mermaid, tool calls, images | heavy-island hydration and height compensation |
 | F4 | one 20,000-character streaming answer | live Markdown and render cadence |
+| F5 | one live run with 300 or 1,000 alternating text/tool steps | unchanged Markdown inside the active message; text and tool updates |
 
 ## Collection
 
@@ -30,6 +31,198 @@ baselines are recorded; they are architecture checks, not product SLAs.
 The fixture unit tests validate shape and size; browser-level numbers remain
 environment-specific and should be recorded on the same machine and window size.
 
+### F5 production comparison
+
+Build the same fixture with current renderers and the pre-fix renderers without
+replacing tracked files:
+
+```powershell
+node scripts/build-chat-performance.mjs 143153c2
+node scripts/build-chat-performance.mjs
+npx vite preview --outDir node_modules/.cache/chat-performance/current --port 5714
+# In another terminal, for the baseline:
+npx vite preview --outDir node_modules/.cache/chat-performance/baseline --port 5715
+```
+
+Open `/scripts/fixtures/chat-performance.html` on each server. Run
+`await window.chatAcceptance.longRun(300, 'text')`, then `'tool'`, and repeat at
+1,000 steps for scale. Save the returned JSON. The baseline swaps the three
+production renderer/reference modules and the chat stylesheet changed by this fix;
+fixtures, dependencies and preview owner are identical. It is a rendering isolation comparison,
+not a complete historical application build.
+CSS imports are read directly by Vite/PostCSS, so the script points the style
+entry at a temporary historical CSS file beside the source and removes it in
+`finally`. Every build asserts the emitted bubble animation fill mode against
+the requested source (`both` at `143153c2`, `backwards` after the animation fix).
+To compare only the later segment memo change, use `442f53c4` as the baseline.
+
+Each run seeds text/tool events through the existing preview owner, waits for
+initial mount, then records 20 updates. Controlled publication measures event
+application and synchronous UI submission, excluding the owner's throttle wait.
+`queuedTaskMs` measures main-thread scheduling delay, not native click latency.
+The fixture collects browser long tasks directly in production; the development
+React Profiler/probe report may be empty there. Measure cold mount separately.
+Do not treat an empty production Profiler report as zero rendering cost.
+The fixture also records `seedMs`, `mountCommitMs` and `mountToSecondFrameMs`.
+Each sample uses a fresh MessageList key: the mount commit includes old-list
+cleanup and new-list mounting, with module caches retained. This is a React
+remount measurement, not application cold start or disk/IPC load time. The
+second animation frame is a scheduling boundary, not a display presentation timestamp.
+`liveBubbleTransform` must be `none` after the entrance animation in the current
+build: retaining the completed transform makes very tall live bubbles repaint
+and rebuild compositing layers on each offscreen status animation.
+
+For the current build, `playwright-cli run-code --filename=scripts/probe-chat-long-run.playwright.js`
+runs all four F5 combinations on the already-open production fixture, checks
+the default DOM budget, access to earlier steps, released transform and bottom
+anchoring after a width change, and stores results in `window.chatLongRunReport`.
+It restores full width after each resize assertion so all timing cases use the
+same width. Serial before/after repetitions and remount measurements for the
+segment memo follow-up are in [the follow-up report](chat-streaming-followup-2026-09-30.json).
+
+### Bounded live work and deferred syntax highlighting (2026-10-04)
+
+Live Work defaults to the latest 20 **process segments**, not 20 tool rounds.
+Earlier steps remain in the transcript and can be revealed in pages of 20.
+Revealed pages and pages inspected by pointer/focus remain mounted as new steps
+arrive. Viewport-level reading intent also pins the last committed page, including
+gutter wheel, history keys, touch and backwards native-scroll movement. Pending
+questions, pending tool permissions, and the current reasoning segment are retained
+outside this default window. Explicitly revealing earlier steps keeps Work open
+after completion; detaching once does not pin every subsequently appended step.
+Final answer text and artifact presentations are not truncated. Closing and
+reopening finished Work resets the inspection pins.
+
+This is bounded default mounting, not sub-step virtualization or a hard DOM cap:
+explicit inspection, many simultaneous pending interactions, and large individual
+segments can still grow the mounted tree. Streaming data processing still scans
+the full timeline.
+
+Streaming code renders escaped full text without syntax-token spans. Settled
+code uses the existing highlighter/cache; copy text, code geometry and Streamdown
+mode remain unchanged. The fixture's `settleStream()` applies a persisted-message
+handoff after `stream()` freezes the live output, without invoking a backend.
+
+Same-machine production fixture observations, Chromium 150, 1280×900, DPR 1.25:
+
+| Scenario / metric | Before | After |
+|---|---:|---:|
+| F5 1,000 steps, default DOM nodes | 36,095 | 456 |
+| F5 1,000 steps, mounted Markdown blocks | 1,001 | 11 |
+| F5 text run, mount commit | 952.9 ms | 51.9 ms |
+| F5 text updates, median / p95 | 16.3 / 28.1 ms | 16.2 / 20.0 ms |
+| F5 tool run, mount commit | 932.1 ms | 33.5 ms |
+| F5 tool updates, median / p95 | 23.3 / 125.1 ms | 11.5 / 17.2 ms |
+| F4 stream, renderer TaskDuration delta | 3,181.7 ms | 1,093.4 ms |
+| F4 stream, elapsed wall time | 4,932.1 ms | 3,999.5 ms |
+
+These are individual before/after runs, not statistical guarantees or native
+model/backend measurements. Both F5 sizes (300 and 1,000) mounted 456 DOM nodes
+afterward. Earlier-page interaction revealed step 980 while preserving step 990
+and current output. Narrow/wide resize bottom gaps were zero. F4 preserved all
+19,954 code-body characters, had zero live token spans, then restored 2,418 spans
+on the same code node at the persisted handoff; pre height stayed 14,576 px.
+The unchanged F5 text-update median is a remaining full-timeline processing cost,
+not evidence that all streaming work is now constant-time.
+
+Verification: production fixture build; real-browser paging/resize/code handoff;
+24 relevant Vitest files / 255 tests; `tsc --noEmit`; targeted ESLint. The link
+tests still emit jsdom's unsupported-navigation diagnostic while passing.
+
+Reader-state repair: follows ZCode's viewport-owned reading intent rather than
+bubble-local wheel detection, without adopting full live-process mounting.
+Real-browser development-fixture smoke retained the same step DOM node after
+gutter scrolling and 101 appended steps, without mounting skipped intermediate
+steps; explicitly revealed history stayed expanded at persisted completion.
+A scroll-only move from 241 to 91 px retained both its offset and inspected step
+after append. This exercises browser scroll events, not an OS-native scrollbar
+drag or a Tauri/WebKit run. Regression coverage includes input and stream updates
+batched together; the viewport authority is read before rendering the new page.
+
+### Math, fixture images and idle scheduling repair (2026-10-05)
+
+`ChatMarkdown` imports KaTeX's dependency stylesheet directly, alongside the math
+renderer, so Vite bundles its relative font assets. Importing it through the
+Tailwind aggregate left unresolved `fonts/KaTeX_*.woff2` URLs in the build.
+KaTeX's accessible MathML remains in the DOM but is visually clipped; only the
+HTML formula occupies layout. The F3 PNG is now a complete, decodable 1×1 image,
+not an image-load failure fixture or a representative large-image benchmark.
+
+Settled/history Markdown disables incomplete-syntax repair. The parser stays in
+Streamdown's keyed-block mode instead of switching to its whole-document static
+tree: unchanged code and loaded images survive completion. Incomplete text is
+restored from the source, and only corrected blocks may remount. This does not
+replace or fix upstream remend's live cross-block repair behavior.
+
+Idle `KivioBlob` has no autonomous breathing, blink, gaze or shape cadence. Poke,
+keyboard and explicit pulse reactions settle, then stop scheduling. Running
+moods keep animation; hidden, offscreen, paused and reduced-motion gates remain.
+Expired interaction holds are processed on resume. The obsolete automatic-antic
+caption callback/hook was removed; rotating greetings no longer nudge the avatar,
+while explicit poke captions remain.
+
+Real Chromium production-fixture verification at 1280×900, DPR 1.25:
+
+- F1 idle, 6 seconds: **0 layouts**, 2.6 ms renderer TaskDuration, compared with
+  the prior 97 layouts / 185.8 ms sample. This is a single renderer sample,
+  not whole-app CPU, native Tauri/WebKit, or a leak/longevity measurement.
+- KaTeX Main/Math fonts loaded; MathML boxes measured 1×1 px. All five mounted F3
+  images decoded as 1×1, without error placeholders.
+- Active avatar animated; paused and settled states had zero SVG mutations.
+  Pointer and keyboard input animated; reduced-motion mode produced zero mutations.
+- F4 retained the same code node and all 19,954 characters at completion, restoring
+  2,418 highlight spans; pre height stayed 14,576 px and reading offset 13,250 px.
+  Actual clipboard text matched all 19,954 characters.
+- F5 1,000-step text/tool updates: p95 10.3 / 9.1 ms, 467 DOM nodes, no recorded
+  long tasks in these runs. The previously observed 223 ms peak remains unassigned;
+  these samples do not establish its elimination.
+
+Verification: production fixture build, browser scenarios above, 28 Vitest files /
+308 tests, `tsc --noEmit`, targeted ESLint. The passing link suite still emits
+jsdom's unsupported-navigation diagnostic. Local measurements:
+`node_modules/.cache/chat-repair-results.json`.
+
+### Native/WebKit completion and resource check (2026-10-05)
+
+The real debug Tauri window exposed a completion-position change that Chromium
+alone did not catch. Isolated WebKit reproduced a 216 px adjustment: the
+virtualizer treated the already-measured live row as unmeasured history.
+Transferring its measured size removes that incorrect compensation. WebKit can
+also reset `scrollTop` while React moves the row from normal flow to absolute
+positioning; `MessageList` captures detached reading intent before the DOM commit
+and restores it through the existing scroll owner after measurement.
+
+- Production WebKit F4: completion retained the same code node and all 19,954
+  characters; `scrollTop` remained **5073**, code Y remained **-4866.155 px**.
+  A separate following run ended with **0 px** bottom gap.
+- Real Tauri: formulas rendered once, an 80-line code response highlighted after
+  completion, and the native copy action matched all 80 lines.
+- Instrumented real Tauri run: after scrolling into a live 300-line code response,
+  14 successive samples through completion kept code Y at **-1560 screenshot
+  pixels**. The recorded follow transition was the upward wheel; completion did
+  not force follow. A separate 300-line run preserved the visible older code
+  landmarks while the new response grew and completed.
+- An earlier, uninstrumented 500-line run returned to the bottom during streaming.
+  Its cause is unassigned; the two instrumented runs did not reproduce it.
+  These checks do not establish that every native scroll anomaly is eliminated.
+
+Two-process `top` samples (Kivio PID 56888 and its identified WebContent PID 56907),
+11 snapshots at one-second intervals, excluding the initial CPU sample:
+
+| Phase | Combined CPU range | Combined resident memory |
+| --- | --- | --- |
+| During a 500-line response | 0.3–0.7% | 756.2 → 720.4 MiB |
+| Settled idle | 0.0–0.4% | 584.3 → 546.0 MiB |
+
+These are short debug/HMR-session observations, not release-package benchmarks.
+GPU/network helpers and external CLI processes are excluded; resident-memory
+totals do not establish unique physical footprint or absence of a long-term leak.
+
+Final verification: 29 Vitest files / 318 tests, TypeScript, targeted ESLint,
+production fixture build, real Tauri and WebKit scenarios above. Temporary
+follow-state/title diagnostics were removed and the native title restored.
+Local detailed evidence: `node_modules/.cache/chat-native-repair-results.json`.
+
 ## Acceptance measurements
 
 - F2/F3 first meaningful transcript paint and first heavy commit.
@@ -39,3 +232,33 @@ environment-specific and should be recorded on the same machine and window size.
 - Repeat navigation to the same conversation: measurement snapshot/cache hit.
 - Scroll authority: navigation, TanStack `scrollToIndex`, measurement adjustments and
   bottom pin all use the same programmatic scroll writer.
+
+## Native streaming acceptance (2026-09-30)
+
+Results: [native streaming report](chat-native-streaming-2026-09-30.json) and
+[interpretation, fixes and remaining cancellation issue](../research/zcode-chat-comparison-2026-09-24.md#147-2026-09-30真实模型cli-与文件树实机验收).
+
+Use a debug Tauri window with a local WebView2 CDP port and attach with
+`playwright-cli -s=native attach --cdp=http://localhost:9223`.
+Create a separate temporary project containing `samples/group-a/case-001.md`
+through `case-030.md` and `samples/group-b/case-031.md` through `case-060.md`.
+Each file contains only public test data: title `# Case N`, batch N, alpha 7N,
+beta 11N. Ask the actual runtime to read these files, produce tables and analysis,
+then continue the same conversation. Do not inject preview-owner events.
+
+Before sending, run
+`playwright-cli -s=native run-code --filename=scripts/probe-chat-native-monitor.playwright.js`.
+During early and late output, run
+`playwright-cli -s=native run-code --filename=scripts/probe-chat-native-interactions.playwright.js`.
+The interaction script expects the test file tree and verifies preview content,
+sidebar controls and scrolling. Open file previews are closed before tree clicks;
+directory expansion is read from its chevron, not inferred from virtualized children.
+
+Export `window.realRunProbe.report()` and `window.realInteractions` before any
+development reload. End collection with `window.realRunProbe.stop()` and remove
+those two globals. The monitor is read-only and never submits model messages.
+It records event timestamp to capture handler, handler to second animation frame,
+long tasks and actual stream progress. Frame timing is not file-read completion
+or end-to-end input latency. Timing samples interrupted by a development reload
+must be discarded. The reported native runs used different window sizes and are
+not a cross-runtime benchmark or a multi-hour longevity test.

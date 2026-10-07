@@ -24,7 +24,6 @@ import {
   Star,
   Trash2,
 } from 'lucide-react'
-import { save } from '@tauri-apps/plugin-dialog'
 import { chatApi } from './api'
 import type {
   ChatProject,
@@ -37,7 +36,6 @@ import type {
   ConversationLibrarySort,
   ConversationSearchHit,
 } from './types'
-import { conversationMarkdownFilename } from './conversationExport'
 import { IconButton, Button } from '../components/Button'
 import { Select, Toggle } from '../settings/public/controls'
 import { useT, type Lang } from '../components/i18n'
@@ -52,6 +50,15 @@ import {
 } from './sessionLibrary/format'
 import { HighlightText } from './searchHighlight'
 import { useClampedMenuPosition } from './useClampedMenuPosition'
+import { alertDialog, confirmDialog } from '../components/dialogQueue'
+import { useWindowStore } from '../utils/windowStore'
+import {
+  markSessionBatchNotified,
+  markSessionBatchRefreshed,
+  sessionBatchStore,
+  startSessionBatch,
+  type SessionBatchAction,
+} from './sessionBatchStore'
 
 const PAGE_SIZE = 80
 
@@ -85,6 +92,40 @@ function columnFlags(tableWidth: number, density: ConversationLibraryDensity) {
 }
 
 type ShelfId = ConversationLibraryShelf
+
+function sameSelection(current: Set<string>, ids: readonly string[]): boolean {
+  if (current.size !== ids.length) return false
+  return ids.every((id) => current.has(id))
+}
+
+function failedBatch(
+  ids: readonly string[],
+  kinds: readonly SessionBatchAction['kind'][],
+): SessionBatchAction | null {
+  const snap = sessionBatchStore.getSnapshot()
+  const action = snap.action
+  if (snap.phase !== 'error' || !action || !kinds.includes(action.kind)) return null
+  if (!sameSelection(new Set(ids), action.ids)) return null
+  return action
+}
+
+function removesCurrentConversation(action: SessionBatchAction): boolean {
+  if (action.kind === 'delete' || action.kind === 'delete-one') return true
+  if (action.kind === 'archive' || action.kind === 'archive-one') return action.archived
+  return false
+}
+
+/** Row delete keeps the single-conversation failure prefix; export keeps paths already written. */
+function batchNotice(
+  batch: { error: string; warnings: string[]; action: SessionBatchAction | null },
+  failedPrefix: string,
+): string {
+  const base = batch.action?.kind === 'delete-one' && batch.error ? failedPrefix + batch.error : batch.error
+  if (batch.action?.kind === 'export' && batch.warnings.length > 0) {
+    return [base, ...batch.warnings].filter(Boolean).join('\n')
+  }
+  return base
+}
 
 interface SessionCenterProps {
   lang: Lang
@@ -185,6 +226,22 @@ export function SessionCenter({
   })
   const [selected, setSelected] = useState<Set<string>>(() => new Set())
   const [busy, setBusy] = useState(false)
+  const [batch] = useWindowStore(sessionBatchStore)
+  const controlsBusy = busy || batch.phase === 'running'
+  const liveBatchRef = useRef({
+    onConversationDeleted,
+    onConversationsChanged,
+    currentConversationId,
+  })
+  liveBatchRef.current = {
+    onConversationDeleted,
+    onConversationsChanged,
+    currentConversationId,
+  }
+  const batchTextRef = useRef(t)
+  batchTextRef.current = t
+  const selectionRev = useRef(0)
+  const selectionTouched = useRef(false)
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null)
   const [renameId, setRenameId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
@@ -206,6 +263,8 @@ export function SessionCenter({
         searchInputRef.current?.focus()
       }
       if (e.key === 'Escape') {
+        selectionTouched.current = true
+        selectionRev.current += 1
         setSelected(new Set())
         setMenu(null)
         setMoveOpen(null)
@@ -235,10 +294,33 @@ export function SessionCenter({
   const loadingMoreRef = useRef(false)
   /** 书架/筛选切换时丢弃过期响应，避免旧页回写造成闪一下。 */
   const loadSeqRef = useRef(0)
+  const applySelectionRef = useRef<(revAtStart: number) => void>(() => {})
+  applySelectionRef.current = (revAtStart: number) => {
+    if (selectionRev.current !== revAtStart) return
+    const pending = sessionBatchStore.getSnapshot()
+    const action = pending.action
+    if ((pending.phase === 'running' || pending.phase === 'error') && action) {
+      setSelected((current) => {
+        if (selectionTouched.current && !sameSelection(current, action.ids)) return current
+        return new Set(action.ids)
+      })
+      return
+    }
+    setSelected((current) => {
+      if (
+        pending.phase === 'success'
+        && action
+        && selectionTouched.current
+        && !sameSelection(current, action.ids)
+      ) return current
+      return new Set()
+    })
+  }
 
   const loadPage = useCallback(
     async (opts?: { append?: boolean }) => {
       const append = opts?.append ?? false
+      const revAtStart = selectionRev.current
       if (append) {
         if (loadingMoreRef.current) return
         loadingMoreRef.current = true
@@ -272,7 +354,7 @@ export function SessionCenter({
           loadingMore: false,
           error: '',
         }))
-        if (!append) setSelected(new Set())
+        if (!append) applySelectionRef.current(revAtStart)
       } catch (err) {
         if (seq !== loadSeqRef.current) return
         setState((s) => ({
@@ -293,6 +375,54 @@ export function SessionCenter({
     void loadPage({ append: false })
   }, [loadPage])
 
+  useLayoutEffect(() => {
+    selectionTouched.current = false
+    const pending = sessionBatchStore.getSnapshot()
+    if ((pending.phase === 'running' || pending.phase === 'error') && pending.action) {
+      setSelected(new Set(pending.action.ids))
+    }
+  }, [])
+
+  const loadPageRef = useRef(loadPage)
+  loadPageRef.current = loadPage
+  useEffect(() => {
+    const snap = sessionBatchStore.getSnapshot()
+    if (snap.phase === 'running' || snap.settledGeneration === 0) return
+    const generation = snap.settledGeneration
+    if (snap.notifiedGeneration !== generation) {
+      markSessionBatchNotified(generation)
+      const claimed = sessionBatchStore.getSnapshot()
+      if (claimed.notifiedGeneration !== generation || claimed.phase === 'running') return
+      const action = claimed.action
+      const currentId = liveBatchRef.current.currentConversationId
+      if (claimed.phase === 'success' && action && currentId && action.ids.includes(currentId) && removesCurrentConversation(action)) {
+        liveBatchRef.current.onConversationDeleted?.(currentId)
+      }
+      liveBatchRef.current.onConversationsChanged?.()
+      const text = batchTextRef.current
+      if (claimed.phase === 'error' && claimed.error) {
+        void alertDialog(batchNotice(claimed, text.chatDeleteConversationFailed))
+      }
+      if (claimed.phase === 'success' && action && (action.kind === 'delete' || action.kind === 'delete-one') && claimed.warnings.length > 0) {
+        const lines = action.kind === 'delete' ? claimed.warnings.slice(0, 8) : claimed.warnings
+        void alertDialog(text.chatDeleteConversationPartial + lines.join('\n'))
+      }
+    }
+    const pending = sessionBatchStore.getSnapshot()
+    if (pending.phase === 'running' || pending.settledGeneration !== generation) return
+    if (pending.refreshedGeneration === generation) return
+    let active = true
+    void (async () => {
+      await loadPageRef.current({ append: false })
+      if (!active) return
+      const latest = sessionBatchStore.getSnapshot()
+      if (latest.phase === 'running' || latest.settledGeneration !== generation) return
+      if (latest.refreshedGeneration === generation) return
+      markSessionBatchRefreshed(generation)
+    })()
+    return () => { active = false }
+  }, [batch.phase, batch.settledGeneration])
+
   const hasMore = state.items.length < state.total
 
   const onScrollList = useCallback(() => {
@@ -307,7 +437,18 @@ export function SessionCenter({
     onConversationsChanged?.()
   }, [onConversationsChanged])
 
+  const markSelectionTouched = useCallback(() => {
+    selectionTouched.current = true
+    selectionRev.current += 1
+  }, [])
+
+  const holdSubmittedSelection = (ids: string[]) => {
+    selectionRev.current += 1
+    setSelected(new Set(ids))
+  }
+
   const toggleSelect = useCallback((id: string, shiftKey: boolean) => {
+    markSelectionTouched()
     setSelected((prev) => {
       const next = new Set(prev)
       if (shiftKey && lastClickedIdRef.current) {
@@ -325,109 +466,110 @@ export function SessionCenter({
       return next
     })
     lastClickedIdRef.current = id
-  }, [state.items])
+  }, [markSelectionTouched, state.items])
 
   const selectAllVisible = useCallback(() => {
+    markSelectionTouched()
     setSelected(new Set(state.items.map((c) => c.id)))
-  }, [state.items])
+  }, [markSelectionTouched, state.items])
 
-  const clearSelection = useCallback(() => setSelected(new Set()), [])
+  const clearSelection = useCallback(() => {
+    markSelectionTouched()
+    setSelected(new Set())
+  }, [markSelectionTouched])
 
   const selectedIds = useMemo(() => [...selected], [selected])
 
-  const runBulk = useCallback(
-    async (action: () => Promise<void>) => {
-      if (selectedIds.length === 0 || busy) return
-      setBusy(true)
-      try {
-        await action()
-        notify()
-        await loadPage({ append: false })
-      } catch (err) {
-        window.alert(err instanceof Error ? err.message : String(err))
-      } finally {
-        setBusy(false)
-        setMoveOpen(null)
-      }
-    },
-    [busy, loadPage, notify, selectedIds.length],
-  )
+  const batchRunning = () => sessionBatchStore.getSnapshot().phase === 'running'
 
-  const bulkPin = (pinned: boolean) =>
-    void runBulk(async () => {
-      await chatApi.bulkUpdateConversations(selectedIds, { pinned })
-    })
-
-  const bulkArchive = (archived: boolean) =>
-    void runBulk(async () => {
-      await chatApi.bulkUpdateConversations(selectedIds, { archived })
-      if (archived && currentConversationId && selected.has(currentConversationId)) {
-        onConversationDeleted?.(currentConversationId)
-      }
-    })
-
-  const bulkMoveProject = (pid: string | null) =>
-    void runBulk(async () => {
-      await chatApi.bulkUpdateConversations(selectedIds, { projectId: pid })
-    })
-
-  const bulkMoveSet = (sid: string | null) =>
-    void runBulk(async () => {
-      await chatApi.bulkUpdateConversations(selectedIds, { setId: sid })
-    })
-
-  const bulkDelete = () => {
-    if (selectedIds.length === 0) return
-    if (!window.confirm(t.chatLibBulkDeleteConfirm.replace('{n}', String(selectedIds.length)))) return
-    void runBulk(async () => {
-      for (const id of selectedIds) {
-        if (generatingConversationIds.has(id)) onForceDropConversation?.(id)
-      }
-      const { warnings } = await chatApi.bulkDeleteConversations(selectedIds)
-      if (currentConversationId && selected.has(currentConversationId)) {
-        onConversationDeleted?.(currentConversationId)
-      }
-      if (warnings.length > 0) {
-        window.alert(t.chatDeleteConversationPartial + warnings.slice(0, 8).join('\n'))
-      }
-    })
+  const bulkPin = (pinned: boolean) => {
+    if (selectedIds.length === 0 || busy || batchRunning()) return
+    holdSubmittedSelection(selectedIds)
+    void startSessionBatch({ kind: 'pin', pinned, ids: selectedIds })
   }
 
-  const bulkExport = () =>
-    void runBulk(async () => {
-      for (const id of selectedIds) {
-        const row = state.items.find((c) => c.id === id)
-        const title = row?.title || id
-        const path = await save({
-          defaultPath: conversationMarkdownFilename(title),
-          filters: [{ name: 'Markdown', extensions: ['md'] }],
-        })
-        if (!path) continue
-        await chatApi.exportConversationMarkdown(id, path, lang)
-      }
+  const bulkArchive = (archived: boolean) => {
+    if (selectedIds.length === 0 || busy || batchRunning()) return
+    const retry = failedBatch(selectedIds, ['archive', 'archive-one'])
+    holdSubmittedSelection(selectedIds)
+    if (retry?.kind === 'archive-one') {
+      void startSessionBatch(retry)
+      return
+    }
+    void startSessionBatch({ kind: 'archive', archived, ids: selectedIds })
+  }
+
+  const bulkMoveProject = (pid: string | null) => {
+    if (selectedIds.length === 0 || busy || batchRunning()) return
+    setMoveOpen(null)
+    holdSubmittedSelection(selectedIds)
+    void startSessionBatch({ kind: 'move-project', projectId: pid, ids: selectedIds })
+  }
+
+  const bulkMoveSet = (sid: string | null) => {
+    if (selectedIds.length === 0 || busy || batchRunning()) return
+    setMoveOpen(null)
+    holdSubmittedSelection(selectedIds)
+    void startSessionBatch({ kind: 'move-set', setId: sid, ids: selectedIds })
+  }
+
+  const bulkDelete = async () => {
+    const ids = [...selectedIds]
+    if (ids.length === 0 || busy || batchRunning()) return
+    if (!(await confirmDialog({ message: t.chatLibBulkDeleteConfirm.replace('{n}', String(ids.length)), confirmLabel: t.dialogDelete, danger: true }))) return
+    if (batchRunning()) return
+    for (const id of ids) {
+      if (generatingConversationIds.has(id)) onForceDropConversation?.(id)
+    }
+    holdSubmittedSelection(ids)
+    const retry = failedBatch(ids, ['delete-one'])
+    void startSessionBatch(retry ?? { kind: 'delete', ids })
+  }
+
+  const bulkExport = () => {
+    if (selectedIds.length === 0 || busy || batchRunning()) return
+    const targets = selectedIds.map((id) => {
+      const row = state.items.find((item) => item.id === id)
+      return { id, title: row?.title || id }
     })
+    holdSubmittedSelection(selectedIds)
+    void startSessionBatch({ kind: 'export', ids: selectedIds, targets, lang })
+  }
 
   const patchOne = useCallback(
     async (id: string, patch: { pinned?: boolean; archived?: boolean; title?: string; projectId?: string | null; setId?: string | null }) => {
+      if (busy || sessionBatchStore.getSnapshot().phase === 'running') return
+      const archiveOnly = patch.archived !== undefined
+        && patch.pinned === undefined
+        && patch.title === undefined
+        && patch.projectId === undefined
+        && patch.setId === undefined
+      if (archiveOnly) {
+        setMenu(null)
+        selectionRev.current += 1
+        setSelected(new Set([id]))
+        void startSessionBatch({ kind: 'archive-one', archived: patch.archived === true, ids: [id] })
+        return
+      }
       setBusy(true)
       try {
         await chatApi.updateConversation(id, patch)
-        if (patch.archived && currentConversationId === id) onConversationDeleted?.(id)
         notify()
         await loadPage({ append: false })
       } catch (err) {
-        window.alert(err instanceof Error ? err.message : String(err))
+        void alertDialog(err instanceof Error ? err.message : String(err))
       } finally {
         setBusy(false)
         setMenu(null)
         setRenameId(null)
       }
     },
-    [currentConversationId, loadPage, notify, onConversationDeleted],
+    [busy, loadPage, notify],
   )
 
   const regenerateTitle = useCallback(
     async (id: string) => {
+      if (busy || sessionBatchStore.getSnapshot().phase === 'running') return
       setBusy(true)
       setMenu(null)
       try {
@@ -435,45 +577,28 @@ export function SessionCenter({
         notify()
         await loadPage({ append: false })
       } catch (err) {
-        window.alert(
+        void alertDialog(
           t.chatRegenerateTitleFailed + (err instanceof Error ? err.message : String(err)),
         )
       } finally {
         setBusy(false)
       }
     },
-    [loadPage, notify, t],
+    [busy, loadPage, notify, t],
   )
 
   const deleteOne = useCallback(
     async (id: string) => {
-      if (!window.confirm(t.chatDeleteConversationConfirm)) return
+      if (busy || sessionBatchStore.getSnapshot().phase === 'running') return
+      if (!(await confirmDialog({ message: t.chatDeleteConversationConfirm, confirmLabel: t.dialogDelete, danger: true }))) return
+      if (sessionBatchStore.getSnapshot().phase === 'running') return
       if (generatingConversationIds.has(id)) onForceDropConversation?.(id)
-      setBusy(true)
-      try {
-        const warnings = await chatApi.deleteConversation(id)
-        if (warnings.length > 0) {
-          window.alert(t.chatDeleteConversationPartial + warnings.join('\n'))
-        }
-        if (currentConversationId === id) onConversationDeleted?.(id)
-        notify()
-        await loadPage({ append: false })
-      } catch (err) {
-        window.alert(t.chatDeleteConversationFailed + (err instanceof Error ? err.message : String(err)))
-      } finally {
-        setBusy(false)
-        setMenu(null)
-      }
+      setMenu(null)
+      selectionRev.current += 1
+      setSelected(new Set([id]))
+      void startSessionBatch({ kind: 'delete-one', ids: [id] })
     },
-    [
-      currentConversationId,
-      generatingConversationIds,
-      loadPage,
-      notify,
-      onConversationDeleted,
-      onForceDropConversation,
-      t,
-    ],
+    [busy, generatingConversationIds, onForceDropConversation, t],
   )
 
   const grouped = useMemo(() => {
@@ -595,8 +720,8 @@ export function SessionCenter({
               onClick={() => pickShelf(id)}
               className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
                 active
-                  ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-white/[0.08] dark:text-neutral-50'
-                  : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.05]'
+                  ? 'bg-neutral-100 font-medium text-neutral-900'
+                  : 'text-neutral-600 hover:bg-neutral-50'
               }`}
             >
               <Icon size={14} className="shrink-0 opacity-70" />
@@ -620,8 +745,8 @@ export function SessionCenter({
                 onClick={() => pickSet(active ? null : s.id)}
                 className={`truncate rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
                   active
-                    ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-white/[0.08] dark:text-neutral-50'
-                    : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.05]'
+                    ? 'bg-neutral-100 font-medium text-neutral-900'
+                    : 'text-neutral-600 hover:bg-neutral-50'
                 }`}
               >
                 {s.name}
@@ -645,8 +770,8 @@ export function SessionCenter({
                 onClick={() => pickProject(active ? null : p.id)}
                 className={`truncate rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
                   active
-                    ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-white/[0.08] dark:text-neutral-50'
-                    : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.05]'
+                    ? 'bg-neutral-100 font-medium text-neutral-900'
+                    : 'text-neutral-600 hover:bg-neutral-50'
                 }`}
               >
                 {p.name}
@@ -661,14 +786,14 @@ export function SessionCenter({
   const chipBtn = (active: boolean) =>
     `shrink-0 rounded-full px-2.5 py-1 text-[12px] transition-colors ${
       active
-        ? 'bg-neutral-900 font-medium text-white dark:bg-neutral-100 dark:text-neutral-900'
-        : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-300 dark:hover:bg-white/[0.1]'
+        ? 'bg-neutral-900 font-medium text-neutral-50'
+        : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'
     }`
 
   return (
     <div
       ref={rootRef}
-      className="assistant-center-root flex h-full min-h-0 flex-col text-neutral-900 dark:text-neutral-100"
+      className="assistant-center-root flex h-full min-h-0 flex-col text-neutral-900"
     >
       <div className={`shrink-0 ${compactPad ? 'px-3 pb-2.5 pt-4' : 'px-6 pb-3 pt-5'} ${embedded ? '!pt-1' : ''}`}>
         <div className="mx-auto flex w-full max-w-[1200px] items-center justify-between gap-3">
@@ -680,7 +805,7 @@ export function SessionCenter({
             </span>
           ) : (
             <h1
-              className={`flex min-w-0 items-center gap-2 font-semibold tracking-tight text-neutral-950 dark:text-neutral-50 ${
+              className={`flex min-w-0 items-center gap-2 font-semibold tracking-tight text-neutral-950 ${
                 compactPad ? 'text-[18px]' : 'gap-2.5 text-[22px]'
               }`}
             >
@@ -726,7 +851,7 @@ export function SessionCenter({
               ))}
               {sets.length > 0 && (
                 <>
-                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-white/[0.1]" />
+                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200" />
                   {sets.map((s) => (
                     <button
                       key={s.id}
@@ -741,7 +866,7 @@ export function SessionCenter({
               )}
               {projects.length > 0 && (
                 <>
-                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-white/[0.1]" />
+                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200" />
                   {projects.map((p) => (
                     <button
                       key={p.id}
@@ -758,10 +883,10 @@ export function SessionCenter({
           </div>
         ) : null}
 
-        <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-neutral-200 bg-white dark:border-white/[0.08] dark:bg-[var(--bg-input)]">
+        <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-neutral-200 bg-neutral-50 dark:bg-[var(--bg-input)]">
         {!shelfAsChips && (
           <aside
-            className={`custom-scrollbar flex shrink-0 flex-col gap-4 overflow-y-auto border-r border-neutral-200/80 bg-neutral-50/70 px-2 py-3 dark:border-white/[0.07] dark:bg-white/[0.02] ${
+            className={`custom-scrollbar flex shrink-0 flex-col gap-4 overflow-y-auto border-r border-neutral-200/80 bg-neutral-50/70 px-2 py-3 ${
               layout.page < 900 ? 'w-[152px]' : 'w-[176px]'
             }`}
           >
@@ -774,7 +899,7 @@ export function SessionCenter({
           ref={tableHostRef}
           className="flex min-h-0 min-w-0 flex-1 flex-col"
         >
-          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-100 px-3 py-2 dark:border-white/[0.06]">
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-100 px-3 py-2">
             <div className="relative min-w-[200px] flex-1">
               <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 z-[1] -translate-y-1/2 text-neutral-400" />
               <input
@@ -812,36 +937,39 @@ export function SessionCenter({
             />
             <label className="flex h-[30px] shrink-0 items-center gap-2">
               <Toggle checked={fullText} onChange={setFullText} ariaLabel={t.chatLibFullText} />
-              <span className="whitespace-nowrap text-[12.5px] text-neutral-600 dark:text-neutral-300">
+              <span className="whitespace-nowrap text-[12.5px] text-neutral-600">
                 {t.chatLibFullText}
               </span>
             </label>
           </div>
           {selected.size > 0 && (
-            <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-neutral-100 bg-neutral-50/90 px-3 py-1.5 dark:border-white/[0.06] dark:bg-white/[0.03]">
-              <span className="text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200">
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-neutral-100 bg-neutral-50/90 px-3 py-1.5" aria-busy={batch.phase === 'running'}>
+              <span className="text-[12.5px] font-medium text-neutral-700">
                 {t.chatLibSelected.replace('{n}', String(selected.size))}
               </span>
-              <Button size="sm" disabled={busy} onClick={() => bulkPin(true)}>
+              {batch.phase === 'error' && batch.error && (
+                <span role="alert" className="text-[12px] text-red-600">{batchNotice(batch, t.chatDeleteConversationFailed)}</span>
+              )}
+              <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibStar} onClick={() => bulkPin(true)}>
                 <Star size={12} />
                 {!compactPad && <span>{t.chatLibStar}</span>}
               </Button>
-              <Button size="sm" disabled={busy} onClick={() => bulkPin(false)}>
+              <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibUnstar} onClick={() => bulkPin(false)}>
                 <PinOff size={12} />
                 {!compactPad && <span>{t.chatLibUnstar}</span>}
               </Button>
               <div className="relative">
-                <Button size="sm" disabled={busy} onClick={() => setMoveOpen(moveOpen === 'set' ? null : 'set')}>
+                <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibMoveToSet} onClick={() => setMoveOpen(moveOpen === 'set' ? null : 'set')}>
                   <Layers size={12} />
                   {!compactPad && <span>{t.chatLibMoveToSet}</span>}
                 </Button>
                 {moveOpen === 'set' && (
-                  <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-white py-1 shadow-lg dark:border-white/[0.09] dark:bg-[#2a2a2c]">
-                    <button type="button" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveSet(null)}>
+                  <div role="menu" className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-neutral-50 py-1 shadow-lg">
+                    <button type="button" role="menuitem" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50" onClick={() => bulkMoveSet(null)}>
                       {t.chatLibClearOwner}
                     </button>
                     {sets.map((s) => (
-                      <button key={s.id} type="button" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveSet(s.id)}>
+                      <button key={s.id} type="button" role="menuitem" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50" onClick={() => bulkMoveSet(s.id)}>
                         {s.name}
                       </button>
                     ))}
@@ -849,17 +977,17 @@ export function SessionCenter({
                 )}
               </div>
               <div className="relative">
-                <Button size="sm" disabled={busy} onClick={() => setMoveOpen(moveOpen === 'project' ? null : 'project')}>
+                <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibMoveToProject} onClick={() => setMoveOpen(moveOpen === 'project' ? null : 'project')}>
                   <FolderKanban size={12} />
                   {!compactPad && <span>{t.chatLibMoveToProject}</span>}
                 </Button>
                 {moveOpen === 'project' && (
-                  <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-white py-1 shadow-lg dark:border-white/[0.09] dark:bg-[#2a2a2c]">
-                    <button type="button" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveProject(null)}>
+                  <div role="menu" className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-neutral-50 py-1 shadow-lg">
+                    <button type="button" role="menuitem" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50" onClick={() => bulkMoveProject(null)}>
                       {t.chatLibClearOwner}
                     </button>
                     {projects.map((p) => (
-                      <button key={p.id} type="button" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveProject(p.id)}>
+                      <button key={p.id} type="button" role="menuitem" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50" onClick={() => bulkMoveProject(p.id)}>
                         {p.name}
                       </button>
                     ))}
@@ -867,24 +995,24 @@ export function SessionCenter({
                 )}
               </div>
               {shelf === 'archived' ? (
-                <Button size="sm" disabled={busy} onClick={() => bulkArchive(false)}>
+                <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibUnarchive} onClick={() => bulkArchive(false)}>
                   <ArchiveRestore size={12} />
                   {!compactPad && <span>{t.chatLibUnarchive}</span>}
                 </Button>
               ) : (
-                <Button size="sm" disabled={busy} onClick={() => bulkArchive(true)}>
+                <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibArchive} onClick={() => bulkArchive(true)}>
                   <Archive size={12} />
                   {!compactPad && <span>{t.chatLibArchive}</span>}
                 </Button>
               )}
-              <Button size="sm" disabled={busy} onClick={bulkExport}>
+              <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibExport} onClick={bulkExport}>
                 {t.chatLibExport}
               </Button>
-              <Button size="sm" disabled={busy} onClick={bulkDelete} className="text-red-600">
+              <Button size="sm" disabled={controlsBusy} aria-label={t.chatLibDelete} onClick={() => void bulkDelete()} className="text-red-600">
                 <Trash2 size={12} />
                 {!compactPad && <span>{t.chatLibDelete}</span>}
               </Button>
-              <button type="button" className="ml-auto text-[12px] text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200" onClick={clearSelection}>
+              <button type="button" className="ml-auto text-[12px] text-neutral-500 hover:text-neutral-800 dark:text-neutral-400" onClick={clearSelection}>
                 {t.chatLibClearSelection}
               </button>
             </div>
@@ -896,13 +1024,13 @@ export function SessionCenter({
             </div>
           )}
 
-          <div className="flex min-w-0 shrink-0 items-center gap-2 border-b border-neutral-200/70 bg-neutral-50 px-3 py-[7px] text-[12px] font-medium text-neutral-500 dark:border-white/[0.07] dark:bg-white/[0.03] dark:text-neutral-400">
+          <div className="flex min-w-0 shrink-0 items-center gap-2 border-b border-neutral-200/70 bg-neutral-50 px-3 py-[7px] text-[12px] font-medium text-neutral-500 dark:text-neutral-400">
             <label className="flex w-7 shrink-0 items-center justify-center">
               <input
                 type="checkbox"
                 checked={state.items.length > 0 && selected.size === state.items.length}
                 onChange={(e) => (e.target.checked ? selectAllVisible() : clearSelection())}
-                className="rounded"
+                className="rounded accent-[var(--accent)]"
               />
             </label>
             <span className="min-w-0 flex-1 truncate">{t.chatLibColTitle}</span>
@@ -942,7 +1070,7 @@ export function SessionCenter({
               grouped.map((group) => (
                 <div key={group.key}>
                   {group.label && (
-                    <div className="sticky top-0 z-[5] border-b border-neutral-100 bg-white/95 px-3 py-1.5 text-[12px] font-medium text-neutral-500 backdrop-blur dark:border-white/[0.06] dark:bg-[var(--bg-input)]/95">
+                    <div className="sticky top-0 z-[5] border-b border-neutral-100 bg-[var(--theme-surface)]/95 px-3 py-1.5 text-[12px] font-medium text-neutral-500 backdrop-blur">
                       {group.label}
                       <span className="ml-1.5 tabular-nums text-neutral-400">{group.items.length}</span>
                     </div>
@@ -964,16 +1092,16 @@ export function SessionCenter({
                         onKeyDown={(e: ReactKeyboardEvent) => {
                           if (e.key === 'Enter') onSelectConversation(c.id, c, selectionScope(c))
                         }}
-                        className={`group flex cursor-pointer items-center gap-2 border-b border-neutral-50 px-3 ${rowPad} transition-colors hover:bg-neutral-50 dark:border-white/[0.04] dark:hover:bg-white/[0.04] ${
-                          isSel ? 'bg-sky-50/80 dark:bg-[var(--accent-soft)]' : ''
-                        } ${isCurrent ? 'ring-1 ring-inset ring-sky-200 dark:ring-white/15' : ''}`}
+                        className={`group flex cursor-pointer items-center gap-2 border-b border-[var(--theme-surface-border)] px-3 ${rowPad} transition-colors hover:bg-[var(--theme-surface-hover)] ${
+                          isSel ? 'bg-[var(--accent-soft)]' : ''
+                        } ${isCurrent ? 'ring-1 ring-inset ring-[var(--accent)]/35' : ''}`}
                       >
                         <label data-row-chrome className="flex w-7 shrink-0 items-center justify-center" onClick={(e) => e.stopPropagation()}>
                           <input
                             type="checkbox"
                             checked={isSel}
                             onChange={(e) => toggleSelect(c.id, (e.nativeEvent as MouseEvent).shiftKey)}
-                            className="rounded"
+                            className="rounded accent-[var(--accent)]"
                           />
                         </label>
                         <div className="min-w-0 flex-1 overflow-hidden">
@@ -996,10 +1124,10 @@ export function SessionCenter({
                                     void patchOne(c.id, { title: renameDraft.trim() })
                                   } else setRenameId(null)
                                 }}
-                                className="min-w-0 flex-1 rounded border border-neutral-300 bg-white px-1.5 py-0.5 text-[13px] dark:border-[var(--border-input)] dark:bg-[var(--bg-hover)]"
+                                className="min-w-0 flex-1 rounded border border-neutral-300 bg-neutral-50 px-1.5 py-0.5 text-[13px] dark:border-[var(--border-input)] dark:bg-[var(--bg-hover)]"
                               />
                             ) : (
-                              <span className="min-w-0 truncate text-[13.5px] font-medium text-neutral-900 dark:text-neutral-50">
+                              <span className="min-w-0 truncate text-[13.5px] font-medium text-neutral-900">
                                 {debouncedQ
                                   ? <HighlightText text={c.title || t.chatLibUntitled} query={debouncedQ} />
                                   : (c.title || t.chatLibUntitled)}
@@ -1044,7 +1172,7 @@ export function SessionCenter({
                         <button
                           data-row-chrome
                           type="button"
-                          className="grid size-8 shrink-0 place-items-center rounded-md text-neutral-400 opacity-60 hover:bg-neutral-100 hover:text-neutral-700 group-hover:opacity-100 dark:text-neutral-500 dark:hover:bg-white/[0.08] dark:hover:text-neutral-200"
+                          className="grid size-8 shrink-0 place-items-center rounded-md text-neutral-400 opacity-60 hover:bg-neutral-100 hover:text-neutral-700 group-hover:opacity-100 dark:text-neutral-500"
                           onClick={(e) => {
                             e.stopPropagation()
                             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
@@ -1070,7 +1198,7 @@ export function SessionCenter({
             {!state.loading && !state.loadingMore && hasMore && (
               <button
                 type="button"
-                className="w-full py-2.5 text-center text-[12.5px] text-neutral-500 hover:bg-neutral-50 dark:hover:bg-white/[0.04]"
+                className="w-full py-2.5 text-center text-[12.5px] text-neutral-500 hover:bg-neutral-50"
                 onClick={() => void loadPage({ append: true })}
               >
                 {t.chatLibLoadMore}
@@ -1087,6 +1215,7 @@ export function SessionCenter({
             <MenuItem
               label={menuConv.pinned ? t.chatLibUnstar : t.chatLibStar}
               icon={menuConv.pinned ? <PinOff size={13} /> : <Pin size={13} />}
+              disabled={controlsBusy}
               onClick={() => void patchOne(menuConv.id, { pinned: !menuConv.pinned })}
             />
             <MenuItem
@@ -1100,34 +1229,38 @@ export function SessionCenter({
             <MenuItem
               label={t.chatRegenerateTitle}
               icon={<RefreshCw size={13} />}
-              disabled={(menuConv.message_count ?? 0) === 0 || busy}
+              disabled={(menuConv.message_count ?? 0) === 0 || controlsBusy}
               onClick={() => void regenerateTitle(menuConv.id)}
             />
             <MenuItem
               label={menuConv.archived ? t.chatLibUnarchive : t.chatLibArchive}
               icon={menuConv.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+              disabled={controlsBusy}
               onClick={() => void patchOne(menuConv.id, { archived: !menuConv.archived })}
             />
             <MenuItem
               label={t.chatLibExport}
+              disabled={controlsBusy}
               onClick={() => {
-                setSelected(new Set([menuConv.id]))
+                if (sessionBatchStore.getSnapshot().phase === 'running') return
+                const id = menuConv.id
                 setMenu(null)
-                void (async () => {
-                  const path = await save({
-                    defaultPath: conversationMarkdownFilename(menuConv.title),
-                    filters: [{ name: 'Markdown', extensions: ['md'] }],
-                  })
-                  if (!path) return
-                  await chatApi.exportConversationMarkdown(menuConv.id, path, lang)
-                })()
+                selectionRev.current += 1
+                setSelected(new Set([id]))
+                void startSessionBatch({
+                  kind: 'export',
+                  ids: [id],
+                  targets: [{ id, title: menuConv.title || id }],
+                  lang,
+                })
               }}
             />
-            <div className="my-1 border-t border-neutral-100 dark:border-white/[0.07]" />
+            <div className="my-1 border-t border-neutral-100" />
             <MenuItem
               label={t.chatLibDelete}
               danger
               icon={<Trash2 size={13} />}
+              disabled={controlsBusy}
               onClick={() => void deleteOne(menuConv.id)}
             />
         </PortaledRowMenu>
@@ -1154,7 +1287,7 @@ function PortaledRowMenu({
       <div
         ref={menuRef}
         role="menu"
-        className="fixed z-[200] w-[180px] rounded-lg border border-neutral-200 bg-white py-1 shadow-xl dark:border-white/[0.09] dark:bg-[#2a2a2c]"
+        className="fixed z-[200] w-[180px] rounded-lg border border-neutral-200 bg-neutral-50 py-1 shadow-xl"
         style={{ left: pos.left, top: pos.top }}
       >
         {children}
@@ -1184,8 +1317,8 @@ function MenuItem({
       role="menuitem"
       onClick={onClick}
       disabled={disabled}
-      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-neutral-50 disabled:cursor-default disabled:opacity-40 dark:hover:bg-white/[0.06] ${
-        danger ? 'text-red-600 dark:text-red-400' : 'text-neutral-700 dark:text-neutral-200'
+      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-neutral-50 disabled:cursor-default disabled:opacity-40 ${
+        danger ? 'text-red-600 dark:text-red-400' : 'text-neutral-700'
       }`}
     >
       {icon}

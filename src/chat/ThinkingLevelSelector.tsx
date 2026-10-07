@@ -1,9 +1,10 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Brain, Check, ChevronDown } from 'lucide-react'
 import { api } from '../api/tauri'
 import { useT } from '../components/i18n'
 import { chatTitlebarPillButtonClass } from './platform'
 import type { ThinkingLevel } from './types'
+import { usePopoverMenu } from './usePopoverMenu'
 
 interface ThinkingLevelSelectorProps {
   /** 当前等级；null = 未显式设置，按默认档 DEFAULT_LEVEL 处理。 */
@@ -39,6 +40,8 @@ function ThinkingLevelSelectorBase({
 }: ThinkingLevelSelectorProps) {
   const t = useT()
   const [open, setOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+  usePopoverMenu(open, () => setOpen(false), menuRef)
   const [levels, setLevels] = useState<string[]>(FALLBACK_LEVELS)
   const [levelsLoaded, setLevelsLoaded] = useState(false)
 
@@ -103,12 +106,14 @@ function ThinkingLevelSelectorBase({
       <button
         type="button"
         onClick={() => setOpen(!open)}
+        aria-haspopup="menu"
+        aria-expanded={open}
         className={`${chatTitlebarPillButtonClass} max-w-full min-w-0`}
         title={t.chatThinkingLevel.replace('{level}', labelFor(effective))}
         aria-label={t.chatThinkingLevel.replace('{level}', labelFor(effective))}
       >
         <Brain size={15} className="shrink-0 text-neutral-500 dark:text-neutral-400" />
-        <span className="chat-thinking-level-label max-w-[64px] truncate font-medium text-neutral-800 dark:text-neutral-200">
+        <span className="chat-thinking-level-label max-w-[64px] truncate font-medium text-neutral-800">
           {labelFor(effective)}
         </span>
         <ChevronDown
@@ -120,12 +125,14 @@ function ThinkingLevelSelectorBase({
       {open && (
         <>
           <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} aria-hidden />
-          <div className="chat-model-selector-menu chat-motion-popover absolute left-0 top-full z-20 mt-2 min-w-[160px] overflow-y-auto kv-menu">
+          <div role="menu" ref={menuRef} className="chat-model-selector-menu chat-motion-popover absolute left-0 top-full z-20 mt-2 min-w-[160px] overflow-y-auto kv-menu">
             {options.map((opt) => {
               const active = opt.value === effective
               return (
                 <button
                   key={opt.value}
+                  role="menuitemradio"
+                  aria-checked={active}
                   type="button"
                   onClick={() => {
                     onChange(opt.value)
@@ -133,8 +140,8 @@ function ThinkingLevelSelectorBase({
                   }}
                   className={`kv-menu-row justify-between transition-colors ${
                     active
-                      ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-100'
-                      : 'text-neutral-700 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-neutral-800/80'
+                      ? 'bg-neutral-100 font-medium text-neutral-900'
+                      : 'text-neutral-700 hover:bg-neutral-50'
                   }`}
                 >
                   <span className="min-w-0 truncate">{opt.label}</span>

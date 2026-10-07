@@ -2,10 +2,12 @@ import { useEffect, useState } from 'react'
 import { save } from '@tauri-apps/plugin-dialog'
 import { ArrowLeft, Check, Clipboard, Download, ImageIcon, Minus, Plus, RotateCcw } from 'lucide-react'
 import type { ChatImageViewerItem } from './imageViewer'
-import { loadArtifactDataUrl } from './attachmentPreview'
+import { loadArtifactOriginalDataUrl } from './attachmentPreview'
 import { base64FromDataUrl, imageExtension } from './imageData'
 import { api } from '../api/tauri'
 import { IconButton } from '../components/Button'
+import { alertDialog } from '../components/dialogQueue'
+import { useT } from '../components/i18n'
 
 type ChatImageViewerProps = {
   item: ChatImageViewerItem
@@ -13,20 +15,25 @@ type ChatImageViewerProps = {
 }
 
 export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
+  const t = useT()
   const [zoom, setZoom] = useState(1)
   // 先显示缩略图(item.src),若有 path 则懒加载全分辨率原图并替换。
-  const [fullSrc, setFullSrc] = useState<string | null>(null)
+  const [original, setOriginal] = useState<{ key: string; src: string | null; failed: boolean } | null>(null)
+  const [retryOriginal, setRetryOriginal] = useState(0)
   const [copied, setCopied] = useState(false)
   const title = item.name || item.alt || '图片附件'
-  // 复制/另存都用当前实际显示的图（有原图就用原图，别复制成缩略图）。
+  const imageKey = `${item.conversationId ?? ''}\u0000${item.path ?? ''}\u0000${item.src.length}:${item.src.slice(-64)}`
+  const fullSrc = original?.key === imageKey ? original.src : null
+  const originalFailed = original?.key === imageKey && original.failed
+  // 有原图路径时，复制和另存必须等原图读取成功。
   const activeSrc = fullSrc ?? item.src
-  const base64 = base64FromDataUrl(activeSrc)
+  const base64 = item.path && !fullSrc ? null : base64FromDataUrl(activeSrc)
 
   const handleCopy = async () => {
     if (!base64) return
     const result = await api.lensCopyImageToClipboard(base64)
     if (!result.success) {
-      window.alert(`复制失败：${result.error ?? '未知错误'}`)
+      void alertDialog(t.chatImageCopyFailed.replace('{error}', () => result.error ?? t.chatUnknownError))
       return
     }
     setCopied(true)
@@ -42,7 +49,7 @@ export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
     })
     if (!path) return
     const result = await api.lensSaveAnnotatedPng(base64, path)
-    if (!result.success) window.alert(`保存失败：${result.error ?? '未知错误'}`)
+    if (!result.success) void alertDialog(t.chatImageSaveFailed.replace('{error}', () => result.error ?? t.chatUnknownError))
   }
 
   useEffect(() => {
@@ -50,19 +57,19 @@ export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
   }, [item.src])
 
   useEffect(() => {
-    setFullSrc(null)
+    setOriginal({ key: imageKey, src: null, failed: false })
     if (!item.path) return
     let cancelled = false
-    void loadArtifactDataUrl(
-      { path: item.path, dataUrl: item.src },
+    void loadArtifactOriginalDataUrl(
+      { path: item.path },
       item.conversationId,
     ).then((src) => {
-      if (!cancelled && src) setFullSrc(src)
+      if (!cancelled) setOriginal({ key: imageKey, src, failed: !src })
     })
     return () => {
       cancelled = true
     }
-  }, [item.path, item.conversationId, item.src])
+  }, [item.path, item.conversationId, item.src, imageKey, retryOriginal])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -73,9 +80,9 @@ export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
   }, [onClose])
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col bg-[#f6f6f4] dark:bg-[#181818]" aria-label="图片查看">
+    <section className="flex min-h-0 flex-1 flex-col bg-neutral-50" aria-label="图片查看">
       <div
-        className="flex h-[52px] shrink-0 items-center gap-2 border-b border-neutral-200/80 bg-white/90 px-4 backdrop-blur dark:border-neutral-800 dark:bg-[#202020]/92"
+        className="flex h-[52px] shrink-0 items-center gap-2 border-b border-neutral-200/80 bg-[var(--theme-surface-titlebar)]/92 px-4 backdrop-blur"
         data-tauri-drag-region
       >
         <IconButton
@@ -86,17 +93,18 @@ export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
         >
           <ArrowLeft size={18} strokeWidth={1.9} />
         </IconButton>
-        <div className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400">
+        <div className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-neutral-100 text-neutral-500 dark:text-neutral-400">
           <ImageIcon size={16} strokeWidth={1.8} />
         </div>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[13px] font-medium text-neutral-800 dark:text-neutral-100">
+          <div className="truncate text-[13px] font-medium text-neutral-800">
             {title}
           </div>
           <div className="truncate text-[11px] text-neutral-400 dark:text-neutral-500">
-            Esc 返回对话
+            {originalFailed ? '无法读取原图' : item.path && !fullSrc ? '正在读取原图…' : 'Esc 返回对话'}
           </div>
         </div>
+        {originalFailed ? <IconButton size="sm" label="重试加载原图" onClick={() => setRetryOriginal((value) => value + 1)}><RotateCcw size={15} /></IconButton> : null}
         <div
           className="flex items-center gap-1"
           data-tauri-drag-region="false"
@@ -113,7 +121,7 @@ export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
           </IconButton>
         </div>
         <div
-          className="flex items-center gap-1 rounded-full border border-neutral-200 bg-neutral-50 p-1 dark:border-neutral-700 dark:bg-neutral-900"
+          className="flex items-center gap-1 rounded-full border border-neutral-200 bg-neutral-50 p-1"
           data-tauri-drag-region="false"
         >
           <IconButton
@@ -150,7 +158,7 @@ export function ChatImageViewer({ item, onClose }: ChatImageViewerProps) {
           <img
             src={fullSrc ?? item.src}
             alt={item.alt ?? ''}
-            className="block rounded-lg bg-white shadow-sm ring-1 ring-black/10 dark:bg-neutral-950 dark:ring-white/10"
+            className="block rounded-lg bg-neutral-50 shadow-sm ring-1 ring-neutral-900/10"
             style={{
               width: zoom <= 1 ? 'auto' : `${zoom * 100}%`,
               maxWidth: zoom <= 1 ? '100%' : 'none',

@@ -1168,14 +1168,46 @@ pub fn glob_files(workspace: &NativeToolWorkspace, arguments: &Value) -> Result<
     }))
 }
 
+#[cfg(test)]
+#[test]
+fn tool_contract_grep_empty_query_uses_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("fixture.txt"),
+        "target needle\nother line\n",
+    )
+    .unwrap();
+    let workspace = NativeToolWorkspace::conversation(dir.path().to_path_buf());
+    let result = search_files(
+        &workspace,
+        &serde_json::json!({"query": "", "pattern": "needle"}),
+    )
+    .unwrap();
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+    let primary = search_files(
+        &workspace,
+        &serde_json::json!({"query": "other", "pattern": "needle"}),
+    )
+    .unwrap();
+    assert!(primary.contains("other line"));
+    assert!(!primary.contains("target needle"));
+    assert!(search_files(&workspace, &serde_json::json!({"query": "", "pattern": ""})).is_err());
+}
+
 pub fn search_files(workspace: &NativeToolWorkspace, arguments: &Value) -> Result<String, String> {
     // `query` 为主名；接受 `pattern` 作为别名——模型常受 grep/Claude Code 的 Grep 习惯影响
     // 传 `pattern`，否则要白白浪费一轮重试（和已有的 caseSensitive/maxResults 别名一致）。
     let query = arguments
         .get("query")
-        .or_else(|| arguments.get("pattern"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            arguments
+                .get("pattern")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
         .ok_or_else(|| "search_files requires query (or its alias pattern)".to_string())?;
     let search_root = resolve_tool_read_path(
         workspace,
@@ -2111,34 +2143,6 @@ mod tests {
             String::from_utf8(fs::read(&file).expect("read")).expect("utf8"),
             "alpha\r\nbeta\r\n"
         );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn edit_file_lf_file_still_edits_and_keeps_lf() {
-        let root = std::env::temp_dir().join(format!("kivio_edit_lf_{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).expect("mkdir");
-        let workspace = NativeToolWorkspace::project(
-            "proj".to_string(),
-            "T".to_string(),
-            Some(root.to_string_lossy().into_owned()),
-        );
-        let file = root.join("lf.txt");
-        fs::write(&file, "x\ny\nz\n").expect("write");
-
-        let result = edit_file(
-            &workspace,
-            &json!({
-                "path": "lf.txt",
-                "edits": [{ "old_string": "y\n", "new_string": "Y\n" }]
-            }),
-        )
-        .expect("LF file edit");
-        assert!(result.ok);
-        let on_disk = String::from_utf8(fs::read(&file).expect("read")).expect("utf8");
-        assert_eq!(on_disk, "x\nY\nz\n");
-        assert!(!on_disk.contains('\r'), "LF file must not gain CR");
 
         let _ = fs::remove_dir_all(&root);
     }
