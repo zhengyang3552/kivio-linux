@@ -491,10 +491,31 @@ mod tests {
             assert!(!response.contains(state));
         }
         assert!(task.await.unwrap().err().unwrap().contains("declined"));
-        // A completed TCP connection can keep the port in TIME_WAIT on macOS.
-        // Refusing a new connection verifies that the listener is gone without
-        // depending on when the OS allows the same port to be rebound.
-        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        // The listener must be gone, but a refused connection is not something to
+        // assert on: a completed TCP connection can keep the port in TIME_WAIT on
+        // macOS, and on Linux a parallel test can be handed the freed ephemeral
+        // port (the runner parallelises the whole test binary). Probe the address
+        // instead — whatever answers there must not be this callback server.
+        if let Ok(Ok(mut socket)) =
+            tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(address))
+                .await
+        {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.write_all(
+                    b"GET /oauth-callback?state=wrong&code=x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                ),
+            )
+            .await;
+            let mut response = String::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), socket.read_to_string(&mut response))
+                    .await;
+            assert!(
+                !response.contains("Invalid OAuth callback"),
+                "callback listener still answered after shutdown: {response:?}"
+            );
+        }
     }
     #[test]
     fn validates_callback() {
