@@ -4,12 +4,12 @@ name: Rust
 
 on:
   push:
-    branches: [main]
+    branches: [Linux]
     # 工作流文件自身也在触发面里:改工作流(如桩步骤)能立即自测,
     # 否则要等下一次 src-tauri 变更才暴露问题。
     paths: ['src-tauri/**', '.github/workflows/rust-check.yml']
   pull_request:
-    branches: [main]
+    branches: [Linux]
     paths: ['src-tauri/**', '.github/workflows/rust-check.yml']
 
 jobs:

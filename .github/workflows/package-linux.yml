@@ -1,6 +1,6 @@
 name: Package Linux
 
-# 仓库从上游同步(push 到 main)后自动编译并打包全部 Linux 发行版格式;也可手动触发。
+# 仓库从上游同步(push 到 Linux)后自动编译并打包全部 Linux 发行版格式;也可手动触发。
 # 发布:网页上创建 Release(写说明)时,自动把最近一次成功构建的产物原样挂上,不重新编译。
 # apt 源:正式 Release 挂完资产后,更新 Pages 托管的 apt 仓库(deb 拷入 pool/ + 重建索引),
 #        Filename 写相对路径,deb 随 Pages 一起托管(apt 不支持绝对 URL Filename);
@@ -23,7 +23,7 @@ name: Package Linux
 
 on:
   push:
-    branches: [main]   # 上游同步:只构建打包,产物供下载测试
+    branches: [Linux]   # 上游同步:只构建打包,产物供下载测试
   # 网页上创建 Release(写说明)时,自动把最近一次成功构建的产物原样挂上——
   # 不重新编译,测过的包就是发布的包
   release:
@@ -467,10 +467,10 @@ jobs:
       - name: Find latest successful build run
         id: run
         run: |
-          RUN_ID="$(gh run list -R "$REPO" -w package-linux.yml -b main -s success -e push \
+          RUN_ID="$(gh run list -R "$REPO" -w package-linux.yml -b Linux -s success -e push \
             --json databaseId --limit 1 --jq '.[0].databaseId')"
           if [ -z "$RUN_ID" ]; then
-            echo "::error::main 上没有成功的构建运行"
+            echo "::error::Linux 上没有成功的构建运行"
             exit 1
           fi
           echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
@@ -554,7 +554,7 @@ jobs:
           echo "attached to release ${TAG}"
 
   # ── 正式 Release 发布后:更新 apt 源,用户可通过 apt upgrade 升级 ─────────
-  # deb 拷入仓库 pool/、索引(Packages/Release/InRelease)重建,一起提交到 main 由 Pages 托管;
+  # deb 拷入仓库 pool/、索引(Packages/Release/InRelease)重建,一起提交到 Linux 由 Pages 托管;
   # apt 按 "Pages base URL + 相对 Filename" 下载,deb 必须入库(apt 不认绝对 URL Filename)。
   # draft Release 的资产匿名不可下载,跳过。
   apt:
@@ -591,11 +591,11 @@ jobs:
             echo "::notice::draft Release 的资产匿名不可下载,跳过 apt 源更新"
           fi
 
-      - name: Checkout main
+      - name: Checkout Linux
         if: steps.draft.outputs.draft == 'false'
         uses: actions/checkout@v5
         with:
-          ref: main
+          ref: Linux
 
       - name: Install apt repo tools
         if: steps.draft.outputs.draft == 'false'
@@ -621,7 +621,7 @@ jobs:
           bash ci/apt/update-apt-repo.sh \
             "files/kivio-desktop_${{ steps.t.outputs.version }}_amd64.deb"
 
-      # 用默认 GITHUB_TOKEN 推 main 会再次触发工作流,不会死循环
+      # 用默认 GITHUB_TOKEN 推 Linux 会再次触发工作流,不会死循环
       - name: Commit & push index (Pages)
         if: steps.draft.outputs.draft == 'false'
         run: |
@@ -633,6 +633,6 @@ jobs:
           else
             # 先提交再 rebase:有暂存变更时 git pull --rebase 会直接拒绝(exit 128)
             git commit -m "apt: publish kivio-desktop ${{ steps.t.outputs.version }}"
-            git pull --rebase origin main
+            git pull --rebase origin Linux
             git push
           fi
