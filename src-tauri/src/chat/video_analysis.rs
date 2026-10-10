@@ -302,8 +302,8 @@ pub(super) fn select_model(
             .filter(|p| p.enabled)
             .ok_or("视频分析模型不可用，请在混音器中重新选择。")?;
         super::video::validate_model(provider, &selection.model).map_err(|e| e.to_string())?;
-        if !provider.has_credentials() {
-            return Err(super::format_chat_missing_api_key_error(&provider.name));
+        if !provider.authentication_ready() {
+            return Err(super::format_chat_login_required_error(&provider.name));
         }
         return Ok(Some(VideoAnalysisModel {
             provider_id: provider.id.clone(),
@@ -313,7 +313,7 @@ pub(super) fn select_model(
     let found = settings
         .providers
         .iter()
-        .filter(|p| p.enabled && p.has_credentials())
+        .filter(|p| p.enabled && p.authentication_ready())
         .find_map(|p| {
             p.enabled_models
                 .iter()
@@ -712,22 +712,35 @@ mod tests {
         let main = provider("main", json!(false));
         let mut disabled = provider("disabled", json!(true));
         disabled.enabled = false;
-        let mut no_auth = provider("no-auth", json!(true));
-        no_auth.api_keys.clear();
+        let mut anonymous = provider("anonymous", json!(true));
+        anonymous.api_keys.clear();
         let mut oauth = provider("oauth", json!(true));
         oauth.api_keys.clear();
         oauth.request.oauth = Some(
             serde_json::from_value(json!({"provider": "kimi", "credentialId": "test-login"}))
                 .unwrap(),
         );
+        let mut signed_out = provider("signed-out", json!(true));
+        signed_out.request.oauth = Some(
+            serde_json::from_value(json!({"provider": "kimi"})).unwrap(),
+        );
         let mut settings = Settings::default();
         settings.providers = vec![
             main.clone(),
             disabled,
-            no_auth,
+            signed_out,
+            anonymous,
             oauth,
             provider("chosen", json!(true)),
         ];
+        assert_eq!(
+            select_model(&settings, &main, "private-model", true)
+                .unwrap()
+                .unwrap()
+                .provider_id,
+            "anonymous"
+        );
+        settings.providers.iter_mut().find(|p| p.id == "anonymous").unwrap().enabled = false;
         assert_eq!(
             select_model(&settings, &main, "private-model", true)
                 .unwrap()

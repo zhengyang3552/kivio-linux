@@ -6,11 +6,11 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::json;
+#[cfg(target_os = "macos")]
+use tauri::TitleBarStyle;
 use tauri::{
     window::Color, AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
-#[cfg(target_os = "macos")]
-use tauri::{LogicalPosition, TitleBarStyle};
 
 /// 侧栏收起时主内容区最小宽度（与前端 `CHAT_MIN_SIZE_COLLAPSED` 一致）。
 pub const CHAT_MIN_INNER_WIDTH_COLLAPSED: f64 = 400.0;
@@ -43,33 +43,17 @@ pub fn apply_chat_window_min_size(window: &WebviewWindow, sidebar_expanded: bool
     let _ = window.set_min_size(Some(LogicalSize::new(width, height)));
 }
 
-/// 悬浮卡片式侧栏的外边距（与 index.css `.chat-sidebar-shell { margin: 8px }` 同步）。
-/// 灯 x 随卡片左缘 +8；y 跟随侧栏顶栏图标（图标在卡片内上提后，窗口坐标中心仍约 26px，与主区顶栏齐）。
 #[cfg(target_os = "macos")]
-const CHAT_SIDEBAR_CARD_INSET: f64 = 8.0;
-
-/// 灯到卡片左缘的距离（不是到窗口左缘）。
+mod traffic_lights;
 #[cfg(target_os = "macos")]
-const CHAT_TRAFFIC_LIGHT_X: f64 = 14.0 + CHAT_SIDEBAR_CARD_INSET;
+use traffic_lights::{measure_traffic_light_center_y, restore_macos_traffic_lights};
 
-/// 交给 tao `traffic_light_inset` 的 y。tao 会在每次内容视图 `drawRect` 重新应用这个 inset
-/// （见 tao 源 view.rs::draw_rect → inset_traffic_lights），故窗口拖动/缩放/移动全程都保持对齐。
-///
-/// 这个 y **不等于**灯中心。tao 只写按钮的 `origin.x`，`origin.y` 始终是 AppKit 布局出来的值：
-///   容器高 = 按钮高 + y，灯中心距顶 = y − button.origin.y + button.height / 2
-/// 而 `button.origin.y` / `button.height` 随 macOS 版本变（标题栏容器自然高度不同），
-/// 所以「y=32 → 中心 30」只在某些系统上成立 —— 早先几次「统一到 30」的修复就是栽在这里。
-/// 现在不再假设：前端用 `chat_traffic_light_center_y` 量出真实中心，顶栏那条线跟着灯走
-/// （见 index.css `--chat-traffic-center-y`）。这个常数只决定灯大致落在哪，不需要精确。
-#[cfg(target_os = "macos")]
-const CHAT_TRAFFIC_LIGHT_INSET_Y: f64 = 32.0;
-
-/// 交通灯中心距 WebView 内容顶缘的距离（CSS px / AppKit point，同一单位）。
-///
-/// 前端据此把侧栏顶栏图标、主区顶栏控件摆到同一条线上。非 macOS / 取不到 / 数值离谱都返回
-/// `None`，前端退回 CSS 里的默认 30px。
+/// 将原生交通灯对齐页面顶栏按钮，返回实际中心供确认；不反向修改页面布局。
 #[tauri::command]
-pub async fn chat_traffic_light_center_y(window: WebviewWindow) -> Option<f64> {
+pub async fn chat_traffic_light_center_y(window: WebviewWindow, center_y: f64) -> Option<f64> {
+    if !center_y.is_finite() || !(24.0..=80.0).contains(&center_y) {
+        return None;
+    }
     #[cfg(target_os = "macos")]
     {
         // NSView 几何只能在主线程读，命令本身在 worker 线程，用 channel 取回。
@@ -82,7 +66,11 @@ pub async fn chat_traffic_light_center_y(window: WebviewWindow) -> Option<f64> {
                     .ok()
                     .filter(|ptr| !ptr.is_null())
                     .and_then(|ptr| unsafe {
-                        measure_traffic_light_center_y(ptr as cocoa::base::id)
+                        let window = ptr as cocoa::base::id;
+                        if !restore_macos_traffic_lights(window, center_y) {
+                            return None;
+                        }
+                        measure_traffic_light_center_y(window)
                     });
                 let _ = tx.send(measured);
             })
@@ -90,7 +78,7 @@ pub async fn chat_traffic_light_center_y(window: WebviewWindow) -> Option<f64> {
         rx.recv_timeout(std::time::Duration::from_millis(500))
             .ok()
             .flatten()
-            // 灯只可能在标题栏那一带；离谱值当没量到，别把 padding 算成负数。
+            // 只确认标题栏范围内的有效坐标；前端不据此改变布局。
             .filter(|y| (8.0..=80.0).contains(y))
     }
     #[cfg(not(target_os = "macos"))]
@@ -100,57 +88,17 @@ pub async fn chat_traffic_light_center_y(window: WebviewWindow) -> Option<f64> {
     }
 }
 
-/// 把 close 按钮的 bounds 转到 contentView 坐标系，换算成「距内容顶缘」。
-/// contentView 未翻转（y 自下而上），故距顶 = 内容高 − (y + 高/2)。
-/// Overlay 标题栏下 contentView 铺满整个窗口 frame，所以这就是 CSS 的 y。
-#[cfg(target_os = "macos")]
-unsafe fn measure_traffic_light_center_y(window: cocoa::base::id) -> Option<f64> {
-    use cocoa::base::{id, nil};
-    use cocoa::foundation::NSRect;
-    use objc::{msg_send, sel, sel_impl};
-
-    const NS_WINDOW_CLOSE_BUTTON: u64 = 0;
-    let close: id = msg_send![window, standardWindowButton: NS_WINDOW_CLOSE_BUTTON];
-    let content: id = msg_send![window, contentView];
-    if close == nil || content == nil {
-        return None;
-    }
-    let bounds: NSRect = msg_send![close, bounds];
-    let in_content: NSRect = msg_send![close, convertRect: bounds toView: content];
-    let content_bounds: NSRect = msg_send![content, bounds];
-    if content_bounds.size.height <= 0.0 || in_content.size.height <= 0.0 {
-        return None;
-    }
-    Some(content_bounds.size.height - (in_content.origin.y + in_content.size.height / 2.0))
-}
-
-/// 隐藏 Overlay 标题栏的窗口标题文字。交通灯位置本身由 builder 的 `traffic_light_position`
-/// （= tao `traffic_light_inset`，tao 每次 drawRect 自动重新应用）负责并持久保持，这里不再手动重排。
+/// Restore window-owned traffic-light geometry on the AppKit thread.
 #[cfg(target_os = "macos")]
 pub(crate) fn apply_macos_traffic_light_position(window: &WebviewWindow) {
-    use cocoa::base::id;
-
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
-        let Ok(ptr) = window_for_main.ns_window() else {
-            return;
-        };
-        if ptr.is_null() {
-            return;
-        }
-        unsafe {
-            hide_macos_window_title(ptr as id);
+        if let Ok(ptr) = window_for_main.ns_window() {
+            if !ptr.is_null() {
+                unsafe { traffic_lights::apply_saved_position(ptr as cocoa::base::id) };
+            }
         }
     });
-}
-
-/// NSWindowTitleHidden — 隐藏 Overlay 标题栏中的窗口标题文字。
-#[cfg(target_os = "macos")]
-unsafe fn hide_macos_window_title(window: cocoa::base::id) {
-    use objc::{msg_send, sel, sel_impl};
-
-    const NS_WINDOW_TITLE_HIDDEN: u64 = 1;
-    let _: () = msg_send![window, setTitleVisibility: NS_WINDOW_TITLE_HIDDEN];
 }
 
 /// Chat 作为普通桌面窗口：不置顶、不跨全 Space（与 Lens overlay 区分）。
@@ -437,10 +385,6 @@ pub fn ensure_chat_window_with_hash(app: &AppHandle, hash: &str) -> Result<Webvi
             .decorations(true)
             .title_bar_style(TitleBarStyle::Overlay)
             .hidden_title(true)
-            .traffic_light_position(LogicalPosition::new(
-                CHAT_TRAFFIC_LIGHT_X,
-                CHAT_TRAFFIC_LIGHT_INSET_Y,
-            ))
             .transparent(true)
             .background_color(Color(0, 0, 0, 0))
             .shadow(true);
@@ -512,10 +456,6 @@ pub fn ensure_chat_popout_window(
             .decorations(true)
             .title_bar_style(TitleBarStyle::Overlay)
             .hidden_title(true)
-            .traffic_light_position(LogicalPosition::new(
-                CHAT_TRAFFIC_LIGHT_X,
-                CHAT_TRAFFIC_LIGHT_INSET_Y,
-            ))
             .transparent(true)
             .background_color(Color(0, 0, 0, 0))
             .shadow(true);

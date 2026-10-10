@@ -17,6 +17,7 @@ import { createChatNavigationController } from './chatNavigationController'
 import { createConversationWarmCache } from './conversationWarmCache'
 import { EMPTY_HISTORY_DIRECTORY, isPartialConversation } from './conversationHistoryWindow'
 import { keepNewerTodoState, patchTodoState } from './agentTodoState'
+import { keepNewerContextMeasurement } from './contextPanel'
 import { forgetChatReadingPosition, recallChatReadingPosition } from './chatReadingPosition'
 import { createChatExecutionOwner } from './chatExecutionOwner'
 import { createChatStreamLifecycleOwner, type StreamLifecycleResult } from './chatStreamLifecycleOwner'
@@ -153,7 +154,7 @@ import { onChatPerfProfiler, useChatPerfLongTaskProbe, useChatPerfRenderProbe } 
 import { ChatRouteKeepAlive } from './ChatRouteKeepAlive'
 import { ChatConversationPane } from './ChatConversationPane'
 import { GoalCard } from './GoalCard'
-import { composerGoal } from './goalPresentation'
+import { composerGoal, setGoalDraftMode, useGoalDraft } from './goalPresentation'
 import { PopoutOccupiedPlaceholder } from './popout/PopoutOccupiedPlaceholder'
 import { emptyPopoutConversation, stripConversationMessages } from './popout/conversationStub'
 import {
@@ -652,7 +653,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       && (conversation.revision < previous.revision
         || (conversation.revision === previous.revision
           && isPartialConversation(conversation) && !isPartialConversation(previous)))
-      ? previous : conversation && keepNewerTodoState(conversation, previous))
+      ? previous
+      : conversation && keepNewerContextMeasurement(keepNewerTodoState(conversation, previous), previous))
   }, [])
 
 
@@ -705,7 +707,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     setCurrentConversation((prev) => {
       if (!prev || prev.id !== updated.id || updated.revision < prev.revision) return prev
       return {
-        ...keepNewerTodoState(updated, prev),
+        ...keepNewerContextMeasurement(keepNewerTodoState(updated, prev), prev),
         messages: prev.messages,
         history_start: prev.history_start,
         history_total: prev.history_total,
@@ -821,15 +823,16 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const currentGoal = currentConversation?.goal_state ?? currentConversation?.goalState
   const visibleGoal = composerGoal(currentGoal, currentConversation?.messages ?? [])
   const goalActive = !!currentGoal && !['completed', 'cancelled'].includes(currentGoal.status)
+  const goalDraft = useGoalDraft(currentConversation?.id)
   const composerModes = useMemo(
     () => derivePermissionModes({
       target: 'composer',
       agentRuntime: activeAgentRuntime,
       agents: detectedExternalAgents,
       agentPlanMode: activeAgentPlanMode,
-      goalActive,
+      goalActive: goalActive || goalDraft,
     }),
-    [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode, goalActive],
+    [activeAgentRuntime, detectedExternalAgents, activeAgentPlanMode, goalActive, goalDraft],
   )
   const dshCustomPresets = useDshCustomPresets(activeAgentRuntime)
   const composerPresets = useMemo(
@@ -1176,7 +1179,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       void import('./SkillCenter')
       void import('./McpCenter')
       void import('./KnowledgeCenter')
-      void import('./NotesCenter')
       void import('./scheduledTasks/TasksCenter')
       void import('./MessageList')
     }, 400)
@@ -1219,6 +1221,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     void loadSkills()
     void refreshToolIndicator()
     setSidebarProfileRefreshKey((key) => key + 1)
+    setSidebarRefreshKey((key) => key + 1)
   }, [loadDefaultModel, loadSkills, onSettingsChange, refreshToolIndicator])
 
   useEffect(() => {
@@ -1938,7 +1941,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     selectedProject?.name, selectedSet?.id, sendDisabledReason, sendController,
   ])
   // 历史预置（Lens「在 AI 客户端继续」交接）：用最新 reactive 值（provider/model/project）创建带历史的新会话。
-  // 插件市场“使用”：新建对话并绑定插件主 Skill，再发出插件的开场消息。
+  // 插件市场“使用”：新建对话并发出开场消息；原有单入口插件仍兼容 Skill 绑定。
   // Skill 由会话的 activeSkillId 决定（后端每次发送都会重新扫描），不依赖本地 skills 列表是否已刷新。
   const handleMarketUse = useCallback(async (plugin: MarketPlugin) => {
     if (usesExternalRuntime || usesChatRuntime) {
@@ -2240,7 +2243,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       return
     }
     if (value === 'goal') {
-      if (!goalActive) insertTextIntoComposer('/goal ')
+      if (!goalActive) setGoalDraftMode(currentConversationIdRef.current, true)
       return
     }
     if (goalActive) {
@@ -2251,6 +2254,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       }
     }
     await handleAgentPlanModeChange(value as AgentPlanMode)
+    setGoalDraftMode(currentConversationIdRef.current, false)
   }, [applyConversationIfCurrent, goalActive, handleAgentPlanModeChange, handleExternalSandboxChange, usesExternalRuntime])
 
   const handleCancelStream = useCallback(async () => {
@@ -2290,6 +2294,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   )
   const showEmptyHero = chatView === 'conversation'
     && !conversationOccupied
+    && !goalDraft && !goalActive
     && isEmptyChatPresentation(displayMessages.length, streamCoarse)
 
   // 输入栏是聊天主区里除 MessageList 外最大的常驻子树。把它的 slot 和对象值稳定下来，
@@ -2354,6 +2359,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const composerUsageSlot = useMemo(
     () => (
       <SessionUsageStrip
+        conversationId={currentConversation?.id}
+        generating={streamCoarse.streaming}
         messages={displayMessages}
         lang={uiLang}
         apiFormats={providerApiFormats}
@@ -2370,6 +2377,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       currentConversation,
       displayMessages,
       providerApiFormats,
+      streamCoarse.streaming,
       uiLang,
       usesExternalRuntime,
     ],
@@ -2926,7 +2934,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             <OnboardingShell
               onComplete={handleOnboardingExit}
               onSkip={handleOnboardingExit}
-              onSettingsChange={onSettingsChange}
+              onSettingsChange={handleSettingsChange}
             />
           </div>
         ) : chatView === 'settings' ? (

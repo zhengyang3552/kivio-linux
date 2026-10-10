@@ -1,7 +1,7 @@
 # Kivio Rust 后端 Cargo 配置
 [package]
 name = "kivio"
-version = "3.1.0"
+version = "3.1.1"
 description = "Kivio Desktop - Screen-level AI assistant for macOS/Windows"
 authors = ["ZM"]
 license = "GPL-3.0-or-later"
@@ -24,6 +24,12 @@ path = "src/bin/export_chat_protocol.rs"
 [[test]]
 name = "bundled-resources"
 path = "build_support/resources.rs"
+
+# AppKit must be exercised on the process main thread, not libtest workers.
+[[test]]
+name = "traffic-lights"
+path = "tests/traffic_lights.rs"
+harness = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

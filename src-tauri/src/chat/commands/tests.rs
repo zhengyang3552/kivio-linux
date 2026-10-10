@@ -16,9 +16,9 @@ use crate::skills;
 
 use super::catalog::{assistant_from_builder_args, strip_transcripts_for_frontend};
 use super::context::{
-    apply_context_clear, build_chat_api_messages, count_tokens_in_value,
-    estimate_image_tokens_for_dimensions, group_answer_excluded_from_context,
-    mark_summary_stale_if_needed, resolve_usage_anchor,
+    apply_context_clear, build_chat_api_messages, conversation_cache_usage,
+    count_tokens_in_value, estimate_image_tokens,
+    group_answer_excluded_from_context, mark_summary_stale_if_needed, resolve_usage_anchor,
 };
 use super::interaction::{format_tool_approval_summary, stream_delta_event_kinds};
 use super::messages::{
@@ -28,12 +28,13 @@ use super::messages::{
 };
 use super::mutations::{
     apply_regenerate_truncation, apply_reply_with_model_result, build_fork_messages,
-    build_fork_messages_before_anchor, prepare_reply_with_model,
+    build_fork_messages_before_anchor, prepare_reply_with_model, remove_assistant_answer,
 };
 use super::reply_runtime::resolve_reply_arms;
 use super::sanitization::sanitize_image_payloads_for_model;
 use super::title::{build_title_summary_prompt, generate_title, sanitize_generated_title};
 use super::tooling::{
+    apply_agent_plan_tool_filter, apply_inline_code_request_tool_filter,
     apply_chat_mode_tool_filter, resolve_request_skill, should_answer_inline_without_file_write,
     try_apply_skill_slash_trigger,
 };
@@ -1663,6 +1664,8 @@ fn editing_assistant_reply_replaces_final_text_segments_only() {
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,
@@ -1766,6 +1769,8 @@ fn editing_assistant_reply_rewrites_replay_to_edited_final_answer() {
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,
@@ -1803,6 +1808,8 @@ fn test_chat_message(id: &str, role: &str, content: &str, timestamp: i64) -> Cha
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,
@@ -2523,6 +2530,8 @@ fn build_chat_api_messages_replays_hidden_tool_transcript() {
                 stream_outcome: None,
                 usage: None,
                 anchor_usage: None,
+                cache_pair_input: None,
+                cache_pair_read: None,
                 group_id: None,
                 provider_id: None,
                 model: None,
@@ -2570,6 +2579,8 @@ fn build_chat_api_messages_replays_hidden_tool_transcript() {
                 stream_outcome: None,
                 usage: None,
                 anchor_usage: None,
+                cache_pair_input: None,
+                cache_pair_read: None,
                 group_id: None,
                 provider_id: None,
                 model: None,
@@ -2701,6 +2712,8 @@ fn build_chat_api_messages_sanitizes_image_payloads_in_replayed_history() {
                     stream_outcome: None,
                     usage: None,
                     anchor_usage: None,
+                    cache_pair_input: None,
+                    cache_pair_read: None,
                     group_id: None,
                     provider_id: None,
                     model: None,
@@ -2769,27 +2782,27 @@ fn context_token_count_ignores_image_data_url_payloads() {
 #[test]
 fn image_token_estimates_follow_provider_dimension_rules() {
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gpt-4o", 1024, 1024),
+        estimate_image_tokens(None, "gpt-4o", Some((1024, 1024)), None),
         765
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gpt-4o", 2048, 4096),
+        estimate_image_tokens(None, "gpt-4o", Some((2048, 4096)), None),
         1105
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gpt-4.1-mini", 1024, 1024),
+        estimate_image_tokens(None, "gpt-4.1-mini", Some((1024, 1024)), None),
         1659
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "claude-sonnet-4", 1000, 1000),
+        estimate_image_tokens(None, "claude-sonnet-4", Some((1000, 1000)), None),
         1334
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gemini-2.0-flash", 384, 384),
+        estimate_image_tokens(None, "gemini-2.0-flash", Some((384, 384)), None),
         258
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gemini-2.0-flash", 1024, 1024),
+        estimate_image_tokens(None, "gemini-2.0-flash", Some((1024, 1024)), None),
         1032
     );
 }
@@ -2943,6 +2956,7 @@ fn test_settings_with_providers(provider_ids: &[&str]) -> Settings {
 fn assistant_with_anchor(id: &str, ts: i64, input_tokens: u64) -> ChatMessage {
     let mut m = test_chat_message(id, "assistant", "reply", ts);
     m.provider_id = Some("openai".to_string());
+    m.model = Some("gpt-4o".to_string());
     m.anchor_usage = Some(crate::chat::model::ModelUsage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(100),
@@ -3316,31 +3330,35 @@ fn group_excludes_only_non_selected_assistants() {
 
 #[test]
 fn stale_group_selection_falls_back_to_first_remaining() {
-    // D5/AC4：删除显式选中条后，清掉指向已删消息的 group_selections，选中条回退到组内
-    // 顺序第一条（这里模拟 chat_delete_message / chat_regenerate_message 的清理后状态）。
+    // 删掉显式选中的那一条：只少这一条，组选中记录被清掉，续聊回退到剩余的第一条。
     let messages = vec![
         test_chat_message("msg_user", "user", "q", 1),
         grouped_assistant("msg_a1", "answer one", "grp_1", 2),
         grouped_assistant("msg_a2", "answer two", "grp_1", 3),
+        grouped_assistant("msg_a3", "answer three", "grp_1", 4),
+        test_chat_message("msg_user_2", "user", "next question", 5),
+        test_chat_message("msg_later", "assistant", "later answer", 6),
     ];
     let mut conversation = test_conversation_with_messages(messages);
-    // 用户显式选了第二条。
     conversation
         .group_selections
         .insert("grp_1".to_string(), "msg_a2".to_string());
-
-    // 模拟删除被选中的 msg_a2：移除消息 + 删除命令对 group_selections 的清理。
-    conversation.messages.retain(|m| m.id != "msg_a2");
-    if conversation
+    conversation
         .group_selections
-        .get("grp_1")
-        .map(String::as_str)
-        == Some("msg_a2")
-    {
-        conversation.group_selections.remove("grp_1");
-    }
+        .insert("grp_other".to_string(), "msg_later".to_string());
 
-    // 残余的 msg_a1 必须仍进上下文（回退到组内第一条），而非被整组排除。
+    remove_assistant_answer(&mut conversation, "msg_a2").unwrap();
+
+    let ids: Vec<&str> = conversation.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["msg_user", "msg_a1", "msg_a3", "msg_user_2", "msg_later"]
+    );
+    assert!(conversation.group_selections.get("grp_1").is_none());
+    assert_eq!(
+        conversation.group_selections.get("grp_other").map(String::as_str),
+        Some("msg_later")
+    );
     assert!(!group_answer_excluded_from_context(
         &conversation,
         &conversation.messages[1]
@@ -3349,6 +3367,42 @@ fn stale_group_selection_falls_back_to_first_remaining() {
         build_chat_api_messages(None, "system", &conversation, Some(0), None, &[]).expect("build");
     let serialized = serde_json::to_string(&built).unwrap();
     assert!(serialized.contains("answer one"));
+    assert!(!serialized.contains("answer two"));
+    assert!(!serialized.contains("answer three"));
+    assert!(serialized.contains("next question"));
+    assert!(serialized.contains("later answer"));
+}
+
+#[test]
+fn remove_assistant_answer_keeps_selection_when_another_sibling_is_deleted() {
+    let mut conversation = test_conversation_with_messages(vec![
+        test_chat_message("msg_user", "user", "q", 1),
+        grouped_assistant("msg_a1", "answer one", "grp_1", 2),
+        grouped_assistant("msg_a2", "answer two", "grp_1", 3),
+    ]);
+    conversation
+        .group_selections
+        .insert("grp_1".to_string(), "msg_a2".to_string());
+
+    remove_assistant_answer(&mut conversation, "msg_a1").unwrap();
+
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg_user", "msg_a2"]
+    );
+    assert_eq!(
+        conversation.group_selections.get("grp_1").map(String::as_str),
+        Some("msg_a2")
+    );
+    assert_eq!(
+        remove_assistant_answer(&mut conversation, "msg_user").unwrap_err(),
+        "仅支持删除助手回复"
+    );
+    assert_eq!(conversation.messages.len(), 2);
 }
 
 // ===== 对话分支（方案 B）=====
@@ -3671,3 +3725,385 @@ fn compaction_fix_selection_respects_snapshot_boundary_and_no_op() {
         assert!(!wire.contains("Previous conversation summary"));
     }
 }
+
+#[test]
+fn usage_anchor_requires_matching_model_identity() {
+    let mut conversation = test_conversation_with_messages(vec![
+        assistant_with_anchor("a1", 2, 30_000),
+    ]);
+    let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
+    assert_eq!(resolve_usage_anchor(&conversation, Some(&provider)).0, Some(30_100));
+    conversation.model = "different-model".into();
+    assert_eq!(resolve_usage_anchor(&conversation, Some(&provider)), (None, 0));
+    conversation.model = "gpt-4o".into();
+    conversation.messages[0].model = None;
+    assert_eq!(resolve_usage_anchor(&conversation, Some(&provider)), (None, 0));
+}
+
+#[test]
+fn display_meter_ignores_an_older_anchor_when_the_latest_request_did_not_report() {
+    let mut latest = assistant_with_anchor("a2", 3, 900);
+    latest.anchor_usage = None;
+    let mut conversation = test_conversation_with_messages(vec![
+        assistant_with_anchor("a1", 2, 7_000),
+        latest,
+    ]);
+    conversation.context_state.lifecycle_id = 1;
+    conversation.context_state.measurement_seq = 5;
+    conversation.context_state.request_measurement = Some(crate::chat::types::ContextRequestMeasurement {
+        seq: 5,
+        lifecycle_id: 1,
+        request_id: "run-latest".into(),
+        provider_id: "openai".into(),
+        model: "gpt-4o".into(),
+        reported_tokens: None,
+        segments: Vec::new(),
+    });
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, None);
+    assert_eq!(display.reported_tokens, None);
+    let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
+    assert_eq!(
+        resolve_usage_anchor(&conversation, Some(&provider)).0,
+        Some(7_100)
+    );
+}
+
+#[test]
+fn live_measurement_outranks_an_older_disk_report_and_a_lower_seq_does_not() {
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    conversation.context_state.lifecycle_id = 1;
+    conversation.context_state.request_measurement = Some(crate::chat::types::ContextRequestMeasurement {
+        seq: 2,
+        lifecycle_id: 1,
+        request_id: "disk".into(),
+        provider_id: "openai".into(),
+        model: "gpt-4o".into(),
+        reported_tokens: Some(7_100),
+        segments: Vec::new(),
+    });
+    let live = crate::chat::agent::context_measure::LiveContextMeasurement {
+        seq: 9,
+        lifecycle_id: 1,
+        request_id: "run".into(),
+        provider_id: "openai".into(),
+        model: "gpt-4o".into(),
+        reported_tokens: Some(53_000),
+        report_received: true,
+        ..Default::default()
+    };
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, Some(&live));
+    assert_eq!(display.reported_tokens, Some(53_000));
+    let stale = crate::chat::agent::context_measure::LiveContextMeasurement {
+        seq: 1,
+        reported_tokens: Some(1_000),
+        ..live
+    };
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, Some(&stale));
+    assert_eq!(display.reported_tokens, Some(7_100));
+    let blank = crate::chat::agent::context_measure::LiveContextMeasurement {
+        seq: 99,
+        ..Default::default()
+    };
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, Some(&blank));
+    assert_eq!(display.reported_tokens, Some(7_100));
+}
+
+#[test]
+fn returning_to_a_previous_model_does_not_restore_its_display_report() {
+    let mut conversation =
+        test_conversation_with_messages(vec![assistant_with_anchor("a1", 2, 7_000)]);
+    conversation.context_state.lifecycle_id = 4;
+    conversation.context_state.measurement_seq = 4;
+    conversation.context_state.reported_context_tokens = None;
+    conversation.context_state.token_count_source = None;
+    conversation.context_state.request_measurement = None;
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, None);
+    assert_eq!(display.reported_tokens, None);
+    let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
+    assert_eq!(
+        resolve_usage_anchor(&conversation, Some(&provider)).0,
+        Some(7_100)
+    );
+}
+
+#[test]
+fn persisted_cache_pairs_keep_the_same_total_when_a_later_request_omits_telemetry() {
+    let mut complete = assistant_with_anchor("a1", 1, 100);
+    complete.cache_pair_input = Some(100);
+    complete.cache_pair_read = Some(90);
+    complete.usage = Some(crate::chat::model::ModelUsage {
+        input_tokens: Some(100),
+        cached_input_tokens: Some(90),
+        ..Default::default()
+    });
+    let mut missing = assistant_with_anchor("a2", 2, 900);
+    missing.usage = Some(crate::chat::model::ModelUsage {
+        input_tokens: Some(900),
+        cached_input_tokens: None,
+        ..Default::default()
+    });
+    let mut child = assistant_with_anchor("subagent-result-child", 3, 50);
+    child.cache_pair_input = Some(50);
+    child.cache_pair_read = Some(50);
+    let conversation = test_conversation_with_messages(vec![complete, missing, child]);
+    assert_eq!(
+        conversation_cache_usage(&conversation, &Settings::default()),
+        Some((100, 90))
+    );
+}
+
+#[test]
+fn request_measurement_refresh_preserves_last_report_until_replacement() {
+    use crate::chat::agent::context_measure::resolve_display;
+    use crate::chat::runtime_state::ChatRuntimeState;
+
+    let runtime = ChatRuntimeState::default();
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    let id = conversation.id.clone();
+    let segments = vec![crate::chat::ContextUsageSegment {
+        id: "tools".into(), label: "Tools".into(),
+        estimated_tokens: 42, chars: 168, color: None,
+    }];
+    runtime.bind_prepared_context(&id, "first", "reply", "openai", "gpt-4o", &segments, None);
+    // Without any provider report the meter really is unknown.
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&id).as_ref()).reported_tokens, None);
+    runtime.report_context_tokens(&id, "first", 7_100).unwrap();
+    let first = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    conversation.context_state.measurement_seq = first.seq;
+    conversation.context_state.request_measurement = first.persist;
+
+    let mut next_segments = segments.clone();
+    next_segments[0].estimated_tokens = 84;
+    runtime.bind_prepared_context(&id, "second", "reply", "openai", "gpt-4o", &next_segments, None);
+    // Reopening/refreshing during the next request must show one coherent report.
+    let waiting = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    assert_eq!(waiting.reported_tokens, Some(7_100));
+    assert_eq!(waiting.segments[0].estimated_tokens, 42);
+    assert!(runtime.report_context_tokens(&id, "first", 99_000).is_none());
+
+    runtime.report_context_tokens(&id, "second", 53_000).unwrap();
+    let refreshed = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    assert_eq!(refreshed.reported_tokens, Some(53_000));
+    assert_eq!(refreshed.segments[0].estimated_tokens, 84);
+    assert!(refreshed.seq > waiting.seq);
+
+    // An unreported request must not erase the latest valid report, even when
+    // disk still contains the first request and another request follows it.
+    for request in ["third", "fourth"] {
+        runtime.bind_prepared_context(&id, request, "reply", "openai", "gpt-4o", &segments, None);
+        assert!(runtime.finish_unreported_context(&id, request).is_none());
+        let retained = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+        assert_eq!(retained.reported_tokens, Some(53_000));
+        assert_eq!(retained.segments[0].estimated_tokens, 84);
+    }
+    let retained = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    conversation.context_state.measurement_seq = retained.seq;
+    conversation.context_state.request_measurement = retained.persist;
+    let restored: Conversation = serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+    assert_eq!(resolve_display(&restored, None).reported_tokens, Some(53_000));
+    let restarted = ChatRuntimeState::default();
+    restarted.seed_context_measurement(&id, restored.context_state.lifecycle_id,
+        restored.context_state.measurement_seq, restored.context_state.request_measurement.as_ref());
+    restarted.bind_prepared_context(&id, "fifth", "reply", "openai", "gpt-4o", &segments, None);
+    let waiting = resolve_display(&restored, restarted.context_measurement(&id).as_ref());
+    assert_eq!(waiting.reported_tokens, Some(53_000));
+    assert_eq!(waiting.segments[0].estimated_tokens, 84);
+
+    let invalid = restarted.invalidate_context_display(&id);
+    conversation.context_state.lifecycle_id = invalid.lifecycle_id;
+    conversation.context_state.measurement_seq = invalid.seq;
+    conversation.context_state.request_measurement = Some(invalid.stored());
+    restarted.bind_prepared_context(&id, "after-clear", "reply", "openai", "gpt-4o", &segments, None);
+    assert!(restarted.finish_unreported_context(&id, "after-clear").is_some());
+    assert_eq!(resolve_display(&conversation, restarted.context_measurement(&id).as_ref()).reported_tokens, None);
+}
+
+#[test]
+fn model_switch_back_and_restart_keep_invalidated_measurements_unknown() {
+    use crate::chat::agent::context_measure::resolve_display;
+    use crate::chat::runtime_state::ChatRuntimeState;
+
+    let runtime = ChatRuntimeState::default();
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    let id = conversation.id.clone();
+    runtime.bind_prepared_context(&id, "old", "reply", "openai", "gpt-4o", &[], None);
+    runtime.report_context_tokens(&id, "old", 7_100).unwrap();
+    let invalid = runtime.invalidate_context_display(&id);
+    conversation.model = "other-model".into();
+    conversation.context_state.lifecycle_id = invalid.lifecycle_id;
+    conversation.context_state.measurement_seq = invalid.seq;
+    conversation.context_state.reported_context_tokens = None;
+    conversation.context_state.token_count_source = None;
+    assert!(runtime.report_context_tokens(&id, "old", 99_000).is_none());
+    conversation.model = "gpt-4o".into();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&id).as_ref()).reported_tokens, None);
+
+    let restarted = ChatRuntimeState::default();
+    restarted.seed_context_measurement(&id, invalid.lifecycle_id, invalid.seq, None);
+    restarted.bind_prepared_context(&id, "new", "new-reply", "openai", "gpt-4o", &[], None);
+    let (reported, _) = restarted.report_context_tokens(&id, "new", 12_000).unwrap();
+    assert!(reported.seq > invalid.seq);
+    assert_eq!(resolve_display(&conversation, Some(&reported)).reported_tokens, Some(12_000));
+}
+
+#[test]
+fn review_regression_request_images_have_independent_cost_without_character_inflation() {
+    use super::context::measure_request_segments;
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(64, 64)
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+    let plain = serde_json::json!({"role":"user","content":[{"type":"text","text":"inspect"}]});
+    let mut with_image = plain.clone();
+    with_image["content"].as_array_mut().unwrap().push(
+        serde_json::json!({"type":"image_url","image_url":{"url":url}})
+    );
+    let plain = measure_request_segments(&[plain], &[], None, "gemini-2.0-flash");
+    let measured = measure_request_segments(&[with_image], &[], None, "gemini-2.0-flash");
+    let before = plain.iter().find(|segment| segment.id == "conversation").unwrap();
+    let after = measured.iter().find(|segment| segment.id == "conversation").unwrap();
+    assert_eq!(after.chars, before.chars);
+    assert_eq!(after.estimated_tokens - before.estimated_tokens, 258);
+}
+
+#[test]
+fn review_regression_branch_selection_invalidates_memory_disk_and_late_reports() {
+    use crate::chat::agent::context_measure::resolve_display;
+    let state = crate::state::test_app_state();
+    let mut first = assistant_with_anchor("first", 1, 100);
+    first.group_id = Some("group".into());
+    first.cache_pair_input = Some(100);
+    first.cache_pair_read = Some(90);
+    let mut second = assistant_with_anchor("second", 2, 100);
+    second.group_id = Some("group".into());
+    second.cache_pair_input = Some(100);
+    second.cache_pair_read = Some(10);
+    let mut conversation = test_conversation_with_messages(vec![first, second]);
+    conversation.group_selections.insert("group".into(), "first".into());
+    let runtime = state.chat_runtime();
+    runtime.bind_prepared_context(&conversation.id, "old", "reply", "openai", "gpt-4o", &[], None);
+    let (live, _) = runtime.report_context_tokens(&conversation.id, "old", 53_000).unwrap();
+    conversation.context_state.measurement_seq = live.seq;
+    conversation.context_state.request_measurement = Some(live.stored());
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "second".into()).unwrap();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&conversation.id).as_ref()).reported_tokens, None);
+    assert_eq!(conversation.context_state.cache_hit_rate, Some(0.1));
+    assert!(runtime.report_context_tokens(&conversation.id, "old", 99_000).is_none());
+    let restored: Conversation = serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+    assert_eq!(resolve_display(&restored, None).reported_tokens, None);
+    let seq = conversation.context_state.measurement_seq;
+    assert!(seq > live.seq);
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "second".into()).unwrap();
+    assert_eq!(conversation.context_state.measurement_seq, seq);
+    assert!(super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "absent".into()).is_err());
+    assert_eq!(conversation.context_state.measurement_seq, seq);
+
+    runtime.bind_prepared_context(&conversation.id, "new", "second", "openai", "gpt-4o", &[], None);
+    runtime.report_context_tokens(&conversation.id, "new", 7_100).unwrap();
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "second".into()).unwrap();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&conversation.id).as_ref()).reported_tokens, Some(7_100));
+    assert!(runtime.report_context_tokens(&conversation.id, "old", 99_000).is_none());
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "first".into()).unwrap();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&conversation.id).as_ref()).reported_tokens, None);
+    assert_eq!(conversation.context_state.cache_hit_rate, Some(0.9));
+    assert!(runtime.report_context_tokens(&conversation.id, "new", 99_000).is_none());
+}
+
+#[test]
+fn image_request_estimates_respect_model_detail_without_changing_character_shares() {
+    use super::context::measure_request_segments;
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2048, 2048)
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+    for (model, detail, expected) in [
+        ("gpt-4o", "low", 85),
+        ("gpt-4o", "high", 765),
+        ("gpt-5.5", "low", 308),
+        ("gpt-5.5", "high", 3000),
+        ("gpt-5.5", "original", 4916),
+        ("gpt-5.4-mini", "low", 4916),
+        ("gpt-5.4-mini", "high", 3000),
+        ("gpt-5.4-mini", "original", 4916),
+    ] {
+        let plain = serde_json::json!({"role":"user","content":[{"type":"text","text":"inspect"}]});
+        let mut request = plain.clone();
+        request["content"].as_array_mut().unwrap().push(
+            serde_json::json!({"type":"image_url","image_url":{"url":url,"detail":detail}})
+        );
+        let before = measure_request_segments(&[plain], &[], None, model);
+        let after = measure_request_segments(&[request], &[], None, model);
+        let before = before.iter().find(|segment| segment.id == "conversation").unwrap();
+        let after = after.iter().find(|segment| segment.id == "conversation").unwrap();
+        assert_eq!(after.chars, before.chars, "{model}/{detail}");
+        assert_eq!(after.estimated_tokens - before.estimated_tokens, expected, "{model}/{detail}");
+    }
+}
+
+#[test]
+fn image_request_estimates_use_model_detail_budgets_for_unknown_dimensions() {
+    use super::context::measure_request_segments;
+    for (model, detail, expected) in [
+        ("gpt-4o", "low", 85),
+        ("gpt-4o", "high", 1445),
+        ("gpt-5.5", "low", 308),
+        ("gpt-5.5", "high", 3000),
+        ("gpt-5.5", "original", 12000),
+        ("gpt-5.5", "auto", 12000),
+        ("gpt-5.4", "auto", 3000),
+        ("gpt-5.4", "original", 12000),
+        ("gpt-6-astra", "original", 36000),
+    ] {
+        for url in ["https://example.invalid/image.png", "data:image/png;base64,invalid!"] {
+            let plain = serde_json::json!({"role":"user","content":[]});
+            let request = serde_json::json!({"role":"user","content":[
+                {"type":"image_url","image_url":{"url":url,"detail":detail}}
+            ]});
+            let before = measure_request_segments(&[plain], &[], None, model);
+            let after = measure_request_segments(&[request], &[], None, model);
+            let before = before.iter().find(|segment| segment.id == "conversation").unwrap();
+            let after = after.iter().find(|segment| segment.id == "conversation").unwrap();
+            assert_eq!(after.chars, before.chars);
+            assert_eq!(after.estimated_tokens - before.estimated_tokens, expected, "{model}/{detail}");
+        }
+    }
+}
+
+
+#[test]
+fn image_request_estimates_count_supported_image_blocks_once() {
+    use super::context::measure_request_segments;
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1024, 1024)
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    let url = format!("data:image/png;base64,{data}");
+    let plain = serde_json::json!({"role":"user","content":[]});
+    let before = measure_request_segments(&[plain], &[], None, "gpt-5.5");
+    let before = before.iter().find(|segment| segment.id == "conversation").unwrap();
+    for block in [
+        serde_json::json!({"type":"image_url","image_url":{"url":url,"detail":"high"}}),
+        serde_json::json!({"type":"input_image","image_url":url,"detail":"high"}),
+        serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data},"detail":"high"}),
+        serde_json::json!({"type":"image","data":data,"mimeType":"image/png","detail":"high"}),
+    ] {
+        let request = serde_json::json!({"role":"user","content":[block]});
+        let measured = measure_request_segments(&[request], &[], None, "gpt-5.5");
+        let after = measured.iter().find(|segment| segment.id == "conversation").unwrap();
+        assert_eq!(after.chars, before.chars);
+        assert_eq!(after.estimated_tokens - before.estimated_tokens, 1229);
+    }
+}
+
+#[test]
+fn image_patch_estimates_fit_dimensions_before_budget_and_preserve_original() {
+    assert_eq!(estimate_image_tokens(None, "gpt-5.5", Some((4096, 512)), Some("high")), 615);
+    assert_eq!(estimate_image_tokens(None, "gpt-6-astra", Some((4096, 512)), Some("high")), 2458);
+    assert_eq!(estimate_image_tokens(None, "gpt-5.5", Some((6400, 6400)), Some("original")), 12000);
+    assert_eq!(estimate_image_tokens(None, "gpt-6-astra", Some((6400, 6400)), Some("original")), 48000);
+    assert_eq!(estimate_image_tokens(None, "gpt-5.5", Some((1, 100_000)), Some("high")), 77);
+}
+

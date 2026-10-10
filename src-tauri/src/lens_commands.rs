@@ -1609,8 +1609,8 @@ pub(crate) async fn lens_translate(
             return Ok(serde_json::json!({ "success": false, "error": "OCR provider not found" }))
         }
     };
-    if !ocr_provider.has_credentials() {
-        return Ok(serde_json::json!({ "success": false, "error": "Missing API Key" }));
+    if !ocr_provider.authentication_ready() {
+        return Ok(serde_json::json!({ "success": false, "error": "Please log in to the provider first" }));
     }
     if settings.screenshot_translation.model.trim().is_empty() {
         return Ok(serde_json::json!({
@@ -1857,8 +1857,8 @@ pub(crate) async fn lens_translate_text(
             return Ok(serde_json::json!({ "success": false, "error": msg }));
         }
     };
-    if !provider.has_credentials() {
-        let msg = "Missing API Key".to_string();
+    if !provider.authentication_ready() {
+        let msg = "Please log in to the provider first".to_string();
         emit_done(false, Some(&msg));
         return Ok(serde_json::json!({ "success": false, "error": msg }));
     }
@@ -2186,8 +2186,8 @@ pub(crate) async fn lens_replace_translate(
         Some(p) => p.clone(),
         None => return fail("Translation provider not found"),
     };
-    if !provider.has_credentials() {
-        return fail("Missing API Key");
+    if !provider.authentication_ready() {
+        return fail("Please log in to the provider first");
     }
     if settings.screenshot_translation.model.trim().is_empty() {
         return fail("Please select a model first");

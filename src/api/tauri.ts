@@ -92,6 +92,7 @@ export type ChatContextUsageSegment = {
   label: string
   estimated_tokens?: number
   estimatedTokens?: number
+  chars?: number
   color?: string | null
 }
 
@@ -138,10 +139,25 @@ export type ChatContextState = {
   autoCompactThresholdTokens?: number | null
   context_window_estimated?: boolean
   contextWindowEstimated?: boolean
+  context_source?: string | null
+  contextSource?: string | null
+  token_count_source?: string | null
+  tokenCountSource?: string | null
+  session_input_tokens?: number | null
+  sessionInputTokens?: number | null
   usage_ratio?: number | null
   usageRatio?: number | null
   status?: string
   segments?: ChatContextUsageSegment[]
+  reported_context_tokens?: number | null
+  reportedContextTokens?: number | null
+  /** Backend measurement order. Full snapshots and live reports share it. */
+  measurement_seq?: number | null
+  measurementSeq?: number | null
+  lifecycle_id?: number | null
+  lifecycleId?: number | null
+  cache_hit_rate?: number | null
+  cacheHitRate?: number | null
   last_measured_at?: number
   lastMeasuredAt?: number
   last_compressed_at?: number | null
@@ -158,18 +174,29 @@ export type ChatContextState = {
 }
 
 export type ChatContextLiveUsage = {
-  /** 此刻已用（分子）。口径与轮末权威值一致，真源在 Rust 侧。 */
+  /** 最近主请求的 API 实报输入＋输出；无来源的事件清除失效实报。 */
   usedTokens: number
-  /** 实报、实报加新增估算或无实报；不能继承上一条快照的来源。 */
+  /** `provider_context_reported` 或空值（历史已改写）；不能继承旧快照来源。 */
   tokenCountSource?: string | null
   /** 上下文窗口（分母）。`null` = 本次上报没带窗口，前端必须保留已知的旧值（分母粘滞）。 */
   contextWindowTokens?: number | null
+  cacheInputTokens?: number | null
+  cacheReadTokens?: number | null
+  /**
+   * 与完整快照共用的后端测量序号。更小的序号不能覆盖已应用的测量；
+   * 失效（改写、压缩、清空、换模型）使用更大的序号。
+   */
+  measurementSeq?: number | null
+  /** Bumped on model change, compaction, and context clear. A higher id invalidates omitted fields. */
+  lifecycleId?: number | null
+  /** Null or omitted keeps the previous categories. An empty array clears them. */
+  segments?: ChatContextUsageSegment[] | null
 }
 
 /**
  * 上下文状态更新。两种形态共用这一条通道：
- * - `contextState` —— 轮末/手动刷新的**权威快照**（含分段、压缩计数、来源标签）。
- * - `live` —— 生成过程中的**活数**（分子 + 分母 + 来源）。完整快照的分段计算不在增量通道执行。
+ * - `contextState` —— 轮末/手动刷新的快照（内部估算与 API 实报分开存放）。
+ * - `live` —— API 实报占用、主请求累计缓存计数或压缩后的失效通知，不传入本地估算。
  */
 export type ChatContextPayload = {
   conversationId: string
@@ -657,9 +684,8 @@ export type ChatToolsConfig = {
   approvalPolicy: 'readonly_auto_sensitive_confirm' | 'always_confirm' | 'auto' | string
   /** 同一时刻最多并行运行的子 agent 数（后端钳制 1..64，默认 12）。 */
   subAgentConcurrency?: number
-  /** 子代理全局模型覆盖（providerId+model，皆空 = 跟随主对话模型）。agent 定义的 model 字段仍优先。 */
-  subAgentProviderId?: string
-  subAgentModel?: string
+  /** 子代理角色的模型与推理强度；SMOL/SLOW 未配置时跟随 TASK，TASK 跟随主对话。 */
+  subAgentModels?: Record<string, SubAgentModelSelection>
   /** 开发者「请求调试」开关：开启后每次 provider 调用被记录到内存环形缓冲（脱敏）。默认关。 */
   requestDebugEnabled?: boolean
   nativeTools: ChatNativeToolsConfig
@@ -953,9 +979,9 @@ export function isOpenCodeFree(provider: ModelProvider): boolean {
     && provider.apiKeys.every(key => !key.trim())
 }
 
-export function providerHasCredentials(provider: ModelProvider): boolean {
-  if (isOpenCodeFree(provider)) return true
-  return provider.request.oauth ? Boolean(provider.request.oauth.credentialId) : provider.apiKeys.some(key => key.trim() !== '')
+export function providerAuthenticationReady(provider: ModelProvider): boolean {
+  // API keys are optional for local/anonymous endpoints; OAuth still requires login.
+  return !provider.request.oauth || Boolean(provider.request.oauth.credentialId)
 }
 
 export type ProviderRequestConfig = {
@@ -1010,6 +1036,12 @@ export type ProviderConnectionInput = {
   apiFormat?: string
   /** 编辑中（可能尚未保存）的请求配置。不传则后端回落已保存的那份。 */
   request?: ProviderRequestConfig
+}
+
+export type SubAgentModelSelection = {
+  providerId: string
+  model: string
+  thinkingLevel?: string | null
 }
 
 export type DefaultModelSelection = {
@@ -1366,6 +1398,12 @@ export type PluginInstallBrief = {
 }
 
 export type UsageRange = 'today' | '1d' | '7d' | '30d' | '365d'
+
+export type ConversationCost = {
+  costUsd: number | null
+  unpricedRequests: number
+  skippedRecords: number
+}
 
 export type UsageStatsQuery = {
   range?: UsageRange
@@ -1815,6 +1853,8 @@ export const api = {
     normalizeSettingsSnapshot(await invoke<SettingsSnapshot>('import_settings', { path, expectedVersion })),
   usageGetStats: (query?: UsageStatsQuery) =>
     invoke<UsageStatsResponse>('usage_get_stats', { query }),
+  usageGetConversationCost: (conversationId: string) =>
+    invoke<ConversationCost>('usage_get_conversation_cost', { conversationId }),
   usageClear: () => invoke<void>('usage_clear'),
   getRequestDebugRecords: () =>
     invoke<RequestDebugRecord[]>('get_request_debug_records'),
@@ -1967,9 +2007,9 @@ export const api = {
    *  材质上了必须传 false，否则 Menu 材质被实色背景挡死。非 macOS 是 no-op。 */
   chatWindowSetOpaque: (opaque: boolean): Promise<void> =>
     invoke('chat_window_set_opaque', { opaque }),
-  /** macOS 交通灯中心距内容顶缘的真实距离（CSS px）。取不到返回 null，前端退回默认值。 */
-  chatTrafficLightCenterY: (): Promise<number | null> =>
-    invoke('chat_traffic_light_center_y'),
+  /** macOS：把交通灯对齐到页面按钮中心，返回校准后的实际位置。 */
+  chatTrafficLightCenterY: (centerY: number): Promise<number | null> =>
+    invoke('chat_traffic_light_center_y', { centerY }),
   chatReportNotificationView: (route: string, viewing: boolean): Promise<void> =>
     invoke('chat_report_notification_view', { route, viewing }),
   resizeWindow: async (width: number, height: number) => {

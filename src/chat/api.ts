@@ -852,6 +852,14 @@ const mockChatApi = {
     if (!target) throw new Error('Message not found')
     if (target.role !== 'assistant') throw new Error('仅支持删除助手回复')
     conversation.messages = conversation.messages.filter((message) => message.id !== messageId)
+    const groupId = target.group_id ?? target.groupId
+    const groupSelections = conversation.group_selections ?? conversation.groupSelections
+    if (groupId && groupSelections?.[groupId] === messageId) {
+      const nextSelections = { ...groupSelections }
+      delete nextSelections[groupId]
+      conversation.group_selections = nextSelections
+      conversation.groupSelections = nextSelections
+    }
     conversation.updated_at = nowSeconds()
     const contextState = estimateMockContext(conversation)
     conversation.context_state = contextState
@@ -1239,6 +1247,16 @@ export const chatApi = {
   async getConversationRevision(conversationId: string): Promise<number | null> {
     if (!isTauriRuntime()) return mockChatApi.getConversationRevision(conversationId)
     return invoke<number | null>('chat_get_conversation_revision', { conversationId })
+  },
+
+  async exportSetBackup(setId: string, path: string): Promise<void> {
+    if (!isTauriRuntime()) throw new Error('Set export requires the desktop app')
+    await invoke<void>('chat_export_set_backup', { setId, path })
+  },
+
+  async importSetBackup(path: string): Promise<ChatSet> {
+    if (!isTauriRuntime()) throw new Error('Set import requires the desktop app')
+    return invoke<ChatSet>('chat_import_set_backup', { path })
   },
 
   async exportConversationMarkdown(

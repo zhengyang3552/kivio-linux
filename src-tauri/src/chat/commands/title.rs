@@ -183,8 +183,8 @@ async fn generate_title_with_model(
         eprintln!("[title] provider 未找到: {provider_id}");
         return None;
     };
-    if !provider.has_credentials() || model.trim().is_empty() {
-        eprintln!("[title] provider 无 key 或 model 为空: {provider_id} / {model}");
+    if !provider.authentication_ready() || model.trim().is_empty() {
+        eprintln!("[title] provider 未登录或 model 为空: {provider_id} / {model}");
         return None;
     }
     if model_can_generate_images_directly(&provider, &model) {
@@ -662,6 +662,8 @@ mod tests {
             stream_outcome: None,
             usage: None,
             anchor_usage: None,
+            cache_pair_input: None,
+            cache_pair_read: None,
             group_id: None,
             provider_id: None,
             model: None,

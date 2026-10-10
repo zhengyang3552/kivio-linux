@@ -182,8 +182,12 @@ impl OpenAiResponsesProvider<'_> {
                     .state
                     .client_for(self.provider)
                     .post(self.responses_url())
-                    .bearer_auth(key)
                     .header(ACCEPT_ENCODING, "identity");
+                req = crate::provider_request::apply_api_key_auth(
+                    req,
+                    crate::settings::ProviderApiFormat::OpenAiResponses,
+                    key,
+                );
                 for (name, value) in self.extra_header_pairs(&request.metadata, body) {
                     req = req.header(name, value);
                 }
@@ -1305,6 +1309,11 @@ fn handle_responses_stream_event(
         "response.completed" | "response.incomplete" => {
             if let Some(response) = value.get("response") {
                 if let Some(usage) = model_usage_from_openai_value(response) {
+                    if let Some(input_tokens) = usage.input_tokens {
+                        sink.emit(StreamPart::ContextUsage {
+                            input_tokens, output_tokens: usage.output_tokens.unwrap_or(0),
+                        })?;
+                    }
                     state.usage = Some(usage);
                 }
                 if let Some(status) = response.get("status").and_then(Value::as_str) {
